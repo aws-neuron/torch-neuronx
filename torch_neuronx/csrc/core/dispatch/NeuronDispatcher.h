@@ -121,6 +121,9 @@ struct SdpaCoreResult {
   std::vector<c10::IValue> original_args;
   torch::Device device;
   bool handled;  // true if early-exit already pushed to stack
+  // True when the op ran off the dispatch path, a CPU fallback for instance. The SDPA
+  // callers cancel their Dispatch.Total section on it.
+  bool bypassed_dispatch = false;
 };
 
 /**

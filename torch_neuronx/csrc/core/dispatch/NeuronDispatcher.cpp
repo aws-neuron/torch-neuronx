@@ -30,6 +30,7 @@
 #include "torch_neuronx/csrc/core/dispatch/ParseLoweringResult.h"
 #include "torch_neuronx/csrc/core/dispatch/PreprocessArgs.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/Transformations.h"
+#include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 #include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 #include "torch_neuronx/csrc/core/utils/DtypeCastVec.h"
 #include "torch_neuronx/csrc/core/utils/HostChain.h"
@@ -233,6 +234,8 @@ std::vector<std::string> NeuronDispatcher::GetRegisteredOps() const {
 void NeuronDispatcher::DispatchScalarTensor(const c10::OperatorHandle& op,
                                             c10::DispatchKeySet dispatch_keys,
                                             torch::jit::Stack* stack) {
+  TORCH_NEURONX_TIMED_SECTION("Dispatch.Total");
+
   // Schema: aten::scalar_tensor(Scalar s, *, ScalarType? dtype=None,
   //           Layout? layout=None, Device? device=None, bool? pin_memory=None)
   auto schema = op.schema();
@@ -1357,12 +1360,7 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
       "' was registered without a "
       "lower_func. All ops must have a C++ lowering path when TORCH_NEURONX_CPP_DISPATCH=1.");
 
-  // ── 1. Generate cache key on RAW args (before any downcast) ──
-  std::string cache_key = GenerateCacheKey(lookup_name, schema, args, reg);
-  TORCH_NEURONX_DISPATCH_DEBUG("[NeuronDispatcher::Dispatch] cache_key", " op=", op_name,
-                               " cache_key=", cache_key);
-
-  // ── 1.5. Int64 → CPU fallback ──
+  // ── 1. Int64 → CPU fallback ──
   // ShouldCpuFallback returns true when:
   //   - The op is UNSUPPORTED (e.g. matmul/conv on int64 would produce garbage), or
   //   - The active Int64Mode steers this op away from Neuron — namely
@@ -1385,7 +1383,22 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
     }
   }
 
-  // ── 2. Dispatch with casting ──
+  // Dispatch benchmark measurement starts here, not at function entry, so the CPU
+  // fallbacks and early returns above record nothing and their ops land in the CSV as
+  // no_dispatch. Excluded from the measurement: the two op-name strings, the arg pop
+  // and the early-out checks. DispatchScalarTensor and the two SDPA entry points do
+  // start at entry, so dispatch_us reads a little higher for those 3 ops of 532.
+  // TODO: align the four by starting at entry and cancelling on each early return
+  // above. That also changes what the complex path and a throwing lower_func check
+  // record, so it needs its own testing.
+  TORCH_NEURONX_TIMED_SECTION("Dispatch.Total");
+
+  // ── 2. Generate cache key on RAW args (before any downcast) ──
+  std::string cache_key = GenerateCacheKey(lookup_name, schema, args, reg);
+  TORCH_NEURONX_DISPATCH_DEBUG("[NeuronDispatcher::Dispatch] cache_key", " op=", op_name,
+                               " cache_key=", cache_key);
+
+  // ── 3. Dispatch with casting ──
   // Dtype inference is unified into the lowering step: on cache miss,
   // lower_func receives both downcasted and original args, and the
   // LoweringResult contains inferred_output_dtypes for upcasting.
@@ -1905,7 +1918,7 @@ SdpaCoreResult NeuronDispatcher::DispatchSdpaCore(const c10::OperatorHandle& op,
 
   // Early exit: empty tensors
   if (TryHandleEmptyTensors(op, stack, args, schema, op_name, reg)) {
-    return {{}, {}, torch::Device(torch::kCPU), true};
+    return {{}, {}, torch::Device(torch::kCPU), true, true};
   }
 
   // Complex dtypes: fall back to CPU
@@ -1916,7 +1929,7 @@ SdpaCoreResult NeuronDispatcher::DispatchSdpaCore(const c10::OperatorHandle& op,
     for (auto& arg : args) torch::jit::push(*stack, arg);
     at::native::cpu_fallback(op, stack);
     logOperationExecuted(op_name);
-    return {{}, {}, torch::Device(torch::kCPU), true};
+    return {{}, {}, torch::Device(torch::kCPU), true, true};
   }
 
   std::string lookup_name = op_name;
@@ -1950,7 +1963,7 @@ SdpaCoreResult NeuronDispatcher::DispatchSdpaCore(const c10::OperatorHandle& op,
     at::native::cpu_fallback(op, stack);
     torch_neuronx::markFallbackLogged(op_name);
     logOperationExecuted(op_name);
-    return {{}, {}, torch::Device(torch::kCPU), true};
+    return {{}, {}, torch::Device(torch::kCPU), true, true};
   }
 
   // Empty-tensor lowering result
@@ -2006,6 +2019,8 @@ SdpaCoreResult NeuronDispatcher::DispatchSdpaCore(const c10::OperatorHandle& op,
 void NeuronDispatcher::DispatchSdpaFwdImpl(const c10::OperatorHandle& op,
                                            c10::DispatchKeySet dispatch_keys,
                                            torch::jit::Stack* stack, const OpRegistration& reg) {
+  TORCH_NEURONX_TIMED_SECTION("Dispatch.Total");
+
   auto op_name = c10::toString(op.schema().operator_name());
 
   // Validate return_debug_mask (arg index 6 in the ATen schema)
@@ -2044,7 +2059,11 @@ void NeuronDispatcher::DispatchSdpaFwdImpl(const c10::OperatorHandle& op,
   }
 
   auto result = DispatchSdpaCore(op, dispatch_keys, stack, reg);
-  if (result.handled) return;
+  if (result.handled) {
+    // The op ran somewhere other than the dispatch path, so drop the sample.
+    if (result.bypassed_dispatch) TORCH_NEURONX_TIMED_SECTION_CANCEL();
+    return;
+  }
 
   auto& final_outputs = result.final_outputs;
   TORCH_CHECK(final_outputs.size() == 7, "SDPA forward expected 7 outputs, got ",
@@ -2096,10 +2115,16 @@ void NeuronDispatcher::DispatchSdpaFwdImpl(const c10::OperatorHandle& op,
 void NeuronDispatcher::DispatchSdpaBwdImpl(const c10::OperatorHandle& op,
                                            c10::DispatchKeySet dispatch_keys,
                                            torch::jit::Stack* stack, const OpRegistration& reg) {
+  TORCH_NEURONX_TIMED_SECTION("Dispatch.Total");
+
   auto op_name = c10::toString(op.schema().operator_name());
 
   auto result = DispatchSdpaCore(op, dispatch_keys, stack, reg);
-  if (result.handled) return;
+  if (result.handled) {
+    // The op ran somewhere other than the dispatch path, so drop the sample.
+    if (result.bypassed_dispatch) TORCH_NEURONX_TIMED_SECTION_CANCEL();
+    return;
+  }
 
   auto& final_outputs = result.final_outputs;
 

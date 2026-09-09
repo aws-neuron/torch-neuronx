@@ -1,11 +1,24 @@
 """Single-source operation registration system for torch-mlir backend."""
 
 import inspect
+import os
+import time
+from collections import deque
 from collections.abc import Callable
 from enum import Enum
 
 import torch
 import torch.library
+
+_DISPATCH_TIMING_ENABLED = os.environ.get("TORCH_NEURONX_DISPATCH_TIMING", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Per-call dispatch duration in ns, one entry per call to combined().
+_DISPATCH_TIMES_MAXLEN = 100_000
+_dispatch_times = deque(maxlen=_DISPATCH_TIMES_MAXLEN)
 
 
 class Preprocessing(Enum):
@@ -496,90 +509,99 @@ def _make_preprocessing_dispatch(
 
     @torch._dynamo.disable
     def combined(*args, **kwargs):
-        # Validate
-        if validate_fn is not None:
-            validate_fn(*args, **kwargs)
+        if _DISPATCH_TIMING_ENABLED:
+            t_start = time.perf_counter_ns()
+        try:
+            # Validate
+            if validate_fn is not None:
+                validate_fn(*args, **kwargs)
 
-        # Preprocess
-        result = torch_fn(*args, **kwargs)
-        compute_fn = result[0]
-        new_args = result[1]
-        new_kwargs = result[2]
+            # Preprocess
+            result = torch_fn(*args, **kwargs)
+            compute_fn = result[0]
+            new_args = result[1]
+            new_kwargs = result[2]
 
-        if not new_args:
+            if not new_args:
+                import torch_neuronx._C as _C
+
+                _C._log_executed_op(aten_name)
+                return None
+
+            # Get or create kernel. Use compute_fn's __name__ as key since
+            # compute_fn is a new closure each call (different id() every time).
+            fn_key = id(getattr(compute_fn, "__code__", compute_fn))
+            kernel = _kernel_cache.get(fn_key)
+            if kernel is None:
+                kernel = TorchMlirKernel(
+                    torch_fn=compute_fn,
+                    op_name=aten_name,
+                    output_params=output_params,
+                    static_argnums=static_argnums,
+                    static_argnames=static_argnames,
+                )
+                _kernel_cache[fn_key] = kernel
+
+            # Execute
+            # For inplace ops, ensure the kernel writes back to the original tensor.
+            # The preprocessing may not set out= for all inplace ops.
+            if aten_name.endswith("_") and new_kwargs.get("out") is None and new_args:
+                first = new_args[0]
+                if isinstance(first, torch.Tensor):
+                    new_kwargs["out"] = first
+                elif isinstance(first, list | tuple) and first:
+                    new_kwargs["out"] = tuple(first)
+
+            try:
+                exec_result = kernel(*new_args, **new_kwargs)
+            except (IndexError, ValueError, TypeError):
+                # Errors — re-raise to match PyTorch behavior.
+                raise
+            except Exception:
+                # Compilation or execution failure fall back to CPU.
+                if fallback_fn is not None:
+                    return fallback_fn(*args, **kwargs)
+                raise
+
+            # Postprocess (only if 4-tuple returned)
+            if len(result) == 4 and result[3] is not None:
+                exec_result = result[3](exec_result)
+
+            # Upcast if preprocessed args had 64-bit dtype (Neuron downcasts 64→32)
+            first_preprocessed = new_args[0] if new_args else None
+            if first_preprocessed is not None:
+                orig_dtype = None
+                if isinstance(first_preprocessed, torch.Tensor):
+                    if first_preprocessed.dtype in (torch.int64, torch.float64):
+                        orig_dtype = first_preprocessed.dtype
+                elif isinstance(first_preprocessed, list | tuple) and first_preprocessed:
+                    t = first_preprocessed[0]
+                    if isinstance(t, torch.Tensor) and t.dtype in (torch.int64, torch.float64):
+                        orig_dtype = t.dtype
+
+                if orig_dtype is not None and exec_result is not None:
+                    target = orig_dtype
+                    if isinstance(exec_result, torch.Tensor):
+                        if _upcast_map.get(exec_result.dtype) == target:
+                            exec_result = exec_result.to(target)
+                    elif isinstance(exec_result, list | tuple):
+                        exec_result = type(exec_result)(
+                            r.to(target)
+                            if isinstance(r, torch.Tensor) and _upcast_map.get(r.dtype) == target
+                            else r
+                            for r in exec_result
+                        )
+
             import torch_neuronx._C as _C
 
             _C._log_executed_op(aten_name)
-            return None
 
-        # Get or create kernel. Use compute_fn's __name__ as key since
-        # compute_fn is a new closure each call (different id() every time).
-        fn_key = id(getattr(compute_fn, "__code__", compute_fn))
-        kernel = _kernel_cache.get(fn_key)
-        if kernel is None:
-            kernel = TorchMlirKernel(
-                torch_fn=compute_fn,
-                op_name=aten_name,
-                output_params=output_params,
-                static_argnums=static_argnums,
-                static_argnames=static_argnames,
-            )
-            _kernel_cache[fn_key] = kernel
-
-        # Execute
-        # For inplace ops, ensure the kernel writes back to the original tensor.
-        # The preprocessing may not set out= for all inplace ops.
-        if aten_name.endswith("_") and new_kwargs.get("out") is None and new_args:
-            first = new_args[0]
-            if isinstance(first, torch.Tensor):
-                new_kwargs["out"] = first
-            elif isinstance(first, list | tuple) and first:
-                new_kwargs["out"] = tuple(first)
-
-        try:
-            exec_result = kernel(*new_args, **new_kwargs)
-        except (IndexError, ValueError, TypeError):
-            # Errors — re-raise to match PyTorch behavior.
-            raise
-        except Exception:
-            # Compilation or execution failure fall back to CPU.
-            if fallback_fn is not None:
-                return fallback_fn(*args, **kwargs)
-            raise
-
-        # Postprocess (only if 4-tuple returned)
-        if len(result) == 4 and result[3] is not None:
-            exec_result = result[3](exec_result)
-
-        # Upcast if preprocessed args had 64-bit dtype (Neuron downcasts 64→32)
-        first_preprocessed = new_args[0] if new_args else None
-        if first_preprocessed is not None:
-            orig_dtype = None
-            if isinstance(first_preprocessed, torch.Tensor):
-                if first_preprocessed.dtype in (torch.int64, torch.float64):
-                    orig_dtype = first_preprocessed.dtype
-            elif isinstance(first_preprocessed, list | tuple) and first_preprocessed:
-                t = first_preprocessed[0]
-                if isinstance(t, torch.Tensor) and t.dtype in (torch.int64, torch.float64):
-                    orig_dtype = t.dtype
-
-            if orig_dtype is not None and exec_result is not None:
-                target = orig_dtype
-                if isinstance(exec_result, torch.Tensor):
-                    if _upcast_map.get(exec_result.dtype) == target:
-                        exec_result = exec_result.to(target)
-                elif isinstance(exec_result, list | tuple):
-                    exec_result = type(exec_result)(
-                        r.to(target)
-                        if isinstance(r, torch.Tensor) and _upcast_map.get(r.dtype) == target
-                        else r
-                        for r in exec_result
-                    )
-
-        import torch_neuronx._C as _C
-
-        _C._log_executed_op(aten_name)
-        return exec_result
+            return exec_result
+        finally:
+            # In a finally so the early return and any raise record a sample too;
+            # otherwise those ops read as no_dispatch in the benchmark.
+            if _DISPATCH_TIMING_ENABLED:
+                _dispatch_times.append(time.perf_counter_ns() - t_start)
 
     return combined
 

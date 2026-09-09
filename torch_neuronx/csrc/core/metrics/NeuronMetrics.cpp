@@ -332,6 +332,8 @@ TimedSection::~TimedSection() {
   }
 }
 
+void TimedSection::Cancel() { start_time_ns_ = 0; }
+
 double TimedSection::Elapsed() const {
   if (!metric_) return 0.0;
   return static_cast<double>(GetCurrentTimeNs() - start_time_ns_) * 1e-9;

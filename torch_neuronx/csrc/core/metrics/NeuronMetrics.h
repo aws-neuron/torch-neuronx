@@ -248,6 +248,10 @@ class TimedSection {
   explicit TimedSection(NeuronMetric* metric);
   ~TimedSection();
 
+  // Discard this section so it records nothing, for a scope that turns out to do work
+  // the metric must not contain.
+  void Cancel();
+
   // Get elapsed time in seconds
   double Elapsed() const;
 
@@ -315,12 +319,18 @@ void SetMetricsEnabled(bool enabled);
     }                                                                                              \
   } while (0)
 
-#define TORCH_NEURONX_TIMED_SECTION(name)                                                      \
-  static ::at::neuron::metrics::NeuronMetric* __timed_metric =                                 \
-      ::at::neuron::metrics::IsMetricsEnabled()                                                \
-          ? new ::at::neuron::metrics::NeuronMetric(name, ::at::neuron::metrics::MetricFnTime) \
-          : nullptr;                                                                           \
+// Do not gate this static on IsMetricsEnabled(). It runs once, so a first call
+// made while metrics were off would leave __timed_metric null for the process.
+// TimedSection checks enablement when it starts and when it records.
+//
+// The names are fixed, so two of these in one scope will not compile.
+#define TORCH_NEURONX_TIMED_SECTION(name)                                                 \
+  static ::at::neuron::metrics::NeuronMetric* __timed_metric =                            \
+      new ::at::neuron::metrics::NeuronMetric(name, ::at::neuron::metrics::MetricFnTime); \
   ::at::neuron::metrics::TimedSection __timed_section(__timed_metric)
+
+// Discard the enclosing TORCH_NEURONX_TIMED_SECTION, so it records nothing.
+#define TORCH_NEURONX_TIMED_SECTION_CANCEL() __timed_section.Cancel()
 
 // =============================================================================
 // Memory Statistics Classes
