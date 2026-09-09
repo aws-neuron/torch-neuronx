@@ -183,19 +183,16 @@ void CacheKeyGenerator::AppendIValue(std::ostringstream& key, const c10::IValue&
                    [&](size_t j) { AppendTensorOrUndef(key, at::Tensor(tl[j])); });
   } else if (val.isIntList()) {
     const auto& il = val.toIntList();
-    AppendListImpl(key, "IL", il.size(),
-                   [&](size_t j) { AppendInt(key, il[j], /*is_static=*/true); });
+    AppendListImpl(key, "IL", il.size(), [&](size_t j) { AppendInt(key, il[j], is_static); });
   } else if (val.isBoolList()) {
     const auto& bl = val.toBoolList();
     AppendListImpl(key, "BL", bl.size(), [&](size_t j) { AppendBool(key, bl[j]); });
   } else if (val.isDoubleList()) {
     const auto& dl = val.toDoubleList();
-    AppendListImpl(key, "DL", dl.size(),
-                   [&](size_t j) { AppendDouble(key, dl[j], /*is_static=*/true); });
+    AppendListImpl(key, "DL", dl.size(), [&](size_t j) { AppendDouble(key, dl[j], is_static); });
   } else if (val.isList()) {
     const auto& gl = val.toListRef();
-    AppendListImpl(key, "GL", gl.size(),
-                   [&](size_t j) { AppendIValue(key, gl[j], /*is_static=*/true); });
+    AppendListImpl(key, "GL", gl.size(), [&](size_t j) { AppendIValue(key, gl[j], is_static); });
   } else {
     TORCH_WARN_ONCE("CacheKeyGenerator: unhandled IValue tag '", val.tagKind(),
                     "' — cache key may not be unique for different values of this type");
@@ -231,10 +228,8 @@ std::string CacheKeyGenerator::Generate(const std::string& op_name,
     bool is_kwarg_only = (i < schema_args.size() && schema_args[i].kwarg_only());
 
     // Determine if this arg is static (must happen BEFORE filtering).
-    bool is_static = static_argnums.count(i) > 0;
-    if (is_kwarg_only && i < schema_args.size()) {
-      is_static = is_static || static_argnames.count(schema_args[i].name()) > 0;
-    }
+    bool is_static =
+        torch_neuronx::dispatch::IsStaticArg(schema, i, static_argnums, static_argnames);
     // dtype args always encode their value — different dtypes produce
     // different HLO and must never share a cache entry.
     // Name-based check required because PyTorch lowers ScalarType? to int?
@@ -266,6 +261,17 @@ std::string CacheKeyGenerator::Generate(const std::string& op_name,
       if (filtered.count(name) && !(name == "out" && arg.isTensor())) {
         continue;
       }
+    }
+
+    // A list's values belong in the key unless FlattenScalarListToTensors will
+    // expand it into 0-dim runtime inputs, in which case the graph depends on its
+    // length and element types only. Asking IsRuntimeScalarList — the predicate
+    // the flatten side uses — is what stops the key from describing a different
+    // input set than the NEFF receives.
+    if (!is_static && (arg.isIntList() || arg.isDoubleList() || arg.isList()) &&
+        !torch_neuronx::dispatch::IsRuntimeScalarList(schema, i, arg, static_argnums,
+                                                      static_argnames)) {
+      is_static = true;
     }
 
     key << "_";

@@ -12,6 +12,7 @@
 #include <cmath>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "torch_neuronx/csrc/core/utils/CPUFallbackContext.h"
@@ -459,6 +460,42 @@ std::vector<MetaOutputSpec> ExtractMetaOutputSpecs(torch::jit::Stack& stack);
  */
 std::vector<MetaOutputSpec> InferOutputsViaMeta(const c10::OperatorHandle& op,
                                                 const std::vector<c10::IValue>& args);
+
+// ═══════════════════════════════════════════════════════════════
+//  Static vs runtime argument classification
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * True if the schema arg is a list of numbers (Scalar[], int[], float[]) —
+ * any ListType whose element is a subtype of NumberType.
+ */
+bool IsScalarListType(const c10::Argument& arg);
+
+/**
+ * True if argument `i` is a compile-time constant baked into the NEFF, rather
+ * than a value bound at launch.
+ *
+ * Every consumer must classify an argument the same way: a constant's value
+ * belongs in the cache key and is not an execution input, while a runtime input
+ * is keyed by shape/dtype alone and is bound per call. When two consumers
+ * disagree the result is either redundant recompiles (key too specific) or a
+ * NEFF built for other values being replayed (key too loose).
+ */
+bool IsStaticArg(const c10::FunctionSchema& schema, size_t i,
+                 const std::unordered_set<size_t>& static_argnums,
+                 const std::unordered_set<std::string>& static_argnames);
+
+/**
+ * True if argument `i` is expanded into 0-dim runtime tensor inputs by
+ * FlattenScalarListToTensors: a non-static positional scalar list.
+ *
+ * Kwarg-only lists are excluded because FlattenAndFilterInputs only expands
+ * positional args, so a kwarg-only Scalar[] stays a constant and its values
+ * must remain in the key.
+ */
+bool IsRuntimeScalarList(const c10::FunctionSchema& schema, size_t i, const c10::IValue& arg,
+                         const std::unordered_set<size_t>& static_argnums,
+                         const std::unordered_set<std::string>& static_argnames);
 
 // ═══════════════════════════════════════════════════════════════
 //  IValue ↔ Python conversion helpers

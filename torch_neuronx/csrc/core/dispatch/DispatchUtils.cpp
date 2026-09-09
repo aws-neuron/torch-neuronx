@@ -736,5 +736,36 @@ PyArgsKwargs IValuesToPyArgsKwargs(const std::vector<c10::IValue>& args,
   return {std::move(py_args), std::move(py_kwargs)};
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  Static vs runtime argument classification
+// ═══════════════════════════════════════════════════════════════
+
+bool IsScalarListType(const c10::Argument& arg) {
+  auto type = arg.type();
+  if (type->kind() != c10::TypeKind::ListType) return false;
+  auto elem_type = type->cast<c10::ListType>()->getElementType();
+  return elem_type->isSubtypeOf(*c10::NumberType::get());
+}
+
+bool IsStaticArg(const c10::FunctionSchema& schema, size_t i,
+                 const std::unordered_set<size_t>& static_argnums,
+                 const std::unordered_set<std::string>& static_argnames) {
+  if (static_argnums.count(i) > 0) return true;
+  const auto& schema_args = schema.arguments();
+  if (i >= schema_args.size()) return false;
+  return static_argnames.count(schema_args[i].name()) > 0;
+}
+
+bool IsRuntimeScalarList(const c10::FunctionSchema& schema, size_t i, const c10::IValue& arg,
+                         const std::unordered_set<size_t>& static_argnums,
+                         const std::unordered_set<std::string>& static_argnames) {
+  const auto& schema_args = schema.arguments();
+  if (i >= schema_args.size()) return false;
+  if (schema_args[i].kwarg_only()) return false;
+  if (!IsScalarListType(schema_args[i])) return false;
+  if (!(arg.isIntList() || arg.isDoubleList() || arg.isList())) return false;
+  return !IsStaticArg(schema, i, static_argnums, static_argnames);
+}
+
 }  // namespace dispatch
 }  // namespace torch_neuronx
