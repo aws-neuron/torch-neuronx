@@ -16,16 +16,24 @@ def torch_mv(mat, vec, out=None):
     return torch.mv(mat, vec)
 
 
-@register_aten(["aten::mm", "aten::mm.out"])
-def torch_mm(mat1, mat2, out=None):
+@register_aten(
+    ["aten::mm", "aten::mm.out", "aten::mm.dtype_out", "aten::mm.dtype"],
+    static_argnames=("out_dtype",),
+)
+def torch_mm(mat1, mat2, out_dtype=None, out=None):
     _reject_bool_matmul("mm", mat1, mat2)
-    return torch.mm(mat1, mat2)
+    result = torch.mm(mat1, mat2)
+    return result if out_dtype is None else result.to(out_dtype)
 
 
-@register_aten(["aten::bmm", "aten::bmm.out"])
-def torch_bmm(batch1, batch2, out=None):
+@register_aten(
+    ["aten::bmm", "aten::bmm.out", "aten::bmm.dtype_out", "aten::bmm.dtype"],
+    static_argnames=("out_dtype",),
+)
+def torch_bmm(batch1, batch2, out_dtype=None, out=None):
     _reject_bool_matmul("bmm", batch1, batch2)
-    return torch.bmm(batch1, batch2)
+    result = torch.bmm(batch1, batch2)
+    return result if out_dtype is None else result.to(out_dtype)
 
 
 # ``caffe2::TypeMeta`` names, spelled exactly as PyTorch's structured-kernel
@@ -169,8 +177,11 @@ def torch_baddbmm_dtype(input, batch1, batch2, out_dtype, beta=1, alpha=1, out=N
     return torch.baddbmm(input, batch1, batch2, beta=beta, alpha=alpha)
 
 
-@register_aten(["aten::addmm", "aten::addmm.out"], static_argnames=("beta", "alpha"))
-def torch_addmm(input, mat1, mat2, beta=1, alpha=1, out=None):
+@register_aten(
+    ["aten::addmm", "aten::addmm.out", "aten::addmm.dtype_out", "aten::addmm.dtype"],
+    static_argnames=("beta", "alpha", "out_dtype"),
+)
+def torch_addmm(input, mat1, mat2, out_dtype=None, beta=1, alpha=1, out=None):
     _reject_bool_matmul("addmm", input, mat1, mat2)
     # Validate that mat1 and mat2 are 2D tensors
     if mat1.dim() != 2:
@@ -191,7 +202,8 @@ def torch_addmm(input, mat1, mat2, beta=1, alpha=1, out=None):
     # Try PyTorch's broadcasting rules
     torch.broadcast_shapes(input.shape, result_shape)
 
-    return torch.addmm(input, mat1, mat2, beta=beta, alpha=alpha)
+    result = torch.addmm(input, mat1, mat2, beta=beta, alpha=alpha)
+    return result if out_dtype is None else result.to(out_dtype)
 
 
 @register_aten(
