@@ -622,3 +622,25 @@ DYNAMO_CUDA_SPECIFIC_UNSUPPORTED = [
     "test_streams.py::TestStreams::test_record_stream_problem_basic",
     "test_streams.py::TestStreams::test_record_stream_problem_interleaved",
 ]
+
+
+# Data-dependent / dynamic tensor shapes. Each test builds an unbacked SymInt or
+# a data-dependent shape (.item(), nonzero, argwhere, unique_consecutive,
+# mark_unbacked, mark_dynamic).
+DYNAMO_DATA_DEPENDENT_DYNAMIC_SHAPE = [
+    "MiscTests::test_aot_autograd_propagate_unbacked_symints_shape",
+    "MiscTests::test_argwhere_with_dynamic_shapes",
+    "NestedGraphBreaksMiscTests::test_argwhere_with_dynamic_shapes_nested_graph_breaks",
+    "MiscTests::test_builtin_bool_on_symfloat",
+    "NestedGraphBreaksMiscTests::test_builtin_bool_on_symfloat_nested_graph_breaks",
+    "MiscTests::test_builtin_bool_on_symint",
+    "MiscTests::test_infer_unbacked_size_gt_zero",
+    "MiscTests::test_sym_constrain_range_on_replaced_unbacked_symbol",
+    "MiscTests::test_unbacked_2d_expand",
+    "MiscTests::test_unbacked_repeat_cat",
+    "MiscTests::test_unique_consecutive",
+    "DynamoOpPromotionTests::test_tensorify_track_item_symint",
+    "SubclassTests::test_tensor_subclass_metadata_with_symint",
+    "UnspecTests::test_mark_unbacked_hint_consistency",
+    "UnspecTests::test_symfloat_to_tensor",
+]
