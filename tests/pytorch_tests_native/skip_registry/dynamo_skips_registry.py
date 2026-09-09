@@ -251,4 +251,13 @@ SKIP_GROUPS: list[SkipGroup] = [
             "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float64",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "Data-dependent or dynamic tensor shape. Each test builds an unbacked"
+            " SymInt or a data-dependent shape (.item(), nonzero, argwhere,"
+            " unique_consecutive, mark_unbacked, mark_dynamic). neuronx-cc needs"
+            " static shapes, so the graph cannot compile. Skip them."
+        ),
+        tests=s.DYNAMO_DATA_DEPENDENT_DYNAMIC_SHAPE,
+    ),
 ]
