@@ -93,8 +93,6 @@ _REASON_REGRESSION_TIMEOUT = "regression causing tests to timeout"
 _OPS_SKIP_COMPILE_HANG: dict[str, str] = {
     "linspace": _REASON_0D_HANG,
     "logspace": _REASON_0D_HANG,
-    "_linalg_det": _REASON_REGRESSION_TIMEOUT,
-    "linalg_slogdet": _REASON_REGRESSION_TIMEOUT,
     "aten::_softmax_backward_data": _REASON_0D_HANG,
 }
 
