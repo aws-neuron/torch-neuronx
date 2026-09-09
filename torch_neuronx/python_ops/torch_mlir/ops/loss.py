@@ -177,8 +177,8 @@ def _flatten_spatial(input, target, n_classes, is_prob_target):
     ["aten::cross_entropy_loss"],
     # Positions 3, 4, 5 are reduction, ignore_index and label_smoothing. They select
     # which graph is compiled, so their values must be in the cache key. They are
-    # positional, so static_argnums is the only mechanism that reaches them:
-    # CacheKeyGenerator consults static_argnames for kwarg-only args alone.
+    # positional, so static_argnums is the mechanism that declares them: on the Python
+    # path static_argnames only reaches the factory's returned kwargs.
     static_argnums=(3, 4, 5),
     # SHAPE_ONLY: nothing here forks the lowering on tensor values. Target values are
     # read only to validate bounds, which raises or passes without changing the graph.

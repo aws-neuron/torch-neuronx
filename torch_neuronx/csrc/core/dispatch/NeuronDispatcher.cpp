@@ -2562,17 +2562,6 @@ static void FlattenTensorsFromIValue(const c10::IValue& val, std::vector<torch::
   }
 }
 
-// True if the schema arg is a list of numbers (Scalar[], int[], float[]) —
-// any ListType whose element is a subtype of NumberType. Note: this matches
-// int[] too, so callers must skip static args (which are HLO constants, not
-// runtime tensor inputs) before converting — see FlattenAndFilterInputs.
-static bool IsScalarListType(const c10::Argument& arg) {
-  auto type = arg.type();
-  if (type->kind() != c10::TypeKind::ListType) return false;
-  auto elem_type = type->cast<c10::ListType>()->getElementType();
-  return elem_type->isSubtypeOf(*c10::NumberType::get());
-}
-
 // Convert a scalar list (IntList or DoubleList) to 0-dim tensors and append to out.
 // This mirrors Python preprocess_inputs(scalar_to_tensor=True) which converts
 // each scalar element of a Scalar[] arg to a 0-dim tensor during lowering.
@@ -2729,14 +2718,13 @@ std::vector<torch::Tensor> NeuronDispatcher::FlattenAndFilterInputs(
   // Positional (non-kwarg-only) tensor args
   for (size_t i = 0; i < args.size() && i < schema_args.size(); ++i) {
     if (schema_args[i].kwarg_only()) continue;
-    bool is_static =
-        static_argnums.count(i) > 0 || static_argnames.count(schema_args[i].name()) > 0;
     // A non-static number list (Scalar[]) is a runtime input: the NEFF was lowered
     // with each element as its own 0-dim tensor, so expand it the same way here.
     // A static number list (e.g. normalized_shape int[]) is a compile-time
     // constant baked into the NEFF, not an input, so leave it out of `flattened`.
-    if (!is_static && IsScalarListType(schema_args[i]) &&
-        (args[i].isIntList() || args[i].isDoubleList() || args[i].isList())) {
+    // CacheKeyGenerator asks the same predicate, which is what keeps the key and
+    // the bound inputs describing the same NEFF.
+    if (IsRuntimeScalarList(schema, i, args[i], static_argnums, static_argnames)) {
       FlattenScalarListToTensors(args[i], flattened, target_device, ref_tensor_dtype);
     } else {
       // Extracts real tensors only; for a static number list this adds nothing.

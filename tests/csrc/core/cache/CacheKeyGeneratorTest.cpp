@@ -454,3 +454,133 @@ TEST_F(CacheKeyGeneratorTest, DynamicCollectiveKeyDisjointFromNativeAllgather) {
       "allgather", {torch::zeros({2048, 4096}, torch::kBFloat16)}, {{0, 1, 2, 3}}, 0, false);
   EXPECT_NE(dynamic_key, native);
 }
+
+// ═══════════════════════════════════════════════════════════════
+//  Suite: which args are keyed by value
+//
+//  A non-static positional Scalar[] becomes runtime inputs, so the key records
+//  its length and element types but not its values. Every other list, and every
+//  static arg, is a graph constant and keeps its values.
+// ═══════════════════════════════════════════════════════════════
+
+class CacheKeyScalarListTest : public ::testing::Test {
+ protected:
+  // _foreach_add.ScalarList(Tensor[] self, Scalar[] scalars) -> Tensor[]
+  // Both positional, neither declared static.
+  c10::FunctionSchema schema() {
+    return c10::Dispatcher::singleton()
+        .findSchemaOrThrow("aten::_foreach_add", "ScalarList")
+        .schema();
+  }
+
+  std::string gen(const std::vector<c10::IValue>& args,
+                  const std::unordered_set<size_t>& static_argnums = {},
+                  const std::unordered_set<std::string>& static_argnames = {}) {
+    return CacheKeyGenerator::Generate("_foreach_add.ScalarList", schema(), args, static_argnums,
+                                       static_argnames);
+  }
+
+  c10::IValue tensors() {
+    return c10::IValue(c10::List<at::Tensor>({torch::zeros({4}), torch::zeros({4})}));
+  }
+};
+
+TEST_F(CacheKeyScalarListTest, RuntimeScalarListValuesNotInKey) {
+  auto a = gen({tensors(), c10::IValue(c10::List<double>({1.1, 1.2}))});
+  auto b = gen({tensors(), c10::IValue(c10::List<double>({2.1, 2.2}))});
+  EXPECT_EQ(a, b);
+}
+
+TEST_F(CacheKeyScalarListTest, RuntimeScalarListLengthStillInKey) {
+  auto a = gen({tensors(), c10::IValue(c10::List<double>({1.1, 1.2}))});
+  auto b = gen({tensors(), c10::IValue(c10::List<double>({1.1, 1.2, 1.3}))});
+  EXPECT_NE(a, b);
+}
+
+TEST_F(CacheKeyScalarListTest, BoolListStillValueAwareInScalarSlot) {
+  // BoolType is not a NumberType subtype, so a bool list is never unpacked.
+  auto a = gen({tensors(), c10::IValue(c10::List<bool>({true, false}))});
+  auto b = gen({tensors(), c10::IValue(c10::List<bool>({false, true}))});
+  EXPECT_NE(a, b);
+}
+
+// --- Lists that shape the graph must keep their values ---
+
+TEST(CacheKeyStaticArgTest, PositionalIntListNeedsItsDeclarationToKeepValues) {
+  // normalized_shape is a positional int[] that selects the graph. Its values stay in
+  // the key only because normalization.py declares static_argnums=(1, 4) — int[] is a
+  // NumberType list, so an undeclared one would be treated as runtime inputs.
+  // Equal-length values, so the keys cannot differ on arity alone.
+  auto s = c10::Dispatcher::singleton().findSchemaOrThrow("aten::native_layer_norm", "").schema();
+  auto key = [&](int64_t dim, const std::unordered_set<size_t>& static_argnums) {
+    return CacheKeyGenerator::Generate(
+        "native_layer_norm", s,
+        {torch::zeros({2, 4, 8}), c10::IValue(c10::List<int64_t>({dim})), c10::IValue(),
+         c10::IValue(), 1e-5},
+        static_argnums);
+  };
+
+  // As declared in production: values in the key.
+  EXPECT_NE(key(4, {1, 4}), key(8, {1, 4}));
+
+  // Undeclared, the values are dropped — the contract a graph-shaping int[] must honour.
+  EXPECT_EQ(key(4, {4}), key(8, {4}));
+}
+
+TEST(CacheKeyStaticArgTest, SumOptionalDimListKeepsValues) {
+  // int[1]? is an OptionalType, not a ListType, so it is never a runtime scalar list.
+  auto s = c10::Dispatcher::singleton().findSchemaOrThrow("aten::sum", "dim_IntList").schema();
+  auto make = [&](c10::List<int64_t> dim) {
+    return CacheKeyGenerator::Generate(
+        "sum.dim_IntList", s, {torch::zeros({2, 3}), c10::IValue(dim), false, c10::IValue()});
+  };
+  EXPECT_NE(make(c10::List<int64_t>({0})), make(c10::List<int64_t>({1})));
+}
+
+// A positional scalar declared via static_argnames is baked into the graph, so its
+// value belongs in the key. Unlike a list, a scalar renders as either the value or a
+// bare type name, so the substring assertions pin which one without a hardware run.
+TEST(CacheKeyStaticArgTest, PositionalScalarDeclaredByNameKeepsValue) {
+  auto t = torch::zeros({4, 4});
+  struct Case {
+    const char* op;
+    const char* overload;
+    const char* argname;
+    std::vector<c10::IValue> args_a;
+    std::vector<c10::IValue> args_b;
+    const char* rendered_a;
+  };
+  // Each op declares the named positional arg via static_argnames.
+  // histc/bins is the only scalar-level AppendInt case; the rest are AppendDouble.
+  const std::vector<Case> cases = {
+      {"aten::leaky_relu", "", "negative_slope", {t, 0.01}, {t, 0.5}, "d0.01"},
+      {"aten::celu", "", "alpha", {t, 1.5}, {t, 2.5}, "d1.5"},
+      {"aten::logit", "", "eps", {t, 1e-5}, {t, 1e-6}, "d1e-05"},
+      {"aten::histc", "", "bins", {t, int64_t{100}}, {t, int64_t{64}}, "i100"},
+      {"aten::add", "Scalar", "alpha", {t, 1.0, int64_t{2}}, {t, 1.0, int64_t{3}}, "i2"},
+  };
+  for (const auto& c : cases) {
+    auto schema = c10::Dispatcher::singleton().findSchemaOrThrow(c.op, c.overload).schema();
+    auto ka = CacheKeyGenerator::Generate(c.op, schema, c.args_a, {}, {c.argname});
+    auto kb = CacheKeyGenerator::Generate(c.op, schema, c.args_b, {}, {c.argname});
+    EXPECT_NE(ka, kb) << c.op << " shared a key across different " << c.argname;
+    EXPECT_NE(ka.find(c.rendered_a), std::string::npos)
+        << c.op << " dropped the value of " << c.argname << "; key=" << ka;
+  }
+}
+
+// FlattenAndFilterInputs skips kwarg-only args, so a kwarg-only Scalar[] is a graph
+// constant and keeps its values. Drop IsRuntimeScalarList's kwarg_only() check and the
+// values leave the key while nothing binds them.
+TEST(CacheKeyStaticArgTest, KwargOnlyScalarListKeepsValues) {
+  // gradient.scalarrayarray(Tensor self, *, Scalar[] spacing, int[] dim, int edge_order=1)
+  auto schema =
+      c10::Dispatcher::singleton().findSchemaOrThrow("aten::gradient", "scalarrayarray").schema();
+  auto make = [&](double a, double b) {
+    return CacheKeyGenerator::Generate(
+        "gradient.scalarrayarray", schema,
+        {torch::zeros({4, 4}), c10::IValue(c10::List<double>({a, b})),
+         c10::IValue(c10::List<int64_t>({0, 1})), int64_t{1}});
+  };
+  EXPECT_NE(make(1.0, 2.0), make(3.0, 4.0));
+}

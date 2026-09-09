@@ -469,3 +469,84 @@ class TestNonNkiCppDispatch:
         """index.Tensor should be registered in the C++ dispatcher."""
         ops = set(_C._get_neuron_dispatcher_ops())
         assert "index.Tensor" in ops
+
+
+class TestCacheKeyRecompileTriggers:
+    """Which argument changes should compile a new graph, and which should not.
+
+    A scalar list is passed to the graph as inputs, so changing its values reuses
+    the same graph. A static argument is compiled into the graph as a constant, so
+    changing it needs a new graph, and reusing the old one would give a wrong
+    answer. That is why these tests also compare against CPU.
+    """
+
+    def test_scalarlist_values_do_not_recompile(self):
+        """Changing the scalars must not compile a new graph, and the results must
+        still be correct because the scalars are passed in fresh on every call.
+        """
+        cpu = [torch.rand(8, 8) + 1.0 for _ in range(3)]
+        neuron = [t.to("neuron") for t in cpu]
+
+        with track_neuron_ops():
+            torch._foreach_div_(neuron, [1.5, 2.5, 3.5])
+            assert_op_runs_on_neuron("_foreach_div_")
+        torch._foreach_div_(cpu, [1.5, 2.5, 3.5])
+        torch.neuron.synchronize()
+        baseline = torch_neuronx._C._get_compilation_cache_stats()["total_entries"]
+
+        for scalars in ([2.0, 3.0, 4.0], [0.5, 0.25, 8.0]):
+            torch._foreach_div_(neuron, scalars)
+            torch._foreach_div_(cpu, scalars)
+            for n, c in zip(neuron, cpu, strict=False):
+                torch.testing.assert_close(n.cpu(), c, rtol=1e-4, atol=1e-4)
+
+        torch.neuron.synchronize()
+        assert (
+            torch_neuronx._C._get_compilation_cache_stats()["total_entries"] == baseline
+        ), "_foreach_div_ compiled a new graph when only the scalar values changed"
+
+    def test_flip_dims_recompiles_and_stays_correct(self):
+        """flip compiles dims into the graph, so two different dims need two graphs.
+
+        The output shape is the same either way, so dims is the only difference
+        between the two calls. Reusing the graph would flip the wrong axis, so the
+        result is compared against CPU as well.
+        """
+        x_cpu = torch.randn(6, 6)
+        x = x_cpu.to("neuron")
+
+        torch.testing.assert_close(torch.flip(x, [0]).cpu(), torch.flip(x_cpu, [0]))
+        torch.neuron.synchronize()
+        baseline = torch_neuronx._C._get_compilation_cache_stats()["total_entries"]
+
+        flipped_dim1 = torch.flip(x, [1])
+
+        torch.neuron.synchronize()
+        assert (
+            torch_neuronx._C._get_compilation_cache_stats()["total_entries"] > baseline
+        ), "flip reused the same graph for different dims"
+        torch.testing.assert_close(flipped_dim1.cpu(), torch.flip(x_cpu, [1]))
+
+    def test_positional_static_scalar_recompiles_and_stays_correct(self):
+        """negative_slope is a positional argument declared with static_argnames.
+
+        It is compiled into the graph as a constant, so two slopes need two graphs.
+        The (3, 5) shape is used only here, so nothing else has compiled it already.
+        """
+        x_cpu = torch.randn(3, 5)
+        x = x_cpu.to("neuron")
+
+        with track_neuron_ops():
+            first = torch.nn.functional.leaky_relu(x, 0.01)
+            assert_op_runs_on_neuron("aten::leaky_relu")
+        torch.testing.assert_close(first.cpu(), torch.nn.functional.leaky_relu(x_cpu, 0.01))
+        torch.neuron.synchronize()
+        baseline = torch_neuronx._C._get_compilation_cache_stats()["total_entries"]
+
+        slope_half = torch.nn.functional.leaky_relu(x, 0.5)
+
+        torch.neuron.synchronize()
+        assert (
+            torch_neuronx._C._get_compilation_cache_stats()["total_entries"] > baseline
+        ), "leaky_relu reused the same graph for a different negative_slope"
+        torch.testing.assert_close(slope_half.cpu(), torch.nn.functional.leaky_relu(x_cpu, 0.5))
