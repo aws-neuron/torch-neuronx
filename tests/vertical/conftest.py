@@ -110,6 +110,16 @@ def pytest_addoption(parser):
         help="JSON shape registry file to load model-traced shapes from",
     )
     parser.addoption(
+        "--no-cache-key-shapes",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the committed cache-key model shapes (register_cache_key_shapes in "
+            "tests/vertical/internal/neuron_shape_defaults_generated.py). The shapes "
+            "load by default. Regenerate them with tools/refresh_cache_key_shapes.py."
+        ),
+    )
+    parser.addoption(
         "--traced-model",
         default=None,
         help=(
@@ -170,6 +180,9 @@ def pytest_configure(config):
     registry_path = config.getoption("--shape-registry", default=None)
     if registry_path:
         os.environ["NEURON_SHAPE_REGISTRY"] = str(registry_path)
+    no_cache_key_shapes = config.getoption("--no-cache-key-shapes", default=False)
+    if no_cache_key_shapes:
+        os.environ["NEURON_CACHE_KEY_SHAPES"] = "0"
     traced_model = config.getoption("--traced-model", default=None)
     if traced_model:
         os.environ["NEURON_TRACED_MODEL"] = str(traced_model)
