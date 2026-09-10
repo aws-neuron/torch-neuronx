@@ -27,6 +27,11 @@ on:
         options:
           - smoke
           - full
+      image_uri:
+        description: 'Optional pre-built ECR image. Empty builds the image from NeuronGithubCIConfig.'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -43,24 +48,25 @@ env:
 jobs:
   aten-tests:
     name: "Smoke Test — PR #${{ github.event.inputs.pr_number }}"
-    runs-on:
-      - self-hosted
-      - linux
-      - neuron
-      - neuron.internal_compute
-      - "neuron.internal_compute:trn2.48xlarge"
-      # Add "neuron.internal_compute.persistent-storage:read" here after the
-      # fleet grants this repository read access to the NEFF cache bucket. The
-      # label makes the fleet inject the cache bucket variables. A runner label
-      # that the fleet does not advertise leaves the job queued, so add the
-      # label only after the access is in place. Until then the suite compiles
-      # cold, which run-test-parallel handles without an error.
-      - neuron.build-image
-      - "neuron.run-${{ github.run_id }}-aten-unit-tests"
-      - "neuron.pr:${{ github.event.inputs.pr_number }}"
-      # This repository has one trn2 instance. Keep the smoke timeout short.
-      # A hung job must not hold the only instance for a full day.
-      - "neuron.timeout:${{ github.event.inputs.test_scope == 'full' && '32400' || '3600' }}"
+    # Built as JSON so the image label can switch between a pre-built image and
+    # a config-driven build. `image_uri` set gives `neuron.image:<uri>`, which
+    # skips the build. Empty gives `neuron.build-image`, which builds the
+    # Dockerfile that NeuronGithubCIConfig holds for this repo and branch.
+    #
+    # The fleet does not yet give this repository read access to the NEFF cache
+    # bucket. Add "neuron.internal_compute.persistent-storage:read" after that
+    # access lands, so the fleet injects the cache bucket variables. A runner
+    # label that the fleet does not advertise leaves the job queued. Until then
+    # the suite compiles cold, which run-test-parallel handles without an error.
+    #
+    # This repository has one trn2 instance, so the smoke scope keeps a short
+    # fleet timeout. A hung job must not hold the only instance for a full day.
+    runs-on: ${{ fromJSON(format(
+      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","{0}","neuron.run-{1}-aten-unit-tests","neuron.pr:{2}","neuron.timeout:{3}"]',
+      github.event.inputs.image_uri != '' && format('neuron.image:{0}', github.event.inputs.image_uri) || 'neuron.build-image',
+      github.run_id,
+      github.event.inputs.pr_number,
+      github.event.inputs.test_scope == 'full' && '32400' || '3600')) }}
     timeout-minutes: ${{ github.event.inputs.test_scope == 'full' && 600 || 60 }}
     env:
       # The full command matches the ATen arm in private-torch-neuronx.
