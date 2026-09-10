@@ -92,6 +92,8 @@ These variables affect eager execution (non-compiled operations).
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
+| `TORCH_NEURONX_ENABLE_STREAMS` | bool | `0` | Controls stream identity. Set this flag to `1` to create distinct streams. |
+| `TORCH_NEURONX_ENABLE_HOST_CC` | bool | `0` | Enables NRT HostCC collectives on non-default streams. Requires `TORCH_NEURONX_ENABLE_STREAMS=1`. On Trn2 and Trn3, HostCC sets `NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=true`, which restricts kernels to `psum_banks=7`. torch-neuronx rejects a true value of this variable when HostCC is off. |
 | `NEURON_USE_SPLIT_ALLGATHER` | bool | `True` | Enables split-based allgather for better memory efficiency. |
 | `NEURON_USE_SPLIT_REDUCE_SCATTER` | bool | `True` | Enables split-based reduce_scatter implementation. |
 | `NEURON_USE_NKI_ALLTOALLV` | bool | `True` | Enables native NKI `all_to_all_v`. Set to `0` to use the compatibility padding fallback. Native mode requires `aws-neuronx-runtime-lib >= 2.x.62579` and `aws-neuronx-collectives >= 2.x.63596`. |

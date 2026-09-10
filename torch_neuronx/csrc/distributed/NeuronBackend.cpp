@@ -28,6 +28,7 @@
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"
 #include "torch_neuronx/csrc/core/rdma/RdmaManager.h"
 #include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
+#include "torch_neuronx/csrc/core/streams/StreamConfig.h"
 #include "torch_neuronx/csrc/core/utils/PlatformUtils.h"
 #include "torch_neuronx/csrc/distributed/DistributedUtils.h"
 #include "torch_neuronx/csrc/distributed/DynamicCollectiveTiling.h"
@@ -104,13 +105,9 @@ c10::intrusive_ptr<NeuronWork> NeuronBackend::CreateWork(const std::vector<at::T
 }
 
 bool NeuronBackend::UseHostCC() const {
-  static const bool hostcc_enabled = []() {
-    const char* val = std::getenv("TORCH_NEURONX_ENABLE_HOST_CC");
-    return val != nullptr && val[0] != '\0' && std::string(val) != "0";
-  }();
   auto current = at::neuron::getCurrentNeuronStream();
   auto default_stream = at::neuron::getDefaultNeuronStream();
-  return (current != default_stream) && hostcc_enabled;
+  return current != default_stream && at::neuron::config::IsHostCCEnabled();
 }
 
 }  // namespace distributed
@@ -136,11 +133,7 @@ int64_t CollectiveBucketSizeBytes() {
 
 // Default policy (in-NEFF flow only).
 bool UseSplitDefaultForCurrentStream() {
-  static const bool hostcc_enabled = []() {
-    const char* val = std::getenv("TORCH_NEURONX_ENABLE_HOST_CC");
-    return val != nullptr && val[0] != '\0' && std::string(val) != "0";
-  }();
-  if (!hostcc_enabled) return true;
+  if (!at::neuron::config::IsHostCCEnabled()) return true;
   auto current = at::neuron::getCurrentNeuronStream();
   auto default_stream = at::neuron::getDefaultNeuronStream();
   return current == default_stream;

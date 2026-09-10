@@ -82,6 +82,7 @@ declare -g PERSISTENT_CACHE_REFRESH=false
 # Initialize environment
 init_environment() {
     cd "$PROJECT_ROOT"
+    unset NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE
     export NEURON_LAUNCH_BLOCKING="${NEURON_LAUNCH_BLOCKING:-0}"
 
     if [ -n "$VIRTUAL_ENV" ]; then
@@ -533,7 +534,7 @@ run_additional_tests() {
     CUSTOM_N=true
     pytest_opts=$(build_pytest_options "host-cc-multi-stream")
     CUSTOM_N="$saved_custom_n"
-    run_and_record "$test_name" "export DISTRIBUTED_TESTS_DEFAULT_TIMEOUT=1200 && TORCH_NEURONX_ENABLE_HOST_CC=1 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/distributed/collective_ops/test_multistream_collectives_with_host_cc.py"
+    run_and_record "host_cc_multi_stream" "export DISTRIBUTED_TESTS_DEFAULT_TIMEOUT=1200 && TORCH_NEURONX_ENABLE_STREAMS=1 TORCH_NEURONX_ENABLE_HOST_CC=1 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/distributed/collective_ops/test_multistream_collectives_with_host_cc.py"
 
     if [[ "$SKIP_VERTICAL" == "false" ]]; then
         local pytest_opts

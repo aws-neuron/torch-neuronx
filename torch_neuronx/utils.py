@@ -192,13 +192,20 @@ def is_sync_mode_enabled():
 def is_host_cc_enabled():
     """Check if host-side collective communication is enabled.
 
-    Host-cc enables collective operations on non-default streams using NRT host collectives API.
+    Host-cc enables collective operations on non-default streams using the NRT
+    host collectives API.
     Result is cached after first call since the env var is set once at process start.
 
     Returns:
-        bool: True if TORCH_NEURONX_ENABLE_HOST_CC is "1"
+        bool: True when TORCH_NEURONX_ENABLE_HOST_CC is ``1``.
     """
-    return os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC", "0") == "1"
+    return os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] == "1"
+
+
+@functools.lru_cache(maxsize=1)
+def is_streams_enabled():
+    """Check whether distinct Neuron streams are enabled."""
+    return os.environ["TORCH_NEURONX_ENABLE_STREAMS"] == "1"
 
 
 def get_gmm_align() -> int:

@@ -31,6 +31,7 @@
 #include "torch_neuronx/csrc/core/dispatch/PreprocessArgs.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/Transformations.h"
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
+#include "torch_neuronx/csrc/core/streams/StreamConfig.h"
 #include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 #include "torch_neuronx/csrc/core/utils/DtypeCastVec.h"
 #include "torch_neuronx/csrc/core/utils/HostChain.h"
@@ -415,11 +416,7 @@ static bool IsToCopyMlirDtypeSupported(c10::ScalarType dt) {
 /// Mirrors Python can_handle() guard: `not (is_host_cc_enabled() and
 /// current_stream() != default_stream())`.
 static bool IsNonDefaultStreamWithHostCC(c10::DeviceIndex device_index) {
-  static const bool host_cc_enabled = [] {
-    const char* env = std::getenv("TORCH_NEURONX_ENABLE_HOST_CC");
-    return env != nullptr && std::string(env) == "1";
-  }();
-  if (!host_cc_enabled) return false;
+  if (!at::neuron::config::IsHostCCEnabled()) return false;
   auto current = at::neuron::getCurrentNeuronStream(device_index);
   auto default_s = at::neuron::getDefaultNeuronStream(device_index);
   return current != default_s;
