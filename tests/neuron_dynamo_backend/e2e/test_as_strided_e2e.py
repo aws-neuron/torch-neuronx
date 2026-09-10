@@ -108,3 +108,54 @@ class TestAsStridedE2E:
             neuron_out = compiled_fn(x.to("neuron"))
 
         torch.testing.assert_close(neuron_out.cpu(), cpu_out)
+
+    @pytest.mark.parametrize(
+        "size,stride",
+        [
+            pytest.param((2, 3), (3, 1), id="default-stride"),
+            pytest.param((2, 3), (1, 2), id="transpose-stride"),
+            pytest.param((4, 5), (1, 4), id="col-major-stride"),
+        ],
+    )
+    def test_new_empty_strided_decomposes(self, size, stride):
+        """new_empty_strided returns uninitialized memory; a following copy_
+        makes the result observable. Torch-mlir must decompose the op for any
+        stride, or StableHLO legalization fails on the surviving stride list."""
+        torch.manual_seed(0)
+        x = torch.randn(size, dtype=torch.float32)
+
+        def fn(a):
+            y = a.new_empty_strided(size, stride)
+            y.copy_(a)
+            return y + 1.0
+
+        cpu_out = fn(x)
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        neuron_out = compiled_fn(x.to("neuron"))
+
+        torch.testing.assert_close(neuron_out.cpu(), cpu_out)
+
+    @pytest.mark.parametrize(
+        "size,stride",
+        [
+            pytest.param((2, 3), (3, 1), id="default-stride"),
+            pytest.param((2, 3), (1, 2), id="transpose-stride"),
+            pytest.param((4, 5), (1, 4), id="col-major-stride"),
+        ],
+    )
+    def test_empty_strided_decomposes(self, size, stride):
+        """empty_strided is the factory form of new_empty_strided; same
+        uninitialized-memory reasoning applies."""
+        torch.manual_seed(0)
+        x = torch.randn(size, dtype=torch.float32)
+
+        def fn(a):
+            y = torch.empty_strided(size, stride, dtype=torch.float32, device=a.device)
+            y.copy_(a)
+            return y + 1.0
+
+        cpu_out = fn(x)
+        compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+        neuron_out = compiled_fn(x.to("neuron"))
+
+        torch.testing.assert_close(neuron_out.cpu(), cpu_out)

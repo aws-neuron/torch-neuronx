@@ -10988,14 +10988,6 @@ public:
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(AtenNewEmptyStridedOp op,
                                 PatternRewriter &rewriter) const override {
-    Location loc = op.getLoc();
-    Value opSize = op.getSize();
-    Value opStride = op.getStride();
-
-    if (failed(checkDefaultStrideHelper(op, rewriter, opSize, opStride, loc)))
-      return rewriter.notifyMatchFailure(
-          op, "Unable to determine if stride is default");
-
     rewriter.replaceOpWithNewOp<AtenNewEmptyOp>(
         op, op.getType(), op.getSelf(), op.getSize(), op.getDtype(),
         op.getLayout(), op.getDevice(), op.getPinMemory());
@@ -11012,14 +11004,6 @@ public:
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(AtenEmptyStridedOp op,
                                 PatternRewriter &rewriter) const override {
-    Location loc = op.getLoc();
-    Value opSize = op.getSize();
-    Value opStride = op.getStride();
-
-    if (failed(checkDefaultStrideHelper(op, rewriter, opSize, opStride, loc)))
-      return rewriter.notifyMatchFailure(
-          op, "Unable to determine if stride is default");
-
     Value noneVal = ConstantNoneOp::create(rewriter, op.getLoc());
 
     FailureOr<Value> dtype = getDtypeFromOp(rewriter, op);
