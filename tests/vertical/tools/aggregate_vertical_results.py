@@ -84,6 +84,16 @@ def _parse_args(argv: list | None = None) -> argparse.Namespace:
         default="/tmp/vertical-results",
         help="Directory that receives the custom-test-artifacts tree.",
     )
+    parser.add_argument(
+        "--run-kind",
+        choices=("coverage", "perf"),
+        default="coverage",
+        help=(
+            "coverage (default): write op_coverage_<variant> and run_metrics_<variant>. "
+            "perf: write op_perf_<variant> only. A perf run forces synchronous launches, "
+            "so keep its timing in a separate table from the async coverage run."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -110,17 +120,27 @@ def main(argv: list | None = None) -> int:
     run_date = datetime.now().strftime("%Y-%m-%d")
     parquet_root = Path(args.output_dir) / ARTIFACT_ROOT
 
-    write_run_metrics_parquet(
-        rows,
-        _partition_path(parquet_root, f"run_metrics_{variant}", branch, run_id, run_date),
-    )
-    write_op_coverage_parquet(
-        rows,
-        _partition_path(parquet_root, f"op_coverage_{variant}", branch, run_id, run_date),
-    )
+    if args.run_kind == "perf":
+        # Perf reuses the op_coverage schema (it carries every timing column) but
+        # writes its own table. Skip run_metrics: that roll-up is a functionality
+        # summary, not a timing one.
+        write_op_coverage_parquet(
+            rows,
+            _partition_path(parquet_root, f"op_perf_{variant}", branch, run_id, run_date),
+        )
+    else:
+        write_run_metrics_parquet(
+            rows,
+            _partition_path(parquet_root, f"run_metrics_{variant}", branch, run_id, run_date),
+        )
+        write_op_coverage_parquet(
+            rows,
+            _partition_path(parquet_root, f"op_coverage_{variant}", branch, run_id, run_date),
+        )
     logger.info(
-        "Wrote parquet for %d ops (suite=%s, variant=%s) under %s",
+        "Wrote parquet for %d ops (run-kind=%s, suite=%s, variant=%s) under %s",
         len(rows),
+        args.run_kind,
         args.suite,
         variant,
         parquet_root,
