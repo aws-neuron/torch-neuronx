@@ -8,21 +8,24 @@ Cross-entropy uses a chunked online-logsumexp algorithm that avoids
 materializing the full (N, V) softmax/log-softmax matrix, keeping peak
 memory proportional to the chunk size rather than the vocabulary size.
 Two target modes (index and probability) are unified behind a single
-traced function, branching on a shape comparison resolved at trace time.
+traced function with ``is_prob_target`` as a static kwarg.
 """
 
 import torch
-from torch._guards import detect_fake_mode
 from torch._refs.nn.functional import TensorLikeType
 
-from torch_neuronx.python_ops.nki_kernels.bound_check import assert_index_in_bounds
-from torch_neuronx.utils import skip_op_preconditions
+from torch_neuronx.python_ops.auto_registration import neuron_op
+from torch_neuronx.python_ops.base import ExecutionResult, OperationImplementation
+from torch_neuronx.python_ops.torch_mlir.op_impl import TorchMlirOpImpl
 
 from ..operation_registry import Preprocessing, register_aten
 
-# NOTE: DTensor / Replicate are imported locally inside
-# cross_entropy_autograd_privateuse1 (torch.distributed may be unavailable at
-# import time in some environments); do not add a module-level import here.
+try:
+    from torch.distributed._tensor import DTensor
+    from torch.distributed._tensor.placement_types import Replicate
+except ImportError:
+    DTensor = None
+    Replicate = None
 
 # ── NLL Loss (forward & backward) ───────────────────────────────────────
 
@@ -78,14 +81,7 @@ _CHUNK_SIZE = 4096
 
 
 def _validate_ce_inputs(input, target, weight, ignore_index, label_smoothing):
-    """Raise on invalid cross-entropy shapes and static arguments.
-
-    Every check here reads a shape or a static argument, and the cache key records
-    both, so running this only on a cache miss is sufficient: any argument
-    combination that would fail produces a different key, misses, and reaches this
-    function. Target *values* cannot be checked that way and are checked inside the
-    traced graph instead (see ``_ce_chunked_fwd_inner``).
-    """
+    """Raise on invalid cross-entropy arguments (before tracing)."""
     if not (0.0 <= label_smoothing <= 1.0):
         raise RuntimeError(
             f"label_smoothing must be between 0.0 and 1.0. " f"Got: {label_smoothing}"
@@ -122,35 +118,22 @@ def _validate_ce_inputs(input, target, weight, ignore_index, label_smoothing):
             f"tensor of shape: {list(weight.shape)}"
         )
 
-
-def _ce_error_handler(ctx):
-    """Raise cross_entropy_loss's exact IndexError after an out-of-bounds target
-    faults the device.
-
-    Invoked by the C++ error path (see op_error_handlers.py) with a lazy context
-    over the op's ATen arguments; it does not re-run the op. Only the target is
-    copied to CPU, the class count comes from metadata. ignore_index entries are
-    excluded so the reported value matches the in-graph check. Returning without
-    raising leaves the original device error in place, which is the right outcome
-    if the fault came from somewhere else.
-
-    ignore_index is read positionally, with ``ctx.scalar(4)``, because nothing in
-    this schema is declared after a ``*``: ``BuildCPUFallbackContext`` only files an
-    argument under ``original_kwargs`` when ``kwarg_only()`` is set, so a by-name
-    lookup would find nothing here and silently widen the check to every target.
-    """
-    shape = ctx.shape(0)
-    n_classes = shape[1] if len(shape) > 2 else shape[-1]
-    target = ctx.tensor(1)
-    valid = target[target != ctx.scalar(4)]  # arg 4 is ignore_index
-    if valid.numel() == 0:
-        return
-    max_t = int(valid.max())
-    if max_t >= n_classes:
-        raise IndexError(f"Target {max_t} is out of bounds.")
-    min_t = int(valid.min())
-    if min_t < 0:
-        raise IndexError(f"Target {min_t} is out of bounds.")
+    if not is_prob_target and target.numel() > 0:
+        # Neutralize ignore_index entries by mapping them to 0 rather than
+        # masking them out. Boolean-mask indexing is nonzero-backed, so its
+        # output shape depends on tensor *values* — that forces a recompile
+        # whenever the number of ignored targets changes between steps. This
+        # form keeps the shape static, so it compiles once and hits the NEFF
+        # cache thereafter. The numel() guard preserves the old code's
+        # `valid.numel() > 0` check: max()/min() raise on 0 elements.
+        safe = torch.where(target == ignore_index, torch.zeros_like(target), target)
+        # Stack before transferring: one host sync instead of two, and both
+        # reductions schedule into a single graph rather than serializing.
+        max_t, min_t = torch.stack([safe.max(), safe.min()]).tolist()
+        if max_t >= n_classes:
+            raise IndexError(f"Target {max_t} is out of bounds.")
+        if min_t < 0:
+            raise IndexError(f"Target {min_t} is out of bounds.")
 
 
 def _flatten_spatial(input, target, n_classes, is_prob_target):
@@ -175,15 +158,17 @@ def _flatten_spatial(input, target, n_classes, is_prob_target):
 
 @register_aten(
     ["aten::cross_entropy_loss"],
-    # Positions 3, 4, 5 are reduction, ignore_index and label_smoothing. They select
-    # which graph is compiled, so their values must be in the cache key. They are
-    # positional, so static_argnums is the mechanism that declares them: on the Python
-    # path static_argnames only reaches the factory's returned kwargs.
-    static_argnums=(3, 4, 5),
-    # SHAPE_ONLY: nothing here forks the lowering on tensor values. Target values are
-    # read only to validate bounds, which raises or passes without changing the graph.
-    preprocessing=Preprocessing.SHAPE_ONLY,
-    error_handler=_ce_error_handler,
+    static_argnames=(
+        "n_classes",
+        "reduction",
+        "ignore_index",
+        "label_smoothing",
+        "no_batch",
+        "orig_shape",
+        "is_prob_target",
+    ),
+    preprocessing=Preprocessing.VALUE_DEPENDENT,
+    skip_dispatch_registration=True,
 )
 def cross_entropy_loss(
     input: TensorLikeType,
@@ -193,50 +178,57 @@ def cross_entropy_loss(
     ignore_index: int = -100,
     label_smoothing: float = 0.0,
 ):
-    """Validate the arguments and return the traced ``_ce_fwd``.
-
-    The spatial flatten and the no-batch unsqueeze happen inside ``_ce_fwd``, not
-    here, because the cached path feeds the NEFF the raw ATen input. Flattening here
-    would compile a NEFF that expects the flattened layout while C++ hands it the
-    row-major buffer, giving a wrong loss for inputs with more than 2 dimensions.
+    """Preprocessing (eager): validate, flatten spatial dims, return the
+    single traced function ``_ce_fwd`` together with static kwargs that
+    control which code path is compiled.
     """
     _validate_ce_inputs(input, target, weight, ignore_index, label_smoothing)
-    return (
-        _ce_fwd,
-        (input, target, weight, reduction, ignore_index, label_smoothing),
-        {},
-    )
-
-
-def _ce_fwd(input, target, weight, reduction, ignore_index, label_smoothing):
-    """Unified entry point for tracing, taking the ATen argument list unchanged.
-
-    ``n_classes``, ``no_batch`` and ``is_prob_target`` are derived here rather than
-    passed in, so they stay Python values resolved at trace time and only one branch
-    is compiled. Keeping them out of the argument list is also what lets the op drop
-    ``static_argnames``: the preprocessing hook only tensorizes int/float *kwargs*.
-
-    All reshaping (no-batch unsqueeze, spatial flatten) happens HERE, inside the
-    traced function, so the compiled NEFF consumes the RAW ATen input layout that
-    the C++ cached path feeds it (see cross_entropy_loss docstring). Mirrors
-    ``_ce_bwd``.
-    """
-    no_batch = input.dim() == 1
-    n_classes = (
-        input.shape[-1] if no_batch else (input.shape[1] if input.dim() > 2 else input.shape[-1])
-    )
-    is_prob_target = target.dim() == input.dim()
 
     # No-batch-dim inputs (e.g. shape (C,)) → add a leading dim of 1.
+    no_batch = input.dim() == 1
     if no_batch:
         input = input.unsqueeze(0)
         target = target.unsqueeze(0)
+
+    n_classes = input.shape[1] if input.dim() > 2 else input.shape[-1]
+    is_prob_target = target.dim() == input.dim()
 
     # Remember the pre-flatten shape so reduction=none can restore it.
     orig_shape = input.shape
 
     input, target = _flatten_spatial(input, target, n_classes, is_prob_target)
 
+    return (
+        _ce_fwd,
+        (input, target, weight),
+        {
+            "n_classes": n_classes,
+            "reduction": reduction,
+            "ignore_index": ignore_index,
+            "label_smoothing": label_smoothing,
+            "no_batch": no_batch,
+            "orig_shape": orig_shape,
+            "is_prob_target": is_prob_target,
+        },
+    )
+
+
+def _ce_fwd(
+    input,
+    target,
+    weight,
+    *,
+    n_classes,
+    reduction,
+    ignore_index,
+    label_smoothing,
+    no_batch,
+    orig_shape,
+    is_prob_target,
+):
+    """Unified entry point for tracing.  ``is_prob_target`` is static, so
+    the branch is resolved at trace time — only one path is compiled.
+    """
     if is_prob_target:
         return _ce_prob_fwd_inner(
             input,
@@ -332,21 +324,7 @@ def _ce_chunked_fwd_inner(
     chunk_size = min(_CHUNK_SIZE, n_classes)
 
     valid_mask = (target != ignore_index).to(input.dtype)
-    # Map ignore_index entries into range so they pass the bounds check below.
-    # valid_mask already zeroes their contribution to the loss.
-    safe_target = torch.where(target == ignore_index, torch.zeros_like(target), target)
-    if not skip_op_preconditions():
-        # Bounds-check the target inside the graph, so it runs on every call
-        # instead of only on a cache miss. safe_target consumes the returned
-        # tensor: that data dependency is what keeps the check alive through the
-        # compiler's dead-code elimination. An out-of-range class id faults the
-        # device and _ce_error_handler turns it into the exact IndexError.
-        # Returns int32, so restore the target's dtype for the gathers below.
-        safe_target = assert_index_in_bounds(safe_target, n_classes, lo=0).to(target.dtype)
-    # Clamp regardless: assert_index_in_bounds returns the index unchecked when it
-    # cannot lower (under a vmap transform, and for an empty index), so without
-    # this an out-of-range id would still reach the gathers on those paths.
-    safe_target = safe_target.clamp(min=0, max=n_classes - 1)
+    safe_target = target.clamp(min=0, max=n_classes - 1)
 
     # Online logsumexp accumulators (Milakov & Gimelshein, 2018).
     running_max = torch.full(
@@ -448,10 +426,14 @@ def _ce_chunked_fwd_inner(
 
 @register_aten(
     ["aten::cross_entropy_loss_backward"],
-    # Positions 4, 5, 6 are reduction, ignore_index and label_smoothing. The offset
-    # differs from the forward's (3, 4, 5) because grad_output is inserted second.
-    # See the forward decorator for why these must be static_argnums.
-    static_argnums=(4, 5, 6),
+    static_argnames=(
+        "n_classes",
+        "reduction",
+        "ignore_index",
+        "label_smoothing",
+        "no_batch",
+        "is_prob_target",
+    ),
     preprocessing=Preprocessing.SHAPE_ONLY,
 )
 def cross_entropy_loss_backward(
@@ -469,26 +451,45 @@ def cross_entropy_loss_backward(
     calling convention. All reshaping is deferred to the traced function so
     the output shape matches input without aliasing its storage.
     """
-    return (
-        _ce_bwd,
-        (input, grad_output, target, weight, reduction, ignore_index, label_smoothing),
-        {},
-    )
-
-
-def _ce_bwd(input, grad_output, target, weight, reduction, ignore_index, label_smoothing):
-    """Unified backward entry point.
-
-    All reshaping (unsqueeze, flatten, unflatten) happens here inside the
-    traced function so the HLO output shape matches the input shape while
-    preserving the input tensor.
-    """
     no_batch = input.dim() == 1
     n_classes = (
         input.shape[-1] if no_batch else (input.shape[1] if input.dim() > 2 else input.shape[-1])
     )
     is_prob_target = target.dim() == input.dim()
 
+    return (
+        _ce_bwd,
+        (input, grad_output, target, weight),
+        {
+            "n_classes": n_classes,
+            "reduction": reduction,
+            "ignore_index": ignore_index,
+            "label_smoothing": label_smoothing,
+            "no_batch": no_batch,
+            "is_prob_target": is_prob_target,
+        },
+    )
+
+
+def _ce_bwd(
+    input,
+    grad_output,
+    target,
+    weight,
+    *,
+    n_classes,
+    reduction,
+    ignore_index,
+    label_smoothing,
+    no_batch,
+    is_prob_target,
+):
+    """Unified backward entry point.
+
+    All reshaping (unsqueeze, flatten, unflatten) happens here inside the
+    traced function so the HLO output shape matches the input shape while
+    preserving the input tensor.
+    """
     if no_batch:
         input = input.unsqueeze(0)
         target = target.unsqueeze(0)
@@ -577,8 +578,6 @@ def _ce_chunked_bwd_inner(
     chunk_size = min(_CHUNK_SIZE, n_classes)
 
     valid_mask = (target != ignore_index).to(input.dtype)
-    # No bounds check here: the forward runs first on the same target and faults on
-    # an out-of-range class id, so the backward never sees one.
     safe_target = target.clamp(min=0, max=n_classes - 1)
 
     # ── Pass 1: global logsumexp (same online algorithm as forward) ──
@@ -675,59 +674,139 @@ def _unflatten_spatial(grad_input, orig_shape):
     return grad_input.permute(*inv_perm)
 
 
-# ── Backward op schema ───────────────────────────────────────────────────
-# There is no upstream cross_entropy_loss_backward, so without this schema the name is
-# only a cache-key string and the op cannot be dispatched. The "aten" namespace is
-# required because NeuronDispatcher::GetDispatchLib registers the Neuron kernels there.
-#
-# This op is not in-place: argument 0 is the saved logits and the return value is a
-# fresh gradient. Do not add a trailing underscore to the name and do not alias-annotate
-# `self`. Either one turns buffer donation back on and the gradient overwrites the
-# caller's logits. See test_backward_does_not_mutate_logits.
-_bwd_schema_lib = torch.library.Library("aten", "FRAGMENT")
-_bwd_schema_lib.define(
-    "cross_entropy_loss_backward(Tensor self, Tensor grad_output, Tensor target, "
-    "Tensor? weight=None, int reduction=1, SymInt ignore_index=-100, "
-    "float label_smoothing=0.) -> Tensor"
+# ── Register autograd formula for C++ dispatch path ──────────────────────
+# The setup_context and backward are op-specific: they know the cross_entropy
+# schema (which args to save, how to call the backward lowering).
+
+_ce_bwd_impl = TorchMlirOpImpl(
+    "aten::cross_entropy_loss_backward",
+    cross_entropy_loss_backward,
+    static_argnames=(
+        "n_classes",
+        "reduction",
+        "ignore_index",
+        "label_smoothing",
+        "no_batch",
+        "is_prob_target",
+    ),
 )
 
+_NONE_WEIGHT_SENTINEL = torch.tensor([])
 
-# Meta kernel: the gradient has the same shape/dtype as the logits. Required so
-# meta/fake-tensor tracing (and the dispatcher's shape inference) work for the
-# newly declared op.
-def _cross_entropy_loss_backward_meta(
-    self,
-    grad_output,
-    target,
-    weight=None,
-    reduction=1,
-    ignore_index=-100,
-    label_smoothing=0.0,
-):
-    """Shape and dtype stub for meta and fake-tensor tracing.
 
-    The gradient has ``self``'s shape. Its dtype follows type promotion because
-    _ce_bwd ends with ``grad_input * grad_output``, so bf16 logits against an fp32
-    grad_output give fp32 and reporting ``self.dtype`` would be wrong.
+def _ce_setup_context(ctx, inputs, output):
+    # inputs: (input, target, weight, reduction, ignore_index, label_smoothing)
+    weight = inputs[2]
+    ctx.save_for_backward(
+        inputs[0],
+        inputs[1],
+        weight if weight is not None else _NONE_WEIGHT_SENTINEL,
+    )
+    ctx.reduction = inputs[3]
+    ctx.ignore_index = inputs[4]
+    ctx.label_smoothing = inputs[5]
+    ctx.has_weight = weight is not None and weight.numel() > 0
+
+
+def _ce_backward(ctx, grad_output):
+    saved = ctx.saved_tensors
+    weight = saved[2] if ctx.has_weight else None
+
+    # During AOT autograd tracing (torch.compile), the kernel's make_fx would
+    # nest inside AOT autograd's make_fx, causing FunctionalTensor mode conflicts.
+    # The forward is decomposed via get_compile_decomposition_table(), but the
+    # AutogradPrivateUse1 formula still captures this backward. Call the backward
+    # function directly so the outer tracer captures individual ops.
+    proxy_mode = torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.PROXY)
+    if proxy_mode is not None:
+        fn, args, kwargs = cross_entropy_loss_backward(
+            saved[0],
+            grad_output,
+            saved[1],
+            weight,
+            ctx.reduction,
+            ctx.ignore_index,
+            ctx.label_smoothing,
+        )
+        grad_input = fn(*args, **kwargs)
+        return grad_input, None, None, None, None, None
+
+    result = _ce_bwd_impl.execute(
+        saved[0],
+        grad_output,
+        saved[1],
+        weight,
+        ctx.reduction,
+        ctx.ignore_index,
+        ctx.label_smoothing,
+    )
+    if not result.success:
+        raise RuntimeError(f"Cross entropy backward failed: {result.error_msg}")
+    return result.output, None, None, None, None, None
+
+
+def _wrap_ce_for_dtensor(autograd_kernel):
+    """Wrap the cross-entropy autograd kernel to handle DTensor inputs.
+
+    When ``loss_parallel()`` is active the logits are a DTensor (Shard on
+    the vocab dim) while targets/weight may be plain Tensors.  The standard
+    ``make_autograd_impl`` kernel calls ``op.redispatch`` which hits the
+    DTensor dispatch key *before* PrivateUse1 and raises
+    "got mixed torch.Tensor and DTensor".
+
+    This wrapper intercepts DTensor inputs, converts plain Tensor args to
+    Replicate DTensors, and decomposes into log_softmax + nll_loss (which
+    DTensor/loss_parallel know how to shard).  Plain-tensor inputs fall
+    through to the standard autograd kernel unchanged.
     """
-    return torch.empty_like(self, dtype=torch.result_type(self, grad_output))
+
+    def wrapper(keyset, *args, **kwargs):
+        x = args[0]
+        if DTensor is not None and isinstance(x, DTensor):
+            target = args[1]
+            weight = args[2] if len(args) > 2 else None
+            reduction_int = args[3] if len(args) > 3 else 1
+            ignore_index = args[4] if len(args) > 4 else -100
+
+            mesh = x.device_mesh
+            replicate = (Replicate(),) * mesh.ndim
+
+            if isinstance(target, torch.Tensor) and not isinstance(target, DTensor):
+                target = DTensor.from_local(
+                    target, device_mesh=mesh, placements=replicate, run_check=False
+                )
+            if isinstance(weight, torch.Tensor) and not isinstance(weight, DTensor):
+                weight = DTensor.from_local(
+                    weight, device_mesh=mesh, placements=replicate, run_check=False
+                )
+
+            reduction_str = {0: "none", 1: "mean", 2: "sum"}.get(reduction_int, "mean")
+            log_softmax = torch.nn.functional.log_softmax(x, dim=1)
+            return torch.nn.functional.nll_loss(
+                log_softmax,
+                target,
+                weight=weight,
+                reduction=reduction_str,
+                ignore_index=ignore_index,
+            )
+
+        return autograd_kernel(keyset, *args, **kwargs)
+
+    return wrapper
 
 
-_bwd_schema_lib.impl("cross_entropy_loss_backward", _cross_entropy_loss_backward_meta, "Meta")
-
+# TODO: (apoorvgu) - add register_autograd_formula once the reason behind
+# the OOM causing extra input reference is found.
+# Removed: register_autograd_formula causes OOM for large-vocab TP1 models.
+# The @neuron_op CrossEntropyLossOp handles autograd via _CrossEntropyAutograd.
 
 # ── Autograd glue ────────────────────────────────────────────────────────
-# Autograd is deliberately not registered via register_autograd_formula or
-# make_autograd_impl: that path keeps an extra reference to the full-vocab logits and
-# runs out of memory on large-vocab TP1 models. _CrossEntropyAutograd below saves only
-# (input, target, weight). DTensor inputs are handled in the handler's decompose branch.
 
 
 class _CrossEntropyAutograd(torch.autograd.Function):
-    """Attaches the chunked backward to the cached forward.
-
-    ``forward`` runs the cached PrivateUse1 kernel and saves only
-    ``(input, target, weight)``. ``backward`` runs the chunked backward kernel.
+    """Connects the traced forward and backward Neuron kernels so that
+    ``loss.backward()`` dispatches to our chunked backward implementation
+    rather than PyTorch's default decomposition.
     """
 
     @staticmethod
@@ -739,12 +818,10 @@ class _CrossEntropyAutograd(torch.autograd.Function):
         reduction,
         ignore_index,
         label_smoothing,
+        forward_impl,
+        backward_impl,
     ):
-        # _op_dk(PrivateUse1) goes straight to the C++ cached kernel, skipping the
-        # autograd key (this Function IS the autograd) and the DTensor key (handled
-        # in cross_entropy_autograd_privateuse1).
-        output = torch.ops.aten.cross_entropy_loss.default._op_dk(
-            torch._C.DispatchKey.PrivateUse1,
+        result = forward_impl.execute(
             input,
             target,
             weight,
@@ -752,19 +829,20 @@ class _CrossEntropyAutograd(torch.autograd.Function):
             ignore_index,
             label_smoothing,
         )
+        if not result.success:
+            raise RuntimeError(f"Cross entropy forward failed: {result.error_msg}")
         ctx.save_for_backward(input, target, weight)
         ctx.reduction = reduction
         ctx.ignore_index = ignore_index
         ctx.label_smoothing = label_smoothing
-        return output
+        ctx.backward_impl = backward_impl
+        return result.output
 
     @staticmethod
     def backward(ctx, grad_output):
         input, target, weight = ctx.saved_tensors
 
-        # Same C++ cached path as the forward; requires the schema declared above.
-        grad_input = torch.ops.aten.cross_entropy_loss_backward.default._op_dk(
-            torch._C.DispatchKey.PrivateUse1,
+        result = ctx.backward_impl.execute(
             input,
             grad_output,
             target,
@@ -773,26 +851,106 @@ class _CrossEntropyAutograd(torch.autograd.Function):
             ctx.ignore_index,
             ctx.label_smoothing,
         )
+        if not result.success:
+            raise RuntimeError(f"Cross entropy backward failed: {result.error_msg}")
         # One gradient per forward arg; None for non-Tensor / non-differentiable.
-        return grad_input, None, None, None, None, None
+        return result.output, None, None, None, None, None, None, None
 
 
-# ── AutogradPrivateUse1 handler: attach grad_fn + DTensor decomposition ───
+# ── PrivateUse1 dispatch entry point ─────────────────────────────────────
+
+
+@neuron_op("aten::cross_entropy_loss")
+class CrossEntropyLossOp(OperationImplementation):
+    """Top-level dispatcher registered on the ``neuron`` (PrivateUse1)
+    device.  Routes through ``_CrossEntropyAutograd`` when gradients are
+    needed, otherwise calls the forward kernel directly.
+
+    When inputs are DTensors (distributed training with TP), decomposes
+    into F.log_softmax + F.nll_loss so loss_parallel() handles them
+    efficiently on sharded logits.
+    """
+
+    def can_handle(self, *args, **kwargs) -> bool:
+        from torch.distributed.tensor import DTensor
+
+        # Reject DTensor inputs — _execute_impl handles decomposition
+        return not any(isinstance(a, DTensor) for a in args)
+
+    def __init__(self):
+        super().__init__()
+        from torch_neuronx.python_ops.torch_mlir.op_impl import TorchMlirOpImpl
+
+        self._fwd = TorchMlirOpImpl(
+            "aten::cross_entropy_loss",
+            cross_entropy_loss,
+            static_argnames=(
+                "n_classes",
+                "reduction",
+                "ignore_index",
+                "label_smoothing",
+                "no_batch",
+                "orig_shape",
+                "is_prob_target",
+            ),
+        )
+
+        bwd_fn = cross_entropy_loss_backward
+        self._bwd = TorchMlirOpImpl(
+            "aten::cross_entropy_loss_backward",
+            bwd_fn,
+            static_argnames=(
+                "n_classes",
+                "reduction",
+                "ignore_index",
+                "label_smoothing",
+                "no_batch",
+                "is_prob_target",
+            ),
+        )
+
+    def _execute_impl(
+        self,
+        input,
+        target,
+        weight=None,
+        reduction=1,
+        ignore_index=-100,
+        label_smoothing=0.0,
+    ) -> ExecutionResult:
+        if input.requires_grad:
+            output = _CrossEntropyAutograd.apply(
+                input,
+                target,
+                weight,
+                reduction,
+                ignore_index,
+                label_smoothing,
+                self._fwd,
+                self._bwd,
+            )
+            return ExecutionResult(success=True, output=output)
+        return self._fwd.execute(
+            input,
+            target,
+            weight,
+            reduction,
+            ignore_index,
+            label_smoothing,
+        )
+
+
+# ── AutogradPrivateUse1 handler for DTensor decomposition ────────────────
 
 
 def cross_entropy_autograd_privateuse1(*args, **kwargs):
     """AutogradPrivateUse1 implementation for cross_entropy_loss.
 
-    This is where the grad_fn is attached (the forward itself is now the pure
-    C++ cached kernel, which has no autograd).
-
     For DTensor inputs (TP training with loss_parallel), decomposes into
     log_softmax + nll_loss so upstream loss_parallel() handlers process them
     efficiently on sharded logits with autograd tracking.
 
-    For plain Tensor inputs, applies _CrossEntropyAutograd (which runs the
-    forward on the C++ cached PrivateUse1 kernel and attaches our memory-lean
-    chunked backward as the grad_fn).
+    For plain Tensor inputs, dispatches to the PrivateUse1 neuron implementation.
     """
     import torch._C
     from torch.distributed.tensor import DTensor, Replicate
@@ -827,50 +985,14 @@ def cross_entropy_autograd_privateuse1(*args, **kwargs):
             ignore_index=ignore_index,
         )
 
-    # Plain tensors. Read positional args only, the same way the branch above does;
-    # reduction, ignore_index and label_smoothing all have schema defaults.
-    input = args[0]
-    target = args[1]
-    weight = args[2] if len(args) > 2 else None
-    reduction = args[3] if len(args) > 3 else 1
-    ignore_index = args[4] if len(args) > 4 else -100
-    label_smoothing = args[5] if len(args) > 5 else 0.0
-
-    # No validation here: shapes and static arguments are checked on the cache miss
-    # (see _validate_ce_inputs) and target values are checked inside the graph.
-
-    if detect_fake_mode(input) is not None:
-        # aten::cross_entropy_loss is CompositeImplicitAutograd in core, and Dynamo
-        # relies on that decomposition to propagate fake tensors. This kernel overrides
-        # it, and the chunked lowering cannot be traced with fake tensors, so decompose
-        # here the same way get_compile_decomposition_table() does.
-        log_probs = torch.log_softmax(input, dim=1 if input.dim() > 1 else 0)
-        loss, _ = torch.ops.aten.nll_loss_forward(
-            log_probs, target, weight, reduction, ignore_index
-        )
-        return loss
-
-    # Attach the grad_fn only when the logits need one. A differentiable target or
-    # weight is accepted and receives no gradient, matching the previous behaviour.
-    # Do not raise instead: the upstream OpInfo suites set requires_grad=True on every
-    # tensor input, so a raise fires on ordinary probability-target calls.
-    if input.requires_grad:
-        return _CrossEntropyAutograd.apply(
-            input, target, weight, reduction, ignore_index, label_smoothing
-        )
-    return torch.ops.aten.cross_entropy_loss.default._op_dk(
-        torch._C.DispatchKey.PrivateUse1,
-        input,
-        target,
-        weight,
-        reduction,
-        ignore_index,
-        label_smoothing,
-    )
+    # Plain tensors — dispatch to PrivateUse1 (neuron fused impl)
+    return torch.ops.aten.cross_entropy_loss.default._op_dk(torch._C.DispatchKey.PrivateUse1, *args)
 
 
-# Register the AutogradPrivateUse1 handler. This is where the grad_fn is attached,
-# because on a cache hit the PrivateUse1 kernel is pure C++ and runs no Python.
+# Register DTensor handler on AutogradPrivateUse1.
+# This does NOT use register_autograd_formula / make_autograd_impl (which causes OOM).
+# For plain tensors, it falls through to PrivateUse1 where @neuron_op handles autograd.
+# For DTensor inputs (TP training), it decomposes to log_softmax + nll_loss.
 _ce_dtensor_lib = torch.library.Library("aten", "IMPL")
 _ce_dtensor_lib.impl(
     "cross_entropy_loss", cross_entropy_autograd_privateuse1, "AutogradPrivateUse1"
