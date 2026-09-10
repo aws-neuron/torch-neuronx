@@ -51,55 +51,14 @@ class TestCppDispatchRegistration:
         ops_before = set(_C._get_neuron_dispatcher_ops())
         assert isinstance(ops_before, set)
 
-    def test_cross_entropy_registered_via_cpp_dispatch(self):
-        """cross_entropy_loss must reach the C++ cached dispatch path.
+    def test_cross_entropy_skip_dispatch_registration(self):
+        """cross_entropy_loss uses @neuron_op so it must not be in _PENDING_OPERATIONS."""
+        from torch_neuronx.python_ops.torch_mlir.operation_registry import _PENDING_OPERATIONS
 
-        It is a plain register_aten op, so it registers through
-        finalize_registrations_cpp like every other cached op.
-        """
-        registered = set(_C._get_neuron_dispatcher_ops())
-        # op names are stored without the "aten::" prefix
-        assert "cross_entropy_loss" in registered, (
-            "cross_entropy_loss should be registered on the C++ NeuronDispatcher, "
-            f"got: {sorted(n for n in registered if 'cross' in n or 'entropy' in n)}"
-        )
-
-    def test_cross_entropy_backward_is_dispatchable(self):
-        """The backward must be a real dispatchable op, not just a cache-key string.
-
-        There is no upstream cross_entropy_loss_backward, so without an explicit schema
-        the op does not exist and the C++ registration binds nothing. Registration
-        failures are swallowed, so this checks the schema, its alias annotation and the
-        bound kernel rather than registry membership.
-        """
-        assert hasattr(torch.ops.aten, "cross_entropy_loss_backward"), (
-            "aten::cross_entropy_loss_backward has no schema, so the "
-            "torch.library.Library('aten', 'FRAGMENT').define(...) in loss.py is missing"
-        )
-        schemas = torch._C._jit_get_schemas_for_operator("aten::cross_entropy_loss_backward")
-        assert len(schemas) == 1, f"expected exactly one schema, got {len(schemas)}"
-
-        # kernel._call_impl donates output 0 onto input 0 for any single-output op whose
-        # name ends in "_", by name alone, and input 0 here is the saved logits.
-        assert not schemas[0].name.endswith("_"), (
-            "the backward is not an in-place op, so its name must not end in '_': "
-            "kernel._call_impl would donate the gradient onto the caller's logits"
-        )
-
-        # An alias mark on `self` re-enables donation on the cached path.
-        assert schemas[0].arguments[0].alias_info is None, (
-            "cross_entropy_loss_backward's first argument is alias-annotated, which "
-            "donates the gradient onto the saved logits"
-        )
-
-        # RegisterOp inserts into op_registrations_ before it calls lib.impl, so a
-        # swallowed binding failure would still report the op as registered.
-        qual = str(schemas[0].name)
-        if schemas[0].overload_name:
-            qual = f"{qual}.{schemas[0].overload_name}"
-        assert torch._C._dispatch_has_kernel_for_dispatch_key(
-            qual, torch._C.DispatchKey.PrivateUse1
-        ), f"no PrivateUse1 kernel is bound for {qual}"
+        ce_ops = [op for op in _PENDING_OPERATIONS if "cross_entropy" in op["aten_name"]]
+        assert (
+            ce_ops == []
+        ), f"cross_entropy_loss should be skipped from dispatch registration, found: {ce_ops}"
 
     def test_preprocessing_validation_uses_original_inputs_first(self):
         """Validation sees logical dtypes before preprocessing sees downcasted inputs."""

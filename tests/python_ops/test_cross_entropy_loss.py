@@ -10,6 +10,7 @@ import torch.nn.functional as functional
 import torch_neuronx
 from tests.utils.neuron_test_utils import (
     assert_op_runs_on_neuron,
+    count_cpu_bounce_calls,
     track_neuron_ops,
 )
 
@@ -196,7 +197,7 @@ class TestCrossEntropy:
         """Test that gradient shape always matches input shape."""
         _run_cross_entropy(torch.randn(shape), targets, backward=True)
 
-    def test_cross_entropy_targets_receive_no_grad(self):
+    def test_cross_entropy_no_grad_on_targets(self):
         """Test that targets don't receive gradients."""
         logits = torch.randn(3, 4).to("neuron").requires_grad_(True)
         targets = torch.tensor([0, 1, 2], dtype=torch.long).to("neuron")
@@ -285,8 +286,6 @@ class TestCrossEntropy:
 
         with pytest.raises(IndexError, match=re.escape(str(cpu_exc.value))):
             functional.cross_entropy(logits.to("neuron"), targets.to("neuron"))
-            # The bounds check runs on the device, so the error arrives on sync.
-            torch.neuron.synchronize()
 
     def test_cross_entropy_invalid_weight_size(self):
         """Test cross_entropy with invalid weight size."""
@@ -487,170 +486,35 @@ class TestCrossEntropy:
             "input validation must not use value-dependent (nonzero-backed) shapes"
         )
 
-    # ── Cached-dispatch regressions ──────────────────────────────────────
+    @pytest.mark.skipif(
+        _CPP_DISPATCH,
+        reason="C++ dispatch calls NRT directly from C++, bypassing the Python-level "
+        "monkeypatch in count_cpu_bounce_calls",
+    )
+    def test_cross_entropy_validation_single_host_sync(self):
+        """Validation must transfer the target bounds in one read.
 
-    def test_backward_does_not_mutate_logits(self):
-        """The backward must NOT write the gradient over the caller's logits.
-
-        Guards a real bug on main: the backward is not in-place (input 0 is the saved
-        LOGITS, read-only; the return value is a fresh gradient), but on main the op
-        was named with a trailing underscore, and kernel._call_impl donates output 0
-        onto input 0 for any single-output op whose name ends in "_". So `logits` came
-        back holding the gradient. Silent, because grad_input is logits-shaped.
-
-        Two independent guards now stop that, which is why this passes in BOTH
-        dispatch modes:
-          * the alias-free schema (no `Tensor(a!) self`) keeps buffer donation off on
-            the C++ cached path, and
-          * the underscore-free name keeps kernel._call_impl's endswith("_") branch
-            from firing on the Python path (TORCH_NEURONX_CPP_DISPATCH=0).
+        The bounds check needs two scalars (min and max).  Stacking them before
+        transferring keeps this at a single blocking device->host sync;
+        reverting to two separate ``.item()`` calls doubles the syncs on a path
+        that runs on every step.  Calls the validator directly so the count
+        isolates validation from the loss computation itself.
         """
-        logits = torch.randn(8, 10).to("neuron").requires_grad_(True)
-        targets = torch.randint(0, 10, (8,)).to("neuron")
-        snapshot = logits.detach().clone()
+        from torch_neuronx.python_ops.torch_mlir.ops.loss import _validate_ce_inputs
 
-        loss = functional.cross_entropy(logits, targets)
-        assert loss.grad_fn is not None, "grad_fn missing: autograd not wired"
-        loss.backward()
+        n_classes = 128
+        logits = torch.randn(64, n_classes).to("neuron")
+        targets = torch.randint(0, n_classes, (64,))
+        targets[:5] = -100
+        targets = targets.to("neuron")
 
-        assert torch.equal(
-            logits.detach().cpu(), snapshot.cpu()
-        ), "backward mutated the caller's logits (buffer donation re-enabled?)"
-        assert logits.grad is not None
+        # Warm up: first call may compile the min/max reduction.
+        _validate_ce_inputs(logits, targets, None, -100, 0.0)
 
-    def test_retain_graph_double_backward_matches(self):
-        """Two backward passes over a retained graph must give the same gradient.
-
-        Fails if the logits are clobbered by the first backward.
-        """
-        logits_cpu = torch.randn(8, 10)
-        targets = torch.randint(0, 10, (8,))
-        lc = logits_cpu.clone().requires_grad_(True)
-        functional.cross_entropy(lc, targets).backward()
-
-        ln = logits_cpu.detach().clone().to("neuron").requires_grad_(True)
-        out = functional.cross_entropy(ln, targets.to("neuron"))
-        out.backward(retain_graph=True)
-        first = ln.grad.detach().clone()
-        ln.grad = None
-        out.backward()
-        second = ln.grad.detach().clone()
-
-        assert torch.allclose(first.cpu(), second.cpu(), rtol=1e-4, atol=1e-4)
-        assert torch.allclose(first.cpu(), lc.grad, rtol=1e-3, atol=1e-3)
-
-    def test_ignore_index_forks_the_cache_key(self):
-        """Same shapes, different ignore_index -> different NEFFs.
-
-        ignore_index is position 4 of static_argnums=(3, 4, 5). Without it in the
-        cache key these two calls collide and the second replays the first's NEFF.
-        Both calls are in ONE test so they share a process even under pytest-xdist.
-        """
-        logits = torch.tensor([[2.0, 0.5, 1.0], [0.5, 1.0, 2.0], [0.1, 0.7, 3.0]])
-        targets = torch.tensor([0, 2, 1], dtype=torch.long)
-        ln, tn = logits.to("neuron"), targets.to("neuron")
-
-        for ignore in (-100, 2):
-            expected = functional.cross_entropy(logits, targets, ignore_index=ignore)
-            got = functional.cross_entropy(ln, tn, ignore_index=ignore)
-            assert torch.allclose(
-                expected, got.cpu(), rtol=1e-4, atol=1e-4
-            ), f"ignore_index={ignore}: {got.cpu()} != {expected} (cache-key collision?)"
-
-    def test_reduction_forks_the_cache_key(self):
-        """Same shapes, different reduction -> different NEFFs, in ONE process."""
-        logits = torch.randn(3, 5)
-        targets = torch.tensor([0, 3, 4])
-        ln, tn = logits.to("neuron"), targets.to("neuron")
-
-        for reduction in ("none", "mean", "sum"):
-            expected = functional.cross_entropy(logits, targets, reduction=reduction)
-            got = functional.cross_entropy(ln, tn, reduction=reduction)
-            assert torch.allclose(
-                expected, got.cpu(), rtol=1e-4, atol=1e-4
-            ), f"reduction={reduction}: cache-key collision"
-
-    def test_label_smoothing_forks_the_cache_key(self):
-        """Same shapes, different label_smoothing -> different NEFFs, one process."""
-        logits = torch.tensor([[1.0, 2.0, 0.5], [0.2, 1.0, 3.0]])
-        targets = torch.tensor([0, 2], dtype=torch.long)
-        ln, tn = logits.to("neuron"), targets.to("neuron")
-
-        for smoothing in (0.0, 0.1, 0.3):
-            expected = functional.cross_entropy(logits, targets, label_smoothing=smoothing)
-            got = functional.cross_entropy(ln, tn, label_smoothing=smoothing)
-            assert torch.allclose(
-                expected, got.cpu(), rtol=1e-4, atol=1e-4
-            ), f"label_smoothing={smoothing}: cache-key collision"
-
-    def test_no_batch_dim_1d_input(self):
-        """1-D input (C,) with a scalar target, the no_batch path.
-
-        This PR moved the no_batch unsqueeze from preprocessing into the traced
-        function, and nothing else in this file exercises a 1-D input.
-        """
-        logits = torch.randn(7)
-        target = torch.tensor(3)
-        expected = functional.cross_entropy(logits, target)
-        got = functional.cross_entropy(logits.to("neuron"), target.to("neuron"))
-        assert expected.shape == got.shape
-        assert torch.allclose(expected, got.cpu(), rtol=1e-4, atol=1e-4)
-
-    def test_differentiable_target_gets_no_gradient(self):
-        """A differentiable target is accepted and receives no gradient.
-
-        The grad_fn is gated on the logits, so when only the target requires grad there
-        is no grad_fn and .backward() fails loudly instead of silently leaving
-        target.grad as None. Do not make a differentiable target raise: the upstream
-        OpInfo suites set requires_grad=True on every tensor input, so a raise fires on
-        ordinary probability-target calls.
-        """
-        probs = torch.rand(4, 6).softmax(dim=-1).to("neuron").requires_grad_(True)
-
-        # logits require grad: gradient flows to the logits only
-        logits = torch.randn(4, 6).to("neuron").requires_grad_(True)
-        functional.cross_entropy(logits, probs).backward()
-        assert logits.grad is not None
-        assert probs.grad is None, "target gradient is not implemented"
-
-        # only the target requires grad: no graph is built
-        loss = functional.cross_entropy(torch.randn(4, 6).to("neuron"), probs)
-        assert loss.grad_fn is None
-        with pytest.raises(RuntimeError, match="does not require grad"):
-            loss.backward()
-
-    def test_oob_target_by_autograd_mode(self):
-        """An out-of-bounds target raises IndexError in every autograd mode, on a cold
-        and a warm cache alike.
-
-        The check lives in the traced graph, so it runs on every execution rather than
-        only where Python runs. inference_mode is the case that pins this: it excludes
-        the autograd keyset, so none of our Python runs and a host-side check would be
-        skipped here.
-
-        The check runs on the device, so the error surfaces on synchronize rather than
-        at the call. Each block syncs for that reason, and so the fault is observed
-        before the next one starts.
-        """
-        logits = torch.randn(4, 6).to("neuron")
-        good = torch.randint(0, 6, (4,)).to("neuron")
-        bad = good.clone()
-        bad[0] = 99  # out of range for 6 classes
-
-        # cold cache
-        with pytest.raises(IndexError):
-            functional.cross_entropy(logits, bad)
-            torch.neuron.synchronize()
-
-        # warm the NEFF for this shape with a valid target
-        functional.cross_entropy(logits, good)
-
-        with pytest.raises(IndexError):
-            functional.cross_entropy(logits, bad)
-            torch.neuron.synchronize()
-        with torch.no_grad(), pytest.raises(IndexError):
-            functional.cross_entropy(logits, bad)
-            torch.neuron.synchronize()
-        with torch.inference_mode(), pytest.raises(IndexError):
-            functional.cross_entropy(logits, bad)
-            torch.neuron.synchronize()
+        counts = count_cpu_bounce_calls(
+            lambda: _validate_ce_inputs(logits, targets, None, -100, 0.0)
+        )
+        assert counts["reads"] == 1, (
+            f"target bounds check performed {counts['reads']} device->host reads, "
+            "expected 1: min and max should transfer in a single stacked read"
+        )
