@@ -12,9 +12,7 @@ import pytest
 MODUSCOPE_MODULES_DIR = Path(__file__).resolve().parents[3] / "testing" / "moduscope"
 sys.path.insert(0, str(MODUSCOPE_MODULES_DIR))
 TEST_TARGETS_PATH = Path(__file__).with_name("fixtures") / "targets.json"
-TEST_HUGGING_FACE_TARGET = "test_hf"
-TEST_TITAN_TARGET = "test_titan"
-TEST_COMPONENT_EQUIVALENCE_TARGET = "component_equiv_qwen3_8b_llama3_8b_neuron"
+TEST_COMPONENT_EQUIVALENCE_TARGET = "component-equiv-dense"
 RUN_ID = "33700000001"
 REPOSITORY = "aws-neuron/private-torch-neuronx"
 RUN_IDENTITY_ENV = {
