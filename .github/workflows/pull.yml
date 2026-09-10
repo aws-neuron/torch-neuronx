@@ -1,8 +1,13 @@
 name: PR Checks
 
-# Triggered by pr-test-dispatcher.yml or manually via workflow_dispatch.
-# The self-hosted runner builds a Docker image and runs the job
-# inside the resulting container.
+# pr-test-dispatcher.yml starts this workflow. You can also start it manually
+# with workflow_dispatch. The self-hosted runner builds a Docker image. The job
+# runs in that container.
+#
+# The commit status context stays "Smoke Test". pr-gate.yml posts the pending
+# status under the same name, and branch protection refers to it. Rename both
+# files together, or the pending status never clears.
+
 on:
   workflow_dispatch:
     inputs:
@@ -14,6 +19,14 @@ on:
         description: 'HEAD SHA of the PR branch'
         required: true
         type: string
+      test_scope:
+        description: 'smoke runs one device test file. full runs the ATen suite.'
+        required: false
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - full
 
 permissions:
   contents: read
@@ -24,8 +37,11 @@ concurrency:
   group: ${{ github.workflow }}-pr-${{ github.event.inputs.pr_number }}
   cancel-in-progress: true
 
+env:
+  AWS_DEFAULT_REGION: us-west-2
+
 jobs:
-  smoke-test:
+  aten-tests:
     name: "Smoke Test — PR #${{ github.event.inputs.pr_number }}"
     runs-on:
       - self-hosted
@@ -33,15 +49,31 @@ jobs:
       - neuron
       - neuron.internal_compute
       - "neuron.internal_compute:trn2.48xlarge"
+      # Add "neuron.internal_compute.persistent-storage:read" here after the
+      # fleet grants this repository read access to the NEFF cache bucket. The
+      # label makes the fleet inject the cache bucket variables. A runner label
+      # that the fleet does not advertise leaves the job queued, so add the
+      # label only after the access is in place. Until then the suite compiles
+      # cold, which run-test-parallel handles without an error.
       - neuron.build-image
-      - "neuron.run-${{ github.run_id }}-smoke-test"
+      - "neuron.run-${{ github.run_id }}-aten-unit-tests"
       - "neuron.pr:${{ github.event.inputs.pr_number }}"
-    timeout-minutes: 30
+      # This repository has one trn2 instance. Keep the smoke timeout short.
+      # A hung job must not hold the only instance for a full day.
+      - "neuron.timeout:${{ github.event.inputs.test_scope == 'full' && '32400' || '3600' }}"
+    timeout-minutes: ${{ github.event.inputs.test_scope == 'full' && 600 || 60 }}
+    env:
+      # The full command matches the ATen arm in private-torch-neuronx.
+      ATEN_FULL_CMD: ./tools/run-test-parallel --no-forked --persistent-cache --skip-distributed --skip_pt_test_distributed --coverage --json-report --report-dir=outputs/test-reports
+      # The smoke command runs one file. It proves the container finds a Neuron
+      # device, pytest runs, and the artifacts reach the runner host.
+      ATEN_SMOKE_CMD: ./tools/run-test-parallel --persistent-cache --json-report --report-dir=outputs/test-reports tests/device/test_device.py
     steps:
       - name: Set status to in-progress
         uses: actions/github-script@v7
         env:
           HEAD_SHA: ${{ github.event.inputs.head_sha }}
+          TEST_SCOPE: ${{ github.event.inputs.test_scope }}
         with:
           script: |
             await github.rest.repos.createCommitStatus({
@@ -50,7 +82,7 @@ jobs:
               sha: process.env.HEAD_SHA,
               state: 'pending',
               context: 'Smoke Test',
-              description: 'Running smoke test...',
+              description: `Running ATen tests (${process.env.TEST_SCOPE} scope)...`,
               target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });
 
@@ -59,22 +91,18 @@ jobs:
         with:
           ref: ${{ github.event.inputs.head_sha }}
 
-      - name: Smoke test
-        run: |
-          echo "========================================="
-          echo "Smoke Test — PR #${{ github.event.inputs.pr_number }}"
-          echo "========================================="
-          echo "Running on internal compute (Neuron hardware)"
-          python3 -c "import sys; print(f'Python {sys.version}')"
-          echo "========================================="
-          echo "✓ Smoke test passed!"
-          echo "========================================="
+      - name: Run ATen tests
+        uses: ./.github/actions/run-test-suite
+        with:
+          test-command: ${{ github.event.inputs.test_scope == 'full' && env.ATEN_FULL_CMD || env.ATEN_SMOKE_CMD }}
+          artifact-name: aten-test-results
 
       - name: Report success
         if: success()
         uses: actions/github-script@v7
         env:
           HEAD_SHA: ${{ github.event.inputs.head_sha }}
+          TEST_SCOPE: ${{ github.event.inputs.test_scope }}
         with:
           script: |
             await github.rest.repos.createCommitStatus({
@@ -83,7 +111,7 @@ jobs:
               sha: process.env.HEAD_SHA,
               state: 'success',
               context: 'Smoke Test',
-              description: 'Smoke test passed',
+              description: `ATen tests passed (${process.env.TEST_SCOPE} scope)`,
               target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });
 
@@ -92,6 +120,7 @@ jobs:
         uses: actions/github-script@v7
         env:
           HEAD_SHA: ${{ github.event.inputs.head_sha }}
+          TEST_SCOPE: ${{ github.event.inputs.test_scope }}
         with:
           script: |
             await github.rest.repos.createCommitStatus({
@@ -100,6 +129,6 @@ jobs:
               sha: process.env.HEAD_SHA,
               state: 'failure',
               context: 'Smoke Test',
-              description: 'Smoke test failed',
+              description: `ATen tests failed (${process.env.TEST_SCOPE} scope)`,
               target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });

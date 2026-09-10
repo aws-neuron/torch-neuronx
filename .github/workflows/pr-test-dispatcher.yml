@@ -9,6 +9,14 @@ on:
         description: 'PR number to test (e.g. 42)'
         required: true
         type: string
+      test_scope:
+        description: 'smoke runs one device test file. full runs the ATen suite.'
+        required: false
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - full
 
 permissions:
   actions: write
@@ -56,16 +64,18 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.inputs.pr_number }}
           HEAD_SHA: ${{ steps.pr-info.outputs.head_sha }}
+          TEST_SCOPE: ${{ github.event.inputs.test_scope }}
         with:
           script: |
             const prNumber = process.env.PR_NUMBER;
             const headSha  = process.env.HEAD_SHA;
+            const testScope = process.env.TEST_SCOPE || 'smoke';
 
             // Hardcode 'main' because the repo's default branch is 'develop',
             // but pull.yml lives on the 'main' branch.
             const dispatchRef = 'main';
 
-            console.log(`Dispatching pull.yml on ref "${dispatchRef}" for PR #${prNumber} (sha: ${headSha})`);
+            console.log(`Dispatching pull.yml on ref "${dispatchRef}" for PR #${prNumber} (sha: ${headSha}, scope: ${testScope})`);
 
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
@@ -75,6 +85,7 @@ jobs:
               inputs: {
                 pr_number: prNumber,
                 head_sha: headSha,
+                test_scope: testScope,
               },
             });
 
