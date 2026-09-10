@@ -688,4 +688,14 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_higher_order_ops.py::FuncTorchHigherOrderOpTests::test_functionalize_compiled_fn_does_not_copy_dynamo_attrs",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "Subtest test: some subTest(case=...) cases are unsupported on Neuron"
+            " and report SUBXFAIL. The xfail marker applies to the whole method."
+        ),
+        tests=[
+            "MiscTests::test_new_tensor_break",
+            "NestedGraphBreaksMiscTests::test_new_tensor_break_nested_graph_breaks",
+        ],
+    ),
 ]
