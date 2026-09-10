@@ -108,7 +108,38 @@ def _exp_reduced(x, exp_bias=0):
     return poly * torch.pow(2.0, k + exp_bias)
 
 
-@register_aten(["aten::abs", "aten::abs.out"])
+def _validate_float_promoting_out(x, *args, out=None, **kwargs):
+    """Reject an out= tensor that cannot hold a floating-point result.
+
+    Raises only when the input is a floating-point type AND the out= tensor is
+    a non-floating dtype.
+
+    Accepts *args/**kwargs so it can serve as validate_static_inputs for any
+    op regardless of how many positional or keyword arguments it has.
+    For ops that return (values, indices), out is a tuple — only the values
+    tensor is checked.
+    """
+    # Unwrap tuple out= (e.g. max.dim returns (values, indices)); check values only.
+    out_tensor = out[0] if isinstance(out, tuple | list) else out
+    if out_tensor is None or not isinstance(out_tensor, torch.Tensor):
+        return
+    # Only check when the input is floating-point: the result is float, and an
+    # integer out= cannot hold it. For integer/bool inputs the result dtype is
+    # also integer (or stays bool), so any integer out= is acceptable.
+    if not x.is_floating_point():
+        return
+    if out_tensor.is_floating_point():
+        return
+    expected = x.dtype
+    raise RuntimeError(
+        f"Expected out tensor to have dtype {expected}, " f"but got {out_tensor.dtype} instead"
+    )
+
+
+@register_aten(
+    ["aten::abs", "aten::abs.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_abs(x, out=None):
     """StableHlo.abs does not support unsigned dtype
 
@@ -122,50 +153,49 @@ def torch_abs(x, out=None):
     return result
 
 
-@register_aten(["aten::neg", "aten::neg.out"])
+@register_aten(
+    ["aten::neg", "aten::neg.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_neg(x, out=None):
     return torch.neg(x)
 
 
-@register_aten(["aten::sqrt", "aten::sqrt.out"])
+@register_aten(
+    ["aten::sqrt", "aten::sqrt.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_sqrt(x, out=None):
     """Square root."""
     return torch.sqrt(x)
 
 
-@register_aten(["aten::rsqrt", "aten::rsqrt.out"])
+@register_aten(
+    ["aten::rsqrt", "aten::rsqrt.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_rsqrt(x, out=None):
     return torch.rsqrt(x)
 
 
-@register_aten(["aten::cos", "aten::cos.out"])
+@register_aten(
+    ["aten::cos", "aten::cos.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_cos(x, out=None):
     return torch.cos(x)
 
 
-@register_aten(["aten::sin", "aten::sin.out"])
+@register_aten(
+    ["aten::sin", "aten::sin.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_sin(x, out=None):
     return torch.sin(x)
 
 
-def _validate_float_promoting_out(x, out=None):
-    """Reject an out= tensor whose dtype can't hold the float result.
-
-    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
-    dispatch path skips (it would otherwise silently cast the result into out).
-    These ops promote integer/bool inputs to the default float dtype, so the
-    expected out dtype is the input dtype only when it is already floating.
-    """
-    expected = x.dtype if x.is_floating_point() else torch.get_default_dtype()
-    if out is not None and out.dtype != expected:
-        raise RuntimeError(
-            f"Expected out tensor to have dtype {expected}, but got {out.dtype} instead"
-        )
-
-
 @register_aten(
     ["aten::cosh", "aten::cosh.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_cosh(x, out=None):
@@ -190,7 +220,6 @@ def torch_cosh(x, out=None):
 
 @register_aten(
     ["aten::sinh", "aten::sinh.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_sinh(x, out=None):
@@ -217,7 +246,6 @@ def torch_sinh(x, out=None):
 
 @register_aten(
     ["aten::tan", "aten::tan.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_tan(x, out=None):
@@ -240,7 +268,6 @@ def torch_tan(x, out=None):
 
 @register_aten(
     ["aten::acos", "aten::acos.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_acos(x, out=None):
@@ -250,7 +277,6 @@ def torch_acos(x, out=None):
 
 @register_aten(
     ["aten::acosh", "aten::acosh.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_acosh(x, out=None):
@@ -260,7 +286,6 @@ def torch_acosh(x, out=None):
 
 @register_aten(
     ["aten::asin", "aten::asin.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_asin(x, out=None):
@@ -270,7 +295,6 @@ def torch_asin(x, out=None):
 
 @register_aten(
     ["aten::asinh", "aten::asinh.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_asinh(x, out=None):
@@ -280,7 +304,6 @@ def torch_asinh(x, out=None):
 
 @register_aten(
     ["aten::atan", "aten::atan.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_atan(x, out=None):
@@ -290,7 +313,6 @@ def torch_atan(x, out=None):
 
 @register_aten(
     ["aten::atanh", "aten::atanh.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_atanh(x, out=None):
@@ -298,12 +320,18 @@ def torch_atanh(x, out=None):
     return torch.atanh(x)
 
 
-@register_aten(["aten::exp", "aten::exp.out"])
+@register_aten(
+    ["aten::exp", "aten::exp.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_exp(x, out=None):
     return torch.exp(x)
 
 
-@register_aten(["aten::log", "aten::log.out"])
+@register_aten(
+    ["aten::log", "aten::log.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_log(x, out=None):
     return torch.log(x)
 
@@ -329,7 +357,10 @@ def torch_log1p(x, out=None):
     return torch.log1p(x)
 
 
-@register_aten(["aten::erf", "aten::erf.out"])
+@register_aten(
+    ["aten::erf", "aten::erf.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_erf(x, out=None):
     # Cast non-floating-point inputs (e.g. bool, int) to float,
     # matching PyTorch CPU behavior where erf promotes to float.
@@ -340,7 +371,10 @@ def torch_erf(x, out=None):
     return torch.where(torch.isnan(x), x, result)
 
 
-@register_aten(["aten::erfinv", "aten::erfinv.out"])
+@register_aten(
+    ["aten::erfinv", "aten::erfinv.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_erfinv(y, out=None):
     # Cast non-floating-point inputs (e.g. bool, int) to float,
     # matching PyTorch CPU behavior where erfinv promotes to float.
@@ -374,20 +408,23 @@ def torch_erfinv(y, out=None):
     return result
 
 
-@register_aten(["aten::ceil", "aten::ceil.out"])
+@register_aten(
+    ["aten::ceil", "aten::ceil.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_ceil(self, out=None):
     return torch.ceil(self)
 
 
 def _validate_floor(self, out=None):
-    """Reject an out= tensor whose dtype doesn't match the input.
+    """Reject bool inputs and mismatched out= dtype for floor.
 
-    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
-    dispatch path skips (it would otherwise silently cast the result into out).
-    floor preserves the input dtype (unlike acos et al., which promote to float),
-    so out must have the same dtype as the input. The message is spelled like
-    CPU (e.g. 'Long', not 'torch.int64').
+    bool is rejected because floor is not defined for bool dtype. The out=
+    dtype must match the input (floor preserves the input dtype, unlike
+    float-promoting ops).
     """
+    if isinstance(self, torch.Tensor) and self.dtype is torch.bool:
+        raise RuntimeError("\"floor\" not implemented for 'Bool'")
     if out is not None and out.dtype != self.dtype:
         raise RuntimeError(
             f"Found dtype {aten_scalar_type_name(out.dtype)} but expected "
@@ -397,7 +434,6 @@ def _validate_floor(self, out=None):
 
 @register_aten(
     ["aten::floor", "aten::floor.out", "aten::floor_"],
-    output_params=("out",),
     validate_static_inputs=_validate_floor,
 )
 def torch_floor(self, out=None):
@@ -419,19 +455,24 @@ def torch_floor(self, out=None):
     return torch.where(torch.isnan(self), self, result)
 
 
-@register_aten(["aten::trunc", "aten::trunc.out"])
+@register_aten(
+    ["aten::trunc", "aten::trunc.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_trunc(x, out=None):
     return torch.trunc(x)
 
 
-@register_aten(["aten::sign", "aten::sign.out"])
+@register_aten(
+    ["aten::sign", "aten::sign.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_sign(x, out=None):
     return torch.sign(x)
 
 
 @register_aten(
     ["aten::angle", "aten::angle.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_angle(x, out=None):
@@ -446,7 +487,10 @@ def torch_angle(x, out=None):
     return torch.angle(x)
 
 
-@register_aten(["aten::reciprocal", "aten::reciprocal_", "aten::reciprocal.out"])
+@register_aten(
+    ["aten::reciprocal", "aten::reciprocal_", "aten::reciprocal.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_reciprocal(a, out=None):
     """Elementwise reciprocal (1/x).
 
@@ -463,7 +507,10 @@ def torch_reciprocal(a, out=None):
     return torch.reciprocal(a)
 
 
-@register_aten(["aten::exp2", "aten::exp2.out"])
+@register_aten(
+    ["aten::exp2", "aten::exp2.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_exp2(self, out=None):
     return torch.ops.aten.exp2(self)
 
@@ -475,7 +522,10 @@ def torch_exp2_(self):
 
 @register_aten(
     ["aten::frac", "aten::frac.out", "aten::frac_"],
-    validate_static_inputs=validate_float_only_dtype,
+    validate_static_inputs=lambda *args, **kw: (
+        validate_float_only_dtype(*args, **kw),
+        _validate_float_promoting_out(*args, **kw),
+    ),
 )
 def torch_frac(self, out=None):
     return torch.ops.aten.frac(self)
@@ -483,7 +533,10 @@ def torch_frac(self, out=None):
 
 @register_aten(
     ["aten::round", "aten::round.out", "aten::round_"],
-    validate_static_inputs=validate_round_dtype,
+    validate_static_inputs=lambda *args, **kw: (
+        validate_round_dtype(*args, **kw),
+        _validate_float_promoting_out(*args, **kw),
+    ),
 )
 def torch_round(self, out=None):
     return torch.ops.aten.round(self)
@@ -492,13 +545,20 @@ def torch_round(self, out=None):
 @register_aten(
     ["aten::round.decimals", "aten::round.decimals_out", "aten::round_.decimals"],
     static_argnames=("decimals",),
-    validate_static_inputs=validate_float_only_dtype,
+    validate_static_inputs=lambda *args, **kw: (
+        validate_float_only_dtype(*args, **kw),
+        _validate_float_promoting_out(*args, **kw),
+    ),
 )
 def torch_round_decimals(self, decimals, out=None):
     return torch.ops.aten.round(self, decimals=decimals)
 
 
-@register_aten(["aten::logit", "aten::logit.out"], static_argnames=("eps",))
+@register_aten(
+    ["aten::logit", "aten::logit.out"],
+    static_argnames=("eps",),
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_logit(self, eps=None, out=None):
     return torch.ops.aten.logit(self, eps)
 
@@ -517,6 +577,9 @@ def torch_logit_backward(grad_output, self, eps=None, grad_input=None):
     return torch.ops.aten.logit_backward.default(grad_output, self, eps)
 
 
-@register_aten(["aten::special_i1e", "aten::special_i1e.out"])
+@register_aten(
+    ["aten::special_i1e", "aten::special_i1e.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_special_i1e(self, out=None):
     return torch.ops.aten.special_i1e(self)

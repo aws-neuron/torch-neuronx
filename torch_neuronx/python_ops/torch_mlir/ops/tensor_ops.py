@@ -3,6 +3,7 @@
 import torch
 
 from ..operation_registry import Preprocessing, register_aten
+from .unary import _validate_float_promoting_out
 
 
 def _wrap_dim(dim, ndim):
@@ -80,7 +81,6 @@ def torch_cat(tensors, dim=0, out=None):
 @register_aten(
     ["aten::stack", "aten::stack.out", "aten::_stack", "aten::_stack.out"],
     static_argnums=(1,),
-    output_params=("out",),
 )
 def torch_stack(tensors, dim=0, out=None):
     return torch.stack(tensors, dim)
@@ -91,12 +91,20 @@ def torch_vstack(tensors):
     return torch.vstack(tensors)
 
 
-@register_aten(["aten::triu", "aten::triu.out"], static_argnums=(1,))
+@register_aten(
+    ["aten::triu", "aten::triu.out"],
+    static_argnums=(1,),
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_triu(m, diagonal=0, out=None):
     return torch.triu(m, diagonal)
 
 
-@register_aten(["aten::tril", "aten::tril.out"], static_argnums=(1,))
+@register_aten(
+    ["aten::tril", "aten::tril.out"],
+    static_argnums=(1,),
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_tril(x, diagonal=0, out=None):
     return torch.tril(x, diagonal)
 

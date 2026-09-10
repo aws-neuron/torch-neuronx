@@ -3,6 +3,7 @@
 import torch
 
 from ..operation_registry import register_aten
+from .unary import _validate_float_promoting_out
 
 
 @register_aten(["aten::relu", "aten::relu.out", "aten::relu_"])
@@ -21,12 +22,18 @@ def torch_silu(x, out=None):
     return torch.nn.functional.silu(x)
 
 
-@register_aten(["aten::sigmoid", "aten::sigmoid.out"])
+@register_aten(
+    ["aten::sigmoid", "aten::sigmoid.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_sigmoid(x, out=None):
     return torch.sigmoid(x)
 
 
-@register_aten(["aten::tanh", "aten::tanh.out"])
+@register_aten(
+    ["aten::tanh", "aten::tanh.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_tanh(self, out=None):
     return torch.tanh(self)
 

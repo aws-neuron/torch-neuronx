@@ -77,7 +77,7 @@ class TestAcos:
     def test_acos_out_dtype_mismatch_raises(self, device):
         """A genuinely wrong out= dtype must still raise (guard not over-relaxed)."""
         x = torch.tensor([0.5], dtype=torch.float32, device=device)
-        out = torch.empty(1, dtype=torch.float16, device=device)
+        out = torch.empty(1, dtype=torch.int32, device=device)
         with pytest.raises(RuntimeError, match="dtype"):
             torch.acos(x, out=out)
 

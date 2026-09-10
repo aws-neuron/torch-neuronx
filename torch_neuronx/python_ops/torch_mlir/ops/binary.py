@@ -4,6 +4,7 @@ import torch
 
 from ..operation_registry import register_aten
 from ..validation import validate_inplace_broadcast
+from .unary import _validate_float_promoting_out
 
 
 def _inplace_result(result, self_tensor):
@@ -96,7 +97,11 @@ def _div_compute(x, y, rounding_mode=None):
     return result.to(x.dtype) if up else result
 
 
-@register_aten(["aten::add.Tensor", "aten::add.out"], static_argnames=("alpha",))
+@register_aten(
+    ["aten::add.Tensor", "aten::add.out"],
+    static_argnames=("alpha",),
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_add(x, y, alpha=1, out=None):
     """Add operation."""
     return torch.add(x, y, alpha=alpha)
@@ -119,7 +124,10 @@ def torch_add_scalar(x, y, alpha=1):
     return torch.add(x, y, alpha=alpha)
 
 
-@register_aten(["aten::mul.Scalar", "aten::mul.Tensor", "aten::mul.out", "aten::mul.Scalar_out"])
+@register_aten(
+    ["aten::mul.Scalar", "aten::mul.Tensor", "aten::mul.out", "aten::mul.Scalar_out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_mul(x, y, out=None):
     """Multiply operation."""
     return torch.mul(x, y)
@@ -131,7 +139,11 @@ def torch_mul_inplace(x, y, out=None):
     return _inplace_result(torch.mul(x, y), x)
 
 
-@register_aten(["aten::sub.Tensor", "aten::sub.out"], static_argnames=("alpha",))
+@register_aten(
+    ["aten::sub.Tensor", "aten::sub.out"],
+    static_argnames=("alpha",),
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_sub(x, y, alpha=1, out=None):
     return torch.sub(x, y, alpha=alpha)
 
@@ -149,6 +161,7 @@ def torch_sub_inplace(x, y, alpha=1, out=None):
 @register_aten(
     ["aten::div", "aten::div.out", "aten::div.out_mode"],
     static_argnames=("rounding_mode",),
+    validate_static_inputs=_validate_float_promoting_out,
 )
 @register_aten(
     ["aten::div_.Tensor"],
@@ -173,7 +186,9 @@ def torch_div_inplace(x, y, rounding_mode=None, out=None):
 
 
 @register_aten(
-    ["aten::pow", "aten::pow.Tensor_Scalar_out", "aten::pow.Tensor_Tensor_out"], static_argnums=(1,)
+    ["aten::pow", "aten::pow.Tensor_Scalar_out", "aten::pow.Tensor_Tensor_out"],
+    static_argnums=(1,),
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_pow(x, exponent, out=None):
     if x.dtype == torch.bool and isinstance(exponent, bool):
@@ -208,18 +223,25 @@ def torch_pow_scalar(self, exponent, out=None):
         "aten::remainder.Scalar",
         "aten::remainder.Scalar_out",
         "aten::remainder_.Scalar",
-    ]
+    ],
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_remainder(x, y, out=None):
     return torch.remainder(x, y)
 
 
-@register_aten(["aten::floor_divide", "aten::floor_divide.out"])
+@register_aten(
+    ["aten::floor_divide", "aten::floor_divide.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_floor_divide(x, y, out=None):
     return torch.floor_divide(x, y)
 
 
-@register_aten(["aten::addcmul", "aten::addcmul.out"])
+@register_aten(
+    ["aten::addcmul", "aten::addcmul.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 @register_aten(["aten::addcmul_"], validate_static_inputs=validate_inplace_broadcast)
 def torch_addcmul(input, tensor1, tensor2, value=1, out=None):
     if input.dtype == torch.bool:
@@ -228,7 +250,10 @@ def torch_addcmul(input, tensor1, tensor2, value=1, out=None):
     return input + value * tensor1 * tensor2
 
 
-@register_aten(["aten::addcdiv", "aten::addcdiv.out"])
+@register_aten(
+    ["aten::addcdiv", "aten::addcdiv.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 @register_aten(["aten::addcdiv_"], validate_static_inputs=validate_inplace_broadcast)
 def torch_addcdiv(input, tensor1, tensor2, value=1, out=None):
     if not input.dtype.is_floating_point:
@@ -245,7 +270,10 @@ def torch_addcdiv(input, tensor1, tensor2, value=1, out=None):
     return input + value * tensor1 / tensor2
 
 
-@register_aten(["aten::ldexp.Tensor", "aten::ldexp.out"])
+@register_aten(
+    ["aten::ldexp.Tensor", "aten::ldexp.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_ldexp(self, other, out=None):
     return torch.ops.aten.ldexp(self, other)
 

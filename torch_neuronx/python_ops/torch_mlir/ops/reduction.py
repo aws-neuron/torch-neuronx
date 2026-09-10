@@ -7,6 +7,7 @@ import torch
 from torch_neuronx.dtype_utils import torch_dtype_to_scalar_type_name
 
 from ..operation_registry import register_aten
+from .unary import _validate_float_promoting_out
 
 
 def _reduction_numel(tensor, dim):
@@ -68,7 +69,6 @@ def _reduce_with_promotion(op_fn, target_dtype, caller_dtype, *args, **kwargs):
     ["aten::sum", "aten::sum.dim_IntList", "aten::sum.IntList_out", "aten::sum.out"],
     static_argnums=(1, 2),
     static_argnames=("dtype",),
-    output_params=("out",),
 )
 def torch_sum(self, dim=None, keepdim=False, dtype=None, out=None):
     target_dtype = _infer_int64_promotion(dtype, self)
@@ -82,6 +82,7 @@ def torch_sum(self, dim=None, keepdim=False, dtype=None, out=None):
     ["aten::mean", "aten::mean.dim", "aten::mean.out", "aten::mean.dtype_out"],
     static_argnums=(1, 2),
     static_argnames=("dtype",),
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_mean(x, dim=None, keepdim=False, dtype=None, out=None):
     # Scalar tensor with dim: short-circuit to avoid MLIR crash
@@ -97,6 +98,7 @@ def torch_mean(x, dim=None, keepdim=False, dtype=None, out=None):
     ["aten::max", "aten::max.unary_out", "aten::max.dim", "aten::max.dim_max"],
     static_argnums=(1, 2),
     output_params=("max", "max_values"),
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_max(x, dim=None, keepdim=False, out=None, **kwargs):
     # neuronx-cc cannot reduce over a pred (bool) operand ("operand: pred[]").
@@ -116,6 +118,7 @@ def torch_max(x, dim=None, keepdim=False, out=None, **kwargs):
     ["aten::min", "aten::min.unary_out", "aten::min.dim", "aten::min.dim_min"],
     static_argnums=(1, 2),
     output_params=("min", "min_indices"),
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_min(x, dim=None, keepdim=False, out=None, **kwargs):
     # neuronx-cc cannot reduce over a pred (bool) operand ("operand: pred[]").
@@ -231,6 +234,7 @@ def _validate_std_inputs(self, dim=None, correction=1, keepdim=False, out=None, 
         )
     if not self.is_floating_point() and self.ndim > 0:
         raise RuntimeError("std and var only support floating point and complex dtypes")
+    _validate_float_promoting_out(self, out=out)
 
 
 @register_aten(
@@ -328,7 +332,6 @@ def _cdist_decompose(x1, x2, p):
 
 @register_aten(
     ["aten::_cdist_forward", "aten::_cdist_forward.out"],
-    output_params=("out",),
     static_argnums=(2, 3),
 )
 def torch_cdist_forward(x1, x2, p, compute_mode=None, out=None):
@@ -380,7 +383,6 @@ def _pdist_pairwise(self, reduce_fn):
 
 @register_aten(
     ["aten::_pdist_forward", "aten::_pdist_forward.out"],
-    output_params=("out",),
     static_argnums=(1,),
     validate_static_inputs=_validate_pdist,
 )

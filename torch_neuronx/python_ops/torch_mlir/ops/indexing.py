@@ -8,6 +8,7 @@ from torch_neuronx.utils import skip_op_preconditions
 
 from ..operation_registry import Preprocessing, register_aten
 from ..validation import validate_inplace_broadcast
+from .unary import _validate_float_promoting_out
 
 
 def convert_indices(indices):
@@ -185,6 +186,7 @@ def torch_index_copy(x, dim, indexes, source, out=None):
     ["aten::index_add", "aten::index_add_", "aten::index_add.out"],
     static_argnums=(1,),
     static_argnames=("alpha",),
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_index_add(x, dim, index, source, alpha=1, out=None):
     return torch.index_add(x, dim, index, source, alpha=alpha)
@@ -217,6 +219,7 @@ def _scatter_error_handler(ctx):
     static_argnums=(1,),
     preprocessing=Preprocessing.SHAPE_ONLY,
     error_handler=_scatter_error_handler,
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_scatter_value(x, dim, index, value, out=None):
     # Convert scalar to tensor with matching dtype
@@ -310,6 +313,7 @@ def torch_scatter_src(x, dim, index, src, out=None, reduce=None):
     # re-lower every call and key on the resolved size. That size usually differs
     # per call, so the NEFF recompiles whenever the count changes.
     relower_every_call=True,
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_masked_select(x, mask, out=None):
     if mask.dtype != torch.bool:
@@ -415,6 +419,11 @@ def torch_masked_fill(x, mask, value, out=None):
         "aten::where.self",
         "aten::where.self_out",
     ],
+    validate_static_inputs=lambda condition,
+    x=None,
+    y=None,
+    out=None,
+    **kw: _validate_float_promoting_out(x if x is not None else condition, out=out),
 )
 def torch_where(condition, x=None, y=None, out=None):
     return torch.where(condition, x, y)
