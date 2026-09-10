@@ -199,7 +199,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason=("Torch-MLIR lowering failure at aten.uniform"),
         tests=[
             "DynamicShapesReproTests::test_tensor_uniform_dynamic_shapes",
-            "UnspecTests::test_shape_graph_break",
         ],
     ),
     SkipGroup(
@@ -308,10 +307,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=("AoTAutogradCache not supported: cache hit/miss count mismatch"),
         tests=x.DYNAMO_AOT_AUTOGRAD_CACHE_HIT_MISS,
-    ),
-    SkipGroup(
-        reason=("Tensor with empty dimensions"),
-        tests=x.DYNAMO_TENSOR_EMPTY_DIMENSIONS,
     ),
     SkipGroup(
         reason=("Numerical precision mismatch on Neuron for inplace ops"),
@@ -510,12 +505,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
-        reason="SymInt proxy tracking failure on Neuron",
-        tests=[
-            "SubclassTests::test_tensor_subclass_metadata_with_symint",
-        ],
-    ),
-    SkipGroup(
         reason="Neuron backend compilation failure for NestedTensor unbind",
         tests=[
             "TestNestedTensor::test_unbind",
@@ -577,7 +566,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "MiscTestsDeviceNEURON::test_module_to_with_shared_weights_compile_neuron",
             "MiscTestsDeviceNEURON::test_randint_no_graphbreak_neuron",
             "MiscTestsDeviceNEURON::test_module_to_move_compile_neuron",
-            "MiscTestsDeviceNEURON::test_interpolate_propagate_real_tensors_neuron",
         ],
     ),
     SkipGroup(
@@ -609,7 +597,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "SubclassTests::test_subclass_TwoTensor_nested_diff_sizes",
-            "TestTwoTensorSubclass::test_subclass_TwoTensor_nested_diff_sizes",
         ],
     ),
     SkipGroup(

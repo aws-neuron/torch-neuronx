@@ -88,9 +88,6 @@ from .dynamo_xfails import (
     DYNAMO_STREAM_EVENT_TYPE_MISMATCH as DYNAMO_STREAM_EVENT_TYPE_MISMATCH,
 )
 from .dynamo_xfails import (
-    DYNAMO_TENSOR_EMPTY_DIMENSIONS as DYNAMO_TENSOR_EMPTY_DIMENSIONS,
-)
-from .dynamo_xfails import (
     DYNAMO_TO_COPY_DISPATCH_FAILURE as DYNAMO_TO_COPY_DISPATCH_FAILURE,
 )
 from .dynamo_xfails import (

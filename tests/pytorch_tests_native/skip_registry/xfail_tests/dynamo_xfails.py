@@ -58,7 +58,6 @@ DYNAMO_UNRESOLVED_MATERIALIZATION_I64 = [
     "DynamicShapesMiscTests::test_item_changes_dynamic_shapes",
     "DynamicShapesMiscTests::test_item_changes_new_shape_dynamic_shapes",
     "DynamicShapesReproTests::test_trace_functional_tensor_with_dynamic_shapes",
-    "SubclassTests::test_torch_function_subclass_survives_into_aot_autograd",
     "TestBytecodeDebugger::test_stack_command",
     "DynamicShapesFunctionTests::test_methodcaller_dynamic_shapes",
     "HOPCacheTests::test_checkpoint_with_dropout_caches_correctly",
@@ -143,10 +142,6 @@ DYNAMO_FAILED_TO_LEGALIZE_OPERATOR = [
     "DynamicShapesReproTests::test_amp_foreach_fake_impl_dynamic_shapes",
     "DynamicShapesReproTests::test_grad_references_cleared_dynamic_shapes",
     "DynamicShapesReproTests::test_hasattr_builtin_dynamic_shapes",
-    "DynamoOpPromotionTests::test_tensorify_track_item_symint",
-    "ExportTests::test_zeroes_in_new_shape_scalar_out",
-    "ExportTests::test_zeroes_in_new_shape_scalar_out_permute",
-    "ExportTests::test_zeroes_in_new_shape_scalar_out_permute_dupe_and_bypass",
     "FxGraphRunnableTest::test_reduce_scatter_collective",
     "FxGraphRunnableTest::test_repeat_interleave_with_constant_output_size",
     "FxGraphRunnableTest::test_scalar_multiply",
@@ -159,12 +154,10 @@ DYNAMO_FAILED_TO_LEGALIZE_OPERATOR = [
     "*MiscTests::test_dynamo_disabled_in_custom_op_kernels*",
     "*MiscTests::test_storage_return*",
     "*ReproTests::test_amp_foreach_fake_impl*",
-    "TestAfterAot::test_save_graph_repro",
     "TestNestedTensor::test_subclass_with_mutation_in_graph",
     "TestStreams::test_event_record_before_input_mutation_no_error",
     "TestStreams::test_event_record_on_different_stream_no_error",
     "TestStreams::test_record_stream_inductor_output_code",
-    "ViewTests::test_view_to_2d",
     "AOTAutogradCacheTests::test_basic",
     "AOTAutogradCacheTests::test_unsafe_mark_cacheable",
     "AotAutogradFallbackTests::test_alias_inputs",
@@ -189,9 +182,6 @@ DYNAMO_FAILED_TO_LEGALIZE_OPERATOR = [
     "DynamicShapesExportTests::test_zeroes_in_new_shape_scalar_out_permute_dynamic_shapes",
     "DynamicShapesMiscTests::test_dynamo_disabled_in_custom_op_kernels_dynamic_shapes",
     "DynamicShapesReproTests::test_optim_state_references_cleared_dynamic_shapes",
-    "InlineAndInstallExportTests::test_zeroes_in_new_shape_scalar_out_inline_and_install",
-    "InlineAndInstallExportTests::test_zeroes_in_new_shape_scalar_out_permute_dupe_and_bypass_inline_and_install",
-    "InlineAndInstallExportTests::test_zeroes_in_new_shape_scalar_out_permute_inline_and_install",
     "AOTAutogradCacheBundledTests::test_cache_lazy_backward_for_compiled_autograd",
     "DynamicShapesFuncTorchHigherOrderOpTests::test_grad_fn_with_kwargs_dynamic_shapes",
     "DynamicShapesFuncTorchHigherOrderOpTests::test_grad_with_side_effect_dynamic_shapes",
@@ -202,7 +192,6 @@ DYNAMO_FAILED_TO_LEGALIZE_OPERATOR = [
     "*MiscTests::test_param_autograd_grad_in_forward*",
     "*MiscTests::test_torch_distributions_gamma_dynamic*",
     "NestedGraphBreaksMiscTests::test_param_autograd_grad_in_forward_nested_graph_breaks",
-    "NestedGraphBreaksMiscTests::test_torch_distributions_gamma_dynamic_nested_graph_breaks",
 ]
 
 DYNAMO_FAILED_TO_LEGALIZE_RUNTIME_ASSERT = [
@@ -214,7 +203,6 @@ DYNAMO_FAILED_TO_LEGALIZE_RUNTIME_ASSERT = [
     "*MiscTests::test_unbacked_2d_expand*",
     "*MiscTests::test_unique_consecutive*",
     "*UnspecTests::test_mark_unbacked*",
-    "ViewTests::test_view_to_1d",
     "*NNModuleTests::test_conv_call_forward_directly*",
     "AotAutogradFallbackTests::test_unbacked_activation_specialized_in_inductor",
     "DynamicShapesAotAutogradFallbackTests::test_unbacked_activation_specialized_in_inductor_dynamic_shapes",
@@ -358,13 +346,6 @@ DYNAMO_AOT_AUTOGRAD_CACHE_HIT_MISS = [
     "AOTAutogradCacheTests::test_autograd_lazy_backward",
     "AOTAutogradCacheTests::test_inference_graph_cache_hit_with_compiled_autograd_enabled",
     "AOTAutogradCacheTests::test_pre_grad_passes_timing_default_with_uuid",
-]
-
-DYNAMO_TENSOR_EMPTY_DIMENSIONS = [
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_bfloat16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float16",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float32",
-    "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float64",
 ]
 
 DYNAMO_NUMERICAL_PRECISION_INPLACE_OPS = [
