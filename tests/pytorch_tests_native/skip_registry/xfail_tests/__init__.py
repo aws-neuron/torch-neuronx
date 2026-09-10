@@ -96,6 +96,9 @@ from .dynamo_xfails import (
 from .dynamo_xfails import (
     DYNAMO_VMAP_RECOMPILE_GUARD as DYNAMO_VMAP_RECOMPILE_GUARD,
 )
+from .error_not_raised.assertion_error import (
+    ERROR_NOT_RAISED_ASSERTION_ERROR as ERROR_NOT_RAISED_ASSERTION_ERROR,
+)
 from .error_not_raised.runtime_error import (
     ERROR_NOT_RAISED_RUNTIME_ERROR as ERROR_NOT_RAISED_RUNTIME_ERROR,
 )

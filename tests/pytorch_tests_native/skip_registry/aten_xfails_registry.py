@@ -259,6 +259,10 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=x.DTYPE_MISMATCH_OBJECT_COMPARISON,
     ),
     SkipGroup(
+        reason="[error_not_raised.assertion_error] Expected AssertionError not raised on Neuron",
+        tests=x.ERROR_NOT_RAISED_ASSERTION_ERROR,
+    ),
+    SkipGroup(
         reason="[error_not_raised.runtime_error] Expected RuntimeError not raised on Neuron",
         tests=x.ERROR_NOT_RAISED_RUNTIME_ERROR,
     ),

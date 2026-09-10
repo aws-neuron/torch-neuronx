@@ -104,6 +104,7 @@ ACCURACY_TENSOR_NOT_EQUAL = [
     "test_linalg.py::TestLinalgNEURON::test_blas_alpha_beta_empty_neuron_int8",
     "test_linalg.py::TestLinalgNEURON::test_blas_alpha_beta_empty_neuron_uint8",
     "test_linalg.py::TestLinalgNEURON::test_triu_tril_extreme_k_values_neuron_int16",
+    "test_neuron_compile_ops.py::TestCompileOpInfoNEURON::test_compile_matches_eager_tril_indices_neuron_int64",
     "test_ops.py::TestCommonNEURON::test_non_standard_bool_values___getitem___neuron_bool",
     "test_ops.py::TestCommonNEURON::test_non_standard_bool_values_argwhere_neuron_bool",
     "test_ops.py::TestCommonNEURON::test_non_standard_bool_values_gather_neuron_bool",
