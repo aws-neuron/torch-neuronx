@@ -22,8 +22,19 @@ def _write_csv(tmp_path: Path) -> Path:
     return csv_path
 
 
-def _run(csv_path: Path, suite: str, out: Path) -> int:
-    return agg.main(["--csv", str(csv_path), "--suite", suite, "--output-dir", str(out)])
+def _run(csv_path: Path, suite: str, out: Path, run_kind: str = "coverage") -> int:
+    return agg.main(
+        [
+            "--csv",
+            str(csv_path),
+            "--suite",
+            suite,
+            "--output-dir",
+            str(out),
+            "--run-kind",
+            run_kind,
+        ]
+    )
 
 
 def test_eager_suite_writes_eager_tables(tmp_path, monkeypatch):
@@ -55,6 +66,22 @@ def test_compile_suite_writes_torch_compile_tables(tmp_path, monkeypatch):
     root = out / "custom-test-artifacts" / "vertical_ops"
     assert (root / "op_coverage_torch_compile").exists()
     assert (root / "run_metrics_torch_compile").exists()
+
+
+def test_perf_run_kind_writes_op_perf_only(tmp_path, monkeypatch):
+    monkeypatch.delenv("GITHUB_REF_NAME", raising=False)
+    monkeypatch.delenv("GITHUB_RUN_ID", raising=False)
+    csv_path = _write_csv(tmp_path)
+    out = tmp_path / "results"
+
+    assert _run(csv_path, "target_ops_coverage", out, run_kind="perf") == 0
+
+    dt = datetime.now().strftime("%Y-%m-%d")
+    root = out / "custom-test-artifacts" / "vertical_ops"
+    assert (root / "op_perf_eager" / "branch=unknown" / f"dt={dt}" / "run_unknown.parquet").exists()
+    # A perf run writes neither the coverage table nor the functionality roll-up.
+    assert not (root / "op_coverage_eager").exists()
+    assert not (root / "run_metrics_eager").exists()
 
 
 def test_unknown_suite_is_rejected(tmp_path):

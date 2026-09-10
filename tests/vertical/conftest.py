@@ -7,8 +7,12 @@ Aggregates coverage results:
 
 import os
 
-# NEURON_LAUNCH_BLOCKING must be set BEFORE any torch_neuronx import
-os.environ.setdefault("NEURON_LAUNCH_BLOCKING", "1")
+# Default to async execution. Coverage measures op status, not timing, so it
+# does not need synchronous launches. The --perf-timing option forces
+# synchronous launches for accurate per-op timing (see pytest_configure).
+# Set before any torch_neuronx import so the runtime reads the intended value;
+# an explicit environment value still wins.
+os.environ.setdefault("NEURON_LAUNCH_BLOCKING", "0")
 
 import csv
 import json
@@ -73,6 +77,11 @@ _DISPATCH_METRICS_DIR = (
     Path(os.environ.get("NEURON_COVERAGE_METRICS_DIR", tempfile.gettempdir()))
     / "neuron_dispatch_metrics"
 )
+
+# Directory that receives the aggregated ``<prefix>_<ts>.csv`` files. Defaults
+# to the current directory (repo root for a local run). CI sets it to a path
+# under ``outputs/`` so the CSVs ship with the test-results artifact.
+_CSV_OUTPUT_DIR = Path(os.environ.get("NEURON_COVERAGE_CSV_DIR", "."))
 
 COVERAGE_FIELDS = [
     "op_name",
@@ -146,6 +155,15 @@ def pytest_addoption(parser):
         ),
     )
     parser.addoption(
+        "--perf-timing",
+        action="store_true",
+        default=False,
+        help=(
+            "Force synchronous launches (NEURON_LAUNCH_BLOCKING=1) for accurate "
+            "per-op timing. The perf workflow sets this. Coverage runs async."
+        ),
+    )
+    parser.addoption(
         "--dynamic",
         action="store_true",
         default=False,
@@ -182,6 +200,10 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
+    # Runs before collection, so this still lands before the first
+    # torch_neuronx import. Force sync only for a perf run.
+    if config.getoption("--perf-timing", default=False):
+        os.environ["NEURON_LAUNCH_BLOCKING"] = "1"
     if config.getoption("--model-shapes-only", default=False):
         os.environ["NEURON_MODEL_SHAPES_ONLY"] = "1"
     registry_path = config.getoption("--shape-registry", default=None)
@@ -273,7 +295,8 @@ def _aggregate_metrics(metrics_dir: Path, prefix: str):
         return
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    output = Path(f"{prefix}_{ts}.csv")
+    _CSV_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output = _CSV_OUTPUT_DIR / f"{prefix}_{ts}.csv"
     with open(output, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=COVERAGE_FIELDS, quoting=csv.QUOTE_MINIMAL)
         w.writeheader()
@@ -343,7 +366,8 @@ def _aggregate_dynamic_metrics(metrics_dir: Path, prefix: str):
     lead = fields[:4]
     rows.sort(key=lambda r: tuple(str(r.get(k, "")) for k in lead))
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    output = Path(f"{prefix}_{ts}.csv")
+    _CSV_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output = _CSV_OUTPUT_DIR / f"{prefix}_{ts}.csv"
     with open(output, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, quoting=csv.QUOTE_MINIMAL, extrasaction="ignore")
         w.writeheader()
