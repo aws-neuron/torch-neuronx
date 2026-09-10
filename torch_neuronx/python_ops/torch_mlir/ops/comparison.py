@@ -4,6 +4,7 @@ import torch
 
 from ..operation_registry import register_aten
 from .constants import INT_DTYPES
+from .unary import _validate_float_promoting_out
 
 
 @register_aten(["aten::eq", "aten::eq.Scalar_out", "aten::eq.Tensor_out"])
@@ -38,6 +39,7 @@ def torch_le(x, y, out=None):
 
 @register_aten(
     ["aten::clamp", "aten::clamp.out", "aten::clamp.Tensor", "aten::clamp.Tensor_out"],
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_clamp(x, min=None, max=None, out=None):
     if min is None and max is None:
@@ -63,6 +65,7 @@ def torch_clamp(x, min=None, max=None, out=None):
         "aten::clamp_max.Tensor",
         "aten::clamp_max.Tensor_out",
     ],
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_clamp_max(x, max, out=None):
     # Ensure tensor max has same dtype as input
@@ -81,6 +84,7 @@ def torch_clamp_max(x, max, out=None):
         "aten::clamp_min.Tensor",
         "aten::clamp_min.Tensor_out",
     ],
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_clamp_min(x, min, out=None):
     # Ensure tensor min has same dtype as input
@@ -128,12 +132,18 @@ def torch_isfinite(x):
         return ~(torch.isnan(x) | torch.isinf(x))
 
 
-@register_aten(["aten::minimum", "aten::minimum.out"])
+@register_aten(
+    ["aten::minimum", "aten::minimum.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_minimum(self, other, out=None):
     return torch.minimum(self, other)
 
 
-@register_aten(["aten::maximum", "aten::maximum.out"])
+@register_aten(
+    ["aten::maximum", "aten::maximum.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_maximum(self, other, out=None):
     return torch.maximum(self, other)
 

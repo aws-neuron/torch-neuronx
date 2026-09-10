@@ -3,6 +3,7 @@
 import torch
 
 from ..operation_registry import register_aten
+from .unary import _validate_float_promoting_out
 
 
 def maybe_cast_dtype(result, dtype):
@@ -192,6 +193,9 @@ def torch_signbit(x, out=None):
     return torch.signbit(x)
 
 
-@register_aten(["aten::sgn", "aten::sgn.out"])
+@register_aten(
+    ["aten::sgn", "aten::sgn.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_sgn(x, out=None):
     return torch.sgn(x)

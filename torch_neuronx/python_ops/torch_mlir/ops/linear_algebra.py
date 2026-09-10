@@ -4,43 +4,8 @@ import torch
 
 from ..operation_registry import register_aten
 
-
-@register_aten(["aten::dot", "aten::dot.out"])
-def torch_dot(tensor1, tensor2, out=None):
-    return torch.dot(tensor1, tensor2)
-
-
-@register_aten(["aten::mv", "aten::mv.out"])
-def torch_mv(mat, vec, out=None):
-    _reject_bool_matmul("mv", mat, vec)
-    return torch.mv(mat, vec)
-
-
-@register_aten(
-    ["aten::mm", "aten::mm.out", "aten::mm.dtype_out", "aten::mm.dtype"],
-    static_argnames=("out_dtype",),
-)
-def torch_mm(mat1, mat2, out_dtype=None, out=None):
-    _reject_bool_matmul("mm", mat1, mat2)
-    result = torch.mm(mat1, mat2)
-    return result if out_dtype is None else result.to(out_dtype)
-
-
-@register_aten(
-    ["aten::bmm", "aten::bmm.out", "aten::bmm.dtype_out", "aten::bmm.dtype"],
-    static_argnames=("out_dtype",),
-)
-def torch_bmm(batch1, batch2, out_dtype=None, out=None):
-    _reject_bool_matmul("bmm", batch1, batch2)
-    result = torch.bmm(batch1, batch2)
-    return result if out_dtype is None else result.to(out_dtype)
-
-
 # ``caffe2::TypeMeta`` names, spelled exactly as PyTorch's structured-kernel
-# out= check prints them ("Expected out tensor to have dtype float, but got
-# long int instead"). These are demangled C++ type names, not
-# ``c10::toString(ScalarType)`` names ("Float"/"Long"), so they cannot be
-# derived from ``str(dtype)``.
+# out= check prints them.
 _TYPE_META_NAMES = {
     torch.float32: "float",
     torch.float64: "double",
@@ -53,6 +18,74 @@ _TYPE_META_NAMES = {
     torch.uint8: "unsigned char",
     torch.bool: "bool",
 }
+
+
+def _validate_matmul_out(x, *args, out=None, out_dtype=None, **kwargs):
+    """Exact-dtype out= check for the matmul family (CPU structured-kernel rule).
+
+    CPU's structured matmul kernels (mm, bmm, mv, dot, addmm, addmv) require
+    the out= tensor to have exactly the result dtype. The result dtype equals
+    the input dtype for both float and integer matmul (integer matmul preserves
+    the integer type, not promoting to float).
+
+    The dtype_out overload has an explicit out_dtype argument. The C++ dispatcher
+    passes it as a positional arg; the Python caller may pass it as a kwarg.
+    Either way, if an explicit output dtype is given, skip the check — the result
+    is cast to that dtype before writing to out=.
+    """
+    out_tensor = out[0] if isinstance(out, tuple | list) else out
+    if out_tensor is None or not isinstance(out_tensor, torch.Tensor):
+        return
+    # out_dtype from kwarg path (Python direct call)
+    if out_dtype is not None:
+        return
+    # out_dtype from positional path (C++ dispatcher for .dtype_out overload)
+    if any(isinstance(a, torch.dtype) for a in args):
+        return
+    if out_tensor.dtype != x.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {_TYPE_META_NAMES.get(x.dtype, x.dtype)}, "
+            f"but got {_TYPE_META_NAMES.get(out_tensor.dtype, out_tensor.dtype)} instead"
+        )
+
+
+@register_aten(
+    ["aten::dot", "aten::dot.out"],
+    validate_static_inputs=_validate_matmul_out,
+)
+def torch_dot(tensor1, tensor2, out=None):
+    return torch.dot(tensor1, tensor2)
+
+
+@register_aten(
+    ["aten::mv", "aten::mv.out"],
+    validate_static_inputs=_validate_matmul_out,
+)
+def torch_mv(mat, vec, out=None):
+    _reject_bool_matmul("mv", mat, vec)
+    return torch.mv(mat, vec)
+
+
+@register_aten(
+    ["aten::mm", "aten::mm.out", "aten::mm.dtype_out", "aten::mm.dtype"],
+    static_argnames=("out_dtype",),
+    validate_static_inputs=_validate_matmul_out,
+)
+def torch_mm(mat1, mat2, out_dtype=None, out=None):
+    _reject_bool_matmul("mm", mat1, mat2)
+    result = torch.mm(mat1, mat2)
+    return result if out_dtype is None else result.to(out_dtype)
+
+
+@register_aten(
+    ["aten::bmm", "aten::bmm.out", "aten::bmm.dtype_out", "aten::bmm.dtype"],
+    static_argnames=("out_dtype",),
+    validate_static_inputs=_validate_matmul_out,
+)
+def torch_bmm(batch1, batch2, out_dtype=None, out=None):
+    _reject_bool_matmul("bmm", batch1, batch2)
+    result = torch.bmm(batch1, batch2)
+    return result if out_dtype is None else result.to(out_dtype)
 
 
 def _reject_bool_matmul(op_name: str, *tensors: object) -> None:
@@ -112,7 +145,6 @@ def _validate_baddbmm_dtype(input, batch1, batch2, out_dtype=None, *_args, out=N
 
 @register_aten(
     ["aten::baddbmm", "aten::baddbmm.out"],
-    output_params=("out",),
     static_argnames=("beta", "alpha"),
     validate_static_inputs=_validate_baddbmm,
 )
@@ -142,7 +174,6 @@ def torch_baddbmm(input, batch1, batch2, beta=1, alpha=1, out=None):
 
 @register_aten(
     ["aten::baddbmm.dtype", "aten::baddbmm.dtype_out"],
-    output_params=("out",),
     static_argnums=(3,),
     static_argnames=("out_dtype", "beta", "alpha"),
     validate_static_inputs=_validate_baddbmm_dtype,
@@ -180,6 +211,7 @@ def torch_baddbmm_dtype(input, batch1, batch2, out_dtype, beta=1, alpha=1, out=N
 @register_aten(
     ["aten::addmm", "aten::addmm.out", "aten::addmm.dtype_out", "aten::addmm.dtype"],
     static_argnames=("beta", "alpha", "out_dtype"),
+    validate_static_inputs=_validate_matmul_out,
 )
 def torch_addmm(input, mat1, mat2, out_dtype=None, beta=1, alpha=1, out=None):
     _reject_bool_matmul("addmm", input, mat1, mat2)
@@ -212,6 +244,7 @@ def torch_addmm(input, mat1, mat2, out_dtype=None, beta=1, alpha=1, out=None):
         "beta",
         "alpha",
     ),
+    validate_static_inputs=_validate_matmul_out,
 )
 def torch_addmv(self, mat, vec, beta=1, alpha=1, out=None):
     """Decomposed implementation of addmv: beta * self + alpha * (mat @ vec)"""
@@ -234,6 +267,7 @@ def torch_addmv(self, mat, vec, beta=1, alpha=1, out=None):
     ["aten::linalg_vector_norm", "aten::linalg_vector_norm.out"],
     static_argnums=(1, 2, 3),
     static_argnames=("dtype",),
+    validate_static_inputs=_validate_matmul_out,
 )
 def torch_linalg_vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None, out=None):
     return torch.linalg.vector_norm(x, ord, dim, keepdim, dtype=dtype)
