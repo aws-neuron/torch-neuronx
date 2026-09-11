@@ -45,6 +45,9 @@ class TestStreamCreation:
         assert stream is not None
         assert stream.device.type == "neuron"
 
+    @pytest.mark.needs_process_isolation(
+        reason="requires_nrt_streams sets the stream flags, which C++ keeps after first use."
+    )
     @requires_nrt_streams
     def test_stream_equality(self):
         """Test stream equality comparison."""
@@ -58,6 +61,9 @@ class TestStreamCreation:
         assert stream1 == stream1
         assert stream2 == stream2
 
+    @pytest.mark.needs_process_isolation(
+        reason="requires_nrt_streams sets the stream flags, which C++ keeps after first use."
+    )
     @requires_nrt_streams
     def test_stream_hash(self):
         """Test stream hashing for use in sets/dicts."""
@@ -100,6 +106,9 @@ class TestStreamCreation:
         # Should contain useful information
         assert "Stream" in repr_str or "neuron" in repr_str.lower()
 
+    @pytest.mark.needs_process_isolation(
+        reason="requires_nrt_streams sets the stream flags, which C++ keeps after first use."
+    )
     @requires_nrt_streams
     def test_multiple_stream_creation(self):
         """Test creating multiple streams doesn't interfere."""
@@ -116,6 +125,9 @@ class TestStreamCreation:
             for j in range(i + 1, len(streams)):
                 assert streams[i] != streams[j]
 
+    @pytest.mark.needs_process_isolation(
+        reason="requires_nrt_streams sets the stream flags, which C++ keeps after first use."
+    )
     @requires_nrt_streams
     def test_stream_creation_sequential_safety(self):
         """Test creating multiple streams sequentially is safe."""

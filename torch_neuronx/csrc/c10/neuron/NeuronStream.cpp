@@ -20,6 +20,7 @@
 #include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
 #include "torch_neuronx/csrc/core/ProfilerMappingCollector.h"
 #include "torch_neuronx/csrc/core/runtime/NRTHandler.h"
+#include "torch_neuronx/csrc/core/streams/StreamConfig.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
 #include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
 #include "torch_neuronx/csrc/profiler/CorrelationTracker.h"
@@ -64,12 +65,6 @@ std::array<std::atomic<bool>, kMaxDevices> stream_state_initialized{};
 std::array<std::mutex, kMaxDevices> stream_init_mutexes{};
 std::atomic<uint32_t> round_robin_counter{0};
 
-// Check if host-cc is enabled via environment variable.
-bool IsHostCCEnabled() {
-  const char* host_cc = std::getenv("TORCH_NEURONX_ENABLE_HOST_CC");
-  return host_cc && std::string(host_cc) == "1";
-}
-
 void EnableHostCC(int stream_pool_size) {
   nrt::HostCollectivesEnable(stream_pool_size);
   TORCH_NEURONX_DEBUG("Host Collectives is enabled for non-default stream support");
@@ -102,7 +97,7 @@ void EnsureDeviceStreamState(c10::DeviceIndex device) {
 }
 
 void InitializeStreamPools() {
-  if (IsHostCCEnabled()) {
+  if (config::IsHostCCEnabled()) {
     EnableHostCC(kStreamPoolSize);
   }
   auto devices = c10_neuron::get_visible_device_indices();
@@ -231,7 +226,7 @@ void NeuronStream::setCurrentStream(const NeuronStream& stream) {
 NeuronStream NeuronStream::createStream(c10::DeviceIndex device_index, int priority) {
   device_index = resolve_device_index(device_index);
 
-  if (!IsHostCCEnabled()) {
+  if (!config::AreStreamsEnabled()) {
     return getDefaultStream(device_index);
   }
 
@@ -312,6 +307,16 @@ void drain_visible_device_streams(const char* phase) noexcept {
 
 void SubmitOperationContext(const NeuronStream& stream,
                             std::unique_ptr<OperationContext> operation) {
+  if (!config::IsHostCCEnabled() && operation->RequiresCompilation() &&
+      operation->GetCompilableKernel().HasCollectives() &&
+      stream != getDefaultNeuronStream(stream.device_index())) {
+    TORCH_CHECK(false, "Neuron ", operation->GetOpName(),
+                " contains collectives and was issued on a non-default stream while HostCC is "
+                "disabled. Set TORCH_NEURONX_ENABLE_HOST_CC=1 to execute collectives on that "
+                "stream, or set TORCH_NEURONX_ENABLE_STREAMS=0 if distinct streams are not "
+                "needed.");
+  }
+
   // Capture submission start time + PyTorch thread OS tid for profiler flow arrows.
   // This is the cudaLaunchKernel equivalent — a synchronous call on the PyTorch thread.
   operation->submit_start = std::chrono::steady_clock::now();

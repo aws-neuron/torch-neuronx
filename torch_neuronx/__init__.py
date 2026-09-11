@@ -86,23 +86,57 @@ os.environ.setdefault("NEURON_RT_DBG_ZEROCOPY", "1")
 # Set default for HBM mapping
 os.environ.setdefault("NEURON_RT_MAP_HBM", "1")
 
-# Set default for host-cc and apply bundled defaults when enabled.
-# When host-cc is enabled, NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE MUST be true.
-os.environ.setdefault("TORCH_NEURONX_ENABLE_HOST_CC", "0")
-if os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC") == "1":
+
+def _read_boolean_environment(name, default):
+    value = os.environ.get(name) or default
+    if value not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1; got {value!r}")
+    return value == "1"
+
+
+_streams_enabled = _read_boolean_environment("TORCH_NEURONX_ENABLE_STREAMS", "0")
+_host_cc_enabled = _read_boolean_environment("TORCH_NEURONX_ENABLE_HOST_CC", "0")
+if _host_cc_enabled and not _streams_enabled:
+    raise RuntimeError("TORCH_NEURONX_ENABLE_HOST_CC=1 requires TORCH_NEURONX_ENABLE_STREAMS=1")
+
+os.environ["TORCH_NEURONX_ENABLE_STREAMS"] = "1" if _streams_enabled else "0"
+os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = "1" if _host_cc_enabled else "0"
+
+if _streams_enabled and not _host_cc_enabled:
+    warnings.warn(
+        "Neuron streams are enabled, but HostCC is disabled. Non-default streams support "
+        "ordinary operations, but compiled collectives submitted to them will fail. "
+        "Distributed training workloads that use non-default-stream collectives, such as "
+        "FSDPv2, should set TORCH_NEURONX_ENABLE_HOST_CC=1.",
+        stacklevel=2,
+    )
+
+_dma_transpose_env = "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE"
+if _host_cc_enabled:
     from torch_neuronx.utils import get_platform_target
 
     platform_target = get_platform_target()
     if platform_target in ("trn2", "trn3"):
-        if os.environ.get("NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE", "").lower() == "false":
+        if os.environ.get(_dma_transpose_env, "").lower() == "false":
             raise RuntimeError(
                 "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=false is incompatible with "
-                f"TORCH_NEURONX_ENABLE_HOST_CC=1 on {platform_target}. This "
+                f"host collectives on {platform_target}. This "
                 "combination can lead to a hang. Remove the "
-                "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=false setting or disable host-cc."
+                "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=false setting or select a "
+                "configuration with TORCH_NEURONX_ENABLE_HOST_CC=0."
             )
-        os.environ.setdefault("NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE", "true")
+        # HostCC hangs on these platforms without this NKI setting. The setting
+        # restricts every kernel to psum_banks=7, which costs kernel performance,
+        # so only HostCC turns it on.
+        os.environ.setdefault(_dma_transpose_env, "true")
     os.environ.setdefault("NEURON_RT_EXEC_TIMEOUT", "300")
+else:
+    if os.environ.get(_dma_transpose_env, "").lower() == "true":
+        raise RuntimeError(
+            "TORCH_NEURONX_ENABLE_HOST_CC=0 does not support "
+            "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=true. Remove "
+            "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE or set TORCH_NEURONX_ENABLE_HOST_CC=1."
+        )
 
 # Default to C++ NeuronBackend process group
 os.environ.setdefault("TORCH_NEURONX_CPP_PROCESS_GROUP", "1")

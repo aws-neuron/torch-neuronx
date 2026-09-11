@@ -84,15 +84,19 @@ Two traps:
   initialized the runtime. Fork a worker that has already touched the device and
   every later device op in the child raises `Neuron runtime should not be used
   after fork()`. `pytest-isolate` is the same mechanism and fails the same way.
-- **A latched setting cannot be toggled per test.** `IsNonDefaultStreamWithHostCC`
-  (`csrc/core/dispatch/NeuronDispatcher.cpp`) reads `TORCH_NEURONX_ENABLE_HOST_CC`
-  into a `static const bool` at the first copy it dispatches, then keeps that value
-  for the life of the process. An early test latches it to off; a later test sets it
-  to `1`; `is_host_cc_enabled()` (`lru_cache`) and `NeuronStream.cpp` (`getenv` per
-  call) now report on while the dispatcher still reports off. The test gets a real
-  non-default stream while the dispatcher routes its copies down the default-stream
-  path, and the worker aborts. Clearing the `lru_cache` makes this worse: it flips
-  the two readers that re-read and leaves the latched one alone.
+- **A latched setting cannot be toggled per test.** `GetStreamConfig`
+  (`csrc/core/streams/StreamConfig.h`) parses `TORCH_NEURONX_ENABLE_STREAMS` and
+  `TORCH_NEURONX_ENABLE_HOST_CC` once, then keeps both values for the life of
+  the process. Set both flags before Python starts. Use a fresh process for each configuration.
+  An environment change after initialization cannot update the runtime consistently.
+  Use `requires_nrt_streams` when a test only needs a stream separate from the default
+  stream. Use `requires_nrt_streams_with_host_cc` only when a test asserts HostCC
+  behavior, such as which copy path runs on a non-default stream; HostCC costs kernel
+  performance, so do not enable it otherwise. Apply the decorator directly to a
+  collected pytest test. The setup hook sets the flags before initialization fixtures
+  run. Mark the test with `needs_process_isolation`. The `nrt_stream_config` marker
+  sets the flags. The decorator also verifies them. A module that applies the marker
+  through `pytestmark` must assert the expected flags.
 
 ## Upstream PyTorch tests (contract)
 

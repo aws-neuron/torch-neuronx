@@ -1,9 +1,4 @@
-"""
-Multi-Stream Collective Operations Tests for Host-CC Feature.
-
-Tests collective operations on non-default streams using NRT host collectives API.
-Environment variable: TORCH_NEURONX_ENABLE_HOST_CC=1 (enabled by tests)
-"""
+"""Multi-stream collective tests for HostCC."""
 
 import os
 
@@ -17,18 +12,10 @@ from tests.utils.neuron_test_utils import assert_raises
 from .base_collective_op import BaseCollectiveOpTest
 
 
-# Module-level setup: enable host-cc for all tests in this file
 @pytest.fixture(scope="module", autouse=True)
-def enable_host_cc():
-    """Enable host-cc for all tests in this module."""
-    old_value = os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC")
+def require_host_cc():
+    os.environ["TORCH_NEURONX_ENABLE_STREAMS"] = "1"
     os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = "1"
-    yield
-    # Restore original value
-    if old_value is None:
-        os.environ.pop("TORCH_NEURONX_ENABLE_HOST_CC", None)
-    else:
-        os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = old_value
 
 
 _DEFAULT_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 2))

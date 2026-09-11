@@ -268,32 +268,60 @@ def get_cache_size():
     return torch_neuronx._C._get_compilation_cache_stats()["total_entries"]
 
 
-def requires_nrt_streams(test_func):
-    """Decorator to enable multi-stream mode for tests that require unique streams.
-
-    Sets TORCH_NEURONX_ENABLE_HOST_CC=1 for the duration of the test.
-
-    Only takes effect in a process that has not read that variable yet, because the
-    C++ dispatcher latches it at the first copy it dispatches. So every test using
-    this decorator must also be marked needs_process_isolation, and clearing the
-    lru_cache on is_host_cc_enabled() is NOT a way around that: it desynchronizes
-    the Python and C++ views of the flag and aborts the worker. See "Trap 2" in
-    docs/AI-testing.md.
-    """
+def _requires_stream_config(test_func, host_cc_enabled):
+    expected_host_cc = "1" if host_cc_enabled else "0"
 
     @wraps(test_func)
     def wrapper(*args, **kwargs):
-        old_host_cc = os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC")
-        os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = "1"
-        try:
-            return test_func(*args, **kwargs)
-        finally:
-            if old_host_cc is None:
-                del os.environ["TORCH_NEURONX_ENABLE_HOST_CC"]
-            else:
-                os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = old_host_cc
+        if not getattr(wrapper, "_nrt_stream_config_seeded", False):
+            raise RuntimeError(
+                "Pytest did not apply the NRT stream configuration. "
+                "Apply this decorator directly to a collected test."
+            )
 
-    return wrapper
+        if (
+            os.environ.get("TORCH_NEURONX_ENABLE_STREAMS") != "1"
+            or os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC") != expected_host_cc
+        ):
+            raise RuntimeError(
+                "The NRT stream environment does not match this decorator. "
+                "Check the pytest setup hook."
+            )
+        if host_cc_enabled and os.environ.get("NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE") != "true":
+            raise RuntimeError(
+                "The HostCC test environment does not enable DMA transpose. "
+                "Check the pytest setup hook."
+            )
+        return test_func(*args, **kwargs)
+
+    wrapper._nrt_stream_config_seeded = False
+    return pytest.mark.nrt_stream_config(host_cc_enabled=host_cc_enabled)(wrapper)
+
+
+def requires_nrt_streams(test_func):
+    """Enable distinct streams and keep HostCC off.
+
+    Use this for a test that only needs a stream separate from the default
+    stream. HostCC costs kernel performance, so do not enable it here.
+
+    Apply this decorator directly to a collected test. Mark the test with
+    needs_process_isolation. The C++ stream configuration keeps both flags for
+    the process lifetime. See "Trap 2" in docs/AI-testing.md.
+    """
+    return _requires_stream_config(test_func, host_cc_enabled=False)
+
+
+def requires_nrt_streams_with_host_cc(test_func):
+    """Enable distinct streams and HostCC.
+
+    Use this only for a test that asserts HostCC behavior, such as which copy
+    path runs on a non-default stream. HostCC also enables the DMA transpose
+    setting that the hang guard needs.
+
+    Apply this decorator directly to a collected test. Mark the test with
+    needs_process_isolation. See "Trap 2" in docs/AI-testing.md.
+    """
+    return _requires_stream_config(test_func, host_cc_enabled=True)
 
 
 def assert_raises(

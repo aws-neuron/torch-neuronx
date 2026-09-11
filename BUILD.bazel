@@ -168,6 +168,7 @@ cc_library(
         "torch_neuronx/csrc/core/allocator/ShelvesCleanup.h",
         "torch_neuronx/csrc/c10/neuron/NeuronStream.h",
         "torch_neuronx/csrc/c10/neuron/NeuronEvent.h",
+        "torch_neuronx/csrc/core/streams/StreamConfig.h",
         "torch_neuronx/csrc/core/streams/StreamImpl.h",
         "torch_neuronx/csrc/core/utils/ErrorHandler.h",
         "torch_neuronx/csrc/core/utils/ErrorRecovery.h",
