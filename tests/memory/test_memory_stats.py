@@ -20,6 +20,13 @@ from tests.utils.defer_retry_helpers import (
 )
 
 _requires_lazy_alloc = requires_lazy_alloc
+_skip_nrt_oom_report_regression = pytest.mark.skip(
+    reason=(
+        "NRT-6217: NRT 2.x.77388.0 aborts in nrt_debug_log_oom_report when the "
+        "process-local device index does not identify the owned host-global core; "
+        "the stable 2.x.68105.0 baseline does not"
+    )
+)
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
@@ -560,10 +567,7 @@ class TestLazyAllocDeferRetry:
         assert stats["num_ooms"] == 1, f"stats={stats}"
 
     @_requires_lazy_alloc
-    @pytest.mark.xfail(
-        reason="Flaky signal-6 crash from a KaenaRuntime assertion (tdrv/db.c:235) in the "
-        "OOM-report path under parallel CI; passes serially. Xfailing to unblock CI."
-    )
+    @_skip_nrt_oom_report_regression
     def test_hard_oom_records_counters(self):
         """Bottom of the funnel: defer → RetryReady → AttemptOOMRecovery →
         cache-drain → final failure on a request that exceeds total HBM."""
@@ -647,10 +651,7 @@ class TestLazyAllocDeferRetry:
         del big
 
     @_requires_lazy_alloc
-    @pytest.mark.xfail(
-        reason="Flaky signal-6 crash from a KaenaRuntime assertion (tdrv/db.c:235) in the "
-        "OOM-report path under parallel CI; passes serially. Xfailing to unblock CI."
-    )
+    @_skip_nrt_oom_report_regression
     def test_alone_on_stream_oom_surfaces_oom_error_first(self):
         """First-exception ordering: when an OOM'd kAlloc has a dependent
         compute behind it, the user-visible RuntimeError must describe the
@@ -673,10 +674,7 @@ class TestLazyAllocDeferRetry:
         assert stats["num_ooms"] == 1, f"stats={stats}"
 
     @_requires_lazy_alloc
-    @pytest.mark.xfail(
-        reason="Flaky signal-6 crash from a KaenaRuntime assertion (tdrv/db.c:235) in the "
-        "OOM-report path under parallel CI; passes serially. Xfailing to unblock CI."
-    )
+    @_skip_nrt_oom_report_regression
     def test_oom_report_fires_on_unrecoverable_oom(self):
         """Unrecoverable OOM should produce a detailed NRT diagnostic dump
         (log_dev_mem) for debugging, not just the basic nrt_infodump."""
