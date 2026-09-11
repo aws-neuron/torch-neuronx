@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 
 import moduscope_artifact_layout as artifact_layout
+from moduscope_process import emit_token_line
 
 # Both suites write "running" before completion.
 NON_TERMINAL_STATUSES = frozenset({None, "", "running"})
@@ -17,22 +19,30 @@ ANNOTATION_UNSAFE_CHARS = str.maketrans("%\r\n", "   ")
 
 
 def infra_fail_row(
-    index: int, name: str | None, reason: str, module_configs_str: str | None = None
+    reason: str,
+    *,
+    identity: dict[str, str] | None = None,
+    never_started: bool = False,
+    **row_fields,
 ) -> dict:
-    """Return a row for ``infra_fail``, a runner or pod failure, not a model-result failure.
+    """Return a run-identified row for an infrastructure failure."""
+    failure_row = {**row_fields, "status": "infra_fail", "error": reason}
+    if never_started:
+        failure_row["never_started"] = True
+    artifact_layout.add_run_identity(failure_row, identity)
+    return failure_row
 
-    Use it when an entry has no usable grid.
-    """
-    failure_row = {
+
+def grid_entry_fields(index: int, name: str | None, module_configs_str: str | None = None) -> dict:
+    """Return the identifying fields for one ModuScope grid entry."""
+    row_fields = {
         "grid_entry_name": name or f"grid_entry_{index}",
         "grid_entry_index": index,
         "mfu(%)": -1,
-        "status": "infra_fail",
-        "error": reason,
     }
     if module_configs_str:
-        failure_row["module_configs_str"] = module_configs_str
-    return failure_row
+        row_fields["module_configs_str"] = module_configs_str
+    return row_fields
 
 
 def status_after_expected_failure(status, expected_to_fail: bool, process_passed: bool):
@@ -49,15 +59,19 @@ def status_after_expected_failure(status, expected_to_fail: bool, process_passed
     return status
 
 
+def all_rows_passing(rows: list[dict] | None) -> bool:
+    """Return whether each row has a passing status."""
+    return bool(rows) and all(row.get("status") in PASSING_STATUSES for row in rows)
+
+
 def expected_failure_absorbs_exit(rows: list[dict] | None, listed: bool) -> bool:
     """Return whether expected failures explain a nonzero process exit.
 
     Require every row to have ``pass``, ``xfail``, or ``xpass`` status.
     """
-    if not rows:
+    if not all_rows_passing(rows):
         return False
-    has_expected_failure = listed or any(row.get("expected_to_fail") is True for row in rows)
-    return has_expected_failure and all(row.get("status") in PASSING_STATUSES for row in rows)
+    return listed or any(row.get("expected_to_fail") is True for row in rows)
 
 
 def _model_name_from_row(row: dict) -> str:
@@ -105,6 +119,25 @@ def github_failure_annotations(
     return annotations
 
 
+def record_never_started_entry(
+    path: str,
+    *,
+    index: int,
+    name: str,
+    reason: str,
+    identity: dict[str, str] | None,
+    module_configs_str: str | None = None,
+) -> dict:
+    """Write and report one never-started infra-failure row."""
+    row_fields = grid_entry_fields(index, name, module_configs_str)
+    failure_row = infra_fail_row(reason, identity=identity, never_started=True, **row_fields)
+    artifact_layout.write_grid_rows(path, [failure_row])
+    emit_token_line(f"NEVER_STARTED entry={index} model={name} reason={reason}")
+    for annotation in github_failure_annotations([failure_row]):
+        emit_token_line(annotation)
+    return failure_row
+
+
 def _fail_unfinished_rows(
     grid_rows: list[dict] | None,
     entry_index: int,
@@ -114,14 +147,8 @@ def _fail_unfinished_rows(
 ) -> tuple[list[dict], int]:
     fallback_entry_name = entry_name or f"grid_entry_{entry_index}"
     if not grid_rows:
-        return [
-            infra_fail_row(
-                entry_index,
-                entry_name,
-                failure_reason,
-                module_configs_str,
-            )
-        ], 1
+        row_fields = grid_entry_fields(entry_index, entry_name, module_configs_str)
+        return [infra_fail_row(failure_reason, **row_fields)], 1
     failed_row_count = 0
     for row in grid_rows:
         if not row.get("grid_entry_name"):
@@ -204,3 +231,35 @@ def finalize_entry_grid(
         f"ENTRY_GRID entry={index} rows={len(rows)} marked_failed={failed_row_count} "
         + "profile_s3_url=none"
     )
+
+
+def finalize_entry(
+    path: str,
+    *,
+    index: int,
+    name: str,
+    returncode: int,
+    reason: str,
+    identity: dict[str, str] | None,
+    expected_failures: Mapping[str, str],
+    module_configs_str: str | None = None,
+) -> tuple[int, list[dict], bool]:
+    """Return the effective code, rows, and write-failure flag after emitting result tokens."""
+    listed_xfail = name in expected_failures
+    finalization_line = finalize_entry_grid(
+        path,
+        index=index,
+        name=name,
+        returncode=returncode,
+        reason=reason,
+        identity=identity,
+        module_configs_str=module_configs_str,
+        expected_to_fail=listed_xfail,
+    )
+    rows = artifact_layout.load_grid_rows(path) or []
+    emit_token_line(finalization_line)
+    for annotation in github_failure_annotations(rows, expected_failures.get(name)):
+        emit_token_line(annotation)
+    if returncode != 0 and expected_failure_absorbs_exit(rows, listed=listed_xfail):
+        returncode = 0
+    return returncode, rows, finalization_line.startswith(f"ENTRY_GRID entry={index} write_failed ")

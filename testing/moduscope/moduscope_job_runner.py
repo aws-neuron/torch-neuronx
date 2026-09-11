@@ -4,7 +4,10 @@ import os
 import re
 import shutil
 import subprocess
-import sys
+
+from moduscope_artifact_layout import OUTPUT_SUBDIR, task_runner_argv
+from moduscope_artifact_layout import grid_model_id as normalize_model_id
+from moduscope_process import TIMEOUT_EXIT_CODE
 
 #: TTFI clears the compile caches before every model, so a run pays a recompile per model for
 #: numbers nothing reads. Set explicitly rather than left to the suite config's default.
@@ -23,23 +26,6 @@ JOB_TIMEOUT_MINUTES_ENV_VAR = "MODUSCOPE_JOB_TIMEOUT_MINUTES"
 #: Too small a reserve and the job bound fires first, killing the step before run_test.sh copies
 #: outputs/ -- losing the grid that shows the hang.
 COPY_BUFFER_MINUTES = 40
-
-MODUSCOPE_ENTRY_POINT = "cli_scripts.task_runner"
-
-#: The exit code the `timeout` command uses for something it killed.
-TIMEOUT_EXIT_CODE = 124
-
-OUTPUT_SUBDIR = os.path.join("outputs", "moduscope")
-
-
-def normalize_model_id(model_id: str) -> str:
-    """Return the form of ``model_id`` a grid row carries: ``org/name`` -> ``org_name``.
-
-    Lives here rather than in ``moduscope_grid`` so dispatch refuses a colliding pair at the
-    spelling grading later reads rows with: the grid module imports this, and a test forbids the
-    reverse edge.
-    """
-    return model_id.replace("/", "_")
 
 
 def resolve_model_ids(raw: str) -> tuple[str, ...]:
@@ -163,10 +149,7 @@ def build_moduscope_argv(model_ids: tuple[str, ...], out_dir: str, suite_tag: st
     assert_suite_reads_wishlist(suite_tag)
     wishlist = ",".join(f"'{model_id}'" for model_id in model_ids)
     return [
-        sys.executable,
-        "-m",
-        MODUSCOPE_ENTRY_POINT,
-        f"--config-name={suite_tag}",
+        *task_runner_argv(suite_tag),
         f"++task_config.hf_cfg_wishlist=[{wishlist}]",
         f"++task_config.artifact_directory={out_dir}",
         TTFI_DISABLE_OVERRIDE,

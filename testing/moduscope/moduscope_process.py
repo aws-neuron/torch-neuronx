@@ -7,8 +7,26 @@ import contextlib
 import os
 import signal
 import subprocess
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass
 
 TIMEOUT_EXIT_CODE = 124
+
+
+@dataclass(frozen=True)
+class TestInvocation:
+    argv: tuple[str, ...]
+    cwd: str | None = None
+    env: Mapping[str, str] | None = None
+    unset_env: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class InvocationResult:
+    returncode: int
+    reason: str
+    seconds: float
 
 
 def shell_exit_code(returncode: int) -> int:
@@ -81,3 +99,15 @@ def run_with_timeout(argv: list[str], bound: float, **popen_kwargs) -> tuple[int
         failure_reason = f"killed by the runner after {bound:.0f}s (exit code {TIMEOUT_EXIT_CODE})"
         return TIMEOUT_EXIT_CODE, failure_reason
     return returncode, f"ModuScope exited with code {returncode}"
+
+
+def run_test_invocation(invocation: TestInvocation, timeout_seconds: float) -> InvocationResult:
+    """Run one test invocation with inherited environment and timeout handling."""
+    start_time = time.monotonic()
+    process_env = {**os.environ, **(invocation.env or {})}
+    for variable_name in invocation.unset_env:
+        process_env.pop(variable_name, None)
+    returncode, reason = run_with_timeout(
+        invocation.argv, timeout_seconds, cwd=invocation.cwd, env=process_env
+    )
+    return InvocationResult(returncode, reason, time.monotonic() - start_time)

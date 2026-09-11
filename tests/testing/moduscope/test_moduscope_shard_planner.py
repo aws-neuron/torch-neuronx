@@ -27,6 +27,7 @@ def test_hand_built_shards_use_target_agnostic_planning():
     target = targets.Target(
         name="synthetic",
         timeout_minutes=45,
+        adapter="hugging-face",
         shards=shards,
     )
 

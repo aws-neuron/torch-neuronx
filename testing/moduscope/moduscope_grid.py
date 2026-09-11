@@ -10,17 +10,16 @@ from __future__ import annotations
 
 import argparse
 import glob
-import json
 import os
 import re
 import sys
 
-from moduscope_job_runner import normalize_model_id, resolve_model_ids
+from moduscope_artifact_layout import GRID_FILE_NAME, read_grid_rows
+from moduscope_artifact_layout import grid_model_id as normalize_model_id
+from moduscope_job_runner import resolve_model_ids
 
-#: ModuScope writes this on the device pod; this module reads it on a hosted runner, so the
-#: writer's GRID_SKELETON_FILENAME override is not visible here and is deliberately not read --
-#: honouring it on this side would make the grader miss a grid that exists.
-GRID_FILE_NAME = "grid_metrics.json"
+#: ModuScope writes the fixed grid name on the device pod. The hosted grader deliberately does
+#: not read the writer's GRID_SKELETON_FILENAME environment override.
 
 #: No trailing anchor, matching ModuScope: one would make ``llama3_1_8B_config_cpu`` yield no id,
 #: reporting a model that really ran as missing. The lookahead skips dict keys instead: full-model
@@ -36,19 +35,12 @@ def read_grid(output_dir: str) -> list[dict]:
     an empty one.
     """
     path = os.path.join(output_dir, GRID_FILE_NAME)
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"ModuScope produced no {GRID_FILE_NAME}: {path} does not exist.")
-    with open(path) as handle:
-        rows = json.load(handle)
-    if not isinstance(rows, list):
-        raise ValueError(f"{path} is not a list of rows: top level is {type(rows).__name__}.")
-    nondict = [type(row).__name__ for row in rows if not isinstance(row, dict)]
-    if nondict:
-        raise ValueError(
-            f"{path} is a list but {len(nondict)} of its entries are not rows: "
-            f"{sorted(set(nondict))}."
-        )
-    return rows
+    try:
+        return read_grid_rows(path)
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"ModuScope produced no {GRID_FILE_NAME}: {path} does not exist."
+        ) from None
 
 
 def grid_model_ids(rows: list[dict]) -> set[str]:

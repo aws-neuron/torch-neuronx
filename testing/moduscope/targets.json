@@ -1,6 +1,7 @@
 {
   "targets": {
     "component-equiv-dense": {
+      "adapter": "component-equivalence",
       "shards": [
         [
           "qwen3_8b",

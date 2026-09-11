@@ -19,11 +19,11 @@ from conftest import (
     SAMPLE_HUGGING_FACE_MODEL_IDS,
     SAMPLE_TITAN_ENTRY_NAMES,
     TEST_COMPONENT_EQUIVALENCE_TARGET,
-    TEST_TARGETS_PATH,
 )
 
 SHIPPED_TARGET_DATA = json.loads((MODUSCOPE_MODULES_DIR / "targets.json").read_text())["targets"]
 TRAINIUM_INSTANCE = "trn2.48xlarge"
+TEST_ADAPTER = "hugging-face"
 DENSE_COMPONENT_SHARDS = (
     ("qwen3_8b", "qwen3_14b", "qwen3_32b"),
     ("llama3_8b", "llama3_70b"),
@@ -36,6 +36,7 @@ DENSE_COMPONENT_ROWS = [
 
 def target_data(shards=(("member",),), **overrides) -> dict:
     data = {
+        "adapter": TEST_ADAPTER,
         "shards": [list(shard) for shard in shards],
         "timeout_minutes": 60,
     }
@@ -72,10 +73,9 @@ def test_the_shipped_file_contains_only_the_component_target_from_any_directory(
     tmp_path, monkeypatch
 ):
     monkeypatch.chdir(tmp_path)
-    fixture_target_data = json.loads(TEST_TARGETS_PATH.read_text())["targets"]
-    assert fixture_target_data == SHIPPED_TARGET_DATA
-    assert fixture_target_data == {
+    assert SHIPPED_TARGET_DATA == {
         TEST_COMPONENT_EQUIVALENCE_TARGET: {
+            "adapter": "component-equivalence",
             "shards": [list(shard) for shard in DENSE_COMPONENT_SHARDS],
             "timeout_minutes": 330,
         }
@@ -103,8 +103,8 @@ def test_target_loading_rejects_an_unknown_name_or_a_missing_targets_object(tmp_
         pytest.param("entries", ["A"], id="entries"),
         pytest.param("model_config_shards", [["qwen3_8b"]], id="model-config-shards"),
         pytest.param("test_files", ["test_00_rms_norm.py"], id="test-files"),
-        pytest.param("excluded_models", {PHI3_MODEL_ID: "why"}, id="excluded-models"),
         pytest.param("excluded_members", {"omitted": "why"}, id="excluded-members"),
+        pytest.param("execution_adapter", "hugging-face", id="execution-adapter"),
     ],
 )
 def test_target_rejects_kind_and_runner_specific_fields(tmp_path, field_name, value):
@@ -160,6 +160,36 @@ def test_target_rejects_kind_and_runner_specific_fields(tmp_path, field_name, va
             "boolean",
             id="compile-setting-string",
         ),
+        pytest.param(
+            target_data(excluded_models=[PHI3_MODEL_ID]),
+            "excluded_models",
+            "object",
+            id="excluded-type",
+        ),
+        pytest.param(
+            target_data(excluded_models={"owner/$(id)": "why"}),
+            "excluded_models",
+            "not over",
+            id="excluded-shell-character",
+        ),
+        pytest.param(
+            target_data(excluded_models={PHI3_MODEL_ID: " "}),
+            "excluded_models",
+            "needs a reason",
+            id="excluded-reason",
+        ),
+        pytest.param(
+            target_data(excluded_models={"member": "why"}),
+            "excluded_models",
+            "also in shards",
+            id="excluded-in-shards",
+        ),
+        pytest.param(
+            target_data(excluded_models={"owner/model": "why"}, adapter="component-equivalence"),
+            "excluded_models",
+            "not over",
+            id="excluded-component-slash",
+        ),
         pytest.param(target_data(xfail=["A"]), "xfail", "object", id="xfail-type"),
         pytest.param(target_data(xfail={"missing": "why"}), "xfail", "not in", id="xfail-unknown"),
         pytest.param(
@@ -182,6 +212,32 @@ def test_target_schema_errors_name_the_target_field_and_reason(
 
 
 @pytest.mark.parametrize(
+    ("data", "message"),
+    [
+        pytest.param(
+            {"shards": [["A"]], "timeout_minutes": 60},
+            (
+                "targets.json: target 'target', field 'adapter': is required. "
+                "Set it to one of hugging-face, titan, component-equivalence."
+            ),
+            id="missing",
+        ),
+        pytest.param(
+            target_data(adapter="unknown"),
+            (
+                "targets.json: target 'target', field 'adapter': must be one of "
+                "hugging-face, titan, component-equivalence, got 'unknown'."
+            ),
+            id="unknown",
+        ),
+    ],
+)
+def test_target_requires_a_known_adapter(tmp_path, data, message):
+    with pytest.raises(ValueError, match=re.escape(message)):
+        read_test_targets(tmp_path, {"target": data})
+
+
+@pytest.mark.parametrize(
     ("shards", "reason_pattern"),
     [
         pytest.param([], "nonempty list", id="empty"),
@@ -192,17 +248,24 @@ def test_target_schema_errors_name_the_target_field_and_reason(
         pytest.param([["member", 3]], "strings", id="member-not-string"),
         pytest.param([["owner/$(id)"]], "not over", id="shell-character"),
         pytest.param([["a/b/c"]], "not over", id="multiple-slashes"),
+        pytest.param([["../outside"]], "not over", id="parent-path"),
         pytest.param([["same", "same"]], "repeat", id="duplicate-within-shard"),
         pytest.param([["same"], ["same"]], "repeat", id="duplicate-across-shards"),
         pytest.param([["foo/bar_baz"], ["foo_bar/baz"]], "collide", id="stored-id-collision"),
     ],
 )
 def test_shards_are_nonempty_safe_unique_member_groups(tmp_path, shards, reason_pattern):
-    data = {"shards": shards, "timeout_minutes": 60}
+    data = {**target_data(), "shards": shards}
     with pytest.raises(
         ValueError,
         match=rf"field 'shards'.*{reason_pattern}",
     ):
+        read_test_targets(tmp_path, {"target": data})
+
+
+def test_component_members_use_one_path_component(tmp_path):
+    data = target_data(((OLMO_MODEL_ID,),), adapter="component-equivalence")
+    with pytest.raises(ValueError, match=r"field 'shards'.*not over"):
         read_test_targets(tmp_path, {"target": data})
 
 
@@ -211,8 +274,10 @@ def test_one_target_shape_accepts_model_entry_and_component_member_names(tmp_pat
         tmp_path,
         {
             "hub": target_data(((OLMO_MODEL_ID,), (LLAMA_MODEL_ID,)), config="full_dense_decoder"),
-            "titan": target_data(tuple((entry,) for entry in SAMPLE_TITAN_ENTRY_NAMES)),
-            "component": target_data(DENSE_COMPONENT_SHARDS),
+            "titan": target_data(
+                tuple((entry,) for entry in SAMPLE_TITAN_ENTRY_NAMES), adapter="titan"
+            ),
+            "component": target_data(DENSE_COMPONENT_SHARDS, adapter="component-equivalence"),
         },
     )
     assert shard_state(parsed_targets["hub"]) == [
@@ -237,7 +302,6 @@ def test_one_target_shape_accepts_model_entry_and_component_member_names(tmp_pat
                 "entries",
                 "model_config_shards",
                 "test_files",
-                "excluded_models",
             )
         )
 
@@ -254,9 +318,21 @@ def test_common_defaults_and_member_level_xfail(tmp_path):
         },
     )["target"]
     assert target.instance == TRAINIUM_INSTANCE
+    assert target.adapter == TEST_ADAPTER
     assert target.config == ""
     assert target.torch_compile_enabled is True
     assert target.xfail == {"B": "known failure"}
+
+
+def test_excluded_models_keep_their_listed_order_and_default_to_none(tmp_path):
+    excluded_models = {PHI3_MODEL_ID: "remote code", OLMO_MODEL_ID: "no weights"}
+    data = target_data(((LLAMA_MODEL_ID,),), excluded_models=excluded_models)
+    path = tmp_path / "targets.json"
+    path.write_text(json.dumps({"targets": {"target": data}}))
+    target = targets_module.resolve_target("target", path=str(path))
+    assert target.excluded_models == (PHI3_MODEL_ID, OLMO_MODEL_ID)
+    assert target.members == (LLAMA_MODEL_ID,)
+    assert targets_module.resolve_target(TEST_COMPONENT_EQUIVALENCE_TARGET).excluded_models == ()
 
 
 def test_shard_order_is_the_only_member_order(tmp_path):
@@ -268,7 +344,7 @@ def test_shard_order_is_the_only_member_order(tmp_path):
         shard_planner.Shard(0, ("C", "A")),
         shard_planner.Shard(1, ("B",)),
     )
-    assert [member for shard in target.shards for member in shard.members] == ["C", "A", "B"]
+    assert target.members == ("C", "A", "B")
 
 
 @pytest.mark.parametrize(
@@ -310,10 +386,7 @@ def test_matrix_and_plan_use_the_same_generic_rows(tmp_path, shards, expected_ro
 
 
 def test_group_members_survive_resolve_plan_matrix_and_cli():
-    target = targets_module.resolve_target(
-        TEST_COMPONENT_EQUIVALENCE_TARGET,
-        str(TEST_TARGETS_PATH),
-    )
+    target = targets_module.resolve_target(TEST_COMPONENT_EQUIVALENCE_TARGET)
     assert [shard.members for shard in target.shards] == list(DENSE_COMPONENT_SHARDS)
     assert targets_module.shard_plan(target) == list(target.shards)
     assert targets_module.shard_matrix(target) == DENSE_COMPONENT_ROWS
