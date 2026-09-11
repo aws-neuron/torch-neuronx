@@ -316,6 +316,12 @@ class TestAllToAllBase(BaseCollectiveOpTest):
         """Test alltoall_base with split sizes (all 1s)."""
         self.distributed_tester.run_test(run_split_sizes_alltoall_base_test)
 
+    @pytest.mark.xfail(
+        reason=(
+            "The NKI version in PR CI supports all_to_all_v receive displacements "
+            "only on NeuronSwitch-based instances; remove after the Trn2 artifacts are updated"
+        )
+    )
     def test_uneven_split_sizes_alltoall_base(self):
         """Test alltoall_base with uneven split sizes (permute_tensor / ring-attention pattern)."""
         self.distributed_tester.run_test(run_uneven_split_sizes_alltoall_base_test)
