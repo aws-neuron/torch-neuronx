@@ -3219,6 +3219,31 @@ bool NeuronDispatcher::TryHandleEmptyTensors(
         }
       }
 
+    } else if (auto* fill_cfg = GetFillValueConfig(op_name)) {
+      // Fill-value op (constant_pad_nd, linear): fill with configured value.
+      TORCH_NEURONX_DISPATCH_DEBUG("[TryHandleEmpty] fill-value op", " op=", op_name);
+
+      for (size_t i = 0; i < meta_specs.size(); ++i) {
+        const auto& spec = meta_specs[i];
+        if (spec.is_undefined) {
+          outputs.push_back(torch::Tensor());
+        } else if (HasZeroDim(spec.shape)) {
+          outputs.push_back(make_empty(spec, i));
+        } else if (fill_cfg->is_tensor_fill) {
+          auto fill_tensor = ExtractTensorArg(args, schema, fill_cfg->fill_arg);
+          if (fill_tensor.defined()) {
+            outputs.push_back(
+                fill_tensor.to(spec.dtype).expand(spec.shape).contiguous().to(device));
+          } else {
+            outputs.push_back(make_zeros(spec, i));  // bias=None → zeros
+          }
+        } else {
+          double fill_value =
+              ExtractScalarArg(args, schema, fill_cfg->fill_arg, fill_cfg->fill_default).toDouble();
+          outputs.push_back(make_full(spec, i, fill_value));
+        }
+      }
+
     } else {
       // ── General case: create zeros ──
       for (size_t i = 0; i < meta_specs.size(); ++i) {

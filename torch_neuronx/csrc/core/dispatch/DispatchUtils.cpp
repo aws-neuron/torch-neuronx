@@ -562,6 +562,18 @@ const MatmulAccumulateConfig* GetMatmulAccumulateConfig(const std::string& op_na
   return (it != kConfigs.end()) ? &it->second : nullptr;
 }
 
+const FillValueConfig* GetFillValueConfig(const std::string& op_name) {
+  static const std::unordered_map<std::string, FillValueConfig> kConfigs = {
+      // constant_pad_nd(input, pad, value=0) — pad value is a scalar
+      {"constant_pad_nd", {"value", 0.0, false}},
+      // linear(input, weight, bias=None) — bias is a tensor
+      {"linear", {"bias", 0.0, true}},
+  };
+  auto base = ExtractBaseOpName(op_name);
+  auto it = kConfigs.find(base);
+  return (it != kConfigs.end()) ? &it->second : nullptr;
+}
+
 bool HasZeroDim(const std::vector<int64_t>& shape) {
   return std::any_of(shape.begin(), shape.end(), [](int64_t d) { return d == 0; });
 }
@@ -575,6 +587,16 @@ c10::Scalar ExtractScalarArg(const std::vector<c10::IValue>& args,
     return args[i].isScalar() ? args[i].toScalar() : default_value;
   }
   return default_value;
+}
+
+torch::Tensor ExtractTensorArg(const std::vector<c10::IValue>& args,
+                               const c10::FunctionSchema& schema, const std::string& name) {
+  const auto& schema_args = schema.arguments();
+  for (size_t i = 0; i < args.size() && i < schema_args.size(); ++i) {
+    if (schema_args[i].name() != name) continue;
+    return args[i].isTensor() ? args[i].toTensor() : torch::Tensor();
+  }
+  return torch::Tensor();
 }
 
 const IndexOpConfig* GetIndexOpConfig(const std::string& op_name) {
