@@ -39,9 +39,9 @@ def _all_reduce_max_hbm(input, replica_group):
 @nki.jit
 def _all_to_all_v_hbm(input, metadata, replica_group, dst_rows, recv_counts_known, has_rdispls):
     # input:    [send_rows, H]      IO tensor (contiguously packed by dest rank)
-    # metadata: [rows, EP] uint32   IO tensor (rows==3 for layout F; rows==4 if has_rdispls)
-    # dst_rows: rg_size * max_recv_rows  (layout F over-allocation)
-    # returns:  [dst_rows, H]        (runtime places chunk r at row r*max_recv_rows)
+    # metadata: [4, EP] uint32      send/recv counts and displacements
+    # dst_rows: globally-uniform packed receive capacity
+    # returns:  [dst_rows, H]       received blocks at their explicit displacements
     H = input.shape[1]
     # name= required on collective src/dst/meta: NCC_IBIR440 DRAM allocation failure without it
     src = nl.ndarray(input.shape, dtype=input.dtype, buffer=nl.shared_hbm, name="a2av_src")
