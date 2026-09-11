@@ -371,6 +371,30 @@ struct MatmulAccumulateConfig {
  */
 const MatmulAccumulateConfig* GetMatmulAccumulateConfig(const std::string& op_name);
 
+/**
+ * Config for ops that produce non-empty output from empty input using a fill
+ * value or bias term (e.g. constant_pad_nd uses a scalar pad value, linear
+ * uses the bias tensor).  When the contraction/input dim is empty but the
+ * output is non-empty, the result is the fill value broadcast to the output
+ * shape.
+ *
+ * fill_arg: schema argument name whose value fills the output.
+ *           For scalar fill (constant_pad_nd "value"): make_full(fill_scalar).
+ *           For tensor fill (linear "bias"): broadcast bias to output shape.
+ * fill_default: default when the argument is absent / None.
+ */
+struct FillValueConfig {
+  std::string fill_arg;  // Schema arg name ("value" or "bias")
+  double fill_default;   // Default fill (0.0 for pad, N/A for bias)
+  bool is_tensor_fill;   // true = tensor arg (bias), false = scalar arg (value)
+};
+
+/**
+ * Check if an op has a fill-value config for empty-input handling.
+ * Returns nullptr if the op is not one.
+ */
+const FillValueConfig* GetFillValueConfig(const std::string& op_name);
+
 /** True if any dimension of `shape` is zero (i.e. the tensor is empty). */
 bool HasZeroDim(const std::vector<int64_t>& shape);
 
@@ -387,6 +411,13 @@ bool HasZeroDim(const std::vector<int64_t>& shape);
 c10::Scalar ExtractScalarArg(const std::vector<c10::IValue>& args,
                              const c10::FunctionSchema& schema, const std::string& name,
                              const c10::Scalar& default_value);
+
+/**
+ * Extract a tensor argument by schema name.
+ * Returns an undefined Tensor when absent or not a tensor.
+ */
+torch::Tensor ExtractTensorArg(const std::vector<c10::IValue>& args,
+                               const c10::FunctionSchema& schema, const std::string& name);
 
 // ═══════════════════════════════════════════════════════════════
 //  Meta dispatch utilities — used by HandleEmptyTensors.
