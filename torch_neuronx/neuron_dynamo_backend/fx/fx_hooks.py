@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch_mlir import fx
 from torch_mlir import ir as mlir_ir
 from torch_mlir.extras.fx_importer import (
@@ -57,7 +58,8 @@ class CustomFxImporterHooks(fx.FxImporterHooks):
                 assert (
                     npy_dtype is not None
                 ), f"Can not create literal tensor for unsupported datatype: {tensor.dtype}"
-                np_tensor = np.array(tensor.cpu().tolist()).astype(npy_dtype)
+                with unset_fake_temporarily():
+                    np_tensor = np.array(tensor.cpu().tolist()).astype(npy_dtype)
 
                 element_type = TORCH_DTYPE_TO_MLIR_TYPE[tensor.dtype]()
 
