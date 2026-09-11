@@ -209,4 +209,6 @@ def dynamic_k_matmul_kernel(x_e, dout, num_k_tiles):
             )
         nisa.tensor_scalar(k_off, k_off, nl.add, tile_k)
 
+    nl.fori_loop(0, nt_reg, body)
+
     return out

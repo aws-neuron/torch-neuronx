@@ -1059,9 +1059,9 @@ TEST_F(OperationExecutionEngineTest, RecordHintDoesNotAccumulateOwnership) {
 
 namespace {
 
-std::shared_ptr<OperationContext> MakeKWaitOp(StreamImpl* stream, int64_t recorded_sid) {
+std::shared_ptr<OperationContext> MakeKWaitOp(StreamImpl* stream, StreamImpl* recorded_on) {
   NeuronEvent event(/*device_id=*/0);
-  event.get_impl()->recorded_stream_id.store(recorded_sid, std::memory_order_relaxed);
+  event.get_impl()->recorded_stream_impl.store(recorded_on, std::memory_order_relaxed);
   event.get_impl()->is_recorded.store(true, std::memory_order_relaxed);
   auto kernel = std::make_unique<EventDirectKernelExecution>(
       "test_event_wait", event, EventDirectKernelExecution::EventAction::kWait,
@@ -1095,7 +1095,7 @@ TEST_F(OperationExecutionEngineTest, ScheduleOperationKWaitSameStreamBypassesGua
   PushPendingDeviceOp(stream.get(), engine);
   ASSERT_TRUE(stream->HasPendingAsyncOperations());
 
-  auto kwait = MakeKWaitOp(stream.get(), /*recorded_sid=*/stream->stream_id);
+  auto kwait = MakeKWaitOp(stream.get(), /*recorded_on=*/stream.get());
   engine.InjectIntoRuntimeQueue(stream.get(), kwait);
   ASSERT_TRUE(engine.SetRuntimeCursorTo(stream.get(), kwait.get()));
   ASSERT_FALSE(kwait->IsSchedulable());
@@ -1116,7 +1116,9 @@ TEST_F(OperationExecutionEngineTest, ScheduleOperationKWaitCrossStreamStillGates
   PushPendingDeviceOp(stream.get(), engine);
   ASSERT_TRUE(stream->HasPendingAsyncOperations());
 
-  auto kwait = MakeKWaitOp(stream.get(), /*recorded_sid=*/99);
+  // Event recorded on a different stream — must not bypass the gate.
+  auto other_stream = std::make_shared<StreamImpl>(0, 2);
+  auto kwait = MakeKWaitOp(stream.get(), /*recorded_on=*/other_stream.get());
   engine.InjectIntoRuntimeQueue(stream.get(), kwait);
   ASSERT_TRUE(engine.SetRuntimeCursorTo(stream.get(), kwait.get()));
   ASSERT_FALSE(kwait->IsSchedulable());

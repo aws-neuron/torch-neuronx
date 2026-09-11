@@ -299,7 +299,21 @@ class TestEmbeddingDenseBackward:
             del memory_pressure
             torch_neuronx.empty_cache()
 
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            torch.bfloat16,
+            pytest.param(
+                torch.float32,
+                marks=pytest.mark.xfail(
+                    reason=(
+                        "P482391671: compiler lowering omits shard-1 write dependencies "
+                        "for this LNC2 shape"
+                    )
+                ),
+            ),
+        ],
+    )
     @pytest.mark.parametrize("values", ["ones", "randn"])
     def test_embedding_dense_backward_llama(self, values, dtype):
         """Test embedding backward at Llama-3.3-70B vocab/hidden (E=128256, D=8192)."""

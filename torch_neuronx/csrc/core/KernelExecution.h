@@ -32,6 +32,7 @@ inline void* GetBaseTensorPtr(void* ptr, size_t offset_bytes) {
 
 // Forward declarations
 class CompilationCache;
+struct StreamImpl;
 
 enum class KernelTypeEnum {
   kHLO,
@@ -717,7 +718,8 @@ class EventDirectKernelExecution : public NeuronKernelExecution {
   EventAction GetEventAction() const { return action_; }
   const NeuronEvent& GetEvent() const { return event_; }
   virtual bool IsReady() const;
-  c10::StreamId GetSignalStreamId() const { return signal_stream_id_; }
+  // StreamImpl that recorded this event; used for same-stream-wait bypass.
+  at::neuron::StreamImpl* GetSignalStreamImpl() const { return signal_stream_impl_; }
 
  protected:
   bool ValidateImpl() const override;
@@ -725,7 +727,7 @@ class EventDirectKernelExecution : public NeuronKernelExecution {
  private:
   NeuronEvent event_;
   EventAction action_;
-  c10::StreamId signal_stream_id_;
+  at::neuron::StreamImpl* signal_stream_impl_;
 };
 
 class AllocDirectKernelExecution

@@ -602,7 +602,7 @@ EventDirectKernelExecution::EventDirectKernelExecution(const std::string& op_nam
     : NeuronKernelExecution(op_name, device_id),
       event_(event),
       action_(action),
-      signal_stream_id_(event.recorded_stream_id()) {}
+      signal_stream_impl_(event.recorded_stream_impl()) {}
 
 bool EventDirectKernelExecution::ValidateImpl() const {
   // Event primitives don't require inputs/outputs

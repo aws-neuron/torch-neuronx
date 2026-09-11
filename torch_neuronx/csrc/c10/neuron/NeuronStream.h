@@ -125,9 +125,10 @@ class NeuronStream {
   /// Submit an event wait primitive to this stream
   void SubmitEventWait(const NeuronEvent& event) const;
 
- private:
+  /// Underlying StreamImpl identity (for logical-stream comparison).
   StreamImpl* get_stream_impl() const;
 
+ private:
   c10::Stream stream_;
 };
 

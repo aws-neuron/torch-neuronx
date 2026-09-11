@@ -13,6 +13,7 @@ namespace at::neuron {
 
 // Forward declarations
 class NeuronStream;
+struct StreamImpl;
 
 // Internal event implementation (holds actual state)
 struct EventImpl {
@@ -22,8 +23,10 @@ struct EventImpl {
   std::atomic<bool> is_recorded{false};
   std::atomic<bool> is_completed{false};
   c10::DeviceIndex device_index = -1;
-  // Written by Python thread in record(), read by runtime worker.
-  std::atomic<int64_t> recorded_stream_id{-1};
+  // Written by Python thread in record(), read by runtime worker. Pointer
+  // identity is the canonical same-stream check (c10::StreamId is
+  // counter-encoded; multiple ids can map to the same StreamImpl).
+  std::atomic<StreamImpl*> recorded_stream_impl{nullptr};
   bool enable_timing = false;
   bool blocking = false;
 };
@@ -69,9 +72,9 @@ class NeuronEvent {
   /// Get the device index where this event was recorded
   c10::DeviceIndex device_index() const { return impl_->device_index; }
 
-  /// Stream ID on which this event was recorded, or -1 if never recorded.
-  int64_t recorded_stream_id() const noexcept {
-    return impl_->recorded_stream_id.load(std::memory_order_relaxed);
+  /// Stream that recorded this event, or nullptr if never recorded.
+  StreamImpl* recorded_stream_impl() const noexcept {
+    return impl_->recorded_stream_impl.load(std::memory_order_relaxed);
   }
 
   /// Complete the event (used by stream for async completion)

@@ -50,7 +50,7 @@ def scatter_add_kernel(data, indices, output_buffer, num_m_tiles):
     data_row_offset = nl.ndarray((1, 1), nl.int32, buffer=nl.sbuf)
     nisa.memset(data_row_offset, 0.0)
 
-    for _ in nl.dynamic_range(0, num_m_tiles_reg, 1):
+    def body(_i):
         # Load 128 indices
         idx_tile = nl.ndarray((tile_size_m, 1), nl.int32, nl.sbuf)
         nisa.dma_copy(
@@ -111,5 +111,7 @@ def scatter_add_kernel(data, indices, output_buffer, num_m_tiles):
             )
 
         nisa.tensor_scalar(data_row_offset, data_row_offset, nl.add, tile_size_m)
+
+    nl.fori_loop(0, num_m_tiles_reg, body)
 
     return output_buffer
