@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import moduscope_entry_results as entry_results
+import moduscope_process as process
 import pytest
 
 from conftest import RUN_IDENTITY_FIELDS, read_rows_at, write_rows
@@ -317,6 +318,67 @@ def test_finalize_applies_target_and_row_expected_failure_rules(
         expected_to_fail=expected_to_fail,
     )
     assert [row.get("status") for row in read_rows_at(grid_path)] == expected_statuses
+
+
+@pytest.mark.parametrize(
+    ("initial_rows", "returncode", "listed_xfail", "expected_returncode", "expected_status"),
+    [
+        ([PASSING_ROW], 0, False, 0, "pass"),
+        ([dict(PASSING_ROW, status="fail")], 0, False, 0, "fail"),
+        ([dict(PASSING_ROW, status="fail")], 3, True, 0, "xfail"),
+        ([dict(PASSING_ROW, status="fail", expected_to_fail=True)], 3, False, 0, "xfail"),
+    ],
+    ids=["pass", "zero-fail", "target-xfail-absorbs", "row-xfail-absorbs"],
+)
+def test_finalize_entry_derives_exit_code_and_orders_tokens(
+    tmp_path, initial_rows, returncode, listed_xfail, expected_returncode, expected_status
+):
+    grid_path = write_rows(tmp_path / "grid_metrics.json", initial_rows)
+    expected_failures = {"model": "known failure"} if listed_xfail else {}
+
+    actual_returncode, rows, finalization_failed = entry_results.finalize_entry(
+        str(grid_path),
+        index=3,
+        name="model",
+        returncode=returncode,
+        reason=f"exit {returncode}",
+        identity=None,
+        expected_failures=expected_failures,
+    )
+
+    assert (actual_returncode, rows[0]["status"], finalization_failed) == (
+        expected_returncode,
+        expected_status,
+        False,
+    )
+    assert process._token_lines[0].startswith("ENTRY_GRID entry=3 ")
+    assert process._token_lines[1:] == entry_results.github_failure_annotations(
+        rows, expected_failures.get("model")
+    )
+
+
+def test_finalize_entry_reports_a_grid_write_after_xfail_absorption(tmp_path, monkeypatch):
+    grid_path = write_rows(tmp_path / "grid_metrics.json", [PASSING_ROW])
+
+    def raise_no_space(*_arguments, **_keyword_arguments):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(entry_results.artifact_layout, "write_grid_rows", raise_no_space)
+
+    returncode, rows, finalization_failed = entry_results.finalize_entry(
+        str(grid_path),
+        index=3,
+        name="model",
+        returncode=3,
+        reason="exit 3",
+        identity=RUN_IDENTITY_FIELDS,
+        expected_failures={"model": "known failure"},
+    )
+
+    assert (returncode, rows, finalization_failed) == (0, [PASSING_ROW], True)
+    assert process._token_lines == [
+        "ENTRY_GRID entry=3 write_failed reason=OSError: [Errno 28] No space left on device"
+    ]
 
 
 def test_failure_annotations_sanitize_text_and_distinguish_xfail_from_xpass():

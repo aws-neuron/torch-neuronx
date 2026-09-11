@@ -35,6 +35,7 @@ import yaml
 # below it an E402.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "testing" / "moduscope"))
 
+import moduscope_artifact_layout as artifact_layout
 import moduscope_grid as grid
 import moduscope_job_runner as mjr
 
@@ -868,13 +869,7 @@ def test_the_wrapper_delegates_to_the_reusable_workflow():
 
 def test_the_grid_module_normalizes_through_the_runner():
     """One normalizer, or the collision check and the grid read can disagree."""
-    assert grid.normalize_model_id is mjr.normalize_model_id
-    tree = ast.parse(Path(grid.__file__).read_text())
-    assert not [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "normalize_model_id"
-    ], "moduscope_grid defines its own normalizer again"
+    assert grid.normalize_model_id is mjr.normalize_model_id is artifact_layout.grid_model_id
 
 
 def test_read_grid_returns_the_rows(tmp_path):
@@ -891,7 +886,7 @@ def test_read_grid_missing_grid_raises_file_not_found(tmp_path, make_dir):
     out = tmp_path / "moduscope-out"
     if make_dir:
         out.mkdir()
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(FileNotFoundError, match="ModuScope produced no grid_metrics.json"):
         grid.read_grid(str(out))
 
 

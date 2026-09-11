@@ -5,13 +5,13 @@ import json
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 MODUSCOPE_MODULES_DIR = Path(__file__).resolve().parents[3] / "testing" / "moduscope"
 sys.path.insert(0, str(MODUSCOPE_MODULES_DIR))
-TEST_TARGETS_PATH = Path(__file__).with_name("fixtures") / "targets.json"
 TEST_COMPONENT_EQUIVALENCE_TARGET = "component-equiv-dense"
 RUN_ID = "33700000001"
 REPOSITORY = "aws-neuron/private-torch-neuronx"
@@ -40,6 +40,19 @@ PROCESS_TERMINATION_GRACE_SECONDS = 1.0
 # Keep this slack no larger than one termination grace period.
 # A second grace period must fail the test.
 TIMING_SLACK_SECONDS = 1.0
+
+
+def run_test_shard(runner, target, shard, output_dir, timeout_seconds, clock=None):
+    """Dispatch a shard runner test through the shared context."""
+    from moduscope_artifact_layout import read_run_identity
+    from moduscope_targets import ShardRunContext
+
+    clock = time if clock is None else clock
+    return runner.run_shard(
+        ShardRunContext(
+            target, shard, str(output_dir), read_run_identity(), clock.monotonic() + timeout_seconds
+        )
+    )
 
 
 def write_rows(grid_path, grid_rows):
@@ -79,13 +92,8 @@ def write_device_results(results_dir, threshold_result="PASS"):
 
 @pytest.fixture(autouse=True)
 def clear_run_identity_env(monkeypatch):
-    """Clear run identity and storage variables before each test."""
-    variable_names_to_clear = (*RUN_IDENTITY_ENV, "GITHUB_STEP_SUMMARY", "RELAY_ENTRIES_FILES")
-    for variable_name in (
-        *variable_names_to_clear,
-        "PERSISTENT_STORAGE_BUCKET",
-        "PERSISTENT_STORAGE_PREFIX",
-    ):
+    """Clear run identity variables before each test."""
+    for variable_name in (*RUN_IDENTITY_ENV, "GITHUB_STEP_SUMMARY", "RELAY_ENTRIES_FILES"):
         monkeypatch.delenv(variable_name, raising=False)
 
 
@@ -94,6 +102,17 @@ def run_identity_env(monkeypatch):
     """Set the complete run identity environment for one test."""
     for variable_name, variable_value in RUN_IDENTITY_ENV.items():
         monkeypatch.setenv(variable_name, variable_value)
+
+
+@pytest.fixture
+def compile_cache_directories(tmp_path, monkeypatch):
+    """Redirect shared compile caches into the test directory."""
+    import moduscope_runner_support as runner_support
+
+    monkeypatch.setattr(runner_support, "HLO_CACHE_DIR", str(tmp_path / "hlo_cache"))
+    monkeypatch.setattr(runner_support, "NEFF_CACHE_DIR", str(tmp_path / "neff_cache"))
+    monkeypatch.setattr(runner_support, "INDUCTOR_CACHE_GLOB", str(tmp_path / "torchinductor_*"))
+    return tmp_path
 
 
 @pytest.fixture

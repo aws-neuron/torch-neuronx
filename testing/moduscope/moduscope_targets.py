@@ -15,19 +15,27 @@ from types import MappingProxyType
 from typing import NamedTuple
 
 import moduscope_shard_planner
+from moduscope_artifact_layout import grid_model_id
 
 TARGETS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "targets.json")
 DEFAULT_INSTANCE = "trn2.48xlarge"
 SAFE_NAME_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
 INSTANCE_NAME_PATTERN = re.compile(r"[a-z0-9.]+")
-MEMBER_PATTERN = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?")
+SINGLE_MEMBER_PATTERN = re.compile(r"(?!\.{1,2}$)[A-Za-z0-9._-]+")
+MEMBER_PATTERN = re.compile(r"(?!\.{1,2}(?:/|$))[A-Za-z0-9._-]+(?:/(?!\.{1,2}$)[A-Za-z0-9._-]+)?")
+HUGGING_FACE_ADAPTER = "hugging-face"
+TITAN_ADAPTER = "titan"
+COMPONENT_EQUIVALENCE_ADAPTER = "component-equivalence"
+ADAPTER_NAMES = (HUGGING_FACE_ADAPTER, TITAN_ADAPTER, COMPONENT_EQUIVALENCE_ADAPTER)
 TARGET_FIELDS = {
+    "adapter",
     "instance",
     "timeout_minutes",
     "config",
     "shards",
     "xfail",
     "torch_compile_enabled",
+    "excluded_models",
 }
 # The relay's external upload function uses this exact artifact name as the S3 key.
 HOSTED_RESULT_ARTIFACT_NAME = "custom-test-artifacts"
@@ -36,11 +44,25 @@ HOSTED_RESULT_ARTIFACT_NAME = "custom-test-artifacts"
 class Target(NamedTuple):
     name: str
     timeout_minutes: int
+    adapter: str = ""
     instance: str = DEFAULT_INSTANCE
     config: str = ""
     shards: tuple[moduscope_shard_planner.Shard, ...] = ()
     torch_compile_enabled: bool = False
+    excluded_models: tuple[str, ...] = ()
     xfail: Mapping[str, str] = MappingProxyType({})
+
+    @property
+    def members(self) -> tuple[str, ...]:
+        return tuple(member for shard in self.shards for member in shard.members)
+
+
+class ShardRunContext(NamedTuple):
+    target: Target
+    shard: moduscope_shard_planner.Shard
+    output_dir: str
+    run_identity: dict[str, str] | None
+    deadline: float
 
 
 def _raise_target_error(target_name: str, field_name: str, reason: str) -> None:
@@ -60,6 +82,7 @@ def _require_matching_string(target_name: str, field_name: str, value, pattern: 
 def _parse_member_groups(
     target_name: str,
     value,
+    member_pattern: re.Pattern,
 ) -> tuple[tuple[str, ...], ...]:
     field_name = "shards"
     if not isinstance(value, list) or not value:
@@ -79,12 +102,12 @@ def _parse_member_groups(
                 f"shard {shard_index} must contain only member strings",
             )
         if invalid_members := [
-            member for member in members if not MEMBER_PATTERN.fullmatch(member)
+            member for member in members if not member_pattern.fullmatch(member)
         ]:
             _raise_target_error(
                 target_name,
                 field_name,
-                f"shard {shard_index} has members not over {MEMBER_PATTERN.pattern}: "
+                f"shard {shard_index} has members not over {member_pattern.pattern}: "
                 + f"{invalid_members}",
             )
         groups.append(tuple(members))
@@ -106,6 +129,22 @@ def _require_nonempty_reasons(target_name: str, field_name: str, value: dict) ->
             field_name,
             f"every id needs a reason, none for: {items_without_reasons}",
         )
+
+
+def _parse_excluded_models(
+    target_name: str, value, members: tuple[str, ...], member_pattern: re.Pattern
+) -> tuple[str, ...]:
+    field_name = "excluded_models"
+    if not isinstance(value, dict):
+        _raise_target_error(target_name, field_name, "must be an object of member to reason")
+    if invalid_members := [item for item in value if not member_pattern.fullmatch(item)]:
+        _raise_target_error(
+            target_name, field_name, f"members not over {member_pattern.pattern}: {invalid_members}"
+        )
+    _require_nonempty_reasons(target_name, field_name, value)
+    if listed_members := [item for item in value if item in members]:
+        _raise_target_error(target_name, field_name, f"also in shards: {listed_members}")
+    return tuple(value)
 
 
 def _parse_expected_failures(
@@ -151,6 +190,16 @@ def _parse_target_data(target_name: str, target_data) -> Target:
             "timeout_minutes",
             f"must be an integer above 0, got {timeout_minutes!r}",
         )
+    adapter = target_data.get("adapter")
+    adapter_names = ", ".join(ADAPTER_NAMES)
+    if adapter is None:
+        _raise_target_error(
+            target_name, "adapter", f"is required. Set it to one of {adapter_names}."
+        )
+    if adapter not in ADAPTER_NAMES:
+        _raise_target_error(
+            target_name, "adapter", f"must be one of {adapter_names}, got {adapter!r}."
+        )
     config = target_data.get("config", "")
     if config:
         config = _require_matching_string(
@@ -161,11 +210,14 @@ def _parse_target_data(target_name: str, target_data) -> Target:
         )
     elif not isinstance(config, str):
         _raise_target_error(target_name, "config", f"must be a string, got {config!r}")
-    groups = _parse_member_groups(target_name, target_data.get("shards"))
+    member_pattern = MEMBER_PATTERN
+    if adapter == COMPONENT_EQUIVALENCE_ADAPTER:
+        member_pattern = SINGLE_MEMBER_PATTERN
+    groups = _parse_member_groups(target_name, target_data.get("shards"), member_pattern)
     members = tuple(member for group in groups for member in group)
     members_by_grid_id: dict[str, list[str]] = {}
     for member in members:
-        members_by_grid_id.setdefault(member.replace("/", "_"), []).append(member)
+        members_by_grid_id.setdefault(grid_model_id(member), []).append(member)
     if colliding_members := {
         stored_member: source_members
         for stored_member, source_members in members_by_grid_id.items()
@@ -183,6 +235,9 @@ def _parse_target_data(target_name: str, target_data) -> Target:
             "torch_compile_enabled",
             f"must be a boolean, got {torch_compile_enabled!r}",
         )
+    excluded_models = _parse_excluded_models(
+        target_name, target_data.get("excluded_models", {}), members, member_pattern
+    )
     expected_failures = _parse_expected_failures(
         target_name,
         target_data.get("xfail", {}),
@@ -191,10 +246,12 @@ def _parse_target_data(target_name: str, target_data) -> Target:
     return Target(
         name=target_name,
         timeout_minutes=timeout_minutes,
+        adapter=adapter,
         instance=instance,
         config=config,
         shards=moduscope_shard_planner.build_shards(groups),
         torch_compile_enabled=torch_compile_enabled,
+        excluded_models=excluded_models,
         xfail=expected_failures,
     )
 

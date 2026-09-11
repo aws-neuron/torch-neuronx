@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 MODUSCOPE_TASK_RUNNER_MODULE = "cli_scripts.task_runner"
@@ -21,6 +22,16 @@ MANIFESTS_DIR_NAME = "manifests"
 GRID_FILE_NAME = "grid_metrics.json"
 BENCHMARK_FILE_NAME = "benchmark_results.jsonl"
 GRID_HTML_RENDERER_PATH = os.path.join("tools", "grid_report_html.py")
+
+
+def grid_model_id(model_id: str) -> str:
+    """Return the model identifier stored in a grid row."""
+    return model_id.replace("/", "_")
+
+
+def task_runner_argv(config_name: str) -> list[str]:
+    """Return the common ModuScope task-runner command prefix."""
+    return [sys.executable, "-m", MODUSCOPE_TASK_RUNNER_MODULE, f"--config-name={config_name}"]
 
 
 def run_id_filename(run_id: str, basename: str) -> str:
