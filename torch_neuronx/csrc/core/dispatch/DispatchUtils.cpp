@@ -10,6 +10,7 @@
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"
+#include "torch_neuronx/csrc/core/dispatch/Int64Policy.h"
 #include "torch_neuronx/csrc/utils/TypeConversion.h"
 
 namespace torch_neuronx {
@@ -276,6 +277,12 @@ void PromoteBinaryCompareOperands(std::vector<c10::IValue>& args,
   if (dt_a == dt_b) return;
 
   auto common = c10::promoteTypes(dt_a, dt_b);
+
+  // In packed int64 mode, comparisons operate on the low int32 word.
+  // Promoting to int64 builds a high word that's immediately discarded.
+  if (common == c10::ScalarType::Long && UsePackedInt64ViewForOp(schema.operator_name().name)) {
+    common = c10::ScalarType::Int;
+  }
 
   // The whitelist contains only ops whose result dtype is bool, so the
   // inputs are always non-bool/non-complex value tensors. Cast each operand
