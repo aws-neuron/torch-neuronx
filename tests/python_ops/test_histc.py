@@ -148,3 +148,14 @@ class TestHistc:
             assert neuron_result.device.type == "neuron"
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
             assert_op_runs_on_neuron("aten::histc")
+
+    @pytest.mark.parametrize("min_max", [5, 0, -3, 100])
+    def test_histc_equal_min_max_auto_ranges(self, device, min_max):
+        """histc with explicit min==max auto-ranges to [input.min(), input.max()]."""
+        with track_neuron_ops():
+            x = torch.tensor([1.0, 2, 1], device=device)
+            neuron_result = torch.histc(x, bins=4, min=min_max, max=min_max)
+            cpu_result = torch.histc(x.cpu(), bins=4, min=min_max, max=min_max)
+
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::histc")
