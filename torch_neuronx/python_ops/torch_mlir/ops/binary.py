@@ -247,7 +247,9 @@ def torch_addcmul(input, tensor1, tensor2, value=1, out=None):
     if input.dtype == torch.bool:
         raise RuntimeError("\"addcmul\" not implemented for 'Bool'")
     torch.broadcast_tensors(input, tensor1, tensor2)
-    return input + value * tensor1 * tensor2
+    # Cast value to input dtype so a float scalar doesn't promote integer tensors.
+    value_t = torch.tensor(value, dtype=input.dtype, device=input.device)
+    return input + value_t * tensor1 * tensor2
 
 
 @register_aten(

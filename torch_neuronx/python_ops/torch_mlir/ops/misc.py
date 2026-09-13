@@ -138,8 +138,8 @@ def torch_histc(
 ) -> torch.Tensor:
     """Fast histogram using linear interpolation like PyTorch."""
 
-    # Handle auto range
-    if min == 0.0 and max == 0.0 and input.numel() > 0:
+    # Handle auto range — CPU auto-ranges whenever min == max (not just 0==0)
+    if min == max and input.numel() > 0:
         min = input.min().item()
         max = input.max().item()
 
