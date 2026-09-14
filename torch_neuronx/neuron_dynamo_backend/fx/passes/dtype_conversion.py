@@ -7,6 +7,7 @@ import re
 import numpy as np
 from torch_mlir.dialects.stablehlo._stablehlo_ops_gen import ConstantOp
 from torch_mlir.ir import (
+    ComplexType,
     F32Type,
     InsertionPoint,
     RankedTensorType,
@@ -15,9 +16,21 @@ from torch_mlir.ir import (
 )
 
 
+def _demoted_element_type(element_type):
+    """
+    f32-family replacement for a demotable 64-bit element type, else None.
+    """
+    s = str(element_type)
+    if s == "f64":
+        return F32Type.get()
+    if s == "complex<f64>":
+        return ComplexType.get(F32Type.get())
+    return None
+
+
 class DTypeConstantConverter:
     """
-    Converts f64 constants to f32 in MLIR module
+    Converts f64/complex128 constants and op types to f32/complex64 in an MLIR module
     """
 
     def _need_op_conversion(self, op):
@@ -32,12 +45,12 @@ class DTypeConstantConverter:
         Returns:
             bool: True if any result has f64 element type.
         """
-        # Check if any result needs conversion
+        # Check if any result needs conversion (f64 or complex<f64>)
         for result in op.results:
             result_type = result.type
-            if hasattr(result_type, "element_type") and str(result_type.element_type) in [
-                "f64",
-            ]:
+            if hasattr(result_type, "element_type") and (
+                _demoted_element_type(result_type.element_type) is not None
+            ):
                 return True
         return False
 
@@ -54,11 +67,9 @@ class DTypeConstantConverter:
         Raises:
             TypeError: If element type is not f64.
         """
-        elem_type = str(result_type.element_type)
-        if elem_type == "f64":
-            new_elem_type = F32Type.get()
-        else:
-            raise TypeError(f"Invalid dtype ({elem_type}) for conversion")
+        new_elem_type = _demoted_element_type(result_type.element_type)
+        if new_elem_type is None:
+            raise TypeError(f"Invalid dtype ({result_type.element_type}) for conversion")
 
         if hasattr(result_type, "shape"):
             new_type = RankedTensorType.get(result_type.shape, new_elem_type, loc=op.location)
@@ -90,6 +101,8 @@ class DTypeConstantConverter:
         elem_type = str(result_type.element_type)
         if elem_type == "f64":
             target_dtype = np.float32
+        elif elem_type == "complex<f64>":
+            target_dtype = np.complex64
         else:
             raise TypeError(f"Invalid dtype ({elem_type}) for conversion")
 
@@ -260,9 +273,8 @@ class DTypeConstantConverter:
         for region in func_op.regions:
             for block in region:
                 for i, arg in enumerate(block.arguments):
-                    arg_type = str(arg.type)
-                    if arg_type == "f64":
-                        new_type = F32Type.get()
+                    new_type = _demoted_element_type(arg.type)
+                    if new_type is not None:
                         block.arguments[i].set_type(new_type)
 
 
