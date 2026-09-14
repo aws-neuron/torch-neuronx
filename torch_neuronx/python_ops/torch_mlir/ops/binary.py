@@ -283,3 +283,30 @@ def torch_ldexp(self, other, out=None):
 @register_aten(["aten::rsub.Tensor", "aten::rsub.Tensor_out"], static_argnames=("alpha",))
 def torch_rsub(self, other, alpha=1, out=None):
     return torch.ops.aten.rsub(self, other, alpha=alpha)
+
+
+def _validate_logaddexp2(self, other, out=None):
+    """Reject non-float inputs and mismatched out= dtypes.
+
+    The Neuron dispatch path skips aten's float-only and unsafe-cast guards, so
+    replicate them here to match CPU.
+    """
+    for t in (self, other):
+        if not t.is_floating_point():
+            raise RuntimeError(f'"logaddexp2" not implemented for {t.dtype}')
+    if out is not None:
+        expected = torch.result_type(self, other)
+        if out.dtype != expected:
+            raise RuntimeError(
+                f"result type {expected} can't be cast to the desired output type {out.dtype}"
+            )
+
+
+@register_aten(
+    ["aten::logaddexp2", "aten::logaddexp2.out"],
+    validate_static_inputs=_validate_logaddexp2,
+)
+def torch_logaddexp2(self, other, out=None):
+    """log2(2**self + 2**other), stable. Neuron has no native fp64, so a double
+    input runs as fp32 and casts back; it does not fall back to CPU."""
+    return torch.ops.aten.logaddexp2(self, other)

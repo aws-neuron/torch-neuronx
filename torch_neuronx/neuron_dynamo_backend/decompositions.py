@@ -69,6 +69,7 @@ _P = ParamSpec("_P")
 
 aten = torch.ops.aten
 from torch_neuronx.nki_hop import wrap_nki
+from torch_neuronx.python_ops.torch_mlir.ops.binary_math import logaddexp2_ref
 from torch_neuronx.utils import get_logical_neuron_cores
 
 wrapped_flash_fwd = wrap_nki(attention_cte)
@@ -293,6 +294,15 @@ def take_decomposition(self, index):
     idx = index.reshape(-1)
     idx = torch.where(idx < 0, idx + flat.numel(), idx)
     return torch.index_select(flat, 0, idx).reshape(index.shape)
+
+
+@register_decomposition([aten.expm1])
+def expm1_decomp(x):
+    """Accurate exp(x) - 1. The torch-mlir default lowers through hardware exp
+    and misses the fp32 tolerance, so use the eager op's range-reduced math."""
+    from torch_neuronx.python_ops.torch_mlir.ops.unary import _expm1_accurate
+
+    return _expm1_accurate(x)
 
 
 def _zero_result(shape, a, b):
@@ -1987,6 +1997,12 @@ def copysign_scalar(self, other):
     wrap the scalar and use the copysign.Tensor leaf, which does."""
     other = torch.full((), other, dtype=self.dtype, device=self.device)
     return aten.copysign.Tensor(self, other)
+
+
+@register_decomposition([aten.logaddexp2])
+def logaddexp2_decomposition(self, other):
+    """Compile-path logaddexp2 via the shared log2(2**a + 2**b) helper."""
+    return logaddexp2_ref(self, other)
 
 
 @register_decomposition(
