@@ -126,6 +126,9 @@ ENTRYPOINT_COMMAND = (
 )
 DIRECT_MAIN_COMMAND = SUBPROCESS_SETUP + "raise SystemExit(moduscope_pod_runner.main())"
 TEST_WHEEL_TOKEN = "MODUSCOPE_WHEEL version=2.0 sha256=0123456789abcdef"
+RENDERER_SOURCE = b"def generate_report_html(rows, title):\n    return title\n"
+RENDERER_SHA256 = hashlib.sha256(RENDERER_SOURCE).hexdigest()
+REAL_STAGE_GRID_RENDERER = pod_runner.stage_grid_renderer
 
 
 def mapped_adapters(transform):
@@ -142,6 +145,7 @@ def pod(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "cli_scripts", None)
     monkeypatch.delenv("MODUSCOPE_SUITE", raising=False)
     monkeypatch.setattr(pod_runner, "moduscope_wheel_token_line", lambda: TEST_WHEEL_TOKEN)
+    monkeypatch.setattr(pod_runner, "stage_grid_renderer", lambda _output_dir: None)
 
     def set_environment(**overrides):
         for name, value in {**WORKFLOW_ENV, **overrides}.items():
@@ -247,6 +251,42 @@ def test_moduscope_wheel_token_is_unavailable_without_the_distribution(monkeypat
 
     assert pod_runner.moduscope_wheel_token_line() == (
         "MODUSCOPE_WHEEL version=unavailable sha256=unavailable"
+    )
+
+
+def test_stage_grid_renderer_writes_exact_source_hash_version_and_token(tmp_path, monkeypatch):
+    source_path = tmp_path / "installed" / "grid_report_html.py"
+    source_path.parent.mkdir()
+    source_path.write_bytes(RENDERER_SOURCE)
+    monkeypatch.setattr(
+        pod_runner.importlib.util,
+        "find_spec",
+        lambda name: SimpleNamespace(origin=str(source_path)),
+    )
+    output_dir = tmp_path / "output"
+
+    pod_runner.stage_grid_renderer(str(output_dir))
+
+    renderer_path = entry_results.STAGED_GRID_RENDERER_RELATIVE_PATH
+    assert (output_dir / renderer_path).read_bytes() == RENDERER_SOURCE
+    assert process._token_lines == [f"RENDERER copied=1 sha256={RENDERER_SHA256}"]
+
+
+def test_main_keeps_zero_exit_and_records_unavailable_renderer(pod, monkeypatch):
+    pod.stub(lambda *_args: 0)
+    monkeypatch.setattr(pod_runner, "stage_grid_renderer", REAL_STAGE_GRID_RENDERER)
+    monkeypatch.setattr(pod_runner.importlib.util, "find_spec", lambda name: None)
+
+    assert pod_runner.main() == 0
+
+    renderer_path = entry_results.STAGED_GRID_RENDERER_RELATIVE_PATH
+    assert not (
+        pod.output_dir
+        / renderer_path.parent
+        / entry_results.run_id_filename(RUN_ID, renderer_path.name)
+    ).exists()
+    assert (pod.output_dir / f"{RUN_ID}-tokens.txt").read_text().splitlines()[-1] == (
+        "RENDERER copied=0 sha256=-"
     )
 
 

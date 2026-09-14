@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import os
 import shutil
@@ -27,6 +28,7 @@ from moduscope_artifact_layout import (
     IDENTITY_ENV_VARS,
     OUTPUT_SUBDIR,
     RUN_ID_ENV_VAR,
+    STAGED_GRID_RENDERER_RELATIVE_PATH,
     read_run_identity,
     require_env,
     run_id_filename,
@@ -53,6 +55,7 @@ TARGET_ENV_VAR = "MODUSCOPE_TARGET"
 SHARD_INDEX_ENV_VAR = "MODUSCOPE_SHARD_INDEX"
 TIMEOUT_SECONDS_ENV_VAR = "MODUSCOPE_TIMEOUT_SECONDS"
 TARGET_CHECK_FILE_NAME = "target_check.json"
+RENDERER_MODULE = "modu_scope.utils.grid_report_html"
 # Keep this list in sync with workflow exports injected into the pod.
 # The installed wheel still reads the forwarded variables.
 # TORCH_NEURONX_ENABLE_PROLOGUE matches the launcher and appears in each device result row.
@@ -245,6 +248,25 @@ def moduscope_wheel_token_line() -> str:
     return f"MODUSCOPE_WHEEL version={wheel_version} sha256={record_sha256}"
 
 
+def stage_grid_renderer(output_dir: str) -> None:
+    """Copy the installed grid renderer. Record its SHA-256 in a token line."""
+    renderer_path = Path(output_dir) / STAGED_GRID_RENDERER_RELATIVE_PATH
+    try:
+        renderer_path.parent.mkdir(parents=True, exist_ok=True)
+        renderer_spec = importlib.util.find_spec(RENDERER_MODULE)
+        if renderer_spec is None or not renderer_spec.origin:
+            raise ModuleNotFoundError(RENDERER_MODULE)
+        renderer_bytes = Path(renderer_spec.origin).read_bytes()
+        renderer_sha256 = hashlib.sha256(renderer_bytes).hexdigest()
+        renderer_path.write_bytes(renderer_bytes)
+    except Exception:
+        with contextlib.suppress(OSError):
+            renderer_path.unlink(missing_ok=True)
+        emit_token_line("RENDERER copied=0 sha256=-")
+        return
+    emit_token_line(f"RENDERER copied=1 sha256={renderer_sha256}")
+
+
 def main() -> int:
     """Run one target shard and return its exit code."""
     output_root = os.path.join(os.getcwd(), ARTIFACT_ROOT)
@@ -281,6 +303,7 @@ def main() -> int:
                         check_target(target, output_dir, adapter.installed_member_field)
                     )
             finally:
+                stage_grid_renderer(output_dir)
                 write_token_lines(output_dir)
     finally:
         if not output_ready:

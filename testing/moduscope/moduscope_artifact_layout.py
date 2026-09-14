@@ -13,6 +13,7 @@ ARTIFACT_ROOT = "outputs"
 OUTPUT_SUBDIR = f"{ARTIFACT_ROOT}/moduscope"
 # Downloaded shard files start at moduscope/ because the upload root is test-results/outputs/.
 SHARD_SUBDIR = Path(OUTPUT_SUBDIR).relative_to(ARTIFACT_ROOT).as_posix()
+SHARD_ARTIFACT_PREFIX = "moduscope-results-"
 RELAY_ENTRIES_SUBDIR = "moduscope-entries"
 RUN_ID_ENV_VAR = "MODUSCOPE_GITHUB_RUN_ID"
 REPOSITORY_ENV_VAR = "MODUSCOPE_GITHUB_REPOSITORY"
@@ -22,6 +23,7 @@ MANIFESTS_DIR_NAME = "manifests"
 GRID_FILE_NAME = "grid_metrics.json"
 BENCHMARK_FILE_NAME = "benchmark_results.jsonl"
 GRID_HTML_RENDERER_PATH = os.path.join("tools", "grid_report_html.py")
+STAGED_GRID_RENDERER_RELATIVE_PATH = Path("renderer/grid_report_html.py")
 
 
 def grid_model_id(model_id: str) -> str:
