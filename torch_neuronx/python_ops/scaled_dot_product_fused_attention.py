@@ -173,7 +173,6 @@ def _sdpa_bwd_traceable(
         scale_val,
         is_causal,
         dropout_p,
-        True,
         philox_seed,
     )
 
@@ -181,7 +180,7 @@ def _sdpa_bwd_traceable(
         grad_k, grad_v, is_gqa, b, orig_kv_heads, q_heads, seq_k, e
     )
 
-    if grad_attn_bias.numel() == 1:
+    if grad_attn_bias is None or grad_attn_bias.numel() == 1:
         grad_attn_bias = query.new_zeros(())
 
     return grad_q, grad_k, grad_v, grad_attn_bias

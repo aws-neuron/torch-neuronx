@@ -223,6 +223,40 @@ class TestSDPAForward:
 class TestSDPABackward:
     """Forward+backward tests for SDPA decomposition (gradient computation)"""
 
+    def test_bf16_reported_shape_matches_eager(self):
+        """Compile and eager Math2 must match for the reported training shape."""
+        torch.manual_seed(1234)
+        shape = (25, 32, 51, 48)
+        query = torch.randn(shape, dtype=torch.bfloat16)
+        key = torch.randn(shape, dtype=torch.bfloat16)
+        value = torch.randn(shape, dtype=torch.bfloat16)
+        grad_out = torch.randn(shape, dtype=torch.bfloat16)
+
+        def run(operation):
+            query_neuron = query.to("neuron").requires_grad_(True)
+            key_neuron = key.to("neuron").requires_grad_(True)
+            value_neuron = value.to("neuron").requires_grad_(True)
+            output = operation(query_neuron, key_neuron, value_neuron)
+            output.backward(grad_out.to("neuron"))
+            return (
+                output.cpu(),
+                query_neuron.grad.cpu(),
+                key_neuron.grad.cpu(),
+                value_neuron.grad.cpu(),
+            )
+
+        eager = run(F.scaled_dot_product_attention)
+        compiled = run(torch.compile(F.scaled_dot_product_attention, backend="neuron"))
+
+        names = ("output", "query gradient", "key gradient", "value gradient")
+        for name, eager_tensor, compiled_tensor in zip(
+            names,
+            eager,
+            compiled,
+            strict=True,
+        ):
+            torch.testing.assert_close(compiled_tensor, eager_tensor, rtol=0, atol=0, msg=name)
+
     @pytest.mark.parametrize("config", SDPA_TEST_CONFIGS)
     def test_sdpa_backward(self, config: SDPAConfig):
         """Test SDPA backward with various configurations."""

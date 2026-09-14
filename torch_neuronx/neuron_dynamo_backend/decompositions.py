@@ -26,6 +26,7 @@ from torch._decomp import get_decompositions
 
 from torch_neuronx import _im2col_maps as im2col_maps
 from torch_neuronx import _interpolation_maps as interpolation_maps
+from torch_neuronx._sdpa_math import compute_attention, compute_attention_backward
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool, _getenv_int
 from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
     _has_nki_elementwise_kernels as _has_nki_foreach,
@@ -1341,22 +1342,24 @@ def scaled_dot_product_attention_decomposition(
     scale: float | None = None,
     enable_gqa: bool = False,
     philox_seed: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Decompose scaled_dot_product_attention into basic ops.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Route aten scaled_dot_product_attention onto the eager SDPA implementation.
 
     Args:
         query (torch.Tensor): Query tensor of shape (B, H, L, E).
         key (torch.Tensor): Key tensor of shape (B, H, S, E).
         value (torch.Tensor): Value tensor of shape (B, H, S, E).
-        attn_mask (torch.Tensor | None): Optional attention mask.
+        attn_mask (torch.Tensor | None): Optional attention mask. Boolean masks are
+            keep-masks; float masks are additive.
         dropout_p (float): Dropout probability.
         is_causal (bool): Whether to apply causal masking.
         scale (float | None): Scale factor. Defaults to 1/sqrt(E).
         enable_gqa (bool): Enable grouped-query attention.
-        philox_seed (torch.Tensor | None): Random seed for dropout.
+        philox_seed (torch.Tensor | None): Unused; kept for signature compatibility.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]: (attention_output, logsumexp).
+        tuple: (attention_output, logsumexp, dropout_mask). dropout_mask is None unless
+        dropout was applied; callers forward it through the philox_seed output slot.
     """
     # Get dimensions - assume (B, H, L, E) layout
     B, q_heads, L, E = query.shape
@@ -1372,41 +1375,38 @@ def scaled_dot_product_attention_decomposition(
     if scale is None:
         scale = 1.0 / math.sqrt(E)
 
-    # Compute attention scores: (B, H, L, S)
-    scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+    # compute_attention takes a single additive bias and signals "absent" with an empty
+    # tensor (it checks numel() > 0), since MLIR kernels cannot be handed None.
+    if attn_mask is None:
+        attn_bias = query.new_zeros((0,))
+    elif attn_mask.dtype == torch.bool:
+        attn_bias = torch.where(attn_mask, 0.0, float("-inf")).to(query.dtype)
+    else:
+        attn_bias = attn_mask
 
-    # Apply causal mask if needed
-    if is_causal:
-        # Create causal mask: positions can only attend to earlier positions
-        # Use scores.new_ones to derive tensor from existing tensor (avoids device issues)
-        causal_mask = torch.triu(scores.new_ones(L, S, dtype=torch.bool), diagonal=S - L + 1)
-        scores = scores.masked_fill(causal_mask, float("-inf"))
-
-    # Apply attention mask if provided
-    if attn_mask is not None:
-        if attn_mask.dtype == torch.bool:
-            scores = scores.masked_fill(~attn_mask, float("-inf"))
+    # The keep-mask has to survive to the backward, which reads it from the philox_seed slot.
+    if dropout_p > 0.0:
+        if dropout_p >= 1.0:
+            dropout_mask = query.new_zeros((B, q_heads, L, S), dtype=torch.bool)
         else:
-            scores = scores + attn_mask
+            dropout_mask = torch.ops.aten.native_dropout.default(
+                query.new_ones((B, q_heads, L, S)), dropout_p, True
+            )[1]
+    else:
+        dropout_mask = query.new_zeros((0,))
 
-    max_scores = torch.max(scores, dim=-1, keepdim=True)[0]
-    exp_scores = torch.exp(scores - max_scores)
-    sum_exp = torch.sum(exp_scores, dim=-1, keepdim=True)
-    attn_weights = exp_scores / sum_exp
+    output, lse = compute_attention(
+        query,
+        key,
+        value,
+        attn_bias,
+        dropout_mask,
+        scale,
+        is_causal,
+        dropout_p,
+    )
 
-    # Compute LSE
-    lse = max_scores.squeeze(-1) + torch.log(sum_exp.squeeze(-1))
-    lse = lse.to(torch.float32)
-
-    dropout_mask = None
-    if dropout_p > 0:
-        attn_weights, dropout_mask = torch.ops.aten.native_dropout.default(
-            attn_weights, dropout_p, train=True
-        )
-
-    output = torch.matmul(attn_weights, value)
-
-    return (output, lse, dropout_mask)
+    return (output, lse, dropout_mask if dropout_p > 0.0 else None)
 
 
 def _can_use_nki_flash_attention(
@@ -1701,7 +1701,6 @@ def compute_attention_backward_decomposition(
     scale: float,
     is_causal: bool,
     dropout_p: float,
-    mixed_precision: bool,
     philox_seed: torch.Tensor | None = None,
 ):
     """Compute attention backward pass using torch decomposition.
@@ -1719,81 +1718,25 @@ def compute_attention_backward_decomposition(
         scale (float): Attention scale factor.
         is_causal (bool): Whether to apply causal masking.
         dropout_p (float): Dropout probability.
-        mixed_precision (bool): Whether to use mixed precision.
         philox_seed (torch.Tensor | None): Random seed for dropout.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (grad_query, grad_key, grad_value).
     """
-    orig_dtype = query.dtype
-    acc_dtype = torch.float32 if mixed_precision else orig_dtype
-
-    grad_out = grad_out.to(acc_dtype)
-    query = query.to(acc_dtype)
-    key = key.to(acc_dtype)
-    value = value.to(acc_dtype)
-    out = out.to(acc_dtype)
-    lse = lse.to(acc_dtype)
-    if attn_bias.numel() > 1:
-        attn_bias = attn_bias.to(acc_dtype)
-
-    logits = query @ key.transpose(-2, -1) * scale
-
-    if is_causal:
-        seq_len_q, seq_len_k = logits.shape[-2:]
-        temp_mask = torch.ones(seq_len_q, seq_len_k, dtype=torch.bool, device=query.device).tril(
-            diagonal=0
-        )
-        logits = logits.masked_fill(temp_mask.logical_not(), float("-inf"))
-    elif attn_bias.numel() > 1:
-        logits = logits + attn_bias
-
-    probs = torch.exp(logits - lse.unsqueeze(-1))
-
-    # use the dropout mask passed to the backwards FX graph
-    # via the philox_seed parameter
-    dropout_mask = philox_seed
-    masked_probs = probs
-    if dropout_mask is not None:
-        if dropout_p == 1:
-            masked_probs = probs * dropout_mask
-        else:
-            masked_probs = probs * dropout_mask * (1 / (1 - dropout_p))
-
-    grad_v = masked_probs.transpose(-2, -1) @ grad_out
-    grad_out_v = grad_out @ value.transpose(-2, -1)
-    grad_out_mask = grad_out_v
-    if dropout_mask is not None:
-        if dropout_p == 1:
-            grad_out_mask = grad_out_v * dropout_mask
-        else:
-            grad_out_mask = grad_out_v * dropout_mask * (1 / (1 - dropout_p))
-
-    # Preserve the full-context reduction order while adding contributions
-    # from other ring/CP blocks through the global output residual.
-    local_out = masked_probs @ value
-    sum_reduction = (grad_out_mask * probs).sum(dim=-1, keepdim=True) + (
-        grad_out * (out - local_out)
-    ).sum(dim=-1, keepdim=True)
-    ds = probs * (grad_out_mask - sum_reduction) * scale
-
-    if is_causal:
-        seq_len_q, seq_len_k = ds.shape[-2:]
-        temp_mask = torch.ones(seq_len_q, seq_len_k, dtype=torch.bool, device=query.device).tril(
-            diagonal=0
-        )
-        ds = ds.masked_fill(temp_mask.logical_not(), 0.0)
-
-    grad_q = ds @ key
-    grad_k = ds.transpose(-2, -1) @ query
-
-    grad_attn_bias = ds.to(orig_dtype) if attn_bias.numel() > 1 else attn_bias.to(orig_dtype)
-
-    grad_q = grad_q.to(orig_dtype)
-    grad_k = grad_k.to(orig_dtype)
-    grad_v = grad_v.to(orig_dtype)
-
-    return grad_q, grad_k, grad_v, grad_attn_bias
+    dropout_mask = philox_seed if dropout_p > 0.0 else query.new_zeros((0,))
+    return compute_attention_backward(
+        grad_out,
+        query,
+        key,
+        value,
+        attn_bias,
+        dropout_mask,
+        out,
+        lse,
+        scale,
+        is_causal,
+        dropout_p,
+    )
 
 
 def _prepare_backward_inputs(query, key, value, orig_k_shape, scale):
@@ -1943,7 +1886,6 @@ def scaled_dot_product_fused_attention_overrideable_backward_decomposition(
         scale,
         is_causal,
         dropout_p,
-        True,
         philox_seed,
     )
 
@@ -1951,7 +1893,7 @@ def scaled_dot_product_fused_attention_overrideable_backward_decomposition(
     grad_k, grad_v = _reduce_gqa_gradients(grad_k, grad_v, is_gqa, B, orig_kv_heads, q_heads, S, E)
 
     # Handle grad_attn_bias
-    if grad_attn_bias.numel() == 1:
+    if grad_attn_bias is not None and grad_attn_bias.numel() == 1:
         grad_attn_bias = None
 
     return grad_q, grad_k, grad_v, grad_attn_bias
