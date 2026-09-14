@@ -27,6 +27,12 @@ from internal.common import (
     STATUS_RANK as _STATUS_RANK,
 )
 from internal.common import (
+    CompileTimeoutError,
+    compile_time_limit,
+    get_neuron_op_db,
+    kill_compile_subprocesses,
+)
+from internal.common import (
     allocate_to_device as _allocate_to_device,
 )
 from internal.common import (
@@ -43,9 +49,6 @@ from internal.common import (
 )
 from internal.common import (
     flatten_tensors as _flatten_tensors,  # re-export for tests/vertical/test_probe.py
-)
-from internal.common import (
-    get_neuron_op_db,
 )
 from internal.common import (
     probe_output_meta as _probe_output_meta,
@@ -270,11 +273,19 @@ def _run_one_sample(op, op_name: str, classification: str, sample) -> dict:
             os.environ.get("TORCH_NEURONX_NEFF_CACHE_DIR", "/tmp/neff_cache"),
         )
         start = time.perf_counter()
-        with torch.no_grad():
+        # Eager runs lazily: the neuronx-cc compile fires at synchronize, so the
+        # time limit must cover it too, not just the op call.
+        with torch.no_grad(), compile_time_limit():
             _ = op(*neuron_args, **neuron_kwargs)
-        torch_neuronx.synchronize()
+            torch_neuronx.synchronize()
         out["ttf_ms"] = (time.perf_counter() - start) * 1000
         err_class = None
+    except CompileTimeoutError as e:
+        # A single shape ran past the compile limit. Kill the leftover
+        # neuronx-cc subprocess so the worker frees its core, then move on.
+        kill_compile_subprocesses()
+        out["error"] = str(e)
+        err_class = "compile_timeout"
     except Exception as e:
         exc_str = str(e)
         out["error"] = exc_str.replace("\n", " ").replace("\r", "")[:5000]
@@ -294,6 +305,8 @@ def _run_one_sample(op, op_name: str, classification: str, sample) -> dict:
     elif err_class == "unsupported":
         # No kernel on Neuron → eager path falls back to CPU.
         out["status"] = "cpu_fallback"
+    elif err_class == "compile_timeout":
+        out["status"] = "compile_timeout"
     elif err_class == "failed_lowering":
         out["status"] = "failed_lowering"
     elif out["fallback"] or has_cpu_roundtrip:
