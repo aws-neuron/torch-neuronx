@@ -392,7 +392,17 @@ def torch_pdist_forward(self, p=2.0, out=None):
     # cases into an explicit per-pair reduction (p=0: count of differing coords;
     # p=inf: max abs coord diff) so the Neuron result is correct. p is static.
     if p == 0:
-        return _pdist_pairwise(self, lambda ad: (ad != 0).to(self.dtype).sum())
+
+        def reduce_p0(ad):
+            count = (ad != 0).to(self.dtype).sum()
+            return torch.where(ad.isnan().any(), ad.sum(), count)
+
+        return _pdist_pairwise(self, reduce_p0)
     if p == float("inf"):
-        return _pdist_pairwise(self, lambda ad: ad.amax())
+
+        def reduce_pinf(ad):
+            result = ad.amax()
+            return torch.where(ad.isnan().any(), ad.sum(), result)
+
+        return _pdist_pairwise(self, reduce_pinf)
     return torch.ops.aten._pdist_forward(self, p)
