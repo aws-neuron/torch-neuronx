@@ -110,6 +110,12 @@ void CacheKeyGenerator::AppendTensor(std::ostringstream& key, const at::Tensor& 
   if (!t.device().is_privateuseone()) {
     key << ":" << t.device().type();
   }
+  // A Python scalar wrapped for a Tensor overload and an explicit rank-0
+  // tensor can otherwise have identical shape/dtype/stride/device fragments,
+  // despite requiring different promotion and lowering.
+  if (t.unsafeGetTensorImpl()->is_wrapped_number()) {
+    key << ":wrapped";
+  }
 }
 
 void CacheKeyGenerator::AppendTensorOrUndef(std::ostringstream& key, const at::Tensor& t) {

@@ -222,6 +222,15 @@ bool IsSupportedDtype(c10::ScalarType dt);
 void DowncastArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& schema);
 
 /**
+ * Copy IValue arguments while giving TensorList and GenericList values
+ * independent container storage. Tensor objects themselves remain shared.
+ *
+ * Dispatch preprocessing mutates list containers in place, so a plain vector
+ * copy is not a stable snapshot for CPU fallback or original-dtype inference.
+ */
+std::vector<c10::IValue> CloneIValueListContainers(const std::vector<c10::IValue>& args);
+
+/**
  * Promote the two leading tensor operands to c10::promoteTypes(a, b) for
  * binary compare/logical ops, mirroring TensorIterator's
  * promote_inputs_to_common_dtype(true) on CPU/CUDA. Must be called
@@ -491,6 +500,32 @@ std::vector<MetaOutputSpec> ExtractMetaOutputSpecs(torch::jit::Stack& stack);
  */
 std::vector<MetaOutputSpec> InferOutputsViaMeta(const c10::OperatorHandle& op,
                                                 const std::vector<c10::IValue>& args);
+
+/**
+ * Resolve the narrow functional weak-integer-scalar route before Neuron
+ * downcasting/lowering.
+ *
+ * PyTorch represents a Python integer passed to a Tensor overload as a
+ * zero-dimensional CPU tensor with TensorImpl::is_wrapped_number().  Neuron's
+ * preprocessing materializes a new device tensor and therefore cannot carry
+ * that runtime-only bit into StableHLO.  Meta conversion intentionally keeps
+ * this adapter on CPU: Python-registered Meta kernels convert it back to the
+ * original Python number, and PyTorch forbids a wrapped number on Meta.
+ * For a functional binary route with
+ * exactly one wrapped integral tensor and one ordinary rank-0 integral tensor,
+ * ask the exact ATen Meta kernel for the result dtype.  The wrapped operand is
+ * normalized only when that dtype equals the ordinary tensor's dtype.
+ *
+ * Writable schemas, multi-output schemas, comparisons, true division, and
+ * other policies whose output dtype does not prove the operand dtype do not
+ * satisfy these guards and are left unchanged.
+ *
+ * @return true when a wrapped operand was replaced by an ordinary tensor cast
+ *         to the Meta-derived dtype.
+ */
+bool NormalizeWrappedIntegerScalarViaMeta(const c10::OperatorHandle& op,
+                                          std::vector<c10::IValue>& args,
+                                          const c10::FunctionSchema& schema);
 
 // ═══════════════════════════════════════════════════════════════
 //  Static vs runtime argument classification

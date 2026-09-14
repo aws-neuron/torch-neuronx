@@ -218,6 +218,18 @@ void DowncastArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& sch
   }
 }
 
+std::vector<c10::IValue> CloneIValueListContainers(const std::vector<c10::IValue>& args) {
+  auto cloned = args;
+  for (size_t i = 0; i < cloned.size(); ++i) {
+    if (cloned[i].isTensorList()) {
+      cloned[i] = c10::IValue(cloned[i].toTensorList().copy());
+    } else if (cloned[i].isList()) {
+      cloned[i] = c10::IValue(cloned[i].toList().copy());
+    }
+  }
+  return cloned;
+}
+
 bool DowncastTensorList(std::vector<at::Tensor>& tensors) {
   bool any_changed = false;
   for (size_t i = 0; i < tensors.size(); ++i) {
@@ -628,7 +640,15 @@ const IndexOpConfig* GetIndexOpConfig(const std::string& op_name) {
 
 at::Tensor TensorToMeta(const at::Tensor& t) {
   if (!t.defined()) return t;
-  return at::detail::empty_strided_meta(t.sizes(), t.strides(), t.scalar_type());
+  // Wrapped numbers are CPU scalar adapters, not ordinary tensors.  Keep
+  // them on CPU so Python-registered Meta kernels can convert them back to
+  // the original Python number.  Moving one to Meta and retaining the bit
+  // violates pybind_utils' wrapped-number invariant.
+  if (t.unsafeGetTensorImpl()->is_wrapped_number()) {
+    return t;
+  }
+  auto meta = at::detail::empty_strided_meta(t.sizes(), t.strides(), t.scalar_type());
+  return meta;
 }
 
 c10::IValue IValueToMeta(const c10::IValue& val) {
@@ -726,6 +746,91 @@ std::vector<MetaOutputSpec> InferOutputsViaMeta(const c10::OperatorHandle& op,
                                                 const std::vector<c10::IValue>& args) {
   auto stack = RunMetaDispatch(op, args);
   return ExtractMetaOutputSpecs(stack);
+}
+
+bool NormalizeWrappedIntegerScalarViaMeta(const c10::OperatorHandle& op,
+                                          std::vector<c10::IValue>& args,
+                                          const c10::FunctionSchema& schema) {
+  // The output dtype of a writable overload is constrained by its destination
+  // and cannot prove the arithmetic operand dtype. Keep out=/in-place behavior
+  // on its existing path.
+  for (const auto& schema_arg : schema.arguments()) {
+    const auto& alias_info = schema_arg.alias_info();
+    if (alias_info != nullptr && alias_info->isWrite()) return false;
+  }
+
+  if (schema.returns().size() != 1 ||
+      schema.returns()[0].type()->kind() != c10::TypeKind::TensorType) {
+    return false;
+  }
+
+  c10::optional<size_t> wrapped_index;
+  c10::optional<c10::ScalarType> ordinary_dtype;
+  size_t defined_tensor_count = 0;
+
+  for (size_t i = 0; i < args.size(); ++i) {
+    if (!args[i].isTensor()) continue;
+    const auto& tensor = args[i].toTensor();
+    if (!tensor.defined()) continue;
+    ++defined_tensor_count;
+
+    const bool is_integral = c10::isIntegralType(tensor.scalar_type(), /*includeBool=*/false);
+    const bool is_wrapped = tensor.unsafeGetTensorImpl()->is_wrapped_number();
+    if (is_wrapped) {
+      if (wrapped_index.has_value() || tensor.dim() != 0 || !is_integral) return false;
+      wrapped_index = i;
+      continue;
+    }
+
+    // This proposal is intentionally scoped to the failing reference route:
+    // one real rank-0 integer tensor plus one wrapped Python integer.
+    if (ordinary_dtype.has_value() || tensor.dim() != 0 || !is_integral) return false;
+    ordinary_dtype = tensor.scalar_type();
+  }
+
+  if (defined_tensor_count != 2 || !wrapped_index.has_value() || !ordinary_dtype.has_value()) {
+    return false;
+  }
+
+  // Result dtype equality is meaningful only when these are the conventional
+  // binary promoting operands. Reject tensor roles such as index, mask, or
+  // destination even if their operator happens to return the other tensor's
+  // dtype.
+  const auto& schema_args = schema.arguments();
+  if (schema_args.size() < 2 || args.size() < 2 || schema_args[0].name() != "self" ||
+      schema_args[1].name() != "other" || (*wrapped_index != 0 && *wrapped_index != 1)) {
+    return false;
+  }
+
+  std::vector<MetaOutputSpec> output_specs;
+  try {
+    output_specs = InferOutputsViaMeta(op, args);
+  } catch (const c10::Error& e) {
+    TORCH_NEURONX_DISPATCH_DEBUG("[NormalizeWrappedIntegerScalarViaMeta] Meta dispatch failed",
+                                 " op=", c10::toString(schema.operator_name()),
+                                 " error=", e.what_without_backtrace());
+    return false;
+  } catch (const std::exception& e) {
+    TORCH_NEURONX_DISPATCH_DEBUG("[NormalizeWrappedIntegerScalarViaMeta] Meta dispatch failed",
+                                 " op=", c10::toString(schema.operator_name()),
+                                 " error=", e.what());
+    return false;
+  }
+
+  if (output_specs.size() != 1 || output_specs[0].is_undefined ||
+      output_specs[0].dtype != *ordinary_dtype) {
+    return false;
+  }
+
+  auto wrapped = args[*wrapped_index].toTensor();
+  auto normalized = wrapped.to(*ordinary_dtype, /*non_blocking=*/false, /*copy=*/true);
+  normalized.unsafeGetTensorImpl()->set_wrapped_number(false);
+  args[*wrapped_index] = c10::IValue(std::move(normalized));
+  TORCH_NEURONX_DISPATCH_DEBUG("[NormalizeWrappedIntegerScalarViaMeta] normalized",
+                               " op=", c10::toString(schema.operator_name()),
+                               " wrapped_dtype=", wrapped.scalar_type(),
+                               " meta_dtype=", *ordinary_dtype);
+  return true;
 }
 
 // ═══════════════════════════════════════════════════════════════
