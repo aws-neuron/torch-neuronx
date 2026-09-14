@@ -524,6 +524,46 @@ bool CopyDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId
   return true;
 }
 
+CastDirectKernelExecution::CastDirectKernelExecution(
+    const std::string& op_name, TensorDataRef src_ref, TensorDataRef dst_ref,
+    uint64_t src_offset_elements, uint64_t dst_offset_elements, c10::ScalarType src_dtype,
+    c10::ScalarType dst_dtype, uint64_t num_elements, int device_id)
+    : NeuronKernelExecutionTyped<KernelTypeEnum::kCast, c10::DeviceType::PrivateUse1,
+                                 c10::DeviceType::PrivateUse1>(op_name, {std::move(src_ref)},
+                                                               {std::move(dst_ref)}, device_id),
+      src_offset_elements_(src_offset_elements),
+      dst_offset_elements_(dst_offset_elements),
+      src_dtype_(src_dtype),
+      dst_dtype_(dst_dtype),
+      num_elements_(num_elements) {}
+
+bool CastDirectKernelExecution::ValidateImpl() const { return num_elements_ > 0; }
+
+bool CastDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                                         c10::StreamId stream_id) const {
+  const NRTHandler::TensorCastOperand src{
+      GetSrcDataPtrs()[0],
+      src_offset_elements_,
+      src_dtype_,
+  };
+  const NRTHandler::TensorCastOperand dst{
+      GetDstDataPtrs()[0],
+      dst_offset_elements_,
+      dst_dtype_,
+  };
+
+  int lnc_idx = c10_neuron::get_vnc_id(device_id_);
+  EXECUTION_RUNTIME_CHECK(lnc_idx >= 0, "Invalid lnc_idx ", lnc_idx, " for device_id ", device_id_);
+  int queue = nrt::GetHardwareQueue(NRTA_XU_TENSOR_OP, stream_id);
+  NRT_STATUS status = NRTHandler::ScheduleTensorCast(src, dst, num_elements_, lnc_idx, queue,
+                                                     nrt_status, sequence_id);
+  if (status != NRT_SUCCESS) {
+    throw torch_neuronx::ExecutionRuntimeException(
+        "Failed to schedule async tensor cast. Status: " + std::to_string(status), status);
+  }
+  return true;
+}
+
 WriteDirectKernelExecution::WriteDirectKernelExecution(const std::string& op_name, void* src_ptr,
                                                        TensorDataRef dst_ref,
                                                        size_t dst_offset_bytes,

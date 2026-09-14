@@ -88,6 +88,15 @@ TEST_F(KernelExecutionTest, ExecutionRequirementCapturedAtConstruction) {
   EXPECT_FALSE(compile_only_kernel.RequiresExecution());
 }
 
+TEST_F(KernelExecutionTest, CastKernelConstruction) {
+  CastDirectKernelExecution kernel("cast", TensorDataRef(input_ptrs_[0]),
+                                   TensorDataRef(output_ptrs_[0]), 3, 7, c10::ScalarType::Float,
+                                   c10::ScalarType::BFloat16, 6, 0);
+
+  EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kCast);
+  EXPECT_TRUE(kernel.IsValid());
+}
+
 TEST_F(KernelExecutionTest, CompilableKernelWithCollectives) {
   std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
   XLACompilableKernelExecution kernel("collective_op", create_fake_tensor_refs(input_ptrs_),
@@ -825,6 +834,7 @@ TEST_F(KernelExecutionTest, IsDeviceKernelTypeReturnsTrue) {
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kHLO));
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kCollective));
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kCopy));
+  EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kCast));
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kWrite));
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kRead));
 }
@@ -840,6 +850,7 @@ TEST_F(KernelExecutionTest, GetXUIndexMapping) {
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kHLO), NRTA_XU_COMPUTE);
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kCollective), NRTA_XU_COLLECTIVES);
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kCopy), NRTA_XU_TENSOR_OP);
+  EXPECT_EQ(GetXUIndex(KernelTypeEnum::kCast), NRTA_XU_TENSOR_OP);
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kWrite), NRTA_XU_TENSOR_OP);
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kRead), NRTA_XU_TENSOR_OP);
 }

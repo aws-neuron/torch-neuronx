@@ -14,6 +14,9 @@ void nrt_copy_neuron_to_cpu(nrt_tensor_t* src_data_ptr, void* dst_data_ptr, size
 void nrt_copy_cpu_to_neuron(void* src_data_ptr, nrt_tensor_t* dst_data_ptr, size_t dst_offset,
                             size_t size);
 void copy_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst);
+// Internal submission helper. The dispatcher validates the NRT cast contract
+// and materializes a contiguous source before calling it.
+void cast_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst);
 
 /// Strided neuron->neuron copy using only NRT/stream primitives.
 /// Submits one stream-ordered device copy op per contiguous span.
@@ -25,6 +28,14 @@ void nki_copy_strided_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst);
 
 nrt_tensor_t* get_nrt_tensor(const at::Tensor& tensor, bool non_blocking = false);
 void write_to_noncontiguous_neuron(at::Tensor& dst, const at::Tensor& src);
+
+inline bool is_nrt_tensor_cast_supported(c10::ScalarType src_dtype, c10::ScalarType dst_dtype) {
+  using ST = c10::ScalarType;
+  return (src_dtype == ST::BFloat16 && dst_dtype == ST::Float) ||
+         (src_dtype == ST::Float && dst_dtype == ST::BFloat16) ||
+         (src_dtype == ST::Half && dst_dtype == ST::Float) ||
+         (src_dtype == ST::Float && dst_dtype == ST::Half);
+}
 
 /// On-device non-contiguous write — central entry point for all copy paths.
 ///

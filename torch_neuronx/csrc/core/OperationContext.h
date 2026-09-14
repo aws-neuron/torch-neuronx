@@ -155,6 +155,7 @@ struct KernelTypeTraits;
 DEFINE_KERNEL_TYPE_TRAITS(kHLO, XLACompilableKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kCollective, CollectiveDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kCopy, CopyDirectKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kCast, CastDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kWrite, WriteDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kRead, ReadDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kEvent, EventDirectKernelExecution)

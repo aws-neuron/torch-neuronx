@@ -233,6 +233,36 @@ def test_copy_non_default_stream_uses_direct_primitive():
     torch.testing.assert_close(src.cpu(), dst.cpu())
 
 
+@pytest.mark.parametrize(
+    ("src_dtype", "dst_dtype"),
+    [
+        (torch.float32, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float16),
+        (torch.float16, torch.float32),
+    ],
+)
+@pytest.mark.needs_process_isolation(reason="HostCC stream flags remain fixed after first use.")
+@requires_nrt_streams_with_host_cc
+def test_copy_non_default_stream_cross_dtype_uses_nrt_cast(src_dtype, dst_dtype):
+    """Supported cross-dtype copy_ uses the NRT cast on a HostCC stream."""
+    src_storage = torch.randn(67, dtype=src_dtype, device="neuron")
+    dst_storage = torch.full((71,), 11, dtype=dst_dtype, device="neuron")
+    src = src_storage.narrow(0, 3, 64)
+    dst = dst_storage.narrow(0, 5, 64)
+
+    stream = torch.neuron.Stream()
+    stream.wait_stream(torch.neuron.current_stream())
+    with torch.neuron.stream(stream):
+        dst.copy_(src)
+    stream.synchronize()
+
+    result = dst_storage.cpu()
+    torch.testing.assert_close(result[5:69], src.cpu().to(dst_dtype))
+    torch.testing.assert_close(result[:5], torch.full((5,), 11, dtype=dst_dtype))
+    torch.testing.assert_close(result[69:], torch.full((2,), 11, dtype=dst_dtype))
+
+
 def test_copy_non_default_stream_without_host_cc_uses_mlir():
     """Test that a copy uses MLIR when HostCC is disabled."""
     from torch_neuronx.python_ops.torch_mlir.ops.copy import CopyMLIRImpl
@@ -490,8 +520,8 @@ class TestNonDefaultStreamGuards:
         torch.testing.assert_close(result.cpu(), cpu_src)
 
     @requires_nrt_streams_with_host_cc
-    def test_to_copy_cross_dtype_falls_back(self):
-        """_to_copy cross-dtype: falls back to CPU bounce which performs the cast."""
+    def test_to_copy_cross_dtype_uses_nrt_cast(self):
+        """Cross-dtype _to_copy uses the NRT cast on a HostCC stream."""
         cpu_src = torch.randn(4, 4, dtype=torch.float32)
         src = cpu_src.to("neuron")
         stream = torch.neuron.Stream()

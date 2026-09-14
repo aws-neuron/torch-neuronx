@@ -19,8 +19,8 @@ Branches:
   - unsupported dtype / mixed device: dst.copy_(src)
 
 On non-default stream + hostCC the MLIR path is gated; same-dtype routes to
-raw NRT instead of per-pair dst.copy_(src), cross-dtype falls back to
-dst.copy_(src) (no raw-NRT cast available yet).
+raw NRT and cross-dtype falls back to dst.copy_(src), whose C++ dispatcher
+selects the appropriate stream-aware implementation.
 """
 
 from __future__ import annotations
@@ -121,9 +121,6 @@ def _raw_nrt_copy_same_dtype(self_tensors, src_tensors):
 
     for dst, src in zip(self_tensors, src_tensors, strict=False):
         _C._nrt_copy_neuron_to_neuron_tensor(src, dst)
-
-
-# No cross-dtype raw-NRT helper — device_cast goes through MLIR for cross-dtype.
 
 
 @register_aten(
