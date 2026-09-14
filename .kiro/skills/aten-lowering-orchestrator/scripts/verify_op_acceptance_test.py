@@ -10,6 +10,7 @@ registry gate accepts a detailed per-op reason but rejects a vague bucket. No
 Neuron device is needed; verify_op_acceptance imports cleanly (main is guarded).
 """
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -128,3 +129,178 @@ def test_fewer_dtypes_reason_is_rejected():
     # Neuron supporting FEWER dtypes than aten is a real gap, not a superset.
     patterns = v._load_allowlist(ALLOWLIST)
     assert not v._reason_allowed("neuron does not support bf16 for this op", patterns)
+
+
+# --- REVIEW verdict: precedent-cited, non-allowlisted skip/xfail -----------
+
+# A baseline group that a candidate can cite as a real precedent.
+_BASE = [
+    {
+        "kind": "xfail",
+        "reason": "reference numerics ulp for exp/erf family",
+        "tests": ["test_reference_numerics_normal_erf"],
+        "patterns": [],
+        "folders": [],
+    }
+]
+
+
+def _registry_args(tmp_path, cand_groups):
+    (tmp_path / "base.json").write_text(json.dumps(_BASE))
+    (tmp_path / "cand.json").write_text(json.dumps(_BASE + cand_groups))
+    return SimpleNamespace(
+        candidate_registry=str(tmp_path / "cand.json"),
+        allowlist=ALLOWLIST,
+        baseline_registry=str(tmp_path / "base.json"),
+        op_nodeids=None,
+    )
+
+
+def _registry_status(tmp_path, cand_groups):
+    vd = v.Verdict("aten::foo")
+    v.check_registry(vd, "aten::foo", _registry_args(tmp_path, cand_groups))
+    return vd.checks[-1].status
+
+
+def _xfail(reason):
+    return {
+        "kind": "xfail",
+        "reason": reason,
+        "tests": ["test_ref_foo"],
+        "patterns": [],
+        "folders": [],
+    }
+
+
+def test_allowlisted_reason_passes_registry(tmp_path):
+    assert _registry_status(tmp_path, [_xfail("complex dtypes not supported on Neuron")]) == v.OK
+
+
+def test_non_allowlisted_no_precedent_fails(tmp_path):
+    assert _registry_status(tmp_path, [_xfail("reference numerics ulp for foo")]) == v.FAILED
+
+
+def test_non_allowlisted_valid_precedent_is_review(tmp_path):
+    reason = "reference numerics ulp for foo; precedent: test_reference_numerics_normal_erf"
+    assert _registry_status(tmp_path, [_xfail(reason)]) == v.NEEDS_REVIEW
+
+
+def test_bogus_precedent_fails(tmp_path):
+    reason = "foo bar; precedent: test_does_not_exist_xyz"
+    assert _registry_status(tmp_path, [_xfail(reason)]) == v.FAILED
+
+
+def test_deny_reason_with_precedent_still_fails(tmp_path):
+    # A deny pattern is a hard FAIL; a precedent citation cannot rescue it.
+    reason = "tensor-likes are not close on float32; precedent: test_reference_numerics_normal_erf"
+    assert _registry_status(tmp_path, [_xfail(reason)]) == v.FAILED
+
+
+def test_finalize_review_below_fail_above_pass():
+    # REVIEW wins only when every hard check is OK; a FAIL still beats it.
+    vd = v.Verdict("aten::foo")
+    vd.add(v.Check("upstream", True, v.OK))
+    vd.add(v.Check("registry", True, v.NEEDS_REVIEW))
+    assert vd.finalize(strict_missing=False) == v.REVIEW
+
+    vd = v.Verdict("aten::foo")
+    vd.add(v.Check("upstream", True, v.FAILED))
+    vd.add(v.Check("registry", True, v.NEEDS_REVIEW))
+    assert vd.finalize(strict_missing=False) == v.FAIL
+
+
+# --- check_upstream: an op left skipped is not "passing" ------------------
+
+
+def _upstream_report(tmp_path, records):
+    p = tmp_path / "upstream.json"
+    p.write_text(json.dumps({"tests": records}))
+    return str(p)
+
+
+def _upstream_args(report_path):
+    return SimpleNamespace(
+        upstream_report=report_path,
+        upstream_match_nodeids=None,
+        upstream_report_runxfail=None,
+        baseline_upstream_report=None,
+    )
+
+
+def _nid(name):
+    return f"test/test_ops.py::TestCommonNEURON::test_dtypes_{name}_neuron_float32"
+
+
+def test_upstream_all_skipped_op_fails(tmp_path):
+    # The pod never removed the op from the skip registry: its tests are skipped,
+    # 0 passed. Skipped is not passing -- this must FAIL, not silently PASS.
+    report = _upstream_report(
+        tmp_path,
+        [
+            {"nodeid": _nid("nansum"), "outcome": "skipped"},
+            {"nodeid": _nid("nansum").replace("float32", "float16"), "outcome": "skipped"},
+        ],
+    )
+    vd = v.Verdict("aten::nansum")
+    v.check_upstream(vd, "aten::nansum", _upstream_args(report))
+    up = next(c for c in vd.checks if c.name == "upstream")
+    assert up.status == v.FAILED
+    assert "skip registry" in up.detail
+
+
+def test_upstream_one_pass_among_skips_is_ok(tmp_path):
+    # A real lowering has a passing witness even if some samples skip for a
+    # legitimate platform limit. One PASS clears the no-witness gate.
+    report = _upstream_report(
+        tmp_path,
+        [
+            {"nodeid": _nid("nansum"), "outcome": "passed"},
+            {"nodeid": _nid("nansum").replace("float32", "float64"), "outcome": "skipped"},
+        ],
+    )
+    vd = v.Verdict("aten::nansum")
+    v.check_upstream(vd, "aten::nansum", _upstream_args(report))
+    up = next(c for c in vd.checks if c.name == "upstream")
+    assert up.status == v.OK
+
+
+def test_upstream_all_xfail_not_flagged_by_skip_gate(tmp_path):
+    # All samples xfail (e.g. fp64-only), 0 skipped: the skip gate must NOT fire.
+    # The registry / --runxfail legs handle a genuine all-xfail op.
+    report = _upstream_report(
+        tmp_path,
+        [{"nodeid": _nid("nansum"), "outcome": "xfailed"}],
+    )
+    vd = v.Verdict("aten::nansum")
+    v.check_upstream(vd, "aten::nansum", _upstream_args(report))
+    up = next(c for c in vd.checks if c.name == "upstream")
+    assert up.status == v.OK
+
+
+# --- _upstream_selector ---------------------------------------------------
+
+
+def test_upstream_selector_default_uses_keyword():
+    # No --upstream-match-nodeids: fall back to the keyword heuristic.
+    args = SimpleNamespace(upstream_match_nodeids=None)
+    select = v._upstream_selector(args, "aten::fmod")
+    assert select("test/test_ops.py::TestCommonNEURON::test_dtypes_fmod_neuron_float32")
+    assert not select("test/test_ops.py::TestCommonNEURON::test_dtypes_add_neuron_float32")
+
+
+def test_upstream_selector_explicit_nodeids_match_by_id(tmp_path):
+    # An op whose test name differs from the aten name: keyword misses it, the
+    # explicit set matches it exactly.
+    nid = (
+        "test/test_ops.py::TestCommonNEURON::"
+        "test_compare_cpu_nn_functional_interpolate_trilinear_neuron_float32"
+    )
+    p = tmp_path / "op_nodeids.txt"
+    p.write_text("# collected\n" + nid + "\n\n")
+    args = SimpleNamespace(upstream_match_nodeids=str(p))
+    select = v._upstream_selector(args, "aten::upsample_trilinear3d")
+    assert select(nid)
+    assert select("  " + nid + "  ")  # whitespace tolerant
+    assert not select(nid.replace("float32", "float64"))
+    # keyword alone would never match this op name
+    assert not v._op_keyword_matches(nid, "aten::upsample_trilinear3d")

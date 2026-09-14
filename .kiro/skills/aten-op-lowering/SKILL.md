@@ -76,11 +76,15 @@ grep -rn "<op>" third_party/torch-mlir/lib/Conversion/   # or a StableHLO patter
 ```
 
 If you inherited a branch/PR, sync it **now** — a stale base invalidates every
-later result:
+later result. The merge also refreshes the policy files (`AGENTS.md`, `.kiro/`,
+`lessons.md`); a branch can hold a stale copy. Read the policy from the merged
+base, not from memory. Do not overwrite an intentional `lessons.md` edit; only
+confirm the branch is not behind `origin/main` on these files:
 
 ```bash
 gh pr view <N> --json headRefName,baseRefName,state
 git checkout <headRefName> && git merge origin/main -m "Merge origin/main into <branch>"
+git diff --stat origin/main -- AGENTS.md .kiro   # expect only your intended edits, nothing stale
 for f in <files you'll edit>; do echo "$(git rev-list --count HEAD..origin/main -- $f)  $f"; done
 ```
 
@@ -146,8 +150,39 @@ new family. Read the neighbouring functions and match them.
 )
 @register_aten(["aten::<op>_"], validate_static_inputs=_validate_inplace)  # in-place goes here
 def torch_<op>(self, arg, out=None):
-    return ...
+    return torch.ops.aten.<op>(self, arg)   # call the aten op, do NOT inline the ref
 ```
+
+- **In the body, call the aten op (`torch.ops.aten.<op>`), not an inline ref.**
+  `make_fx` in `kernel.py` then reuses the registered decomposition, so one ref
+  serves the functional op, the `.out` overload, and the compile path. Inlining
+  the ref (e.g. `return <op>_ref(a, b)`) duplicates the math and drifts. See
+  `ldexp`/`rsub` in `binary.py`. In a `register_decomposition([aten.<op>.out])`,
+  do **not** write `out.copy_(<op>_ref(...))` — the dispatcher handles `out=`
+  outside the lowering, so the functional and `.out` variants share ONE decomposition.
+- **Register on the C++ dispatch path. Do NOT set `python_dispatch=True`.** A plain
+  `@register_aten` uses the cached C++ dispatch — keep it. `python_dispatch=True`
+  runs preprocessing AND execution in Python and holds the GIL for both. It hurts
+  perf. The flag is deprecated and goes away. Do not add a new op to it. A reviewer
+  rejects any new op that uses `python_dispatch=True`. If the op needs
+  preprocessing that reads a tensor value (an output size or a static arg),
+  set `relower_every_call=True` with `preprocessing=` (PR #1065): the preprocessing
+  and the lowering run in Python, execution stays in C++, and the HLO/NEFF cache
+  still applies (keyed on the preprocessed args). See `one_hot` / `histc`.
+- **A CompositeImplicitAutograd op needs no backend registration** — it decomposes
+  to lowered primitives and runs on Neuron with no CPU fallback. Register it only
+  to attach a custom backward, and then wrap it in ONE `torch.autograd.Function`
+  like `_CrossEntropyAutograd` in `loss.py`. Do not stack a `@register_aten` AND a
+  separate `autograd.Function` for the same op (the `selu` / `selu_` double-register
+  was a reviewer rejection).
+- **Do not say "falls back to CPU" for fp64.** Neuron has no native fp64, so a
+  double input is **downcast to fp32, computed, then cast back** — it does not fall
+  back to CPU. Use that wording in docstrings, comments, and reviewer replies.
+- **Comment a corner-case workaround so it is removable.** An extra op added only
+  to fix `inf`/`nan` (e.g. a `>=` mask) needs a one-line "why" comment, so a future
+  reader can delete it when the primitive is fixed. Drop dead casts: `.float()` on
+  an already-fp32 tensor is a no-op, so remove a `x.float() if up else x` guard when
+  both operands are always fp32.
 
 - **Register every overload in the schema** — but measure which ones actually
   reach the backend first. For a structured op, `.default`, `.vec`, `.vec_out`
@@ -222,9 +257,19 @@ fail once, then pass on a second `git add`.
 
 ## Step 3 — Unit tests (make these good enough that upstream passes first try)
 
-`tests/python_ops/test_<op>.py`, plus
-`tests/neuron_dynamo_backend/e2e/test_<family>_decomposition_e2e.py` if the op
-has a decomposition.
+Add the tests to the **existing family file**, not a new per-op file. A unary or
+activation op goes in `tests/python_ops/test_unary_elementwise_ops.py` (add a row
+to `POINTWISE_OPS` / `UNARY_OPS_LIST`); a binary op goes in its family file
+(`test_sub`, `test_ldexp`, ...). `grep -rn "aten::<sibling>" tests/python_ops/` to
+find the family file first. Make a new `test_<op>.py` ONLY for a genuinely new
+family. A per-op file for an op that fits a family is a repeat reviewer rejection.
+Also add `tests/neuron_dynamo_backend/e2e/test_<family>_decomposition_e2e.py` if the
+op has a decomposition. This file goes in the dynamo backend tree, not
+`tests/python_ops/`, because it tests the compile path, not the eager handler.
+Assert the routing (both overloads in `neuron_decompositions`), then run the
+decomposition under `torch.compile` for the forward and the backward. Run it with
+your unit tests (bare `pytest` under `agent-run`); do not put an eager op-unit test
+in this file.
 
 Mandatory, from the acceptance criteria:
 
@@ -505,6 +550,16 @@ Efficiency rules that avoid re-runs:
 **Strongest signal: does it reproduce for pure integer dtypes?** If yes it is a
 real bug, not precision.
 
+**A legitimate but unlisted xfail reason: cite a precedent, do NOT stop to ask.**
+If the reason is a genuine limitation whose pattern is not on the allowlist, do
+not block and do not widen `platform-limitations.md`. Add the xfail and end its
+reason with `precedent: <an existing group reason or nodeid>` that already xfails
+the same class (grep the registry for the sibling). The verifier confirms the
+precedent is real and returns a **REVIEW** verdict, which still opens the draft
+PR; a human accepts or rejects the reason at review. A reason with no real
+precedent, or one matching a deny pattern (wrong fp32/int value, crash, layout,
+CPU fallback), stays a FAIL — fix the op.
+
 Before you decide a failure is yours, confirm it is not pre-existing. Re-run only
 the failing nodeids on a pristine `origin/main` checkout, or check the
 orchestrator's list of known pre-existing failures. Then:
@@ -519,6 +574,27 @@ orchestrator's list of known pre-existing failures. Then:
   result survived a full rewrite of my graph and still turned out to be fixed by
   changing the op's rounding. Try changing your own emitted pattern before
   blaming neuronx-cc.
+- **Do not add ops to mask a compiler `inf`/`nan` bug.** If Neuron gives a wrong
+  `inf`/`nan` where the CPU oracle is right and your math is sound, do NOT hide it
+  with a `torch.where`/mask. xfail the affected case with a compiler-bug reason,
+  note the compiler-ticket follow-up in the PR description, and package a standalone
+  repro with the `compiler-artifact-repro` skill (see the hardtanh/hardshrink/relu6
+  ticket follow-ups in #1810). Invoke `/compiler-artifact-repro`; it gates the ticket
+  and produces the three required deliverables: the `ticket.md` description, a minimal
+  standalone `repro.py`, and the offending HLO dump. Confirm the miscompile with an
+  on-device divergence probe against the CPU oracle first; a wrong-looking torch-mlir
+  decomp is not a bug if a native lowering shadows it (leaky_relu_backward). Then drop
+  the op from the PR. But FIRST rule out reference-matching: if CPU `torch.<op>`
+  itself special-cases the value (e.g. `logaddexp2` returns `inf` for `inf`+`inf`,
+  which the log-sum-exp formula gives as `nan`), then a small correcting op matches
+  the reference and is correct. Keep it, and comment it as reference-matching, not a
+  removable workaround.
+- **Complex is a platform limit: raise on it, and keep a raise-only reference call.**
+  Do not half-support complex. An upstream test can assert the op's EXACT error for a
+  complex input with a real dtype (`assertRaisesRegex(..., r"torch.linspace\(\): inferred
+  dtype")`, #789). A `torch.<op>(...)` call that only raises (no return) reproduces that
+  exact message by reusing torch's own dtype inference; it is required, not dead code.
+  Skip only the test that wants a complex OUTPUT; never skip a whole real test for it.
 - **Dump the StableHLO before theorising** about miscompiles — there is no env
   var; wrap the converter (patch the *source* module, `kernel.py` imports it
   inside the function) and use a fresh shape or the cache hides it:
@@ -563,6 +639,31 @@ an inline `@pytest.mark.xfail`; never edit files under
 - Add every new overload to `tests/vertical/internal/target_ops.py` **and** a
   shape to the registry. Without both, the op silently gets no row — which is how
   a 2-second backward regression went unnoticed.
+- **Run both vertical suites for your op and read the rows.** Adding the op to
+  `target_ops.py` does not run it — run both suites and confirm a green row for
+  the eager path AND, when the op has a decomposition, the compile path:
+
+  ```
+  # Under agent-run; -n = slice size. Filter with -k, NOT --ops.
+  pytest tests/vertical/test_target_ops_coverage.py \
+      tests/vertical/test_target_ops_compile_coverage.py \
+      -k "<op>" -n <slice> -q
+  ```
+
+  Read the CSV rows the run writes (`target_ops_coverage_<ts>.csv`,
+  `target_ops_compile_coverage_<ts>.csv`): the eager row needs
+  `status == runs_on_neuron` and `correctness_test == pass`; the compile row
+  needs `status == supported` and `correctness_test == pass`. A missing compile
+  row means the decomposition did not register — go back to Step 3.
+  - **`--ops` filters only the EAGER suite.** The `--ops` option sets
+    `NEURON_OPS_FILTER`, which only `test_target_ops_coverage.py` reads;
+    `test_target_ops_compile_coverage.py` ignores it and sweeps every op (~680,
+    slow). Use `-k "<op>"` to trim BOTH suites. Match the op name, not a
+    superstring — for `logaddexp` use `-k "logaddexp and not logaddexp2"`.
+  - A `Logical Neuron Core(s) not available ... (cores busy, ret=-16)` failure at
+    Neuron init is a transient worker core-availability race, not a defect.
+    Re-run the failed items with a smaller `-n` (for example `-n 2`).
+  - Delete any `target_ops_*.csv` a stray run writes into the repo root.
 - Sanity-check steady-state time and cold compile per op. Forwards of a
   20 MiB gather-shaped op land at 0.3–1.0 ms; a backward in the seconds means
   gotcha #2.
@@ -615,18 +716,32 @@ git fetch origin main && git rev-list --left-right --count origin/main...HEAD
 
 Merge and **re-verify on the merged base** if `origin/main` touched your files.
 
-- `docs/torch_api_compatibility.md` — flip `CPU_FALLBACK` → `Y` with a
-  one-phrase limitation for what still falls back. Measure it with
+**Before you commit, push, or open the PR: re-read
+`.kiro/skills/aten-lowering-orchestrator/references/lessons.md` AND `AGENTS.md`,
+then confirm you follow every applicable rule and lesson.** The lessons are prior
+reviewer findings; `AGENTS.md` is the always-on repo policy (STE, no autonomous
+GitHub action, draft PR only, disclose AI authorship). A clean pass here stops a
+known comment from coming back on this PR.
+
+- `docs/torch_api_compatibility.md`: flip `CPU_FALLBACK` to `Y`. For the note,
+  match the repo convention: write `Native MLIR impl` for a native
+  `@register_aten` lowering (the dominant phrasing, 200+ rows), or
+  `Decomposes to <op>` when the op only decomposes to supported ops. Do not
+  invent free-form text, for example "lowers to" or "passthrough registration".
+  Add a one-phrase limitation for what still falls back. Measure it with
   `track_neuron_ops`, don't guess.
 - `docs/environment_variables.md` if you added an env var.
 - Run **`/pr-review` in branch mode** and act on it before asking a human.
-- PR from `.github/PULL_REQUEST_TEMPLATE.md`, base **`main`**, draft first, and
-  **label it `torch-neuronx-agent`** (`gh pr create --label torch-neuronx-agent …`,
-  or `gh pr edit <N> --add-label torch-neuronx-agent` if it opened without one).
-  Report results as a table with counts; name pre-existing failures with the
-  evidence they reproduce on a clean base; explain a counter-intuitive registry
-  diff (adds and removes net to zero in the GitHub diff); recount test totals
-  after the last edit.
+- PR body follows
+  `.kiro/skills/aten-lowering-orchestrator/references/pr-body-format.md` exactly
+  (the canonical section order, the one-line-per-paragraph rule, and the
+  tight-list rule that stop the two common GitHub render defects), base **`main`**,
+  draft first, and **label it `torch-neuronx-agent`**
+  (`gh pr create --label torch-neuronx-agent …`, or
+  `gh pr edit <N> --add-label torch-neuronx-agent` if it opened without one).
+  Name pre-existing failures with the evidence they reproduce on a clean base;
+  explain a counter-intuitive registry diff (adds and removes net to zero in the
+  GitHub diff); recount test totals after the last edit.
 - **Commit messages follow conventional-commits**, matching this repo's history:
   `feat:` / `fix:` / `docs:` / `chore:` / `test:` / `refactor:`, optional scope
   (`feat(dispatch): …`). One logical change per commit.
