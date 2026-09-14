@@ -728,6 +728,7 @@ def nki_op(
     name: str,
     fn: Callable | None = None,
     mutates_args: str | Iterable[str] = {},
+    fake_fn: Callable | None = None,
 ) -> Callable:
     """Create a custom operator whose implementation is backed by NKI kernels.
 
@@ -737,6 +738,11 @@ def nki_op(
         name (str): A name for the custom op that looks like "{namespace}::{name}",
             e.g. "mylib::my_add".
         mutates_args (Iterable[str] or "unknown"): The names of args that the function mutates.
+        fake_fn (Callable): The Fake/meta kernel. Defaults to ``fn``, which is
+            correct only while ``fn`` is make_fx traceable. Pass an explicit
+            ``fake_fn`` when ``fn`` calls a NKI kernel directly, because the
+            kernel cannot run on a meta tensor. The fake must only compute
+            output metadata.
 
     Example::
         >>> @nki_op("mylib::add", mutates_args={})
@@ -836,9 +842,11 @@ def nki_op(
             mutates_args=mutates_args,
             schema=infer_schema(fn, mutates_args=mutates_args),
         )
-        # We require that the user pass us a function that is make_fx traceable,
-        # so we can just register it as the Fake/meta kernel.
-        result.register_fake(fn)
+        # Most ops pass a make_fx traceable function, so it doubles as the
+        # Fake/meta kernel. An op whose body calls a NKI kernel directly is not
+        # traceable: running it on a meta tensor tries to compile the kernel and
+        # raises. Such an op must pass fake_fn.
+        result.register_fake(fake_fn if fake_fn is not None else fn)
         from torch._subclasses.functional_tensor import FunctionalTensorMode
 
         # This allows torch.compile to trace the internal function
