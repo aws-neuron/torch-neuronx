@@ -338,6 +338,24 @@ TEST(DowncastArgsTest, Int64TensorListDowncast_CpuBounce) {
   }
 }
 
+TEST(CloneIValueListContainersTest, DowncastDoesNotMutateSnapshot) {
+  std::unordered_set<std::string> empty;
+  InitInt64Policy(empty, empty);
+  SetInt64ModeForTesting(Int64Mode::kCpuBounce);
+
+  auto schema =
+      c10::Dispatcher::singleton().findSchemaOrThrow("aten::_foreach_add", "List").schema();
+  c10::List<at::Tensor> tensors({torch::ones({2}, torch::kInt64)});
+  std::vector<c10::IValue> args = {c10::IValue(tensors), c10::IValue(tensors.copy())};
+  auto snapshot = CloneIValueListContainers(args);
+
+  DowncastArgs(args, schema);
+
+  EXPECT_EQ(args[0].toTensorList().get(0).scalar_type(), c10::ScalarType::Int);
+  EXPECT_EQ(snapshot[0].toTensorList().get(0).scalar_type(), c10::ScalarType::Long);
+  SetInt64ModeForTesting(Int64Mode::kNative);
+}
+
 TEST(DowncastArgsTest, Int64TensorListPreserved_Native) {
   auto schema =
       c10::Dispatcher::singleton().findSchemaOrThrow("aten::_foreach_add", "List").schema();
@@ -731,6 +749,24 @@ TEST(TensorToMetaTest, DifferentDtypes) {
   EXPECT_EQ(TensorToMeta(torch::zeros({2}, torch::kHalf)).scalar_type(), c10::ScalarType::Half);
 }
 
+TEST(TensorToMetaTest, KeepsWrappedNumberOnCpu) {
+  auto wrapped = torch::tensor(7, torch::kInt64);
+  wrapped.unsafeGetTensorImpl()->set_wrapped_number(true);
+
+  auto meta = TensorToMeta(wrapped);
+
+  EXPECT_TRUE(meta.unsafeGetTensorImpl()->is_wrapped_number());
+  EXPECT_EQ(meta.scalar_type(), c10::ScalarType::Long);
+  EXPECT_TRUE(meta.device().is_cpu());
+  EXPECT_TRUE(meta.is_same(wrapped));
+}
+
+TEST(TensorToMetaTest, ExplicitZeroDimRemainsUnwrapped) {
+  auto explicit_tensor = torch::tensor(7, torch::kInt64);
+  auto meta = TensorToMeta(explicit_tensor);
+  EXPECT_FALSE(meta.unsafeGetTensorImpl()->is_wrapped_number());
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  IValueToMeta
 // ═══════════════════════════════════════════════════════════════
@@ -775,6 +811,146 @@ TEST(IValueToMetaTest, GenericListWithTensors) {
   auto list = result.toListRef();
   EXPECT_TRUE(list[0].toTensor().device().is_meta());
   EXPECT_EQ(list[1].toInt(), 42);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Meta-derived wrapped integer normalization
+// ═══════════════════════════════════════════════════════════════
+
+static at::Tensor WrappedLong(int64_t value) {
+  auto tensor = torch::tensor(value, torch::kInt64);
+  tensor.unsafeGetTensorImpl()->set_wrapped_number(true);
+  return tensor;
+}
+
+static c10::OperatorHandle FindOp(const char* name, const char* overload) {
+  return c10::Dispatcher::singleton().findSchemaOrThrow(name, overload);
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, ExactFamiliesUseMetaDerivedDtype) {
+  struct Case {
+    const char* name;
+    const char* overload;
+    bool has_alpha;
+    c10::ScalarType dtype;
+  };
+  const std::vector<Case> cases = {
+      {"aten::add", "Tensor", true, c10::ScalarType::Char},
+      {"aten::add", "Tensor", true, c10::ScalarType::Byte},
+      {"aten::add", "Tensor", true, c10::ScalarType::Short},
+      {"aten::add", "Tensor", true, c10::ScalarType::Int},
+      {"aten::mul", "Tensor", false, c10::ScalarType::Byte},
+      {"aten::mul", "Tensor", false, c10::ScalarType::Short},
+      {"aten::sub", "Tensor", true, c10::ScalarType::Char},
+      {"aten::sub", "Tensor", true, c10::ScalarType::Byte},
+      {"aten::sub", "Tensor", true, c10::ScalarType::Short},
+      {"aten::sub", "Tensor", true, c10::ScalarType::Int},
+  };
+
+  for (const auto& test_case : cases) {
+    auto op = FindOp(test_case.name, test_case.overload);
+    auto options = torch::TensorOptions().dtype(test_case.dtype);
+    std::vector<c10::IValue> args = {torch::tensor(5, options), WrappedLong(2)};
+    if (test_case.has_alpha) args.emplace_back(1);
+
+    ASSERT_TRUE(NormalizeWrappedIntegerScalarViaMeta(op, args, op.schema())) << test_case.name;
+    ASSERT_TRUE(args[1].isTensor());
+    EXPECT_EQ(args[1].toTensor().scalar_type(), test_case.dtype) << test_case.name;
+    EXPECT_FALSE(args[1].toTensor().unsafeGetTensorImpl()->is_wrapped_number()) << test_case.name;
+  }
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, PythonRegisteredMetaKernelsAreConservative) {
+  // These Meta kernels are registered by torch/_meta_registrations.py.  A
+  // standalone C++ test binary does not import those registrations, so this
+  // helper must conservatively leave the operands unchanged.  The Python
+  // hardware regression covers their positive routes after normal torch
+  // initialization.
+  for (const auto& [name, overload] : std::vector<std::pair<const char*, const char*>>{
+           {"aten::floor_divide", ""},
+           {"aten::rsub", "Tensor"},
+       }) {
+    auto op = FindOp(name, overload);
+    std::vector<c10::IValue> args = {
+        torch::tensor(5, torch::kUInt8),
+        WrappedLong(2),
+    };
+    if (std::string(name) == "aten::rsub") args.emplace_back(1);
+
+    EXPECT_FALSE(NormalizeWrappedIntegerScalarViaMeta(op, args, op.schema())) << name;
+    EXPECT_TRUE(args[1].toTensor().unsafeGetTensorImpl()->is_wrapped_number()) << name;
+  }
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, ExplicitTensorIsNotNormalized) {
+  auto op = FindOp("aten::add", "Tensor");
+  std::vector<c10::IValue> args = {
+      torch::tensor(5, torch::kInt16),
+      torch::tensor(2, torch::kInt64),
+      1,
+  };
+
+  EXPECT_FALSE(NormalizeWrappedIntegerScalarViaMeta(op, args, op.schema()));
+  EXPECT_EQ(args[1].toTensor().scalar_type(), c10::ScalarType::Long);
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, WrappedFirstOperandIsNormalized) {
+  auto op = FindOp("aten::add", "Tensor");
+  std::vector<c10::IValue> args = {
+      WrappedLong(2),
+      torch::tensor(5, torch::kInt16),
+      1,
+  };
+
+  ASSERT_TRUE(NormalizeWrappedIntegerScalarViaMeta(op, args, op.schema()));
+  EXPECT_EQ(args[0].toTensor().scalar_type(), c10::ScalarType::Short);
+  EXPECT_FALSE(args[0].toTensor().unsafeGetTensorImpl()->is_wrapped_number());
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, NonPromotingTensorRoleIsRejected) {
+  auto op = FindOp("aten::gather", "");
+  std::vector<c10::IValue> args = {
+      torch::tensor(5, torch::kInt16),
+      0,
+      WrappedLong(0),
+      false,
+  };
+
+  EXPECT_FALSE(NormalizeWrappedIntegerScalarViaMeta(op, args, op.schema()));
+  EXPECT_TRUE(args[2].toTensor().unsafeGetTensorImpl()->is_wrapped_number());
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, OutputPolicyMustProveOperandDtype) {
+  auto div = FindOp("aten::div", "Tensor");
+  std::vector<c10::IValue> div_args = {
+      torch::tensor(5, torch::kInt16),
+      WrappedLong(2),
+  };
+  EXPECT_FALSE(NormalizeWrappedIntegerScalarViaMeta(div, div_args, div.schema()));
+  EXPECT_TRUE(div_args[1].toTensor().unsafeGetTensorImpl()->is_wrapped_number());
+
+  auto eq = FindOp("aten::eq", "Tensor");
+  std::vector<c10::IValue> eq_args = {
+      torch::tensor(5, torch::kInt16),
+      WrappedLong(2),
+  };
+  EXPECT_FALSE(NormalizeWrappedIntegerScalarViaMeta(eq, eq_args, eq.schema()));
+  EXPECT_TRUE(eq_args[1].toTensor().unsafeGetTensorImpl()->is_wrapped_number());
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, WritableOutRouteIsUnchanged) {
+  auto op = FindOp("aten::add", "out");
+  auto wrapped = WrappedLong(2);
+  std::vector<c10::IValue> args = {
+      torch::tensor(5, torch::kInt16),
+      wrapped,
+      1,
+      torch::empty({}, torch::kInt32),
+  };
+
+  EXPECT_FALSE(NormalizeWrappedIntegerScalarViaMeta(op, args, op.schema()));
+  EXPECT_TRUE(args[1].toTensor().unsafeGetTensorImpl()->is_wrapped_number());
+  EXPECT_EQ(args[3].toTensor().scalar_type(), c10::ScalarType::Int);
 }
 
 // ═══════════════════════════════════════════════════════════════

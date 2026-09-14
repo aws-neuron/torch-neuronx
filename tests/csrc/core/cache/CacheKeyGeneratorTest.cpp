@@ -112,6 +112,19 @@ TEST_F(CacheKeyGeneratorTest, ZeroDimTensor) {
   EXPECT_NE(k.find("[]"), std::string::npos);
 }
 
+TEST_F(CacheKeyGeneratorTest, WrappedAndExplicitZeroDimTensorsHaveDifferentKeys) {
+  auto explicit_tensor = torch::tensor(5, torch::kInt64);
+  auto wrapped_tensor = explicit_tensor.clone();
+  wrapped_tensor.unsafeGetTensorImpl()->set_wrapped_number(true);
+
+  auto explicit_key = gen({torch::tensor(1, torch::kInt16), explicit_tensor, 1});
+  auto wrapped_key = gen({torch::tensor(1, torch::kInt16), wrapped_tensor, 1});
+
+  EXPECT_NE(explicit_key, wrapped_key);
+  EXPECT_EQ(explicit_key.find(":wrapped"), std::string::npos);
+  EXPECT_NE(wrapped_key.find(":wrapped"), std::string::npos);
+}
+
 TEST_F(CacheKeyGeneratorTest, EmptyTensor) {
   auto k = gen({torch::zeros({0, 3}), torch::zeros({2}), 1});
   EXPECT_NE(k.find("[0,3]"), std::string::npos);

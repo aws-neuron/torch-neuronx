@@ -1357,18 +1357,22 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
       "' was registered without a "
       "lower_func. All ops must have a C++ lowering path when TORCH_NEURONX_CPP_DISPATCH=1.");
 
-  // ── 1. Int64 → CPU fallback ──
+  // ── 1. Strong int64 → CPU fallback ──
   // ShouldCpuFallback returns true when:
   //   - The op is UNSUPPORTED (e.g. matmul/conv on int64 would produce garbage), or
   //   - The active Int64Mode steers this op away from Neuron — namely
   //     native_strict, where any non-native op runs on CPU. (packed and
   //     cpu_bounce never force a whole-op CPU fallback.)
-  // We still require at least one int64 input — when there's no int64 there's
-  // nothing to fall back from.
+  // A wrapped int64 is a weak Python scalar adapter, not a strong int64
+  // operand. Defer it to DispatchWithCasting so Meta can resolve its semantic
+  // dtype first; an unresolved wrapped scalar still takes the later fallback.
   if (ShouldCpuFallback(op_name)) {
     bool has_int64_input = false;
     ForEachTensor(args, [&](const at::Tensor& t) {
-      if (t.scalar_type() == c10::ScalarType::Long) has_int64_input = true;
+      if (t.scalar_type() == c10::ScalarType::Long &&
+          !t.unsafeGetTensorImpl()->is_wrapped_number()) {
+        has_int64_input = true;
+      }
     });
     if (has_int64_input) {
       TORCH_NEURONX_DISPATCH_DEBUG("[NeuronDispatcher::Dispatch] int64 → CPU fallback",
@@ -2179,7 +2183,8 @@ std::vector<torch::Tensor> NeuronDispatcher::DispatchCore(
     c10::DispatchKeySet dispatch_keys, torch::jit::Stack* stack, std::vector<c10::IValue>& args,
     const c10::FunctionSchema& schema, const OpRegistration& reg, NeuronDispatcher& dispatcher,
     at::neuron::CPUFallbackContext fallback_ctx, const std::vector<c10::IValue>& original_args,
-    std::shared_ptr<DispatchCacheEntry>* out_entry, bool use_complex_decomposition) {
+    std::shared_ptr<DispatchCacheEntry>* out_entry, bool use_complex_decomposition,
+    const std::vector<c10::IValue>& raw_fallback_args) {
   TORCH_NEURONX_DISPATCH_DEBUG("[DispatchCore] using cache_key", " op=", op_name,
                                " cache_key=", cache_key);
 
@@ -2203,7 +2208,9 @@ std::vector<torch::Tensor> NeuronDispatcher::DispatchCore(
     // Use original (pre-downcast) args for CPU fallback when available,
     // so that dtypes (e.g. int64) are preserved instead of using the
     // downcasted args (e.g. int32) from DowncastArgs.
-    const auto& fallback_args = original_args.empty() ? args : original_args;
+    const auto& fallback_args = !raw_fallback_args.empty()
+                                    ? raw_fallback_args
+                                    : (original_args.empty() ? args : original_args);
     for (const auto& arg : fallback_args) {
       torch::jit::push(*stack, arg);
     }
@@ -2328,19 +2335,39 @@ void NeuronDispatcher::DispatchWithCasting(const c10::OperatorHandle& op,
     // capture mutated types (int64→int32, scalars→tensors) causing type mismatches.
     auto fallback_ctx = BuildCPUFallbackContext(args, schema);
 
-    // ── 2. Snapshot original args before downcast ──
-    // Original args are passed to lower_func on cache miss for dtype inference
-    // at original precision, and used for CPU fallback with original dtypes.
-    // Deep-copy TensorList/GenericList args because DowncastArgs mutates them
-    // in-place via shared intrusive_ptr storage.
-    auto original_args = args;
-    for (size_t i = 0; i < original_args.size(); ++i) {
-      if (original_args[i].isTensorList()) {
-        original_args[i] = c10::IValue(original_args[i].toTensorList().copy());
-      } else if (original_args[i].isList()) {
-        original_args[i] = c10::IValue(original_args[i].toList().copy());
+    // Keep a distinct raw copy for immediate CPU fallback. The semantic args
+    // below may be normalized for lowering, but fallback must reproduce the
+    // exact user call, including wrapped Python-scalar provenance.
+    auto raw_fallback_args = CloneIValueListContainers(args);
+
+    // Resolve only the Meta-proven functional rank-0 weak-integer route.
+    // The cache key was generated from raw args and distinguishes wrapped
+    // scalars from explicit rank-0 tensors.
+    NormalizeWrappedIntegerScalarViaMeta(op, args, schema);
+
+    // Apply whole-op int64 routing after weak wrapped integers have had a
+    // chance to resolve to their Meta-proven narrow dtype. A strong int64
+    // tensor still takes the existing fallback route.
+    if (ShouldCpuFallback(op_name)) {
+      bool has_int64_input = false;
+      ForEachTensor(args, [&](const at::Tensor& t) {
+        if (t.scalar_type() == c10::ScalarType::Long) has_int64_input = true;
+      });
+      if (has_int64_input) {
+        TORCH_NEURONX_DISPATCH_DEBUG("[DispatchWithCasting] int64 → CPU fallback", " op=", op_name);
+        torch_neuronx::markFallbackLogged(op_name);
+        for (const auto& arg : raw_fallback_args) torch::jit::push(*stack, arg);
+        at::native::cpu_fallback(op, stack);
+        return;
       }
     }
+
+    // ── 2. Snapshot semantic original args before Neuron downcast ──
+    // Semantic original args are passed to lower_func on cache miss for dtype
+    // inference at original precision. CPU fallback uses raw_fallback_args.
+    // Deep-copy TensorList/GenericList args because DowncastArgs mutates them
+    // in-place via shared intrusive_ptr storage.
+    auto original_args = CloneIValueListContainers(args);
 
     // ── 3. Downcast args (tensors + dtype kwargs) to supported types ──
     DowncastArgs(args, schema);
@@ -2368,7 +2395,7 @@ void NeuronDispatcher::DispatchWithCasting(const c10::OperatorHandle& op,
     std::shared_ptr<DispatchCacheEntry> cache_entry;
     auto exec_outputs = DispatchCore(op_name, cache_key, op, dispatch_keys, stack, args, schema,
                                      reg, dispatcher, std::move(fallback_ctx), original_args,
-                                     &cache_entry, use_complex_decomposition);
+                                     &cache_entry, use_complex_decomposition, raw_fallback_args);
 
     if (exec_outputs.empty()) {
       // DispatchCore already handled fallback and pushed to stack

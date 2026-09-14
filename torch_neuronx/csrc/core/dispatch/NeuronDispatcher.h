@@ -426,7 +426,8 @@ class NeuronDispatcher {
       at::neuron::CPUFallbackContext fallback_ctx,
       const std::vector<c10::IValue>& original_args = {},
       std::shared_ptr<DispatchCacheEntry>* out_entry = nullptr,
-      bool use_complex_decomposition = false);
+      bool use_complex_decomposition = false,
+      const std::vector<c10::IValue>& raw_fallback_args = {});
 
   /**
    * Casting path: handles dtype downcasting/upcasting.

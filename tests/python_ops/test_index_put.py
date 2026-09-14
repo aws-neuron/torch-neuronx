@@ -473,20 +473,17 @@ class TestIndexPut:
                 x, [None, torch.tensor([1], device=device)], values, False, False
             )
 
-    def test_index_put_int64_source_into_int32_dest(self, device):
-        """An int64 source into an int32 destination must not be rejected here.
+    def test_index_put_wrapped_scalar_source_matches_int32_dest(self, device):
+        """A Python integer must not widen a rank-0 int32 source.
 
-        PyTorch's index_add decomposition does `tensor * alpha`, and on Neuron a 0-dim
-        int32 times a Python int promotes to int64 (CPU and CUDA keep int32), so the
-        decomposition hands index_put exactly this pair. The dtype check compares
-        categories, not widths, so it must not fire here. Guards upstream
-        test_decomp.py::test_quick_index_add.
+        PyTorch's index_add decomposition computes ``tensor * alpha`` before calling
+        index_put. CPU keeps a rank-0 int32 tensor at int32 when multiplying by a
+        Python integer, so Neuron must produce the same dtype and hand index_put an
+        exact source/destination match. Guards test_decomp.py::test_quick_index_add.
         """
         x = torch.ones(1, dtype=torch.int32, device=device)
         source = torch.ones((), dtype=torch.int32, device=device) * -1
-        # Pin the premise. Once the wrapped-number promotion is faithful this becomes
-        # int32 and the test would otherwise pass without exercising anything.
-        assert source.dtype == torch.int64, "promotion fixed; tighten the dtype check to =="
+        assert source.dtype == torch.int32
         result = torch.ops.aten.index_put(
             x, (torch.zeros(1, dtype=torch.int64, device=device),), source, True
         )
