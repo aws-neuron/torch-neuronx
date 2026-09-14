@@ -668,6 +668,15 @@ main() {
             "$PROJECT_ROOT/tests/utils/generate_hud.py" \
             --multi --reports-dir "$REPORTS_DIR" --output-dir "$REPORTS_DIR" \
             || echo "WARNING: HUD generation failed (non-fatal)"
+
+        # Write the GitHub step summary from the same JSON reports. Non-fatal:
+        # a summary failure must not mask the test exit code.
+        echo ""
+        echo "=== Generating GitHub step summary ==="
+        PYTHONPATH="$PROJECT_ROOT/tests:${PYTHONPATH:-}" python3 \
+            "$PROJECT_ROOT/tests/utils/generate_unit_step_summary.py" \
+            --reports-dir "$REPORTS_DIR" \
+            || echo "WARNING: step summary generation failed (non-fatal)"
     fi
 
     display_results
