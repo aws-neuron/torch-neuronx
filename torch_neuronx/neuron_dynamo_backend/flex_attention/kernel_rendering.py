@@ -94,9 +94,9 @@ def generate_buffer_allocator(graph_lowering: NISAPointwiseSubgraphLowering, pre
     for bufname in ctx.buffers:
         buffer = ctx.buffers[bufname]
         nl_dtype = str(buffer.dtype).replace("torch.", "nl.")
-        # TODO: nl.bool_ is not correctly handled yet in flexattention kernel
+        # The nisa bitvec ops need 1-byte operands. nl.bool_ has no sbuf allocator size.
         if buffer.dtype == torch.bool:
-            nl_dtype = "nl.int32"
+            nl_dtype = "nl.uint8"
         if manual:
             parts.append(
                 bufname

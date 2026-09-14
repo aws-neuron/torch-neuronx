@@ -1898,6 +1898,10 @@ def _exp_impl(
             num_p = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
             num_f = min(seqlen_k - k_start_pos, atp.exp_inst_elems)
 
+            # The loop count exceeds the real tile count for a partial last large tile.
+            if num_f <= 0:
+                continue
+
             q_start_pos = grp_i * _Q_GRP_SZ
 
 {% if static_tile_elimination %}
@@ -2375,8 +2379,10 @@ def _qk_and_max_large_tile_impl(
         q_indices_sb_tile = bufs.q_indices_sb[qkmax_grp][large_tile_idx][k_tile_idx]
         k_indices_sb_tile = bufs.k_indices_sb[qkmax_grp][large_tile_idx][k_tile_idx]
 
-        if k_tile_idx_in_section < atp.num_k_tiles_per_section:
-            num_f = min(seqlen_k - k_start_pos, _K_TILE_SZ)
+        num_f = min(seqlen_k - k_start_pos, _K_TILE_SZ)
+
+        # The index bound alone is vacuous for a short final section.
+        if k_tile_idx_in_section < atp.num_k_tiles_per_section and num_f > 0:
             num_q_free = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
             num_p = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
 
