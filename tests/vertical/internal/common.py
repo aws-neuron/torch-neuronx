@@ -362,6 +362,25 @@ def count_input_elems(sample) -> int:
         return 0
 
 
+def sample_inputs_have_nan(sample) -> bool:
+    """Return True if a positional float input tensor holds a NaN.
+
+    Scan ``sample.input`` and each positional arg. This is the same scope as
+    ``count_input_elems``. Do not scan kwargs. The write-alias ``out=`` slot is
+    an uninitialized buffer, and its bytes can read as NaN. A NaN input makes
+    the correctness compare not meaningful, so the caller skips that check.
+    """
+    try:
+        for t in (sample.input, *sample.args):
+            items = t if isinstance(t, list | tuple) else (t,)
+            for x in items:
+                if isinstance(x, torch.Tensor) and x.is_floating_point() and torch.isnan(x).any():
+                    return True
+    except Exception as e:
+        logger.debug("sample_inputs_have_nan failed: %s", e)
+    return False
+
+
 def probe_output_meta(op, sample):
     """Infer output metadata (shape/dtype) via FakeTensorMode — no real kernel
     run, no storage allocated, no mutation. Empty list on failure; callers

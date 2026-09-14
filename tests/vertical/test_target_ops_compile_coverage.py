@@ -52,6 +52,9 @@ from internal.common import (
 from internal.common import (
     reset_cache_dirs as _reset_cache_dirs,
 )
+from internal.common import (
+    sample_inputs_have_nan as _sample_inputs_have_nan,
+)
 from internal.neuron_op_info import _resolve_op
 from internal.roofline import compute_roofline
 
@@ -469,6 +472,8 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
             out["correctness"] = "skip_slow_cpu"
         elif _is_rng_op(op):
             out["correctness"] = "skip_accuracy_check_rng"
+        elif _sample_inputs_have_nan(sample):
+            out["correctness"] = "skip_nan"
         else:
             try:
                 cpu_args = tuple(
@@ -595,6 +600,8 @@ def _aggregate_compile_results(result: dict, per_shape: list[dict], classificati
             result["correctness_test"] = "skip_no_cpu"
         elif "skip_accuracy_check_rng" in correctness:
             result["correctness_test"] = "skip_accuracy_check_rng"
+        elif "skip_nan" in correctness:
+            result["correctness_test"] = "skip_nan"
 
 
 class TestTargetOpsCompileCoverage:
