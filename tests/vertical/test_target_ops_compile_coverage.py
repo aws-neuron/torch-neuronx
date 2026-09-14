@@ -29,6 +29,12 @@ from internal.common import (
     STATUS_RANK as _STATUS_RANK,
 )
 from internal.common import (
+    CompileTimeoutError,
+    compile_time_limit,
+    get_neuron_op_db,
+    kill_compile_subprocesses,
+)
+from internal.common import (
     allocate_to_device as _allocate_to_device,
 )
 from internal.common import (
@@ -39,9 +45,6 @@ from internal.common import (
 )
 from internal.common import (
     count_input_elems as _count_input_elems,
-)
-from internal.common import (
-    get_neuron_op_db,
 )
 from internal.common import (
     probe_output_meta as _probe_output_meta,
@@ -289,7 +292,12 @@ neuron_op_db = get_neuron_op_db()
 
 
 def _build_params():
-    return _build_params_for(neuron_op_db)
+    db = neuron_op_db
+    ops_filter = os.environ.get("NEURON_OPS_FILTER", "").strip()
+    if ops_filter:
+        wanted = {op.strip() for op in ops_filter.split(",") if op.strip()}
+        db = [info for info in db if info.op_name in wanted]
+    return _build_params_for(db)
 
 
 def _save_compile_result(result: dict):
@@ -402,11 +410,20 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
                 os.environ.get("TORCH_NEURONX_NEFF_CACHE_DIR", "/tmp/neff_cache"),
             )
             start = time.perf_counter()
-            with torch.no_grad():
+            with torch.no_grad(), compile_time_limit():
                 _ = compiled_fn(*neuron_args, **neuron_kwargs)
-            torch_neuronx.synchronize()
+                # torch.compile(backend="neuron") runs lazily: the neuronx-cc
+                # compile fires at synchronize, so the time limit must cover it
+                # too, not just the trace call.
+                torch_neuronx.synchronize()
             out["ttf_ms"] = (time.perf_counter() - start) * 1000
             err_class = None
+        except CompileTimeoutError as e:
+            # A single shape ran past the compile limit. Kill the leftover
+            # neuronx-cc subprocess so the worker frees its core, then move on.
+            kill_compile_subprocesses()
+            out["error"] = str(e)
+            err_class = "compile_timeout"
         except Exception as e:
             exc_str = str(e)
             out["error"] = exc_str.replace("\n", " ").replace("\r", "")[:ERROR_MAXLEN]
@@ -417,6 +434,8 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
         # Single status decision.
         if err_class == "graph_break":
             out["status"] = "graph_break"
+        elif err_class == "compile_timeout":
+            out["status"] = "compile_timeout"
         elif err_class == "failed_lowering":
             out["status"] = "failed_lowering"
         else:
