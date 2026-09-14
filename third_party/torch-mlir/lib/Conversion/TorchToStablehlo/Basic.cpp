@@ -501,6 +501,82 @@ public:
 };
 } // namespace
 
+// Exact float floor(lhs/rhs), matching CPU's div(floor): floor = (x - fmod(x,y))/y, minus 1
+// when the remainder and divisor have opposite signs. x - fmod(x,y) is an exact multiple of
+// y, so the divide is exact -- recovering the boundary integer a naive floor(x/y) misses.
+// fp16/bf16 compute in fp32 and downcast the (integer) floor once. Float-only.
+static Value emitExactFloatFloor(ConversionPatternRewriter &rewriter, Location loc,
+                                 Value lhs, Value rhs, TensorType outType) {
+  DenseI64ArrayAttr bcast;
+  bool upcast = outType.getElementType().getIntOrFloatBitWidth() < 32;
+  Type elemTy = upcast ? rewriter.getF32Type() : outType.getElementType();
+  auto ty = cast<TensorType>(outType.clone(elemTy));
+  if (upcast) {
+    lhs = stablehlo::ConvertOp::create(
+        rewriter, loc, cast<TensorType>(lhs.getType()).clone(elemTy), lhs);
+    rhs = stablehlo::ConvertOp::create(
+        rewriter, loc, cast<TensorType>(rhs.getType()).clone(elemTy), rhs);
+  }
+  auto i1Ty = ty.clone(rewriter.getI1Type());
+  chlo::ComparisonTypeAttr cmpTy;
+  auto lt = chlo::ComparisonDirectionAttr::get(rewriter.getContext(),
+                                               chlo::ComparisonDirection::LT);
+  auto ge = chlo::ComparisonDirectionAttr::get(rewriter.getContext(),
+                                               chlo::ComparisonDirection::GE);
+  auto ne = chlo::ComparisonDirectionAttr::get(rewriter.getContext(),
+                                               chlo::ComparisonDirection::NE);
+  Value mod = chlo::BroadcastRemOp::create(rewriter, loc, ty, lhs, rhs, bcast);
+  Value numer = chlo::BroadcastSubOp::create(rewriter, loc, ty, lhs, mod, bcast);
+  // (x - fmod(x,y))/y is the exact trunc(x/y). The exact-boundary correction is valid only
+  // for finite, in-range operands: |x|,|y|,|quotient| < 2**24 keeps the fmod remainder and
+  // that quotient exact, and excludes inf/nan (whose abs compares false). Everywhere else
+  // fall back to the naive floor(x/y), which is what upstream/IEEE gives for inf/nan, a zero
+  // or infinite divisor, and large magnitudes.
+  Value divRaw = chlo::BroadcastDivOp::create(rewriter, loc, ty, numer, rhs, bcast);
+  Value zero = hlo::getConstantLike(rewriter, loc, 0.0, divRaw);
+  Value one = hlo::getConstantLike(rewriter, loc, 1.0, divRaw);
+  Value c = hlo::getConstantLike(rewriter, loc, 16777216.0, divRaw);
+  Value inRangeX = chlo::BroadcastCompareOp::create(
+      rewriter, loc, i1Ty, stablehlo::AbsOp::create(rewriter, loc, lhs), c, bcast, lt, cmpTy);
+  Value inRangeY = chlo::BroadcastCompareOp::create(
+      rewriter, loc, i1Ty, stablehlo::AbsOp::create(rewriter, loc, rhs), c, bcast, lt, cmpTy);
+  Value inRangeQ = chlo::BroadcastCompareOp::create(
+      rewriter, loc, i1Ty, stablehlo::AbsOp::create(rewriter, loc, divRaw), c, bcast, lt, cmpTy);
+  Value safe = stablehlo::AndOp::create(
+      rewriter, loc, stablehlo::AndOp::create(rewriter, loc, inRangeX, inRangeY), inRangeQ);
+
+  // A bare stablehlo.round/floor lets neuronx-cc fold it into a saturating float->int cast that
+  // clamps |x| >= 2**31 to 2**31 (NCC-9323). Guard both exactly as aten::round/floor decompose:
+  // for |x| >= 2**23 (already integral) or nan, return the input unchanged so that cast never
+  // forms. Applied to the exact-path round and to the naive floor below.
+  Value integral = hlo::getConstantLike(rewriter, loc, 8388608.0, divRaw); // 2**23
+  auto guardIntegral = [&](Value in, Value rounded) -> Value {
+    Value big = chlo::BroadcastCompareOp::create(
+        rewriter, loc, i1Ty, stablehlo::AbsOp::create(rewriter, loc, in), integral, bcast, ge,
+        cmpTy);
+    rounded = stablehlo::SelectOp::create(rewriter, loc, big, in, rounded);
+    Value isNan = chlo::BroadcastCompareOp::create(rewriter, loc, i1Ty, in, in, bcast, ne, cmpTy);
+    return stablehlo::SelectOp::create(rewriter, loc, isNan, in, rounded);
+  };
+
+  // Snap the (in-range) quotient to its exact integer. Clamp out-of-range operands to 0 first so
+  // the round only ever sees finite, in-range values.
+  Value divSafe = stablehlo::SelectOp::create(rewriter, loc, safe, divRaw, zero);
+  Value q = guardIntegral(divSafe, stablehlo::RoundNearestEvenOp::create(rewriter, loc, divSafe));
+  // floor and trunc differ by 1 exactly when the remainder and divisor have opposite signs,
+  // i.e. mod*y < 0 (which also implies mod != 0).
+  Value prod = chlo::BroadcastMulOp::create(rewriter, loc, ty, mod, rhs, bcast);
+  Value adjust = chlo::BroadcastCompareOp::create(rewriter, loc, i1Ty, prod, zero, bcast, lt, cmpTy);
+  Value exact = stablehlo::SelectOp::create(
+      rewriter, loc, adjust, stablehlo::SubtractOp::create(rewriter, loc, q, one), q);
+  // naive floor(x/y) for out-of-range/inf/nan operands -- what upstream/IEEE gives there.
+  Value naiveQ = chlo::BroadcastDivOp::create(rewriter, loc, ty, lhs, rhs, bcast);
+  Value naive = guardIntegral(naiveQ, stablehlo::FloorOp::create(rewriter, loc, naiveQ));
+  Value floordiv = stablehlo::SelectOp::create(rewriter, loc, safe, exact, naive);
+  return upcast ? stablehlo::ConvertOp::create(rewriter, loc, outType, floordiv).getResult()
+                : floordiv;
+}
+
 // Binary op legalizations for Mul/Div variants.
 namespace {
 template <typename AtenOpT, typename ChloOpT>
@@ -580,9 +656,14 @@ public:
     if (roundingMode == "floor") {
       // "floor" - rounds the results of the division down. Equivalent to
       // floor division in Python (the // operator)
-      if (isa<mlir::FloatType>(outElemTy))
-        result = stablehlo::FloorOp::create(rewriter, loc, result).getResult();
-      else if (!outElemTy.isUnsignedInteger()) {
+      if (isa<mlir::FloatType>(outElemTy)) {
+        // fp16/bf16/fp32 get the exact-boundary correction; fp64 keeps the naive floor
+        // (already precise, and the correction's ops are unsupported for fp64 on Neuron).
+        if (outElemTy.getIntOrFloatBitWidth() <= 32)
+          result = emitExactFloatFloor(rewriter, loc, lhs, rhs, outType);
+        else
+          result = stablehlo::FloorOp::create(rewriter, loc, result);
+      } else if (!outElemTy.isUnsignedInteger()) {
         Type defaultIntToFloatType = rewriter.getF64Type();
         lhs =
             hlo::promoteType(rewriter, op.getLoc(), lhs, defaultIntToFloatType);

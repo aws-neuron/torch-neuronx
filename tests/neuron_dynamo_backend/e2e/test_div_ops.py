@@ -25,6 +25,90 @@ ROUNDING_MODES = [
     pytest.param("floor", id="floor"),
 ]
 
+# Boundary classes cover every float dtype: the correction runs in fp32 (fp16/bf16 upcast
+# and downcast once) so it applies across all of them.
+BOUNDARY_DTYPES = DTYPES
+
+
+def _boundary_grid(dtype):
+    """Every (num, den) pair over a grid of fractional values, so many quotients land
+    exactly on / just under integer boundaries. Shared by the boundary classes below."""
+    vals = torch.arange(-16, 16, 0.5)
+    num, den = torch.cartesian_prod(vals, vals).unbind(1)
+    keep = den != 0
+    return num[keep].to(dtype), den[keep].to(dtype)
+
+
+class TestDivBoundaryE2E:
+    """div.Tensor_mode at integer-boundary quotients, for the modes the fix covers (None +
+    floor). The torch-mlir floor lowering applies an exact-boundary correction for fp32; a
+    naive floor(x/y) lands one integer off when the fp32 quotient rounds an exact boundary.
+    floor_divide / remainder have their own classes below.
+    """
+
+    @pytest.mark.parametrize("dtype", BOUNDARY_DTYPES)
+    @pytest.mark.parametrize(
+        "rounding_mode", [pytest.param(None, id="none"), pytest.param("floor", id="floor")]
+    )
+    def test_boundary(self, dtype, rounding_mode):
+        num, den = _boundary_grid(dtype)
+
+        def fn(a, b):
+            return torch.div(a, b, rounding_mode=rounding_mode)
+
+        with torch.no_grad():
+            cpu_out = fn(num, den)
+            compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+            neuron_out = compiled_fn(num.to("neuron"), den.to("neuron"))
+        if rounding_mode is None:
+            rtol, atol = (1e-2, 1e-3) if dtype in (torch.float16, torch.bfloat16) else (1e-4, 1e-5)
+            torch.testing.assert_close(neuron_out.cpu(), cpu_out, rtol=rtol, atol=atol)
+        else:
+            torch.testing.assert_close(neuron_out.cpu(), cpu_out, equal_nan=True)
+
+
+class TestFloorDivideBoundaryE2E:
+    """floor_divide at integer boundaries under compile -- fences the floor_divide decomp.
+
+    The decomposition would otherwise floor an fp32-rounded quotient, one integer off at a
+    boundary quotient; the Neuron floor lowering applies the exact-boundary correction (fp32).
+    Fails on the naive decomposition.
+    """
+
+    @pytest.mark.parametrize("dtype", BOUNDARY_DTYPES)
+    def test_boundary(self, dtype):
+        num, den = _boundary_grid(dtype)
+
+        def fn(a, b):
+            return torch.floor_divide(a, b)
+
+        with torch.no_grad():
+            cpu_out = fn(num, den)
+            compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+            neuron_out = compiled_fn(num.to("neuron"), den.to("neuron"))
+        torch.testing.assert_close(neuron_out.cpu(), cpu_out, equal_nan=True)
+
+
+class TestRemainderBoundaryE2E:
+    """remainder at integer boundaries under compile -- fences the remainder decomp.
+
+    A boundary quotient that floors one integer off shifts remainder = x - floor(x/y)*y by
+    ~y; the Neuron decomposition recovers the exact floor. Fails on the naive decomposition.
+    """
+
+    @pytest.mark.parametrize("dtype", BOUNDARY_DTYPES)
+    def test_boundary(self, dtype):
+        num, den = _boundary_grid(dtype)
+
+        def fn(a, b):
+            return torch.remainder(a, b)
+
+        with torch.no_grad():
+            cpu_out = fn(num, den)
+            compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+            neuron_out = compiled_fn(num.to("neuron"), den.to("neuron"))
+        torch.testing.assert_close(neuron_out.cpu(), cpu_out, equal_nan=True)
+
 
 class TestDivTensorModeE2E:
     """E2E tests for aten.div.Tensor_mode (tensor / tensor with rounding_mode)."""
