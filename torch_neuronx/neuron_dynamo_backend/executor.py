@@ -149,6 +149,8 @@ class Executor:
                     tensor = tensor.view(self.INT_64_TO_32[tensor.dtype])
             elif tensor.dtype == torch.float64:
                 tensor = tensor.to(torch.float32)
+            elif tensor.dtype == torch.complex128:
+                tensor = tensor.to(torch.complex64)
 
             if self.wlo_transforms:
                 for t in self.wlo_transforms:
@@ -202,7 +204,7 @@ class Executor:
         for tensor, cast_spec in zip(outputs, self.cast_spec, strict=False):
             if cast_spec.dtype in self.INT_64_TO_32:
                 tensor = tensor.view(cast_spec.dtype).reshape(cast_spec.shape)
-            elif cast_spec.dtype == torch.float64:
+            elif cast_spec.dtype == torch.float64 or cast_spec.dtype == torch.complex128:
                 tensor = tensor.to(cast_spec.dtype)
             tensors.append(tensor)
 
