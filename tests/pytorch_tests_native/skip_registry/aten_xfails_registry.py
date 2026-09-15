@@ -37,6 +37,19 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "[platform.float64] Neuron has no native float64; the dispatch layer"
+            " downcasts float64 to float32 (DispatchUtils CastTarget). The float64"
+            " forward runs in float32 and still meets the test tolerance, so it"
+            " passes. Only the backward gradient misses the float64 reference on"
+            " precision. xfail (not skip): the op runs, so a future float64 story"
+            " would xpass and flag it."
+        ),
+        tests=[
+            "test_decomp.py::TestDecompNEURON::test_quick_core_backward_logaddexp2_neuron_float64",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "these are @unittest.expectedFailure"
             " upstream but run on Neuron. The expected failure no longer occurs and"
             " unittest reports an Unexpected success. xfailing so the test"

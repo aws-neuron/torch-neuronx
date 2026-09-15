@@ -67,6 +67,15 @@ _LN2_HI, _LN2_LO = _cody_waite_split(math.log(2.0), 2)
 # past 1. Measured at x=1: Taylor 8.0e-08, exp 1.0e-07.
 _SINH_TAYLOR_LIMIT = 1.0
 
+# expm1 near 0: exp(x) - 1 cancels; below this |x| use the Taylor series. Above
+# it the reduced exp is accurate. Both stay under the fp32 tolerance at 0.35.
+_EXPM1_TAYLOR_LIMIT = 0.35
+
+# expm1 large negative: below this x, exp(x) is 0 to float precision, so
+# expm1(x) = -1. Saturate here to skip the range reduction, which returns nan for
+# very negative x (2**k underflows to 0 and exp(r) is non-finite).
+_EXPM1_NEG_SATURATE = -40.0
+
 
 def _exp_reduced(x, exp_bias=0):
     """Accurate exp(x) * 2**exp_bias, sidestepping the hardware exp unit.
@@ -326,6 +335,78 @@ def torch_atanh(x, out=None):
 )
 def torch_exp(x, out=None):
     return torch.exp(x)
+
+
+def _expm1_accurate(x):
+    """exp(x) - 1 over the accurate reduced exp; Taylor near zero.
+
+    The hardware exp has ~1e-05 relative error, so exp(x) - 1 misses the fp32
+    tolerance. Use the range-reduced exp instead (see _exp_reduced, ~7e-08).
+    Near zero exp(x) - 1 cancels catastrophically, so small inputs use the
+    Taylor series expm1(x) = x + x**2/2! + x**3/3! + ... instead.
+
+    This helper calls no torch.expm1, so the torch.compile decomposition that
+    reuses it (expm1_decomp in decompositions.py) does not recurse. Both paths
+    share this one implementation. Compute fp16/bf16 in float32 for accuracy.
+    """
+    # Integer and bool inputs promote to the default float dtype, matching CPU.
+    if not x.is_floating_point():
+        x = x.to(torch.get_default_dtype())
+    orig_dtype = x.dtype
+    if orig_dtype in (torch.float16, torch.bfloat16):
+        x = x.float()
+    large = _exp_reduced(x) - 1.0
+    series = x * (
+        1.0 + x * (0.5 + x * (1 / 6 + x * (1 / 24 + x * (1 / 120 + x * (1 / 720 + x / 5040)))))
+    )
+    computed = torch.where(x.abs() < _EXPM1_TAYLOR_LIMIT, series, large)
+    # Large negative x: exp(x) is 0 to float precision, so expm1(x) = -1. Saturate
+    # before the range reduction reaches it: for very negative x, 2**k underflows
+    # to 0 while the corrupted reduced argument makes exp(r) non-finite, so
+    # _exp_reduced returns 0 * inf = nan. -40 is far above that (exp(-40)~4e-18,
+    # negligible for every float dtype) and far below the underflow region.
+    computed = torch.where(x < _EXPM1_NEG_SATURATE, torch.full_like(x, -1.0), computed)
+    # Non-finite inputs: expm1(+inf)=+inf, expm1(-inf)=-1, expm1(nan)=nan. A
+    # finite overflow already yields +inf through 2**k, and nan propagates.
+    computed = torch.where(x == float("-inf"), torch.full_like(x, -1.0), computed)
+    computed = torch.where(x == float("inf"), torch.full_like(x, float("inf")), computed)
+    # A nan input must stay nan. On Neuron the large-negative `<` compare above can
+    # read a nan as true, so the saturate can turn nan into -1. Restore nan last.
+    computed = torch.where(torch.isnan(x), x, computed)
+    if orig_dtype in (torch.float16, torch.bfloat16):
+        computed = computed.to(orig_dtype)
+    return computed
+
+
+@register_aten(
+    ["aten::expm1", "aten::expm1.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
+def torch_expm1(x, out=None):
+    # Call the aten op so make_fx reuses the registered expm1 decomposition
+    # (expm1_decomp -> _expm1_accurate); both paths share the one helper.
+    return torch.ops.aten.expm1(x)
+
+
+def _validate_expm1_inplace(self):
+    """Reject an integer or bool in-place expm1_.
+
+    expm1 promotes an integer input to float, but the in-place variant must
+    store the result back into self. The Neuron dispatch path skips PyTorch's
+    structured-kernel guard, so check here. CPU raises the same error.
+    """
+    if not self.is_floating_point():
+        expected = torch.get_default_dtype()
+        raise RuntimeError(
+            f"result type {expected} can't be cast to the desired output type {self.dtype}"
+        )
+
+
+@register_aten(["aten::expm1_"], validate_static_inputs=_validate_expm1_inplace)
+def torch_expm1_(self):
+    # Same as torch_expm1: call the aten op so make_fx reuses the registered
+    # expm1 decomposition. The in-place path writes the result back into self.
+    return torch.ops.aten.expm1(self)
 
 
 @register_aten(

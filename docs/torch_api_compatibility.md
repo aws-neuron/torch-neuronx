@@ -182,7 +182,7 @@
 |175|torch.erfinv|Y|Native MLIR impl (polynomial approximation)|
 |176|torch.exp|Y|Native MLIR impl|
 |177|torch.exp2|Y|Native MLIR impl|
-|178|torch.expm1|CPU_FALLBACK|aten::expm1 not registered|
+|178|torch.expm1|Y|Native MLIR impl|
 |179|torch.fake_quantize_per_channel_affine|CPU_FALLBACK|Quantization not supported|
 |180|torch.fake_quantize_per_tensor_affine|CPU_FALLBACK|Quantization not supported|
 |181|torch.fix|Y|Alias for trunc; native MLIR impl|
@@ -202,7 +202,7 @@
 |195|torch.log1p|Y|Native MLIR impl|
 |196|torch.log2|Y|Native MLIR impl|
 |197|torch.logaddexp|CPU_FALLBACK|aten::logaddexp not registered|
-|198|torch.logaddexp2|CPU_FALLBACK|aten::logaddexp2 not registered|
+|198|torch.logaddexp2|Y|Native MLIR impl|
 |199|torch.logical_and|Y|Native MLIR impl|
 |200|torch.logical_not|Y|Native MLIR impl|
 |201|torch.logical_or|Y|Native MLIR impl|
@@ -1098,8 +1098,8 @@
 |175|Tensor.erfinv_|Y/CPU_FALLBACK|erf/erfinv native; erfc falls back|
 |176|Tensor.exp|Y|Native MLIR impl / In-place|
 |177|Tensor.exp_|Y|Native MLIR impl / In-place|
-|178|Tensor.expm1|CPU_FALLBACK|Falls back to CPU (aten::expm1.out)|
-|179|Tensor.expm1_|CPU_FALLBACK|Falls back to CPU (aten::expm1.out)|
+|178|Tensor.expm1|Y|Native MLIR impl|
+|179|Tensor.expm1_|Y|Native MLIR impl|
 |180|Tensor.expand|Y|View operation, no copy|
 |181|Tensor.expand_as|Y|View operation, no copy|
 |182|Tensor.exponential_|CPU_FALLBACK|No native Neuron impl|
@@ -1211,7 +1211,7 @@
 |288|Tensor.log2_|Y|Native MLIR impl / In-place|
 |289|Tensor.log_normal_|CPU_FALLBACK|No native Neuron impl|
 |290|Tensor.logaddexp|CPU_FALLBACK|No native Neuron impl|
-|291|Tensor.logaddexp2|CPU_FALLBACK|No native Neuron impl|
+|291|Tensor.logaddexp2|Y|Native MLIR impl|
 |292|Tensor.logsumexp|CPU_FALLBACK|No native Neuron impl|
 |293|Tensor.logical_and|Y|Native MLIR impl / In-place|
 |294|Tensor.logical_and_|Y|Native MLIR impl / In-place|
