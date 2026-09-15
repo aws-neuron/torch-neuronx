@@ -11,7 +11,7 @@ generalize get promoted here by the retro (Reflection) subagent.
   that op's PR body, not here.
 - **Format:** one `### <short title>` per lesson, then ≤ 5 lines:
   *symptom → root cause → fix pattern*. No transcripts, no op-by-op logs.
-- **Size budget: ≤ 40 lessons / ≤ 200 lines.** When full, the retro must
+- **Size budget: ≤ 40 lessons / ≤ 300 lines.** When full, the retro must
   dedup/merge overlapping lessons or prune the lowest-value / superseded ones —
   it may **not** just append. Report what was pruned.
 - **Reviewable commits only.** Lesson edits land as a normal commit for human
@@ -56,13 +56,55 @@ a plain numeric arg was marked static though it only feeds arithmetic (changes t
 numbers, not the graph). Fix: mark static ONLY if it changes output shape or lets
 the compiler specialize (`pow`'s exponent, `alpha`, `rounding_mode`); pass a scalar
 operand (`pow.Scalar`'s base, #1670) as a 0-d runtime tensor, like `mul.Scalar`.
+`linspace`'s `start`/`end` are the same case. Only `steps` sets the shape, so keep
+`start`/`end` runtime. Be ready to show an example HLO; a reviewer asks why an arg is
+static (runtime bounds give one reusable NEFF, static bounds constant-fold per value).
+A POSITIONAL Scalar marked static does NOT enter the NEFF cache key (the cache key
+honors `kwarg_only` args only), so two values silently reuse one stale NEFF (celu
+`alpha`, leaky_relu `negative_slope`). Use `static_argnums` (positional), not
+`static_argnames`, for a positional graph-changing arg.
 
-### One decorator for functional + `.out`; no `output_params` for a single `out`
-Symptom: a separate `_out` function with `output_params=("out",)` (#1579). Root
-cause: the C++ `register_aten` path already aliases `out=` and keeps its dtype, so
-`output_params` is a no-op. Fix: fold functional + `.out` into one decorator
-(addcmul/div/lerp); reserve `output_params` for multi-output/non-`out` names or
-`@neuron_op` ops; split overloads only for differing static args.
+### One decorator for functional + `.out`; call the aten op, never inline the ref
+Symptom: a separate `_out` function with `output_params=("out",)` (#1579), or an
+`out.copy_(<op>_ref(...))` inside `register_decomposition([aten.<op>.out])`, or a
+lowering body that returns `<op>_ref(a, b)` (#1775, repeated). Root cause: the
+`register_aten` path and the decomp table already handle `out=` OUTSIDE the lowering
+(alias or copy), so a hand-written `out.copy_` is redundant and a separate `_out`
+is dead weight. Fix: fold functional + `.out` into one decorator/decomposition; in
+the body call the aten op (`torch.ops.aten.<op>`, like `ldexp`/`rsub`) so `make_fx`
+reuses the ONE registered decomposition; reserve `output_params` for multi-output/
+non-`out` names or `@neuron_op` ops; split overloads only for differing static args. An UNRAISED
+`out=` unsafe-cast error is usually a missing opt-in, not a platform gap: pass
+`validate_static_inputs=_validate_float_promoting_out` like the siblings before you
+xfail "RuntimeError not raised" (`TensorIterator` uses `canCast`; the matmul family
+needs an exact match, so do not over-generalize the guard).
+
+### Comment the op-specific "why", not a mechanism common to every op
+Symptom: a per-op docstring restates behavior shared by all handlers, for example
+"call the aten op so make_fx reuses the registered decomposition" or "Neuron has
+no native fp64, so a double input runs as fp32" (#1807 logaddexp). Root cause:
+decomposition routing (`torch.ops.aten.<op>`, like ldexp/rsub) and the fp64->fp32
+widening (gotcha #3) apply to every op, so a per-handler repeat is noise a
+reviewer removes. Fix: keep only the op-specific note (what the op computes, an
+op-specific NaN/edge-case rule, a shape-guard reason); drop any comment about
+behavior common across ops, especially the generic fp64/dtype-widening note.
+
+### A CompositeImplicitAutograd op needs no backend registration; never double-register
+Symptom: a `@register_aten` added for a CompositeImplicitAutograd op (selu), plus a
+second `torch.autograd.Function` stacked on the same op (#1810). Root cause: a
+composite op decomposes to lowered primitives and runs on Neuron with no CPU
+fallback, so the registration is unnecessary; two registrations for one op are
+redundant. Fix: register only to attach a custom backward, and then use ONE
+`autograd.Function` modeled on `_CrossEntropyAutograd` in `loss.py`. First confirm
+the op actually reaches the backend (op tracking on main) before registering it.
+
+### Add op tests to the family file, not a new per-op file
+Symptom: a new `test_<op>.py` per op (elu/selu, #1810), a repeat reviewer rejection.
+Root cause: the skill's old example named `tests/python_ops/test_<op>.py`, so agents
+made a file per op. Fix: add a row to the existing family file (unary/activation ->
+`test_unary_elementwise_ops.py` `POINTWISE_OPS`/`UNARY_OPS_LIST`; binary -> its
+`test_<family>` file). `grep -rn "aten::<sibling>" tests/python_ops/` to find it. A
+new file is for a genuinely new family only.
 
 ### float64/double is a known platform limit — recognize it fast, never chase it
 Symptom: an on-device suite hangs for tens of minutes on `*_float64`/`*_double`
@@ -70,6 +112,9 @@ Symptom: an on-device suite hangs for tens of minutes on `*_float64`/`*_double`
 fp64; emulation compiles pathologically slowly. It is allowlisted, not a bug. Fix:
 xfail the fp64 variants with the float64 reason; never escalate timeouts. When you
 remove a blanket "unimplemented" skip, re-add a NARROW fp64 xfail (incl. `test_dtypes`).
+Wording: a double input is **downcast to fp32, computed, then cast back** — it does
+NOT "fall back to CPU" (#1775). Never write "fp64 falls back to CPU" in a docstring,
+comment, or reviewer reply; that is a recurring mischaracterization.
 
 ### Escalating the timeout on a re-run is a failure signal, not progress (watchdog)
 Symptom: an Implementer re-runs one on-device step for hours, bumping `--timeout`
@@ -140,3 +185,90 @@ run passed. Root cause: the per-op run uses `-k <op>`, which deselects every
 whole-registry snapshot test whose name lacks the op string. Fix: after any
 decomposition registration or `py_kernels` pop/repoint, run `HasDecompTest`
 unfiltered (CPU-only); then narrow the surgery or add a documented xfail.
+
+### A tensor factory `out=` must handle a strided target and bind zero inputs
+Symptom: `linspace(..., out=strided_view)` wrote values contiguously (wrong memory), or
+crashed `input address count (1) != argument count (0)`. Root cause: the shared `out=`
+path resized before the `is_contiguous()` check (flattening the view), and a factory NEFF
+has empty `kept_input_indices`, so the write-aliased `out=` leaked in as a phantom input.
+Fix: resize only inside the contiguity guard and scatter by stride; drop write-aliased
+args in the empty-kept branch (they bind on the output side). Covers linspace/arange/
+zeros/ones/eye/full; add C++ coverage for both the strided and the zero-input case.
+
+### Do not add ops to mask a compiler inf/nan bug — xfail and file a ticket
+Symptom: a `torch.where`/mask added to fix a wrong `inf`/`nan` on device. Root cause:
+two different situations get conflated. Fix: FIRST check the CPU oracle. If CPU
+`torch.<op>` special-cases the value (e.g. `logaddexp2` returns `inf` for `inf`+`inf`,
+which the formula gives as `nan`, #1775), the correcting op MATCHES the reference. Keep
+it, and comment it as reference-matching. If instead Neuron is wrong where CPU is right and
+your math is sound, it is a neuronx-cc bug: do NOT mask it. xfail the case, note the
+compiler-ticket follow-up in the PR body, and package a repro with `compiler-artifact-repro`
+(see hardtanh/hardshrink/relu6 in #1810). Alert the human; never silently paper over it.
+Before you ticket, CONFIRM the divergence with an on-device probe against the CPU
+oracle: a wrong-looking torch-mlir decomp is not a bug if a native lowering shadows
+it (leaky_relu_backward). Reconstructing an op's DEFINED value is reference-matching,
+not masking (hypot re-adds the nan/inf that Neuron `maximum` drops).
+
+### Complex is a platform limit: raise on it; a raise-only reference call is not dead code
+Symptom: a reviewer flags a `torch.<op>(...)` call that only raises (no return or assign)
+as a dead "partial fix" and asks to remove it (#789 linspace). Root cause: an upstream
+test asserts the op's EXACT error for a complex input with a real dtype
+(`assertRaisesRegex(..., r"torch.linspace\(\): inferred dtype")`). Fix: raise on complex,
+never half-support it, but check the upstream assertion FIRST. Reproduce the exact
+reference error by delegating to `torch.<op>` (or reuse `RaiseComplexFallbackDisabled`
+when the generic message matches). Skip only the test that wants a complex OUTPUT
+(`test_linspace_deduction`); never skip a whole real test to dodge one complex sub-check.
+
+### Assert (no-)recompilation with cache stats, not wall-clock
+Symptom: a test timed a second call to prove "no recompile", which is flaky and slow. Root cause:
+wall-clock conflates compile time with noise. Fix: assert on the compilation cache with
+`kernel_cache_size()` / `_get_compilation_cache_stats()` (see `test_addxmul_div.py`). A
+new distinct static value grows the cache; a runtime value does not. This is the robust
+signal for a `static_argnums` choice.
+
+### Put dtype promotion in the shared decomposition, not the register_aten handler
+Symptom: an op works in eager but crashes under `torch.compile` on a bool/int input
+("Negation on a bool tensor is not supported", `special_i0e`). Root cause: the handler
+ran the promotion, but the compile path calls the registered decomposition DIRECTLY and
+skips the handler. Fix: promote inside the decomposition (use `torch.result_type` across
+ALL operands, or `_promote_integral`); test the COMPILE path on bool and int, not eager.
+
+### One handler per overload; never fold functional and in-place together
+Symptom: the in-place `<op>_` returned a NEW tensor instead of writing `self` (xlogy).
+Root cause: functional and in-place overloads were stacked on one handler. Fix: give the
+in-place overload its own handler that writes and returns `self`, and that does NOT
+promote dtype; fold only functional + `.out` on the single decorator (see that lesson).
+
+### Delete an inherited xfail your lowering now fixes; accumulate half in fp32
+Symptom: after a lowering lands, an inherited precision/`*_float64` xfail turns XPASS and
+blocks acceptance; or a half-precision elementwise op drifts 1-2 ULP in a layout test.
+Root cause: a stale xfail the new on-device path now passes, and half math accumulated in
+half. Fix: grep siblings for the xfail and DELETE it when the lowering fixes it (an XPASS
+is a gating fail); accumulate half-precision elementwise in fp32, then cast back.
+
+### Preflight the worktree: fresh `.so`, linked test trees, sane collection
+Symptom: every `torch.compile` fails with an unrelated error though eager works; or
+`test_ops.py` collects 0 with `cannot import get_unsupported_dtypes_for_device`; or a
+`collected=0`/exit 5 run reads as PASS. Root cause: a stale `_C.so` older than `csrc/`
+(breaks ONLY compile), the gitignored vendored trees `tests/pytorch_tests_native/{torch,
+test}` missing from the worktree, a `PRIVATEUSE1` nodeid suffix, or one uncollectable
+nodeid zeroing the whole collection. Fix: assert `_C.so` newer than the merge-base and run
+the `'wlo' in compile_graph.__doc__` check; symlink the two vendored trees into every
+worktree; normalize `PRIVATEUSE1`->`NEURON`; treat `collected=0`/exit 5 as INCONCLUSIVE
+(INFRA_RETRY), never a pass; never `find /` for a test file (it finds a stranger's tree).
+
+### A doc or non-code fork must not touch code, build, or the device
+Symptom: a subagent spawned for a docs/analysis task inherited the parent context,
+role-played the parent, rebuilt, and held the device. Root cause: a fork inherits the full
+conversation and can drift into the parent's role. Fix: scope a non-code fork explicitly
+("edit docs only; do not build, run tests, or touch `/dev/neuron*`"); diff a suspect
+agent's edits against HEAD before you trust them.
+
+### New ops go on the C++ dispatch path, never `python_dispatch=True`
+Symptom: an op onboards with `python_dispatch=True`. Root cause: that flag runs
+preprocessing AND execution in Python and holds the GIL for both, so it hurts perf;
+it is deprecated and goes away. Fix: register on the C++ dispatch path (a plain
+`@register_aten`). For preprocessing that reads a tensor value (an output size, a
+static arg), use `relower_every_call=True` with `preprocessing=` (PR #1065) —
+execution stays in C++ and the HLO/NEFF cache still applies. Reject a new op that
+uses `python_dispatch=True`.

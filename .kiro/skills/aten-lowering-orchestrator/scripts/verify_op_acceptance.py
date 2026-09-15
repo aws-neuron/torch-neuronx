@@ -20,7 +20,11 @@ Two subcommands:
   verify --op aten::<op> [artifact flags] --out verdict.json
       Grade one op against the gating criteria and emit a verdict. Exit code:
       0 = PASS, 1 = FAIL, 2 = INFRA_RETRY (a suspected infrastructure flake the
-      orchestrator should re-run once before trusting), 3 = usage error.
+      orchestrator should re-run once before trusting), 3 = usage error,
+      4 = REVIEW (every hard check is OK, but a new skip/xfail reason is not on
+      the auto-accept allowlist and needs a human sign-off at the PR). The
+      orchestrator opens the draft PR on PASS or REVIEW; REVIEW adds the
+      "Xfails needing human sign-off" list to the PR body.
 
 GATING criteria (block a PR from being marked ready):
   * upstream       -- every op-relevant upstream test passes (no failure, no
@@ -29,9 +33,13 @@ GATING criteria (block a PR from being marked ready):
                       failure) and newly-skipped tests vs baseline. The workflow
                       does not produce that baseline, so the --runxfail leg is
                       advisory and the registry check gates new skip/xfails.
-  * registry       -- no new skip/xfail entry whose reason is not on the
-                      platform-limitation allowlist; the op does not remain
-                      matched by a non-allowlisted skip/xfail group.
+  * registry       -- a new skip/xfail is auto-accepted only if its reason is on
+                      the allowlist. A non-allowlisted reason is a FAIL, UNLESS
+                      it cites a real precedent inline ("precedent: <existing
+                      reason or nodeid>") -- then it is REVIEW (human signs off
+                      at the PR), not a mid-run stop. A reason matching the
+                      "Not allowed" deny patterns is always a FAIL; no precedent
+                      rescues it.
   * dispatch       -- eager vertical coverage status == runs_on_neuron (no
                       fallback).
   * correctness    -- eager vertical coverage correctness_test == pass. A genuine
@@ -108,12 +116,20 @@ from pathlib import Path
 PASS = "PASS"
 FAIL = "FAIL"
 INFRA_RETRY = "INFRA_RETRY"
+# REVIEW = the op is clean on every hard check, but it introduces a skip/xfail
+# whose reason is NOT on the auto-accept allowlist yet cites a real existing
+# precedent. It is not a FAIL: the orchestrator opens the draft PR and a human
+# adjudicates the reason at review time. This stops the agent from stopping
+# mid-run to ask, while keeping it unable to self-approve a new reason.
+REVIEW = "REVIEW"
 
 # Per-check status values.
 OK = "ok"
 FAILED = "failed"
 NOT_PROVIDED = "not_provided"
 INFRA = "infra"
+# NEEDS_REVIEW = non-blocking, needs a human at the PR (see REVIEW above).
+NEEDS_REVIEW = "needs_review"
 
 # Signatures in a test's longrepr/message that indicate environment skew rather
 # than a real defect (see pytorch-upstream-test-debugger: stale overlay, etc.).
@@ -161,6 +177,10 @@ class Verdict:
         elif any(c.status == NOT_PROVIDED and not strict_missing for c in gating):
             # A missing gating measurement is a blocking gap, not a pass.
             self.verdict = FAIL
+        elif any(c.status == NEEDS_REVIEW for c in gating):
+            # Every hard check is OK; only a human sign-off on a new xfail reason
+            # is outstanding. Non-blocking: the draft PR still opens.
+            self.verdict = REVIEW
         else:
             self.verdict = PASS
         return self.verdict
@@ -230,6 +250,35 @@ def _op_keyword_matches(nodeid: str, op: str) -> bool:
         if idx != -1 and optoken[idx:] != f"{ns}_{bn}":
             return False
     return True
+
+
+def _load_nodeid_set(path: str) -> set[str]:
+    """Read explicit test nodeids, one per line. Skip blank and comment lines."""
+    out: set[str] = set()
+    with open(path) as fh:
+        for ln in fh:
+            s = ln.strip()
+            if s and not s.startswith("#"):
+                out.add(s)
+    return out
+
+
+def _upstream_selector(args, op):
+    """Return a predicate that selects the op-relevant tests in an upstream report.
+
+    Default: the `_op_keyword_matches` heuristic. It needs the aten base name to be
+    the OpInfo/test name. When `--upstream-match-nodeids` is given, match against
+    that EXPLICIT reviewed nodeid set instead. Use it for an op whose test name
+    differs from the aten name (upsample_trilinear3d vs interpolate, grid_sampler_2d
+    vs grid_sample, max_pool2d_with_indices vs max_pool2d). This does NOT relax a
+    pass rule: the selected tests must still all pass (no failure, no XPASS). It only
+    fixes which tests count as this op's. The set MUST come from the collect-only step.
+    """
+    explicit = getattr(args, "upstream_match_nodeids", None)
+    if explicit:
+        ids = _load_nodeid_set(explicit)
+        return lambda nid: nid.strip() in ids
+    return lambda nid: _op_keyword_matches(nid, op)
 
 
 # ---------------------------------------------------------------------------
@@ -366,26 +415,59 @@ def _reason_allowed(reason: str, patterns: list[str]) -> bool:
     return False
 
 
-def _load_allowlist(path: str) -> list[str]:
-    """Parse allowlist patterns from a markdown file.
-
-    Patterns are the text of `- ` bullet lines that appear AFTER a heading
-    containing the word 'Allowed'. Everything else (prose, examples under a
-    'Not allowed' heading) is ignored.
-    """
+def _load_bullet_patterns(path: str, want_heading: str, reject_heading: str) -> list[str]:
+    """Parse the leading `\\`pattern\\`` of every `- ` bullet under a heading that
+    contains `want_heading` (and not `reject_heading`). A bullet with no leading
+    backtick pattern is ignored (it is prose, not a machine pattern)."""
     patterns: list[str] = []
     active = False
     for line in Path(path).read_text().splitlines():
         s = line.strip()
         if s.startswith("#"):
-            active = "allowed" in s.lower() and "not allowed" not in s.lower()
+            low = s.lower()
+            active = want_heading in low and reject_heading not in low
             continue
         if active and s.startswith("- "):
-            # strip a leading `pattern:` label and surrounding backticks
-            body = s[2:].strip()
-            m = re.match(r"^`([^`]+)`", body)
-            patterns.append(m.group(1) if m else body)
+            m = re.match(r"^`([^`]+)`", s[2:].strip())
+            if m:
+                patterns.append(m.group(1))
     return patterns
+
+
+def _load_allowlist(path: str) -> list[str]:
+    """Auto-accept reasons: bullets under the 'Allowed' heading (not 'Not allowed')."""
+    return _load_bullet_patterns(path, "allowed", "not allowed")
+
+
+def _load_denylist(path: str) -> list[str]:
+    """Hard-deny reasons: bullets under the 'Not allowed' heading. A reason that
+    matches one of these is a FAIL that no precedent citation can rescue."""
+    return _load_bullet_patterns(path, "not allowed", "\x00never-match\x00")
+
+
+# A non-allowlisted reason may reach REVIEW (not FAIL) only if it cites a real
+# precedent inline, e.g. "... precedent: aten::erf test_reference_numerics".
+_PRECEDENT_RE = re.compile(r"precedent:\s*(.+?)\s*$", re.IGNORECASE)
+
+
+def _cited_precedent(reason: str) -> str:
+    m = _PRECEDENT_RE.search(reason or "")
+    return m.group(1).strip().lower() if m else ""
+
+
+def _precedent_exists(citation: str, baseline_groups: list[dict]) -> bool:
+    """The cited text must appear in an EXISTING baseline group's reason or one
+    of its test entries. This confirms the sibling xfail is real, not invented."""
+    if not citation:
+        return False
+    for g in baseline_groups:
+        if citation in (g.get("reason") or "").lower():
+            return True
+        for fld in ("tests", "patterns", "folders"):
+            for e in g.get(fld, []):
+                if citation in str(e).lower():
+                    return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +490,8 @@ def check_upstream(v: Verdict, op: str, args) -> None:
         v.add(Check("upstream", True, INFRA, f"cannot read report: {e}"))
         return
 
-    tests = [t for t in _report_tests(rep) if _op_keyword_matches(t.get("nodeid", ""), op)]
+    select = _upstream_selector(args, op)
+    tests = [t for t in _report_tests(rep) if select(t.get("nodeid", ""))]
     if not tests:
         v.add(
             Check(
@@ -450,6 +533,29 @@ def check_upstream(v: Verdict, op: str, args) -> None:
         )
         return
 
+    # No passing witness: the op has tests but not one PASSED, and at least one
+    # is skipped. A skip means the test never ran -- the op is still listed in
+    # aten_unimplemented_ops_skips_registry (or another skip group), so the pod
+    # never enabled its tests. A skipped test is not a passing test; do not count
+    # it as coverage. This needs no baseline: the op the pod claims to lower is
+    # exactly the op whose skip must be gone. (An all-xfail op with 0 passes is a
+    # different case; the registry and --runxfail legs gate that.)
+    passed = [t for t in tests if _test_outcome(t) in _PASSED]
+    skipped = [t for t in tests if _test_outcome(t) == "skipped"]
+    if not passed and skipped:
+        v.add(
+            Check(
+                "upstream",
+                True,
+                FAILED,
+                f"{len(skipped)}/{len(tests)} op-relevant tests are skipped and 0 "
+                "passed -- the op is still in the skip registry. Remove its pattern "
+                "from aten_unimplemented_ops_skips_registry.py to enable the tests.",
+                [t["nodeid"] for t in skipped[:20]],
+            )
+        )
+        return
+
     # --runxfail leg: the same op tests must not fail when xfails are forced to
     # run. This catches a candidate that xfailed a genuinely-failing test.
     #
@@ -465,7 +571,7 @@ def check_upstream(v: Verdict, op: str, args) -> None:
         except Exception as e:
             v.add(Check("upstream", True, INFRA, f"cannot read runxfail report: {e}"))
             return
-        rx = [t for t in _report_tests(repx) if _op_keyword_matches(t.get("nodeid", ""), op)]
+        rx = [t for t in _report_tests(repx) if select(t.get("nodeid", ""))]
         rx_failed = [t for t in rx if _test_outcome(t) in _FAILEDLIKE]
         base_passed_ids: set[str] = set()
         if args.baseline_upstream_report:
@@ -474,7 +580,7 @@ def check_upstream(v: Verdict, op: str, args) -> None:
                 base_passed_ids = {
                     t["nodeid"]
                     for t in _report_tests(_b)
-                    if _test_outcome(t) in _PASSED and _op_keyword_matches(t.get("nodeid", ""), op)
+                    if _test_outcome(t) in _PASSED and select(t.get("nodeid", ""))
                 }
             except Exception:
                 base_passed_ids = set()
@@ -521,7 +627,7 @@ def check_upstream(v: Verdict, op: str, args) -> None:
         base_passed = {
             t["nodeid"]
             for t in _report_tests(base)
-            if _test_outcome(t) in _PASSED and _op_keyword_matches(t.get("nodeid", ""), op)
+            if _test_outcome(t) in _PASSED and select(t.get("nodeid", ""))
         }
         cand_silenced = {t["nodeid"] for t in tests if _test_outcome(t) in _SKIPLIKE}
         newly_silenced = sorted(base_passed & cand_silenced)
@@ -558,6 +664,7 @@ def check_registry(v: Verdict, op: str, args) -> None:
         v.add(Check("registry", True, NOT_PROVIDED, "need --candidate-registry and --allowlist"))
         return
     patterns = _load_allowlist(args.allowlist)
+    deny = _load_denylist(args.allowlist)
     cand = json.loads(Path(args.candidate_registry).read_text())
     base = json.loads(Path(args.baseline_registry).read_text()) if args.baseline_registry else []
 
@@ -566,12 +673,25 @@ def check_registry(v: Verdict, op: str, args) -> None:
     for g in base:
         base_keys |= _group_entry_keys(g)
 
+    # A new, non-allowlisted xfail is classified three ways:
+    #   deny match          -> hard FAIL (a precedent cannot rescue it)
+    #   valid precedent cite -> REVIEW (human signs off at the PR)
+    #   otherwise            -> FAIL (as before)
     new_bad: list[str] = []
+    new_review: list[str] = []
     for g in cand:
         new_entries = _group_entry_keys(g) - base_keys
-        if new_entries and not _reason_allowed(g["reason"], patterns):
-            for kind, fld, e in sorted(new_entries):
-                new_bad.append(f"[{kind}:{fld}] {e!r}  reason={g['reason']!r}")
+        if not new_entries or _reason_allowed(g["reason"], patterns):
+            continue
+        entries = [
+            f"[{kind}:{fld}] {e!r}  reason={g['reason']!r}" for kind, fld, e in sorted(new_entries)
+        ]
+        if _reason_allowed(g["reason"], deny):
+            new_bad.extend(entries)
+        elif _precedent_exists(_cited_precedent(g["reason"]), base):
+            new_review.extend(entries)
+        else:
+            new_bad.extend(entries)
 
     if new_bad:
         v.add(
@@ -579,9 +699,23 @@ def check_registry(v: Verdict, op: str, args) -> None:
                 "registry",
                 True,
                 FAILED,
-                f"{len(new_bad)} new skip/xfail entr(y/ies) with a reason not "
-                "on the platform-limitation allowlist",
+                f"{len(new_bad)} new skip/xfail entr(y/ies) with a reason not on the "
+                "allowlist and not backed by a real precedent (cite one with "
+                "'precedent: <existing reason or nodeid>' to route it to REVIEW)",
                 new_bad[:20],
+            )
+        )
+        return
+
+    if new_review:
+        v.add(
+            Check(
+                "registry",
+                True,
+                NEEDS_REVIEW,
+                f"{len(new_review)} new skip/xfail entr(y/ies) cite a precedent but are "
+                "not on the auto-accept allowlist -- a human must sign off at the PR",
+                new_review[:20],
             )
         )
         return
@@ -594,16 +728,28 @@ def check_registry(v: Verdict, op: str, args) -> None:
     # groups with at least one entry not already in the baseline registry.
     if args.op_nodeids:
         new_groups = [g for g in cand if (_group_entry_keys(g) - base_keys)] if base else cand
-        left = _op_still_skipped(op, new_groups, patterns, args.op_nodeids)
-        if left:
+        blocked, review = _op_still_skipped(op, new_groups, patterns, deny, base, args.op_nodeids)
+        if blocked:
             v.add(
                 Check(
                     "registry",
                     True,
                     FAILED,
-                    f"{len(left)} op test(s) still matched by a "
-                    "non-allowlisted skip/xfail group",
-                    left[:20],
+                    f"{len(blocked)} op test(s) still matched by a "
+                    "non-allowlisted skip/xfail group with no valid precedent",
+                    blocked[:20],
+                )
+            )
+            return
+        if review:
+            v.add(
+                Check(
+                    "registry",
+                    True,
+                    NEEDS_REVIEW,
+                    f"{len(review)} op test(s) matched by a precedent-cited "
+                    "skip/xfail group -- a human must sign off at the PR",
+                    review[:20],
                 )
             )
             return
@@ -611,27 +757,40 @@ def check_registry(v: Verdict, op: str, args) -> None:
     v.add(Check("registry", True, OK, "no new non-allowlisted skip/xfail entries"))
 
 
-def _op_still_skipped(op, cand_groups, patterns, nodeids_file) -> list[str]:
-    """Return op nodeids still matched by a non-allowlisted group.
+def _op_still_skipped(op, cand_groups, patterns, deny, base, nodeids_file):
+    """Classify op nodeids matched by a non-allowlisted group.
 
-    Reuses the repo's own matcher via a lightweight re-implementation of the
-    contiguous-subsequence rule so this stays torch-free and self-contained.
+    Returns (blocked, review): `blocked` = matched by a deny group or a group
+    with no valid precedent (hard FAIL); `review` = matched only by a group that
+    cites a real precedent (human sign-off at the PR). Reuses the repo's matcher
+    via a lightweight re-implementation of the contiguous-subsequence rule so
+    this stays torch-free and self-contained.
     """
     nodeids = [
         ln.strip()
         for ln in Path(nodeids_file).read_text().splitlines()
         if ln.strip() and _op_keyword_matches(ln.strip(), op)
     ]
-    left = []
+    blocked, review = [], []
     for nid in nodeids:
         parts = nid.replace("/", "::").split("::")
+        review_only = False
         for g in cand_groups:
             if _reason_allowed(g["reason"], patterns):
                 continue
-            if _matches_group(g, nid, parts):
-                left.append(nid)
-                break
-    return left
+            if not _matches_group(g, nid, parts):
+                continue
+            if not _reason_allowed(g["reason"], deny) and _precedent_exists(
+                _cited_precedent(g["reason"]), base
+            ):
+                review_only = True
+                continue
+            blocked.append(nid)
+            review_only = False
+            break
+        if review_only:
+            review.append(nid)
+    return blocked, review
 
 
 def _matches_group(g: dict, nodeid: str, parts: list[str]) -> bool:
@@ -665,10 +824,11 @@ def _op_gradient_tests_passed(op: str, args) -> tuple[int, int]:
         rep = _load_json_report(args.upstream_report)
     except Exception:
         return (0, 0)
+    select = _upstream_selector(args, op)
     grad = [
         t
         for t in _report_tests(rep)
-        if _op_keyword_matches(t.get("nodeid", ""), op) and "grad" in t.get("nodeid", "").lower()
+        if select(t.get("nodeid", "")) and "grad" in t.get("nodeid", "").lower()
     ]
     return (len(grad), sum(1 for t in grad if _test_outcome(t) in _PASSED))
 
@@ -1158,7 +1318,7 @@ def cmd_verify(args) -> int:
         Path(args.out).write_text(text)
     print(text)
 
-    return {PASS: 0, FAIL: 1, INFRA_RETRY: 2}[verdict]
+    return {PASS: 0, FAIL: 1, INFRA_RETRY: 2, REVIEW: 4}[verdict]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1189,6 +1349,14 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--baseline-registry", help="snapshot-registry JSON from pristine main")
     w.add_argument(
         "--op-nodeids", help="file of collected op upstream nodeids (op-left-skipped check)"
+    )
+    w.add_argument(
+        "--upstream-match-nodeids",
+        help="file of explicit test nodeids for the upstream check, for an op whose "
+        "OpInfo/test name differs from the aten name (interpolate vs "
+        "upsample_trilinear3d, grid_sample vs grid_sampler_2d, max_pool2d vs "
+        "max_pool2d_with_indices). The tests must still all pass; this only fixes "
+        "op-to-test association. Use the reviewed collect-only set (op_nodeids.txt)",
     )
     w.add_argument("--allowlist", help="platform-limitations.md allowlist file")
     w.add_argument("--coverage-csv", help="eager vertical target_ops_coverage_<ts>.csv")

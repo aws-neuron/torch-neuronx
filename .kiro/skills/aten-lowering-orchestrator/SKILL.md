@@ -102,8 +102,12 @@ OpInfo sample / exotic signature) the check is a blocking gap until a human
 resolves it and passes the explicit `--differentiable --backward-op aten::<bwd>`
 flags (which the verifier uses only as a fallback when no probe resolved the op).
 
-Exit code **0 = PASS, 1 = FAIL, 2 = INFRA_RETRY, 3 = usage error.** Read
-`verdict.json` for the per-check breakdown.
+Exit code **0 = PASS, 1 = FAIL, 2 = INFRA_RETRY, 3 = usage error, 4 = REVIEW.**
+Read `verdict.json` for the per-check breakdown. **REVIEW** means every hard
+check is OK but the op added a skip/xfail whose reason is not on the auto-accept
+allowlist and cites a real precedent. Treat REVIEW like PASS for opening the
+draft PR (the agent does NOT stop to ask); the PR body must list those xfails
+under "Xfails needing human sign-off" so the human adjudicates at review.
 
 ### Gating checks (a FAIL on any one blocks the PR)
 
@@ -339,7 +343,7 @@ spell it out in the prompt):
 | `op_nodeids.txt` | `pytest $(cat op_files.txt) -k "<op>" --collect-only -q` (the op-left-skipped check). Collect one file at a time in sequence, each under a per-file `timeout` (see `/aten-op-lowering`). Do not run one pytest per file in parallel over the same venv — the conftest overlay swap races (`ImportError`/`INTERNALERROR`) |
 | `candidate_registry.json` | `verify_op_acceptance.py snapshot-registry --repo-root . --out ...` from the candidate checkout |
 | `target_ops_coverage.csv` | the `tests/vertical/test_target_ops_coverage.py` CSV for the op (copied out of the repo root — it's written there) |
-| `target_ops_compile_coverage.csv` | the `tests/vertical/test_target_ops_compile_coverage.py` CSV for the op (compile path). Always produce it; pass `--require-compile` only when the op has a decomposition |
+| `target_ops_compile_coverage.csv` | the `tests/vertical/test_target_ops_compile_coverage.py` CSV for the op (compile path). Always produce it; pass `--require-compile` only when the op has a decomposition. Filter the run with `-k "<op>"`, NOT `--ops` — `--ops` filters only the eager suite, so the compile suite would sweep all ops (slow). See `/aten-op-lowering` Step 6 |
 | `unit_rc.txt` | the exit code of the op's unit-test run |
 | `completion.json` | the **completion contract** (below): at least `state` (a lifecycle state), `round` (int), `ready_for_verify` (bool), and a `heartbeat` it refreshes every step. Its final write per round is the ONLY done-signal. Backward detection lives in `autograd_probe.json`, not here |
 | `handoff.json` | the **durable handoff** (below): chosen decomposition, overloads registered, what it tried and rejected, current failing `checks[]`, next-step hypothesis. A fresh Implementer resumes from this + the persisted worktree |
@@ -411,19 +415,31 @@ distrust — an adversarial re-run in a fresh **Verifier** subagent with NO
 implementation context (see "The deterministic verifier"). Read `verdict.json`:
 
 - **PASS** → proceed to PR (Phase 1 → PR step).
+- **REVIEW** (exit 4) → proceed to PR exactly like PASS. Do NOT stop to ask and
+  do NOT hand back to the Implementer. Copy the `registry` check's flagged
+  entries into a PR "Xfails needing human sign-off" section so the human
+  adjudicates each new reason at review. A REVIEW is not a defect; it is an
+  unlisted-but-precedented xfail that only a human may accept.
 - **INFRA_RETRY** (exit 2) → re-run the failing on-device step **once** through
   `agent-run ... with-hw-lock`, then re-verify. If it flakes twice, treat as
   FAIL and surface it.
 - **FAIL** → hand the specific failing checks (`verdict.json` `checks[]`) back via
   `handoff.json` to a **fresh** Implementer on the persisted worktree, for a
   bounded number of rounds (≤ 3). Re-verify each round. Do not loosen the bar to
-  make it pass — if the only way to green is a disallowed skip/xfail, the op is
-  **blocked** (Phase "Blocked ops").
+  make it pass — if the only way to green is a disallowed skip/xfail with no
+  precedent, or a deny-listed reason, the op is **blocked** (Phase "Blocked ops").
 
-**PR (only after PASS).** Instruct the Implementer to open a **draft** PR:
-branch `lower/<slug>` off `origin/main`; body = custom summary (results table
-with counts, registry diff explanation, roofline ratio vs threshold) **then**
-`.github/PULL_REQUEST_TEMPLATE.md` verbatim; label `torch-neuronx-agent`; base
+**PR (after PASS or REVIEW).** Before the PR opens, re-read `references/lessons.md`
+AND `AGENTS.md`, then confirm you follow every applicable rule and lesson. The
+lessons are prior reviewer findings and `AGENTS.md` is the always-on repo policy
+(STE, no autonomous GitHub action, draft PR only, disclose AI authorship), so a
+clean pass here stops a known comment from coming back. Read both from the
+`origin/main` version; a branch can hold a stale copy. Then instruct the
+Implementer to open a **draft** PR:
+branch `lower/<slug>` off `origin/main`; body follows
+`references/pr-body-format.md` exactly (the canonical section order, the
+one-line-per-paragraph rule, and the tight-list rule that stop the two common
+GitHub render defects); label `torch-neuronx-agent`; base
 `main`. **No `Co-Authored-By` trailer.** The PR stays draft — a human merges.
 
 **Docs update (part of the PR).** A successful lowering means the op no longer
@@ -431,7 +447,11 @@ falls back to CPU, so its compatibility row must change. The PR must flip the
 op's `neuron_compatible` value in `docs/torch_api_compatibility.md` from
 `CPU_FALLBACK` to `Y` (with a one-phrase limitation for anything that still
 falls back — measured with `track_neuron_ops`, not guessed), and add any new env
-var to `docs/environment_variables.md`. **The Implementer makes this edit** as
+var to `docs/environment_variables.md`. For the note, match the repo convention:
+`Native MLIR impl` for a native `@register_aten` lowering (the dominant phrasing,
+200+ rows), or `Decomposes to <op>` when the op only decomposes to supported
+ops. Do not invent free-form text, for example "lowers to" or "passthrough
+registration". **The Implementer makes this edit** as
 part of the PR. If it is missing, the Phase-2 Reviewer flags it in the review and
 a fresh Implementer adds the flip; the Reviewer never edits or pushes.
 
@@ -452,11 +472,13 @@ merge.
 
 ### Blocked ops
 
-An op is blocked when it cannot reach a PASS verdict without a disallowed
-skip/xfail, or an Implementer exhausts its retry rounds. **Never silently skip.**
-File a tracking issue, and if a registry entry is genuinely warranted, add an
-xfail with a reason **on the allowlist** (`references/platform-limitations.md`)
-that cites the issue. Report the op as blocked with the reason.
+An op is blocked when it cannot reach a PASS or REVIEW verdict, or an Implementer
+exhausts its retry rounds. **Never silently skip.** File a tracking issue, and if
+a registry entry is genuinely warranted, either use a reason **on the allowlist**
+(`references/platform-limitations.md`) for a PASS, or cite a real precedent inline
+(`precedent: <existing reason or nodeid>`) for a REVIEW that a human accepts at
+the PR. A reason that is neither allowlisted nor precedented, or that matches a
+deny pattern, stays blocked. Report the op as blocked with the reason.
 
 ### Retro (self-improvement, size-budgeted)
 
@@ -537,7 +559,8 @@ Next actions:
   `tests/pytorch_tests_native/test/`. The verifier runs under `--runxfail` to
   catch xfail-masking and XPASS.
 - **The verdict is computed by `verify_op_acceptance.py`, not by you or any
-  subagent.** No PR opens on an op whose verdict is not PASS.
+  subagent.** A PR opens only on a PASS or a REVIEW verdict; a REVIEW PR carries
+  the "Xfails needing human sign-off" list.
 - **"Done" is an explicit flag, never an inference.** Gate the Verifier only on
   the completion notification AND `completion.json.ready_for_verify == true`.
   **BANNED as a done-signal: process-sniffing (no pytest running), diff/`git diff`
@@ -560,6 +583,12 @@ Next actions:
   measurement you couldn't produce — investigate why.
 - **Fixed shape set for perf/coverage** (model registry + small/med/large) — the
   agent cannot cherry-pick favorable shapes.
+- **Never onboard a new op via the Python dispatch path.** A new op registers on
+  the C++ dispatch path (a plain `@register_aten`). Do not set
+  `python_dispatch=True`; it holds the GIL for preprocessing and execution and is
+  deprecated. For preprocessing that reads a tensor value, use
+  `relower_every_call=True` with `preprocessing=` (PR #1065; execution stays in
+  C++). The Reviewer rejects any PR that adds a new op on `python_dispatch=True`.
 - **Draft PRs only; a human merges.** Every PR carries `torch-neuronx-agent`.
   **No `Co-Authored-By` trailer.** Never reply to PR review comments without a
   human.
