@@ -1082,8 +1082,9 @@ def adaptive_avg_pool3d_backward_decomp(grad_output, self):
 def _is_static_contiguous_access(size, stride, storage_offset):
     """True when `stride` is concrete and effectively the row-major stride of `size`.
 
-    Such an access is one contiguous span, so a write is a concat. Symbolic values report
-    False: comparing one would plant a shape guard or raise on an unbacked symint.
+    Such an access is one contiguous span, so a write is a padded copy plus a select.
+    Symbolic values report False: comparing one would plant a shape guard or raise on an
+    unbacked symint.
     """
     if not all(isinstance(v, int) for v in (storage_offset, *size, *stride)):
         return False
@@ -1091,6 +1092,36 @@ def _is_static_contiguous_access(size, stride, storage_offset):
     row_major = [math.prod(sizes[d + 1 :]) for d in range(len(sizes))]
     # A size-1 dim's only index is 0, so its stride never reaches an address.
     return all(st == rm or sz == 1 for st, rm, sz in zip(stride, row_major, sizes, strict=False))
+
+
+def _clamp_slice_bound(v, full):
+    """Clamp one slice bound to PyTorch semantics: a negative counts back from the end."""
+    return max(0, min(full, v + full if v < 0 else v))
+
+
+def _pad_spec(rank, dim, low, high):
+    """Pad list padding only `dim`, by `low` then `high`; aten takes the pairs innermost first."""
+    return [0, 0] * (rank - 1 - dim) + [low, high]
+
+
+def _pad_select_span(dst, value, dim, low, high):
+    """Write `value` into `dst[low:high]` along `dim` by masking a zero-padded copy.
+
+    constant_pad_nd carries the span boundary in a pad attribute; cat carries it in a
+    tensor operand, and the backend adopts that operand's extent as the shard dim. Padding
+    plus a full-width select keeps the shard dim at the real one.
+    """
+    rank = dst.dim()
+    full = dst.shape[dim]
+    padded = torch.ops.aten.constant_pad_nd.default(
+        value, _pad_spec(rank, dim, low, full - high), 0
+    )
+
+    shape = [1] * rank
+    shape[dim] = full
+    idx = torch.arange(full, device=dst.device)
+    keep = ((idx >= low) & (idx < high)).reshape(shape)
+    return torch.where(keep, padded, dst)
 
 
 def _strided_runs_plan(size, stride, storage_offset, numel):
@@ -2395,27 +2426,54 @@ def slice_backward_decomposition(grad_output, input_sizes, dim, start, end, step
         dim = len(input_sizes) + dim
 
     full = input_sizes[dim]
-    # Clamp to PyTorch slice semantics: start/end are clamped to [0, full].
-    start_clamped = max(0, min(full, start if start >= 0 else full + start))
-    end_clamped = max(0, min(full, end if end >= 0 else full + end))
-    if end_clamped < start_clamped:
-        end_clamped = start_clamped
+    start_clamped = _clamp_slice_bound(start, full)
+    end_clamped = max(start_clamped, _clamp_slice_bound(end, full))
 
     low = start_clamped
     high = full - end_clamped
     if low < 0 or high < 0:
         return _slice_backward_default(grad_output, input_sizes, dim, start, end, step)
 
-    # constant_pad_nd takes pads in highest-dim-first pairs of (low, high).
-    # Build a flat list with zeros for trailing dims after `dim`.
-    rank = len(input_sizes)
-    pad = []
-    for d in range(rank - 1, dim - 1, -1):
-        if d == dim:
-            pad.extend([low, high])
-        else:
-            pad.extend([0, 0])
+    pad = _pad_spec(len(input_sizes), dim, low, high)
     return torch.ops.aten.constant_pad_nd.default(grad_output, pad, 0)
+
+
+@register_decomposition([aten.slice_scatter.default])
+def slice_scatter_decomposition(input, src, dim=0, start=None, end=None, step=1):
+    """Decompose a statically contiguous slice write to a zero-padded copy and a select.
+
+    Left alone the op reaches torch-mlir as stablehlo.scatter, which is descriptor-generated
+    DMA even for a dense compile-time-constant region. _pad_select_span covers why the pad
+    beats a cat of the untouched spans. Strided and symbolic writes keep the scatter.
+    """
+    rank = input.dim()
+    d = dim + rank if dim < 0 else dim
+    if not 0 <= d < rank:
+        return NotImplemented
+
+    full = input.shape[d]
+    low = 0 if start is None else start
+    high = full if end is None else end
+    # Comparing a symbolic bound would plant a guard, or raise on an unbacked symint.
+    if not all(isinstance(v, int) for v in (step, full, low, high)):
+        return NotImplemented
+    if step != 1:
+        return NotImplemented
+
+    low = _clamp_slice_bound(low, full)
+    high = max(low, _clamp_slice_bound(high, full))  # an inverted range is empty, not negative
+
+    # aten returns a fresh tensor, so neither short circuit may hand back an input.
+    if high == low:
+        return input.clone()
+
+    # select would type-promote; aten casts src into the destination instead.
+    value = src.to(input.dtype)
+
+    if low == 0 and high == full:
+        return value.clone()
+
+    return _pad_select_span(input, value, d, low, high)
 
 
 def _argsort_via_topk(x):
@@ -2597,10 +2655,10 @@ def lshift_decomp(x, shift):
 
 @register_decomposition([aten.as_strided_scatter.default])
 def as_strided_scatter_decomp(input, src, size, stride, storage_offset=0):
-    """Decompose as_strided_scatter to a concat of the spans around src.
+    """Decompose as_strided_scatter to a zero-padded copy of src and a select.
 
-    A contiguous write needs no index tensor, just a concat of src with the spans it does
-    not touch. Everything else falls back to index_copy, one index per written element.
+    A contiguous write needs no index tensor, just src padded out to the storage span and
+    masked in. Everything else falls back to index_copy, one index per written element.
     """
     if storage_offset is None:
         storage_offset = 0
@@ -2612,16 +2670,13 @@ def as_strided_scatter_decomp(input, src, size, stride, storage_offset=0):
         numel_out = math.prod(size)
         # Defensive: a view past the end of storage is invalid per aten anyway.
         if storage_offset + numel_out <= input_flat.numel():
-            # A rank-1 slice_scatter lowers to one DMA descriptor per written element; concat
-            # avoids that. Spans are conditional so no zero-size node lands in the trace.
-            spans = []
-            if storage_offset:
-                spans.append(torch.narrow(input_flat, 0, 0, storage_offset))
-            spans.append(torch.reshape(src, (-1,)).to(input_flat.dtype))
-            tail = input_flat.numel() - storage_offset - numel_out
-            if tail:
-                spans.append(torch.narrow(input_flat, 0, storage_offset + numel_out, tail))
-            result = spans[0] if len(spans) == 1 else torch.cat(spans)
+            result = _pad_select_span(
+                input_flat,
+                torch.reshape(src, (-1,)).to(input_flat.dtype),
+                0,
+                storage_offset,
+                storage_offset + numel_out,
+            )
             out = torch.reshape(result, base_shape)
             return out if inverse is None else out.permute(inverse)
 
