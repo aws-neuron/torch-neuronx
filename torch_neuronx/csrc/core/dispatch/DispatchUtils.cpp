@@ -585,6 +585,12 @@ const FillValueConfig* GetFillValueConfig(const std::string& op_name) {
   static const std::unordered_map<std::string, FillValueConfig> kConfigs = {
       // constant_pad_nd(input, pad, value=0) — pad value is a scalar
       {"constant_pad_nd", {"value", 0.0, false}},
+      // isin(elements, test_elements, *, invert=False) — with an empty test set every
+      // element is a non-member, so the eager result is all-`invert` (shaped like
+      // `elements`; a 0-element operand can't be compiled, so it's filled here). `invert`
+      // is a bool kwarg read as a scalar fill (True->1.0, False->0.0). The torch.compile
+      // path handles empty in the aten.isin decomposition instead (this branch is eager-only).
+      {"isin", {"invert", 0.0, false}},
       // linear(input, weight, bias=None) — bias is a tensor
       {"linear", {"bias", 0.0, true}},
   };

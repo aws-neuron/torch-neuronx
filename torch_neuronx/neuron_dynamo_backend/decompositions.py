@@ -160,7 +160,6 @@ neuron_decompositions = get_decompositions(
         aten.index_fill,
         aten._unsafe_masked_index,
         aten._unsafe_masked_index_put_accumulate,
-        aten.isin,
         aten.std_mean.correction,
         aten.all.dims,
         aten.any.dims,
@@ -277,6 +276,37 @@ def angle_decomp(x):
         x = x.to(torch.get_default_dtype())
     result = torch.where(x < 0, torch.full_like(x, math.pi), torch.zeros_like(x))
     return torch.where(torch.isnan(x), x, result)
+
+
+@register_decomposition([aten.isin.Tensor_Tensor, aten.isin.Tensor_Scalar, aten.isin.Scalar_Tensor])
+def isin_decomposition(elements, test_elements, *, assume_unique=False, invert=False):
+    """Membership test: True where ``elements[i]`` is in ``test_elements``.
+
+    Lowers as a broadcast compare + any-reduction,
+    ``(elements[..., None] == test_elements).any(-1)``, negated by ``invert``;
+    a scalar operand reduces to plain (in)equality. ``assume_unique`` is an
+    ignored hint; bool is rejected to match CPU ``torch.isin``.
+    """
+    # Reject bool, matching CPU torch.isin (raises "Unsupported input type ... Bool").
+    for t in (elements, test_elements):
+        if isinstance(t, torch.Tensor) and t.dtype == torch.bool:
+            raise RuntimeError("Unsupported input type encountered for isin(): Bool")
+
+    # Scalar test set -> plain (in)equality.
+    if not isinstance(test_elements, torch.Tensor):
+        return torch.ne(elements, test_elements) if invert else torch.eq(elements, test_elements)
+    # Scalar element -> 1-element tensor, reuse the tensor path, squeeze to 0-dim.
+    if not isinstance(elements, torch.Tensor):
+        elements = torch.scalar_tensor(elements, device=test_elements.device)
+
+    # Empty test set: all-False (all-True when inverted). Returning zeros_like
+    # avoids an any-reduction over a zero-length dim, which the compiler rejects.
+    if test_elements.numel() == 0:
+        return torch.zeros_like(elements, dtype=torch.bool) != invert
+
+    common = torch.promote_types(elements.dtype, test_elements.dtype)
+    matches = elements.to(common).unsqueeze(-1) == test_elements.to(common).flatten()
+    return matches.any(dim=-1) != invert
 
 
 @register_decomposition([aten.take])

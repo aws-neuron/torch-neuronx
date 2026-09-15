@@ -133,6 +133,21 @@ def torch_isfinite(x):
 
 
 @register_aten(
+    [
+        "aten::isin.Tensor_Tensor_out",
+        "aten::isin.Tensor_Scalar_out",
+        "aten::isin.Scalar_Tensor_out",
+    ],
+    static_argnames=("assume_unique", "invert"),
+)
+def torch_isin_out(elements, test_elements, assume_unique=False, invert=False, out=None):
+    """out= variants for isin: delegate to functional ``torch.isin`` and let the
+    dispatcher write the result into the caller's ``out`` buffer.
+    """
+    return torch.isin(elements, test_elements, assume_unique=assume_unique, invert=invert)
+
+
+@register_aten(
     ["aten::minimum", "aten::minimum.out"],
     validate_static_inputs=_validate_float_promoting_out,
 )
