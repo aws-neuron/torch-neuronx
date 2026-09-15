@@ -137,11 +137,7 @@ class Executor:
                 tensor = inp
 
             if not tensor.is_contiguous():
-                contiguous_tensor = torch.empty(
-                    tensor.shape, dtype=tensor.dtype, device=tensor.device
-                )
-                torch_neuronx._C._nki_copy_strided_neuron_to_neuron(tensor, contiguous_tensor)
-                tensor = contiguous_tensor
+                tensor = tensor.contiguous()
             if tensor.dtype in self.INT_64_TO_32:
                 if tensor.dim() == 0:
                     tensor = tensor.reshape(1).view(self.INT_64_TO_32[tensor.dtype])
