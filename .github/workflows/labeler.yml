@@ -1,0 +1,25 @@
+name: PR Labeler
+
+# Phase 1 of "Smarter Post-Merge Upstream Test Selection".
+# Applies path-based labels to PRs for observation only. Post-merge gating
+# is NOT wired up yet — see the proposal for Phase 2.
+#
+# Re-runs on every push so labels stay in sync with the latest diff.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    name: Apply path-based labels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v5
+        with:
+          configuration-path: .github/labeler.yml
+          sync-labels: true

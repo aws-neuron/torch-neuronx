@@ -1,0 +1,156 @@
+# Path-based PR labeling for upstream test selection.
+#
+# Naming convention (modeled on pytorch/pytorch):
+#   module:*  — categorization. Tells humans what subsystem a PR touches.
+#   ciflow:*  — CI action. Tells automation what to run.
+#
+# Manual-only labels (apply by hand on a PR; not in this file):
+#   ciflow:run-full-suite — force the full upstream suite regardless of paths
+#                           (e.g. for runtime-core / build PRs that don't
+#                           match a module label cleanly).
+# ``ciflow:skip-upstream`` is auto-applied below for docs-only PRs, but can
+# also be added manually to bypass the suite for any PR.
+#
+# Format: actions/labeler v5 (changed-files / any-glob-to-any-file).
+# Docs: https://github.com/actions/labeler
+
+"module:aten-ops":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'torch_neuronx/csrc/aten/**'
+          - 'torch_neuronx/csrc/ops/**'
+          - 'torch_neuronx/csrc/amp/**'
+          - 'torch_neuronx/csrc/utils/**'
+          - 'torch_neuronx/python_ops/**'
+          - 'tests/python_ops/**'
+
+# Python op lowerings via torch-mlir and the vendored upstream torch-mlir tree.
+"module:torch-mlir":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'torch_neuronx/python_ops/torch_mlir/**'
+          - 'tests/python_ops/torch_mlir/**'
+          - 'third_party/torch-mlir/**'
+
+"module:distributed":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'torch_neuronx/csrc/distributed/**'
+          - 'torch_neuronx/csrc/c10/**'
+          - 'torch_neuronx/distributed/**'
+          - 'tests/distributed/**'
+
+"module:dynamo":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'torch_neuronx/neuron_dynamo_backend/**'
+          - 'tests/neuron_dynamo_backend/**'
+
+"module:profiler":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'torch_neuronx/csrc/profiler/**'
+          - 'torch_neuronx/profiling.py'
+          - 'tests/profiler/**'
+
+"module:memory":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'torch_neuronx/csrc/core/allocator/**'
+          - 'torch_neuronx/memory.py'
+          - 'tests/allocator/**'
+          - 'tests/memory/**'
+
+# Run-everything terminator: dispatch, core runtime, and top-level entrypoints.
+"module:runtime-core":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'torch_neuronx/csrc/core/**'
+          - 'torch_neuronx/csrc/Stream.*'
+          - 'torch_neuronx/neuron.py'
+          - 'torch_neuronx/__init__.py'
+
+# Upstream PyTorch test infra: runner, conftest, dist config, etc.
+# Excludes ``skip_registry/`` because those are pure metadata (which tests
+# to skip/xfail) and don't affect upstream test execution — they're
+# absorbed by ``module:ci`` below and skip upstream entirely.
+#
+# Uses ``all-globs-to-any-file`` (not ``any-glob-to-any-file``) so the
+# negation pattern is honored: a file matches only if it matches the
+# positive glob AND not the negation. With ``any-glob-*``, each pattern
+# is evaluated independently and the negation is effectively ignored.
+"module:upstream-test-infra":
+  - changed-files:
+      - all-globs-to-any-file:
+          - 'tests/pytorch_tests_native/**'
+          - '!tests/pytorch_tests_native/skip_registry/**'
+
+# Non-functional plumbing — none of these affect upstream test execution.
+# Covers GitHub Actions config, tools/ scripts, test-runner unit tests,
+# and the upstream skip/xfail registry. Auto-paired with
+# ``ciflow:skip-upstream`` below so pure-plumbing PRs skip upstream
+# entirely. Mixed PRs (plumbing + real code) still get this label for
+# visibility but ``module:ci`` is intentionally NOT in
+# label_test_selection.json — only the real-code label drives the
+# upstream subset for mixed PRs.
+"module:ci":
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/**'
+          - 'tools/**'
+          - 'tests/test_infra/**'
+          - 'tests/pytorch_tests_native/skip_registry/**'
+
+"module:build":
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'setup.py'
+          - 'pyproject.toml'
+          - 'CMakeLists.txt'
+          - 'BUILD.bazel'
+          - 'MODULE.bazel'
+          - 'WORKSPACE'
+          - 'bazel/**'
+          - 'torch_neuronx/_build_config.py'
+          - 'torch_neuronx/_version.py'
+
+# Skip the trn2 PR checks (pull.yml) entirely for docs-only PRs.
+# Reviewers can also attach this label manually for any PR that doesn't
+# warrant the trn2 cost.
+"ciflow:skip-pr-checks":
+  - all:
+      - changed-files:
+          - any-glob-to-all-files:
+              - 'docs/**'
+              - '**/*.md'
+              - 'LICENSE'
+
+# Skip-upstream terminator: applied when ALL changed files match one of
+# the rules below.
+#   1. Docs-only PRs.
+#   2. Local test-only PRs that don't touch upstream test infra
+#      (changes under ``tests/pytorch_tests_native/`` non-skip_registry
+#      MUST run upstream — they're handled by ``module:upstream-test-infra``).
+#   3. Pure plumbing PRs (CI config, tools, runner unit tests, skip
+#      registry) — same paths as ``module:ci`` above.
+#
+# Rules below MUST stay inside a single ``any:`` block — labeler v5
+# AND's top-level entries under a label, so separating them would
+# require all three to fire simultaneously (impossible).
+"ciflow:skip-upstream":
+  - any:
+      - changed-files:
+          - any-glob-to-all-files:
+              - 'docs/**'
+              - '**/*.md'
+              - 'LICENSE'
+      - changed-files:
+          - all-globs-to-all-files:
+              - 'tests/**'
+              - '!tests/pytorch_tests_native/**'
+      - changed-files:
+          - any-glob-to-all-files:
+              - '.github/**'
+              - 'tools/**'
+              - 'tests/test_infra/**'
+              - 'tests/pytorch_tests_native/skip_registry/**'

@@ -1,0 +1,98 @@
+name: Resolve PR Labels (Reusable)
+
+# Reusable workflow for finding the PR associated with a merge commit
+# and exposing its labels as workflow outputs. Callers gate downstream
+# jobs on the boolean outputs (skip_upstream / run_full_suite) without
+# needing the GitHub API plumbing themselves.
+#
+# Outputs default safely on direct push to main and workflow_dispatch
+# (no PR association → empty labels → all booleans false → callers fall
+# back to their default behavior, typically "run everything").
+
+on:
+  workflow_call:
+    outputs:
+      labels:
+        description: "Comma-separated PR label names"
+        value: ${{ jobs.resolve.outputs.labels }}
+      skip_upstream:
+        description: "true if ``ciflow:skip-upstream`` is present"
+        value: ${{ jobs.resolve.outputs.skip_upstream }}
+      run_full_suite:
+        description: "true if ``ciflow:run-full-suite`` is present"
+        value: ${{ jobs.resolve.outputs.run_full_suite }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  resolve:
+    name: Resolve PR Labels
+    runs-on: ubuntu-latest
+    outputs:
+      labels: ${{ steps.lookup.outputs.labels }}
+      skip_upstream: ${{ steps.lookup.outputs.skip_upstream }}
+      run_full_suite: ${{ steps.lookup.outputs.run_full_suite }}
+    steps:
+      - name: Lookup PR labels for merge commit
+        id: lookup
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // PR number comes from two places depending on the event:
+            //  * merge_group: parsed from the queue head_ref
+            //    (refs/heads/gh-readonly-queue/main/pr-123-<sha>) — the temp
+            //    commit subject has no (#NNN) marker.
+            //  * push (post-merge): parsed from the squash-merge commit
+            //    subject (#NNN). Avoids the async commits/<sha>/pulls index.
+            const { owner, repo } = context.repo;
+
+            let prNum = null;
+
+            if (context.eventName === 'merge_group') {
+              const headRef = context.payload.merge_group?.head_ref || '';
+              const mgMatch = headRef.match(/\/pr-(\d+)-/);
+              if (mgMatch) {
+                prNum = Number(mgMatch[1]);
+                core.info(`Resolved PR #${prNum} from merge_group head_ref`);
+              } else {
+                core.info(`Could not parse PR number from merge_group head_ref: '${headRef}'`);
+              }
+            } else {
+              const sha = context.sha;
+              const { data: commit } = await github.rest.repos.getCommit({
+                owner, repo, ref: sha,
+              });
+              const subject = commit.commit.message.split('\n', 1)[0];
+              const match = subject.match(/\(#(\d+)\)$/);
+              if (match) {
+                prNum = Number(match[1]);
+                core.info(`Resolved PR #${prNum} from commit subject`);
+              } else {
+                core.info(
+                  'No (#NNN) marker in commit subject — treating as direct ' +
+                  'push / workflow_dispatch with no PR association.'
+                );
+              }
+            }
+
+            let labels = [];
+            if (prNum !== null) {
+              const { data } = await github.rest.issues.listLabelsOnIssue({
+                owner, repo, issue_number: prNum,
+              });
+              labels = data.map(l => l.name);
+            }
+
+            const csv = labels.join(',');
+            core.info(`labels=${csv}`);
+            core.setOutput('labels', csv);
+            core.setOutput(
+              'skip_upstream',
+              labels.includes('ciflow:skip-upstream') ? 'true' : 'false',
+            );
+            core.setOutput(
+              'run_full_suite',
+              labels.includes('ciflow:run-full-suite') ? 'true' : 'false',
+            );
