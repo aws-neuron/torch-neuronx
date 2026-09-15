@@ -20,6 +20,20 @@ namespace cache_utils {
 //   32-character hex string (128-bit hash)
 std::string ComputeXXH3Hash128(const std::vector<uint8_t>& data);
 
+// Returns a filesystem-safe 32-character hex name for a cache key string.
+//
+// Use this for a store that is already keyed by its own frontend key, for example the
+// HLO cache. Do NOT use it for the persistent NEFF key: that key must stay
+// content-addressed on the lowered IR. See CompilationCacheKey.
+std::string HashCacheKeyString(const std::string& key);
+
+// Returns a filesystem-safe 32-character hex name for an HLO cache entry.
+//
+// Folds in CompilationCacheKey::BuildCompilerExtension(). The HLO is target-specific
+// (flex-attention bakes `grid: [lnc]` into the graph) and the eager frontend key carries
+// no platform target and no LNC count.
+std::string HashHloCacheKey(const std::string& key);
+
 // Returns the full compilation working directory path for a given kernel ID.
 //
 // The path is constructed as: <debug_dir>/neuronx-cc/<random hash>

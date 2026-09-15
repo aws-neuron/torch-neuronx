@@ -190,7 +190,21 @@ class CompilationCache {
   // Should be called when a NEFF is no longer being used for execution.
   void MarkEntryInactive(const std::string& cache_key);
 
+  // Records a persistent_key_hints_ entry. Thread-safe.
+  //
+  // The compile step records its own hint. Call this only for a NEFF that an external
+  // caller staged, for example through put_neff_cache().
+  void RegisterPersistentKeyHint(const std::string& base_key, const std::string& persistent_key);
+
  private:
+  // Returns the persistent key from the IR, else from persistent_key_hints_, else "".
+  // The caller must hold cache_mutex_.
+  std::string ResolvePersistentKeyLocked(const CompilationCacheKey& key) const;
+
+  // The caller must hold cache_mutex_ in exclusive mode.
+  void RecordPersistentKeyHintLocked(const std::string& base_key,
+                                     const std::string& persistent_key);
+
   // Main cache storage and synchronization.
   mutable std::shared_mutex cache_mutex_;
   std::unordered_map<std::string, std::shared_ptr<CacheEntry>> cache_;
@@ -204,6 +218,13 @@ class CompilationCache {
         : promise(std::move(p)), future(promise->get_future().share()) {}
   };
   std::unordered_map<std::string, PendingCompilation> pending_compilations_;
+
+  // base_key -> persistent_key. NeffDirectKernelExecution carries no IR, so it cannot
+  // recompute the content-addressed key. LRU eviction drops the NEFF but keeps this
+  // entry, so a later execution reads the NEFF from disk instead of throwing in
+  // CompileToNeff(). Entries are tiny, so the map is never evicted.
+  // Guarded by cache_mutex_.
+  std::unordered_map<std::string, std::string> persistent_key_hints_;
 
   // Signaled (under cache_mutex_) whenever a key becomes pending or cached, so an async WLO
   // fetch (GetWrappedNeffHlo) can wait for the stream worker to register the just-submitted

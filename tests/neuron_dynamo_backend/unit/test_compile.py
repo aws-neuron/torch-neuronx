@@ -27,8 +27,12 @@ def hlo_content_key_enabled(monkeypatch):
 
 @pytest.fixture
 def hlo_content_key_disabled(monkeypatch):
-    """Pin TORCH_NEURONX_NEFF_KEY_FROM_HLO unset (legacy/prod default)."""
-    monkeypatch.delenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", raising=False)
+    """Pin TORCH_NEURONX_NEFF_KEY_FROM_HLO=0 for the legacy opt-out path.
+
+    Content addressing is the default, so an unset variable no longer selects the
+    legacy key. Only "0" does.
+    """
+    monkeypatch.setenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "0")
 
 
 class TestCompileGraph:
@@ -167,13 +171,37 @@ class TestCompileGraph:
         assert key1 != key2
 
     @patch("torch_neuronx._C.compile_graph")
+    def test_content_key_drops_version_hash_by_default(self, mock_compile_graph, monkeypatch):
+        """An unset TORCH_NEURONX_NEFF_KEY_FROM_HLO must give the content key.
+
+        The Python gate must match utils::IsHloContentKeyEnabled(), which defaults on.
+        If the two disagree, the base key and the persistent key disagree about the
+        version salt.
+        """
+        import hashlib
+
+        monkeypatch.delenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", raising=False)
+        mock_compile_graph.return_value = "exec_handle"
+        mock_stablehlo_mlir = MagicMock()
+        mock_bytecode_buffer = MagicMock()
+        mlir_bytes = b"fake_mlir_for_default_path"
+
+        with patch("io.BytesIO", return_value=mock_bytecode_buffer):
+            mock_bytecode_buffer.getvalue.return_value = mlir_bytes
+            CompileGraph(mock_stablehlo_mlir, "m", "s", "g").compile()
+
+        content_key = mock_compile_graph.call_args[0][0]
+        assert content_key == hashlib.sha256(mlir_bytes).hexdigest()
+        assert ":" not in content_key
+
+    @patch("torch_neuronx._C.compile_graph")
     def test_content_key_includes_version_hash_in_legacy_mode(
         self, mock_compile_graph, hlo_content_key_disabled
     ):
-        """With the flag off (legacy / production default), content_key keeps
-        the global_version_hash suffix — base_key drives the persistent key on
-        the C++ side, and any Python source change in the lowering directories
-        must invalidate the NEFF cache (the pre-flag behavior)."""
+        """With the explicit opt-out (=0), content_key keeps the global_version_hash
+        suffix. base_key then drives the persistent key on the C++ side, so any Python
+        source change in the lowering directories invalidates the NEFF cache. This is
+        the diagnostic path only, not the default."""
         import hashlib
 
         mock_compile_graph.return_value = "exec_handle"

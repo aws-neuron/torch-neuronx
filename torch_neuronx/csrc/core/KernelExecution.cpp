@@ -282,10 +282,9 @@ NeffDirectKernelExecution::NeffDirectKernelExecution(
                                  c10::DeviceType::PrivateUse1>(
           graph_name, std::move(input_refs), std::move(output_refs), input_contexts,
           output_contexts, device_id),
-      // Match CompileOnlyKernelExecution's persistent-key derivation so the on-disk
-      // lookup performed by CompilationCache::CheckCacheAndCoordinateWork finds the
-      // NEFF written by the compile path (torch.compile → compile_graph) or an
-      // external put_neff_cache under the same base cache key.
+      // No IR here, so this kernel cannot compute the content-addressed persistent key.
+      // Keep CompileOnlyKernelExecution's compiler config, and let CompilationCache
+      // resolve the key from the hint that the compile step recorded.
       CompilableKernelExecution(
           CompilationCacheKey(cache_key, CompileOnlyKernelExecution::GetCompileAdditionalArgs(),
                               CompileOnlyKernelExecution::GetCompileOptimizationLevel(),

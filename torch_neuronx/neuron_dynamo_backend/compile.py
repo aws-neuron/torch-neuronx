@@ -86,8 +86,12 @@ def _serialize_mlir_module(mlir, *, use_tensorizer: bool = False) -> bytes:
 
 
 def _content_key(mlir_bytes: bytes) -> str:
-    """Compute the NEFF content key for serialized MLIR."""
-    if os.environ.get("TORCH_NEURONX_NEFF_KEY_FROM_HLO") == "1":
+    """Compute the NEFF content key for serialized MLIR.
+
+    Keep the gate identical to the C++ utils::IsHloContentKeyEnabled(). The two must
+    agree, or the base key and the persistent key disagree about the version salt.
+    """
+    if os.environ.get("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "1") != "0":
         return hashlib.sha256(mlir_bytes).hexdigest()
 
     from torch_neuronx.utils import global_version_hash
