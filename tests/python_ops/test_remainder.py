@@ -87,6 +87,29 @@ class TestRemainder:
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
             assert_op_runs_on_neuron("aten::remainder")
 
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    def test_remainder_float_boundary(self, device, dtype):
+        """remainder on floats must match CPU at integer boundaries.
+
+        fp16/bf16 compute the whole x - floor(x/y)*y in fp32 and downcast once, so the
+        boundary correction applies to every float dtype.
+
+        Regression: remainder is x - floor(x/y)*y, and flooring an fp32-rounded quotient
+        at an integer boundary (k - eps -> k-1) shifted the remainder by ~y. Sweep every
+        (num, den) pair over a grid of fractional values so boundary-adjacent quotients
+        are covered, and compare to CPU.
+        """
+        vals = torch.arange(-16, 16, 0.5)
+        num, den = torch.cartesian_prod(vals, vals).unbind(1)
+        keep = den != 0
+        num, den = num[keep].to(dtype), den[keep].to(dtype)
+        with track_neuron_ops():
+            expected = torch.remainder(num, den)
+            result = torch.remainder(num.to(device), den.to(device))
+            torch.testing.assert_close(result.cpu(), expected, equal_nan=True)
+            assert result.device.type == "neuron"
+            assert_op_runs_on_neuron("aten::remainder")
+
     def test_remainder_single_element(self, device):
         """Test remainder with single element tensor."""
         with track_neuron_ops():

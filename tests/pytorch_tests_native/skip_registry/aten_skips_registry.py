@@ -5,6 +5,19 @@ from tests.pytorch_tests_native.skip_registry import xfail_tests as x
 SKIP_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=(
+            "[platform.float64] float64 is not natively supported on Neuron (64-bit types"
+            " are computed on a 32-bit datapath), so float64 floor_divide/remainder/div-floor"
+            " leave a residual that exceeds test_decomp's strict DecompCrossRefMode tolerance."
+        ),
+        tests=[
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_div_floor_rounding_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_floor_divide_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_remainder_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_quick_div_floor_rounding_neuron_float64",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "Neuron does the index bounds check on-device (async), like CUDA/XPU,"
             " so an out-of-bounds fancy index does not raise a synchronous"
             " IndexError at the op call. The upstream test already skips CUDA/XPU"

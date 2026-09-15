@@ -10006,10 +10006,13 @@ class DecomposeAtenFmodTensorOp : public OpRewritePattern<AtenFmodTensorOp> {
 } // namespace
 
 namespace {
-// decompose `remainder(x, y)` to `x - floor(x/y) * y`
-// This uses floor division semantics (Python-style), unlike fmod which uses
-// truncation. Works for both Tensor and Scalar variants.
-template <typename RemainderOp, typename DivOp, typename MulOp>
+// decompose `remainder(x, y)` to `x - floor(x/y) * y` (Python floor-division semantics).
+// The floor is dtype-scoped: fp32 uses the boundary-corrected div(floor) (a naive floor of an
+// fp32-rounded quotient lands one integer off at a boundary); fp16/bf16 do the whole thing in
+// fp32 and downcast once (a reduced-precision mul/sub rounds inconsistently across strides);
+// fp64 and integers keep the plain true-divide + floor (fp64 is already precise; integers must
+// keep their overflow semantics, e.g. remainder(INT_MIN, -1)). Tensor and Scalar variants.
+template <typename RemainderOp, typename DivOp, typename MulOp, typename DivModeOp>
 class DecomposeAtenRemainderOp : public OpRewritePattern<RemainderOp> {
 public:
   using OpRewritePattern<RemainderOp>::OpRewritePattern;
@@ -10024,11 +10027,40 @@ public:
       return rewriter.notifyMatchFailure(op, "result must have dtype");
     }
 
-    Value div = DivOp::create(rewriter, loc, resultTy, self, other);
-    Value floor = AtenFloorOp::create(rewriter, loc, resultTy, div);
-    Value mul = MulOp::create(rewriter, loc, resultTy, floor, other);
+    Type dtype = resultTy.getDtype();
     Value alpha =
         ConstantFloatOp::create(rewriter, loc, rewriter.getF64FloatAttr(1));
+
+    if (isa<mlir::FloatType>(dtype) && dtype.getIntOrFloatBitWidth() < 32) {
+      // fp16/bf16: whole computation in fp32, downcast once.
+      Type f32 = rewriter.getF32Type();
+      auto f32Ty = cast<ValueTensorType>(
+          resultTy.getWithSizesAndDtype(resultTy.getOptionalSizes(), f32));
+      Value selfF = convertTensorToDtype(rewriter, loc, self, f32);
+      Value otherF = isa<ValueTensorType>(other.getType())
+                         ? convertTensorToDtype(rewriter, loc, other, f32)
+                         : other;
+      Value cstFloor = Torch::ConstantStrOp::create(rewriter, loc, "floor");
+      Value floorF =
+          DivModeOp::create(rewriter, loc, f32Ty, selfF, otherF, cstFloor);
+      Value mulF = MulOp::create(rewriter, loc, f32Ty, floorF, otherF);
+      Value subF =
+          AtenSubTensorOp::create(rewriter, loc, f32Ty, selfF, mulF, alpha);
+      rewriter.replaceOp(op, convertTensorToDtype(rewriter, loc, subF, dtype));
+      return success();
+    }
+
+    Value floor;
+    if (isa<mlir::FloatType>(dtype) && dtype.getIntOrFloatBitWidth() == 32) {
+      // fp32: boundary-corrected div(floor).
+      Value cstFloor = Torch::ConstantStrOp::create(rewriter, loc, "floor");
+      floor = DivModeOp::create(rewriter, loc, resultTy, self, other, cstFloor);
+    } else {
+      // fp64 and integers: plain true-divide + floor.
+      Value div = DivOp::create(rewriter, loc, resultTy, self, other);
+      floor = AtenFloorOp::create(rewriter, loc, resultTy, div);
+    }
+    Value mul = MulOp::create(rewriter, loc, resultTy, floor, other);
     rewriter.replaceOpWithNewOp<AtenSubTensorOp>(op, resultTy, self, mul,
                                                  alpha);
     return success();
@@ -13850,9 +13882,11 @@ public:
       addPatternIfTargetOpIsIllegal<DecomposeAtenLdexpTensorOp>(patterns);
       addPatternIfTargetOpIsIllegal<DecomposeAtenFmodTensorOp>(patterns);
       addPatternIfTargetOpIsIllegal<DecomposeAtenRemainderOp<
-          AtenRemainderTensorOp, AtenDivTensorOp, AtenMulTensorOp>>(patterns);
+          AtenRemainderTensorOp, AtenDivTensorOp, AtenMulTensorOp,
+          AtenDivTensorModeOp>>(patterns);
       addPatternIfTargetOpIsIllegal<DecomposeAtenRemainderOp<
-          AtenRemainderScalarOp, AtenDivScalarOp, AtenMulScalarOp>>(patterns);
+          AtenRemainderScalarOp, AtenDivScalarOp, AtenMulScalarOp,
+          AtenDivScalarModeOp>>(patterns);
       addPatternIfTargetOpIsIllegal<DecomposeAtenBaddbmmOp>(patterns);
       addPatternIfTargetOpIsIllegal<DecomposeAtenFloorDivideOp>(patterns);
       addPatternIfTargetOpIsIllegal<DecomposeAtenFloorDivideScalarOp>(patterns);
