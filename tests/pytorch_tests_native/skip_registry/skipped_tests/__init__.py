@@ -7,6 +7,9 @@ from .aten_skips import (
 )
 from .aten_skips import ATEN_FOREACH_WORKER_CRASH as ATEN_FOREACH_WORKER_CRASH
 from .aten_skips import ATEN_INT64_OVERFLOW as ATEN_INT64_OVERFLOW
+from .aten_skips import (
+    ATEN_NON_NEURON_COMPILE_BACKEND as ATEN_NON_NEURON_COMPILE_BACKEND,
+)
 from .aten_skips import ATEN_SEGFAULT as ATEN_SEGFAULT
 from .aten_skips import (
     ATEN_TEST_DTYPES_MLIR_CONTEXT_SEGFAULT as ATEN_TEST_DTYPES_MLIR_CONTEXT_SEGFAULT,

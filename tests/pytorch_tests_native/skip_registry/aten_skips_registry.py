@@ -437,4 +437,30 @@ SKIP_GROUPS: list[SkipGroup] = [
             "test_reductions.py::TestReductionsNEURON::test_dim_ndim_limit_masked_var_neuron",
         ],
     ),
+    SkipGroup(
+        reason="Tests use torch.compile with a non-Neuron backend (eager/inductor/aot_eager)",
+        tests=s.ATEN_NON_NEURON_COMPILE_BACKEND,
+    ),
+    SkipGroup(
+        reason="Assumes torch is linked with CUDA — not applicable on Neuron",
+        tests=[
+            "FakeTensorOperatorInvariants::test_fake_gpu_no_init",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Neuron registers ops without schemas (schemaless boxed dispatch)."
+            " test_find_dangling_impls expects all registered ops to have a schema."
+        ),
+        tests=[
+            "TestDispatch::test_find_dangling_impls",
+            "TestDispatch::test_find_dangling_impls_ext",
+        ],
+    ),
+    SkipGroup(
+        reason="Requires z3-solver package (not installed on Neuron hosts)",
+        tests=[
+            "TestSymbolicTracing::test_constant_specialization",
+        ],
+    ),
 ]
