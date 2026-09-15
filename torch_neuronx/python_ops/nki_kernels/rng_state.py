@@ -26,7 +26,22 @@ try:
     # which may be deprecated
     wrapped_rand.has_side_effect = True
 
-    @nki_op("nki_kernels::get_rng_state", mutates_args={})
+    # ── Fake/meta kernels ──
+    # These four ops call a NKI kernel directly, so the real body cannot run on a
+    # meta tensor. Without an explicit fake, PyTorch registers the real body as
+    # the Fake kernel and any meta-dispatch path (test_meta, FakeTensorMode,
+    # torch.compile tracing) tries to compile the kernel and raises
+    # "failed to run: nki_kernels.set_rng_state.default(... device='meta' ...)".
+    # torch.manual_seed() reaches set_rng_state through the PrivateUse1 hook, so
+    # every random op inherited the failure. A fake only reports output metadata.
+
+    def _fake_get_rng_state() -> torch.Tensor:
+        return torch.empty(NUM_RNG_SEEDS, device="neuron", dtype=torch.uint32)
+
+    def _fake_set_rng_state(seed: torch.Tensor) -> None:
+        return None
+
+    @nki_op("nki_kernels::get_rng_state", mutates_args={}, fake_fn=_fake_get_rng_state)
     def get_rng_state() -> torch.Tensor:
         """
         Get RNG state from GPSIMD engine.
@@ -38,7 +53,7 @@ try:
         result = get_rng_state_gpsimd(state)
         return result.squeeze(0)
 
-    @nki_op("nki_kernels::set_rng_state", mutates_args={})
+    @nki_op("nki_kernels::set_rng_state", mutates_args={}, fake_fn=_fake_set_rng_state)
     def set_rng_state(seed: torch.Tensor) -> None:
         """
         Set RNG state for GPSIMD engine.
@@ -91,14 +106,32 @@ def rand(
     return result.to(dtype=dtype)
 
 
-@nki_op("nki_kernels::rand", mutates_args={})
+def _fake_rand(
+    ref: torch.Tensor, size: Sequence[int], dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """Fake kernel for ``nki_kernels::rand``: metadata only, no NKI kernel."""
+    return torch.empty(tuple(size), dtype=dtype, device=ref.device)
+
+
+def _fake_randint(
+    ref: torch.Tensor,
+    low: int,
+    high: int,
+    size: Sequence[int],
+    dtype: torch.dtype = torch.int64,
+) -> torch.Tensor:
+    """Fake kernel for ``nki_kernels::randint``: metadata only, no NKI kernel."""
+    return torch.empty(tuple(size), dtype=dtype, device=ref.device)
+
+
+@nki_op("nki_kernels::rand", mutates_args={}, fake_fn=_fake_rand)
 def eager_rand(
     ref: torch.Tensor, size: Sequence[int], dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
     return rand(ref, size, dtype)
 
 
-@nki_op("nki_kernels::randint", mutates_args={})
+@nki_op("nki_kernels::randint", mutates_args={}, fake_fn=_fake_randint)
 def randint(
     ref: torch.Tensor, low: int, high: int, size: Sequence[int], dtype: torch.dtype = torch.int64
 ) -> torch.Tensor:

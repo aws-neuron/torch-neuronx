@@ -125,17 +125,29 @@ def manual_seed(seed: int) -> None:
 def _set_device_rng_seed(seed: int) -> None:
     """Set the on-device GPSIMD RNG state from a scalar seed."""
     import torch
+    from torch.utils._python_dispatch import _disable_current_modes
 
     from torch_neuronx.python_ops.nki_kernels.rng_state import _has_nki_rng
 
     if _has_nki_rng:
         from torch_neuronx.python_ops.nki_kernels.rng_state import NUM_RNG_SEEDS, set_rng_state
 
-        # Cast to int32 until torch-mlir uint32 is there
-        state = torch.zeros(1, NUM_RNG_SEEDS, dtype=torch.uint32, device="cpu")
-        state[0][0] = seed & 0xFFFFFFFF
-        state = state.view(torch.int32).to("neuron")
-        set_rng_state(state)
+        # Seeding the device is host-side state management, not part of the
+        # computation, so it must stay invisible to an active dispatch or
+        # __torch_function__ mode. CUDA gets this for free because it seeds in
+        # C++; Neuron builds a seed tensor in Python, so a tracing or
+        # cross-reference mode captures it and .to("neuron") then raises
+        # "Cannot copy out of meta tensor; no data!". torch.manual_seed() reaches
+        # here through the PrivateUse1 hook, so every test that seeds before a
+        # random op hit that error.
+        # Both stacks must be off: _disable_current_modes() pops TorchDispatchMode
+        # only, and Tensor.to is intercepted through __torch_function__.
+        with _disable_current_modes(), torch._C.DisableTorchFunction():
+            # Cast to int32 until torch-mlir uint32 is there
+            state = torch.zeros(1, NUM_RNG_SEEDS, dtype=torch.uint32, device="cpu")
+            state[0][0] = seed & 0xFFFFFFFF
+            state = state.view(torch.int32).to("neuron")
+            set_rng_state(state)
     # If nki rng is not available, no-op
 
 
