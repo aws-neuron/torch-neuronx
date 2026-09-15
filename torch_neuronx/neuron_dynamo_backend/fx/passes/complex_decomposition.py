@@ -54,7 +54,12 @@ def _decompose_complex(
         logger.debug("Applied complex decomposition for the %s path.", path_name)
         return decomposed
     except Exception as error:
-        raise RuntimeError(f"Complex decomposition failed for the {path_name} path.") from error
+        # Cause goes in the message: dynamo re-raises backend failures `from None`.
+        logger.error("Complex decomposition failed for the %s path.", path_name, exc_info=True)
+        raise RuntimeError(
+            f"Complex decomposition failed for the {path_name} path: "
+            f"{type(error).__name__}: {error}"
+        ) from error
 
 
 def maybe_decompose_complex(gm: fx.GraphModule, example_inputs: Any) -> fx.GraphModule:

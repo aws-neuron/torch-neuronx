@@ -141,6 +141,53 @@ class TestComplexDecompCompileSub:
         _assert_subprocess_ok(result, "compile:sub")
 
 
+class TestComplexDecompCompileWithNKIKernel:
+    """Complex ops and a NKI kernel in the same compiled graph (llama3's shape).
+
+    Regression test for the missing `WrapComplexMode` rule on the `nki_kernel_wrapper` HOP.
+    The all-complex graphs above do not cover it.
+    """
+
+    def test_compile_complex_rope_with_nki_attention(self):
+        snippet = """
+            import torch, torch_neuronx
+            import torch.nn.functional as F
+
+            BS, SEQ, HEADS, DIM = 1, 512, 4, 64  # SEQ >= 512 keeps SDPA on the NKI kernel path
+
+            def rope_then_attention(xq, xk, xv, freqs_cis):
+                # llama3 RoPE: real -> complex -> multiply -> back to real, then NKI attention.
+                xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+                xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+                freqs = freqs_cis[: xq_.shape[1]].view(1, xq_.shape[1], 1, xq_.shape[-1])
+                q = torch.view_as_real(xq_ * freqs).flatten(3).type_as(xq)
+                k = torch.view_as_real(xk_ * freqs).flatten(3).type_as(xk)
+                return F.scaled_dot_product_attention(
+                    q.transpose(1, 2), k.transpose(1, 2), xv.transpose(1, 2), is_causal=True
+                )
+
+            freqs = torch.outer(
+                torch.arange(SEQ, dtype=torch.float32),
+                1.0 / (10000 ** (torch.arange(0, DIM, 2).float() / DIM)),
+            )
+            freqs_cis = torch.polar(torch.ones_like(freqs), freqs).to("neuron")
+            xq, xk, xv = (
+                torch.randn(
+                    BS, SEQ, HEADS, DIM, dtype=torch.bfloat16, device="neuron", requires_grad=True
+                )
+                for _ in range(3)
+            )
+
+            out = torch.compile(rope_then_attention, backend="neuron")(xq, xk, xv, freqs_cis)
+            assert out.shape == (BS, HEADS, SEQ, DIM), out.shape
+            out.float().sum().backward()
+            assert xq.grad is not None and torch.isfinite(xq.grad.float()).all()
+            print("PASS")
+        """
+        result = _run_decomp_subprocess(snippet)
+        _assert_subprocess_ok(result, "compile:complex_rope+nki_attention")
+
+
 # Version guard tests (no hardware needed)
 
 

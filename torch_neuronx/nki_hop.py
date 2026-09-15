@@ -17,6 +17,7 @@ from torch._higher_order_ops.utils import redirect_to_mode
 from torch._library.custom_ops import custom_op
 from torch._library.infer_schema import infer_schema
 from torch._ops import HigherOrderOperator
+from torch._subclasses.complex_tensor import WrapComplexMode
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode, unset_fake_temporarily
 from torch.fx.experimental.proxy_tensor import (
     ProxyTorchDispatchMode,
@@ -470,6 +471,52 @@ def nki_kernel_wrapper_proxy_torch_dispatch_mode(
     )
 
     return track_tensor_tree(out, out_proxy, constant=None, tracer=proxy_mode.tracer)
+
+
+@nki_kernel_wrapper.py_impl(WrapComplexMode)
+def nki_kernel_wrapper_wrap_complex_mode(
+    mode: "WrapComplexMode",
+    *,
+    kernel_idx: int,
+    grid: NKIGridType,
+    backend_config: str,
+    operand_output_aliases: dict[int, int],
+    args: Sequence[Any],
+    arg_names: Sequence[str],
+    constant_args_key: int,
+    **hop_kwargs: Any,
+) -> Any:
+    """Pass the kernel through complex decomposition untouched.
+
+    NKI kernels take and return real dtypes, so there is nothing to wrap or unwrap. The
+    mode is already popped for this handler, so re-dispatching lands on the next one.
+
+    The remaining kwargs (`has_side_effect`, plus `has_collectives` where the branch has it)
+    are forwarded verbatim rather than listed: mode dispatch passes whatever the caller
+    supplied, so one this handler does not name is a TypeError at trace time.
+    """
+    complex_inputs = [
+        name
+        for name, arg in zip(arg_names, args, strict=False)
+        if isinstance(arg, torch.Tensor) and arg.is_complex()
+    ]
+    if complex_inputs:
+        raise NotImplementedError(
+            f"NKI kernel {kernel_registry.get_kernel(kernel_idx).__name__} received "
+            f"complex tensor input(s) {complex_inputs}; NKI kernels support real dtypes "
+            "only. Convert to real (e.g. torch.view_as_real) before the kernel call."
+        )
+
+    return nki_kernel_wrapper(
+        kernel_idx=kernel_idx,
+        grid=grid,
+        backend_config=backend_config,
+        operand_output_aliases=operand_output_aliases,
+        args=args,
+        arg_names=arg_names,
+        constant_args_key=constant_args_key,
+        **hop_kwargs,
+    )
 
 
 @nki_kernel_wrapper.py_functionalize_impl
