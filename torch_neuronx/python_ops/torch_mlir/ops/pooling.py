@@ -5,6 +5,7 @@ import torch
 from torch_neuronx.dtype_utils import torch_dtype_to_scalar_type_name
 
 from ..operation_registry import Preprocessing, register_aten
+from ..output_layout import channels_last_strides, suggest_output_memory_format
 
 
 def _validate_adaptive_avg_pool2d(x, output_size, out=None):
@@ -134,20 +135,47 @@ def _validate_avg_pool2d(
         )
 
 
+def _request_channels_last_epilogue(lowering_result, tensor):
+    """Set channels-last output strides so the C++ dispatch path returns the
+    input's memory format. reduce_window always yields a contiguous result and a
+    fused ``.to(memory_format)`` is dropped by lowering, so the layout is applied
+    as a fused output epilogue (CPU/CUDA AvgPool2d propagate the input format)."""
+    if not lowering_result.output_specs or not isinstance(tensor, torch.Tensor):
+        return
+    memory_format = suggest_output_memory_format(tensor)
+    if memory_format not in (torch.channels_last, torch.channels_last_3d):
+        return
+    spec = lowering_result.output_specs[0]
+    if not isinstance(spec, tuple) or len(spec) < 2:
+        return
+    target_strides = channels_last_strides(spec[0], memory_format)
+    if target_strides is not None:
+        lowering_result.output_specs[0] = (spec[0], spec[1], target_strides)
+
+
+def _set_avg_pool2d_output_strides(lowering_result, logical_args, logical_kwargs):
+    """avg_pool2d output follows the input (arg 0)."""
+    if logical_args:
+        _request_channels_last_epilogue(lowering_result, logical_args[0])
+
+
+def _set_avg_pool2d_backward_output_strides(lowering_result, logical_args, logical_kwargs):
+    """avg_pool2d_backward grad_input follows ``self`` (arg 1)."""
+    if len(logical_args) >= 2:
+        _request_channels_last_epilogue(lowering_result, logical_args[1])
+
+
 @register_aten(
     ["aten::avg_pool2d", "aten::avg_pool2d.out"],
     output_params=("out",),
     static_argnums=(1, 2, 3, 4, 5, 6),
     preprocessing=Preprocessing.SHAPE_ONLY,
     validate_static_inputs=_validate_avg_pool2d,
-    # Python dispatch so the input's channels_last memory format can be restored
-    # on the *materialized* output (see the postprocess below). The StableHLO
-    # reduce_window lowering models logical tensors and always produces a
-    # contiguous result; a ``.to(memory_format=channels_last)`` fused into the
-    # traced graph is dropped by lowering, so the layout conversion must run as a
-    # separate op on the executed result. CPU/CUDA AvgPool2d preserve the input's
-    # memory format, and the module memory-format tests assert it.
-    python_dispatch=True,
+    # CPU/CUDA AvgPool2d propagate the input's memory format; reduce_window yields
+    # a contiguous result, so request a fused channels-last output epilogue on the
+    # C++ dispatch path (a fused ``.to(memory_format)`` would be dropped by
+    # lowering). The module memory-format tests assert this layout.
+    lowering_result_transform=_set_avg_pool2d_output_strides,
 )
 def torch_avg_pool2d(
     x,
@@ -175,11 +203,11 @@ def torch_avg_pool2d(
     integer element types. Pool in float32 and truncate back to int64 (``.to``
     truncates toward zero, matching CPU).
 
-    Returns a (compute_fn, args, kwargs, postprocess) tuple for the Python
-    dispatch path: ``compute_fn`` is lowered to the cached NEFF, and
-    ``postprocess`` restores channels_last on the materialized output. Input
-    validation (dtype, kernel/stride/padding ranges, divisor_override, out=
-    dtype) lives in _validate_avg_pool2d.
+    Returns a (compute_fn, args, kwargs) preprocessing tuple for the C++
+    dispatch path; ``compute_fn`` is lowered to the cached NEFF and a
+    ``lowering_result_transform`` requests the channels-last output epilogue.
+    Input validation (dtype, kernel/stride/padding ranges, divisor_override,
+    out= dtype) lives in _validate_avg_pool2d.
     """
     # PyTorch uses kernel_size as the stride when stride is omitted/empty.
     if stride is None or (isinstance(stride, list | tuple) and len(stride) == 0):
@@ -190,13 +218,6 @@ def torch_avg_pool2d(
     # input needs its layout restored afterward. Only for the non-out= path — the
     # out= tensor's layout is the caller's to choose (and restoring would break
     # the out aliasing).
-    restore_channels_last = (
-        out is None
-        and x.dim() == 4
-        and x.is_contiguous(memory_format=torch.channels_last)
-        and not x.is_contiguous()
-    )
-
     def compute(
         x, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override, out=None
     ):
@@ -214,16 +235,10 @@ def torch_avg_pool2d(
             x, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override
         )
 
-    def restore_memory_format(result):
-        if restore_channels_last and isinstance(result, torch.Tensor):
-            return result.to(memory_format=torch.channels_last)
-        return result
-
     return (
         compute,
         (x, kernel_size, stride, padding, ceil_mode, count_include_pad, divisor_override),
         {"out": out},
-        restore_memory_format,
     )
 
 
@@ -249,11 +264,11 @@ def _validate_avg_pool2d_backward(
     static_argnums=(2, 3, 4, 5, 6, 7),
     preprocessing=Preprocessing.SHAPE_ONLY,
     validate_static_inputs=_validate_avg_pool2d_backward,
-    # Python dispatch so grad_input can be returned in self's channels_last memory
-    # format (CPU/CUDA propagate it; the lowering yields a contiguous result, and
-    # a fused to(memory_format) is dropped). Same pattern/rationale as
-    # torch_avg_pool2d; the module memory-format tests assert the grad layout.
-    python_dispatch=True,
+    # grad_input follows self's memory format (CPU/CUDA propagate it); reduce_window
+    # yields a contiguous result, so request a fused channels-last output epilogue on
+    # the C++ dispatch path. Same pattern as torch_avg_pool2d; the module
+    # memory-format tests assert the grad layout.
+    lowering_result_transform=_set_avg_pool2d_backward_output_strides,
 )
 def torch_avg_pool2d_backward(
     grad_output,
@@ -275,20 +290,14 @@ def torch_avg_pool2d_backward(
     Delegates to the aten op, which is rewritten by avg_pool2d_backward_decomp
     in neuron_dynamo_backend/decompositions.py (separable scatter matmuls) since
     the native torch-mlir backward cannot lower overlapping windows or
-    count_include_pad=False. Returns a (compute_fn, args, kwargs, postprocess)
-    tuple for the Python dispatch path; ``postprocess`` restores self's
-    channels_last layout on the materialized grad_input. Input validation lives
-    in _validate_avg_pool2d_backward. The output variant is ``.grad_input``.
+    count_include_pad=False. Returns a (compute_fn, args, kwargs) preprocessing
+    tuple for the C++ dispatch path; a ``lowering_result_transform`` requests the
+    channels-last grad_input epilogue. Input validation lives in
+    _validate_avg_pool2d_backward. The output variant is ``.grad_input``.
     """
+
     # grad_input follows self's memory format (CPU/CUDA behavior). Skip the
     # grad_input= (out=) path, whose layout the caller owns.
-    restore_channels_last = (
-        grad_input is None
-        and self.dim() == 4
-        and self.is_contiguous(memory_format=torch.channels_last)
-        and not self.is_contiguous()
-    )
-
     def compute(
         grad_output,
         self,
@@ -311,11 +320,6 @@ def torch_avg_pool2d_backward(
             divisor_override,
         )
 
-    def restore_memory_format(result):
-        if restore_channels_last and isinstance(result, torch.Tensor):
-            return result.to(memory_format=torch.channels_last)
-        return result
-
     return (
         compute,
         (
@@ -329,5 +333,4 @@ def torch_avg_pool2d_backward(
             divisor_override,
         ),
         {"grad_input": grad_input},
-        restore_memory_format,
     )
