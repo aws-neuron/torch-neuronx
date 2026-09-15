@@ -89,7 +89,7 @@ def _sdpa_fwd_traceable(
     # max_q and max_k are plain ints in the ATen schema output — they cannot
     # be part of the traced HLO.  Return only tensor outputs from the traceable
     # function; the lower_func wrapper will splice max_q/max_k back in.
-    if _can_use_nki_flash_attention(query, key, value, attn_bias, dropout_p):
+    if _can_use_nki_flash_attention(query, key, value, attn_bias, dropout_p, scale):
         output, logsumexp = _compute_attention_nki(
             query, key, value, is_causal, scale, training=True
         )
@@ -138,7 +138,7 @@ def _sdpa_bwd_traceable(
     scale: float | None = None,
 ):
     """Traceable backward wrapper for make_fx. Mirrors the backward decomposition."""
-    if _can_use_nki_flash_attention_backward(query, key, value, attn_bias, dropout_p):
+    if _can_use_nki_flash_attention_backward(query, key, value, attn_bias, dropout_p, scale):
         grad_q, grad_k, grad_v = _compute_attention_backward_nki(
             grad_out,
             query,
@@ -206,7 +206,9 @@ class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
         ):
             return False
 
-        return _can_use_nki_flash_attention(query, key, value, attn_bias, dropout_p=dropout_p)
+        return _can_use_nki_flash_attention(
+            query, key, value, attn_bias, dropout_p=dropout_p, scale=scale
+        )
 
     def _execute_impl(
         self,
@@ -434,11 +436,12 @@ class ScaledDotProductAttentionBackwardNKIImpl(AttentionOpImpl):
         value = args[3] if len(args) > 3 else kwargs.get("value")
         attn_bias = args[4] if len(args) > 4 else kwargs.get("attn_bias")
         dropout_p = args[12] if len(args) > 12 else kwargs.get("dropout_p", 0.0)
+        scale = args[16] if len(args) > 16 else kwargs.get("scale")
 
         if not super().can_handle(query, key, value, attn_bias):
             return False
 
-        return _can_use_nki_flash_attention_backward(query, key, value, attn_bias, dropout_p)
+        return _can_use_nki_flash_attention_backward(query, key, value, attn_bias, dropout_p, scale)
 
     def _execute_impl(self, *args, **kwargs) -> ExecutionResult:
         """Execute the backward pass"""

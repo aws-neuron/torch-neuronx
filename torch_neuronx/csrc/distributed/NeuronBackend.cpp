@@ -1341,13 +1341,6 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::alltoall(std::vector<at::Tensor>& 
                   group_size % 32 == 0,
               "unsupported world size ", group_size,
               ", supported sizes: 2, 4, 8, 16, or multiples of 32");
-  // Each replica group start rank must be a multiple of group size.
-  for (size_t i = 0; i < replica_groups.size(); ++i) {
-    const auto& g = replica_groups[i];
-    TORCH_CHECK(!g.empty() && g[0] % group_size == 0,
-                "replica group start ranks must be multiples of world size (", group_size,
-                "), found: group[", i, "] starts at rank ", g.empty() ? -1 : g[0]);
-  }
   auto input_shape = input_tensors[0].sizes();
 
   // Allocate temp concatenated result
