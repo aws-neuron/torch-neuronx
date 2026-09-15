@@ -1,0 +1,83 @@
+# Manual workflow: builds an upstream test image from stable base (no nightly
+# dependency), then invokes _upstream-tests.yml with the specified config.
+name: Manual Upstream Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      dist-config:
+        description: >
+          Distribution config filename (resolved against
+          tests/pytorch_tests_native/). Use the smoke variant for quick
+          verification: upstream_pytorch_test_distribution_config.smoke.json
+        required: false
+        type: string
+        default: upstream_pytorch_test_distribution_config.json
+      timeout-minutes:
+        description: "Per-matrix-node timeout in minutes"
+        required: false
+        type: number
+        default: 600
+      download-neff-cache:
+        description: >
+          Hydrate the persistent NEFF cache from the shared S3 store before the
+          run. Defaults to FALSE on public: there is no nightly here to seed a
+          cache and the S3 access request is still open, so asking for the
+          storage binding would just fail. Flip the default once the bucket
+          exists. Manual runs never write the cache either way.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_DEFAULT_REGION: us-west-2
+  STABLE_BASE_IMAGE: 684844594039.dkr.ecr.us-west-2.amazonaws.com/neuron-image-builder-public:torch-neuronx-main-nightly-base-stable
+
+jobs:
+  # Build upstream test image using Dockerfile.nightly-test on stable base.
+  build-upstream-image:
+    name: Build Upstream Test Image
+    runs-on: [
+      self-hosted,
+      linux,
+      neuron.build-nightly-image,
+      "neuron.run-${{ github.run_id }}-manual-upstream-build",
+      "neuron.dockerfile:Dockerfile.nightly-test",
+      "neuron.base-image:684844594039.dkr.ecr.us-west-2.amazonaws.com/neuron-image-builder-public:torch-neuronx-main-nightly-base-stable",
+      "neuron.build-arg:PYTORCH_CHANNEL:stable"
+    ]
+    timeout-minutes: 60
+    outputs:
+      image: ${{ steps.wait.outputs.image_uri }}
+    steps:
+      - name: Wait for upstream test image build
+        id: wait
+        run: |
+          echo "========================================="
+          echo "  Manual Upstream Tests — Build Image"
+          echo "  Base: ${{ env.STABLE_BASE_IMAGE }}"
+          echo "  Branch: ${{ github.ref_name }}"
+          echo "  SHA: ${{ github.sha }}"
+          echo "  Run ID: ${{ github.run_id }}"
+          echo "========================================="
+          /opt/neuron-ci/wait-for-nightly-image.sh | tee /tmp/upstream-output.log
+          IMAGE_URI=$(grep "Nightly base image ready:" /tmp/upstream-output.log | sed 's/.*ready: //')
+          echo "Upstream test image ready: $IMAGE_URI"
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+  # Invoke reusable upstream test suite with user-specified config and timeout.
+  pytorch-upstream:
+    name: PyTorch Upstream Suite
+    needs: [build-upstream-image]
+    uses: ./.github/workflows/_upstream-tests.yml
+    with:
+      image: ${{ needs.build-upstream-image.outputs.image }}
+      dist-config: ${{ inputs.dist-config }}
+      timeout-minutes: ${{ fromJSON(inputs.timeout-minutes) }}
+      download-neff-cache: ${{ inputs.download-neff-cache }}
+      # No refresh-neff-cache passthrough: manual runs never upload (only nightly
+      # seeds), so the reusable workflow's default of false stands.
