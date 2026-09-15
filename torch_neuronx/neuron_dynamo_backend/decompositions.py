@@ -2208,6 +2208,14 @@ def nonzero_with_count(
         else:
             return result
 
+    # 0-dim (scalar) tensor: output is [count, 0] — no coordinates to report.
+    if tensor.dim() == 0:
+        result = torch.empty(size, 0, dtype=torch.long, device=tensor.device)
+        if with_count:
+            return result, num_nonzero
+        else:
+            return result
+
     # --- NKI fast path (Trn2/Trn3): flat nonzero via nisa.nonzero_with_count ---
     # Avoids the cumsum/scatter_add reduce_window blowup that dominates compile
     # time for large inputs. Falls back to the decomposition below on failure.
