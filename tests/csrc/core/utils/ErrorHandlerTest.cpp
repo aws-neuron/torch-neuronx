@@ -662,6 +662,29 @@ Third error: Timeout)";
   EXPECT_EQ(cleaned, "Third error: Timeout");
 }
 
+// A multi-line neuronx-cc compilation failure puts the actionable [NCC_*]
+// diagnostic first and the failing HLO instruction last. The diagnostic, with
+// its error code, must survive; keeping only the last line drops the reason.
+TEST_F(ErrorHandlerTest, CleanErrorMessagePreservesCompilerDiagnostic) {
+  std::string compiler_error =
+      R"(2026-01-01 00:00:00.000000: E hilo/hlo_passes/NeuronHloVerifier.cc:1154] module.mlir:8 [ERROR] [NCC_EVRF010] Operation convolution does not support both input dilation and kernel dilation simultaneously.
+%convolution.9 = bf16[2,4,22]{2,1,0} convolution(%Arg_0.1, %reshape.8), window={size=4 lhs_dilate=3 rhs_dilate=4}, dim_labels=bf0_0oi->bf0)";
+
+  std::string cleaned = ErrorHandler::CleanErrorMessage(compiler_error);
+  // The compiler error code and reason must be preserved.
+  EXPECT_THAT(cleaned, ::testing::HasSubstr("[NCC_EVRF010]"));
+  EXPECT_THAT(cleaned, ::testing::HasSubstr("does not support both input dilation"));
+  // The failing op line is still included for context.
+  EXPECT_THAT(cleaned, ::testing::HasSubstr("%convolution.9"));
+}
+
+// When the diagnostic is the only meaningful line, it is returned as-is.
+TEST_F(ErrorHandlerTest, CleanErrorMessageDiagnosticOnly) {
+  std::string compiler_error = "[ERROR] [NCC_EBIR110] internal compiler error";
+  std::string cleaned = ErrorHandler::CleanErrorMessage(compiler_error);
+  EXPECT_EQ(cleaned, compiler_error);
+}
+
 // Test CheckAndThrowPendingException with clear_exception parameter
 TEST_F(ErrorHandlerTest, CheckAndThrowPendingExceptionWithoutClearing) {
   uint32_t stream_id = 888;

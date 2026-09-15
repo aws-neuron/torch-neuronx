@@ -246,10 +246,11 @@ std::string ErrorHandler::ExceptionToString(const std::exception& exception) {
 }
 
 std::string ErrorHandler::CleanErrorMessage(const std::string& error_message) {
-  // Remove stacktrace and keep only the last meaningful error line
+  // Remove stacktrace lines; preserve the compiler diagnostic AND the failing op line.
   std::istringstream stream(error_message);
   std::string line;
-  std::string last_meaningful_line;
+  std::string diagnostic_line;       // first line carrying an [NCC_*]/[ERROR] code
+  std::string last_meaningful_line;  // typically the failing HLO instruction
 
   while (std::getline(stream, line)) {
     // Skip empty lines and common stacktrace patterns
@@ -259,12 +260,26 @@ std::string ErrorHandler::CleanErrorMessage(const std::string& error_message) {
       continue;
     }
 
+    // Remember the first actionable compiler diagnostic (e.g. "[NCC_EVRF010] ...").
+    if (diagnostic_line.empty() &&
+        (line.find("[NCC_") != std::string::npos || line.find("[ERROR]") != std::string::npos)) {
+      diagnostic_line = line;
+    }
+
     // Keep lines that look like actual error messages
     if (line.find("Error:") != std::string::npos || line.find("Exception:") != std::string::npos ||
         line.find("Failed") != std::string::npos || line.find("failed") != std::string::npos ||
         (!line.empty() && line[0] != ' ' && line[0] != '\t')) {
       last_meaningful_line = line;
     }
+  }
+
+  // Prefer the actionable compiler diagnostic; append the failing op line for context.
+  if (!diagnostic_line.empty()) {
+    if (!last_meaningful_line.empty() && last_meaningful_line != diagnostic_line) {
+      return diagnostic_line + "\n" + last_meaningful_line;
+    }
+    return diagnostic_line;
   }
 
   // Return cleaned message or original if no meaningful line found
