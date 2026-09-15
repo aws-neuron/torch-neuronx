@@ -261,3 +261,47 @@ ATEN_UPSAMPLINGBIMODE2D_AA_NO_LOWERING = [
     "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_True_mode_bicubic_memory_format0_neuron",
     "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_True_mode_bicubic_memory_format1_neuron",
 ]
+
+# Tests that explicitly pass backend="eager", backend="inductor", or
+# backend="aot_eager" to torch.compile. These backends target CPU/GPU and
+# are not applicable on Neuron.
+ATEN_NON_NEURON_COMPILE_BACKEND = [
+    # test_custom_ops.py
+    "TestCustomOpAPI::test_compile",
+    "TestCustomOpAPI::test_custom_op_inplace_tag_compile_eager",
+    "TestCustomOpAPI::test_custom_op_inplace_tag_compile_eager_fullgraph",
+    "TestCustomOpAPI::test_custom_op_inplace_tag_compile_inductor_fullgraph",
+    "TestCustomOpAPI::test_custom_op_out_tag_compile_eager",
+    "TestCustomOpAPI::test_custom_op_out_tag_compile_eager_fullgraph",
+    "TestCustomOpAPI::test_custom_op_out_tag_compile_inductor_fullgraph",
+    # test_fake_tensor.py
+    "FakeTensorTest::test_embedding_meta_indices_torch_compile",
+    # test_opaque_obj_v2.py
+    "TestOpaqueObject::test_compile1",
+    "TestOpaqueObject::test_compile_contiguous_strides",
+    "TestOpaqueObject::test_compile_create_intermediate",
+    "TestOpaqueObject::test_compile_exact_strides",
+    "TestOpaqueObject::test_compile_fixed_stride_order",
+    "TestOpaqueObject::test_compile_inline_methods",
+    "TestOpaqueObject::test_custom_op_reference_return",
+    "TestOpaqueObject::test_hoist_basic",
+    "TestOpaqueObject::test_hoist_cache_hits",
+    "TestOpaqueObject::test_multiple_opaque_objects_in_backward",
+    "TestOpaqueObject::test_op_passthrough_counter_in_tuple",
+    "TestOpaqueObject::test_opaque_obj_saved_for_backward",
+    "TestOpaqueObject::test_opaque_produced_by_call_function_saved_for_backward",
+    "TestOpaqueObject::test_script_object_intermediate_exposed_from_checkpoint",
+    "TestOpaqueObject::test_subclass_opaque_attrs_cache_hit",
+    "TestOpaqueObject::test_tensor_subclass_opaque_backward_compiled_autograd",
+    "TestOpaqueObject::test_tensor_subclass_shared_opaque_backward",
+    "TestOpaqueObject::test_tensor_subclass_shared_opaque_remapping",
+    "TestOpaqueObject::test_value_type_graph_intermediate",
+    "TestOpaqueObject::test_value_type_graph_output_backend_aot_eager",
+    "TestOpaqueObject::test_value_type_graph_output_backend_eager",
+    "TestOpaqueObject::test_value_type_graph_output_backend_inductor",
+    "TestOpaqueObject::test_value_type_list",
+    "TestOpaqueObject::test_value_type_nested",
+    "TestOpaqueObject::test_value_type_subclass",
+    # test_out_dtype_op.py
+    "TestOutDtypeOp::test_out_dtype_dynamo",
+]

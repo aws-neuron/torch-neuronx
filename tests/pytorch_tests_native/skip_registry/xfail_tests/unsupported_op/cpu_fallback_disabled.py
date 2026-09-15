@@ -165,4 +165,8 @@ UNSUPPORTED_OP_CPU_FALLBACK_DISABLED = [
     "test_transformers.py::TestTransformersNEURON::test_transformerencoder_fastpath_use_torchscript_False_enable_nested_tensor_True_use_autocast_False_d_model_256_neuron",
     "test_transformers.py::TestTransformersNEURON::test_transformerencoder_fastpath_use_torchscript_False_enable_nested_tensor_True_use_autocast_True_d_model_12_neuron",
     "test_transformers.py::TestTransformersNEURON::test_transformerencoder_fastpath_use_torchscript_False_enable_nested_tensor_True_use_autocast_True_d_model_256_neuron",
+    # test_fake_tensor.py -- PropagateRealTensors mode dispatches aten::copy_ to Neuron,
+    # which fails because CPU fallback is disabled for unimplemented ops.
+    "FakeTensorOperatorInvariants::test_flash_attention",
+    "PropagateRealTensorsFakeTensorOperatorInvariants::test_flash_attention_propagate_real_tensors",
 ]

@@ -61,4 +61,7 @@ UNSUPPORTED_OP_SPARSE = [
     "test_dataloader.py::TestDataLoaderDeviceTypeNEURON::test_sparse_tensor_multiprocessing_context_fork_neuron",
     "test_dataloader.py::TestDataLoaderDeviceTypeNEURON::test_sparse_tensor_multiprocessing_context_forkserver_neuron",
     "test_dataloader.py::TestDataLoaderDeviceTypeNEURON::test_sparse_tensor_multiprocessing_context_spawn_neuron",
+    # test_fake_tensor.py
+    "FakeTensorTest::test_sparse_spdiags_compile_backend_eager",
+    "PropagateRealTensorsFakeTensorTest::test_sparse_spdiags_compile_backend_eager_propagate_real_tensors",
 ]
