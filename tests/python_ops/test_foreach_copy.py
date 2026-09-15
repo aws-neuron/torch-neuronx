@@ -298,21 +298,27 @@ def test_nondefault_stream_neg_src_falls_back():
         torch.testing.assert_close(d.cpu(), -s)
 
 
-@pytest.mark.needs_process_isolation(
-    reason="requires_nrt_streams_with_host_cc sets the stream flags, which the C++ "
-    "stream configuration keeps after first use."
+@pytest.mark.parametrize(
+    ("src_dtype", "dst_dtype"),
+    [
+        (torch.float32, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float16),
+        (torch.float16, torch.float32),
+    ],
 )
+@pytest.mark.needs_process_isolation(reason="HostCC stream flags remain fixed after first use.")
 @requires_nrt_streams_with_host_cc
-def test_nondefault_stream_cross_dtype_falls_back():
-    """Non-default stream + hostCC: cross-dtype falls through to per-pair dst.copy_(src)."""
-    cpu_srcs = [torch.randn(64, dtype=torch.float32) for _ in range(2)]
-    srcs = [s.to("neuron") for s in cpu_srcs]
-    dsts = [torch.zeros(64, dtype=torch.bfloat16, device="neuron") for _ in range(2)]
+def test_nondefault_stream_cross_dtype_uses_copy_dispatch(src_dtype, dst_dtype):
+    """Cross-dtype foreach remains functional through per-pair copy_ dispatch."""
+    cpu_srcs = [torch.randn(64, dtype=src_dtype) for _ in range(2)]
+    srcs = [src.to("neuron") for src in cpu_srcs]
+    dsts = [torch.zeros(64, dtype=dst_dtype, device="neuron") for _ in range(2)]
 
     stream = torch.neuron.Stream()
     stream.wait_stream(torch.neuron.current_stream())
     with torch.neuron.stream(stream):
         torch._foreach_copy_(dsts, srcs)
     stream.synchronize()
-    for d, s in zip(dsts, cpu_srcs, strict=False):
-        torch.testing.assert_close(d.cpu(), s.to(torch.bfloat16))
+    for dst, src in zip(dsts, cpu_srcs, strict=False):
+        torch.testing.assert_close(dst.cpu(), src.to(dst_dtype))

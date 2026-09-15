@@ -37,6 +37,7 @@ enum class KernelTypeEnum {
   kHLO,
   kCollective,
   kCopy,
+  kCast,
   kWrite,
   kRead,
   kEvent,
@@ -48,13 +49,14 @@ enum class KernelTypeEnum {
 };
 
 // Check if a kernel type represents a device operation (vs host-side operation).
-// Device operations: kHLO, kCollective, kCopy, kWrite, kRead
+// Device operations: kHLO, kCollective, kCopy, kCast, kWrite, kRead
 // Host-side operations: kEvent, kBarrier, kHint, kAlloc, kDealloc, kHost
 inline bool IsDeviceKernelType(KernelTypeEnum kernel_type) {
   switch (kernel_type) {
     case KernelTypeEnum::kHLO:
     case KernelTypeEnum::kCollective:
     case KernelTypeEnum::kCopy:
+    case KernelTypeEnum::kCast:
     case KernelTypeEnum::kWrite:
     case KernelTypeEnum::kRead:
       return true;
@@ -80,6 +82,7 @@ inline bool IsConcatBufferableKernelType(KernelTypeEnum kernel_type) {
       return true;
     case KernelTypeEnum::kCollective:
     case KernelTypeEnum::kCopy:
+    case KernelTypeEnum::kCast:
     case KernelTypeEnum::kWrite:
     case KernelTypeEnum::kRead:
     case KernelTypeEnum::kEvent:
@@ -98,6 +101,7 @@ inline size_t GetXUIndex(KernelTypeEnum kernel_type) {
     case KernelTypeEnum::kCollective:
       return NRTA_XU_COLLECTIVES;
     case KernelTypeEnum::kCopy:
+    case KernelTypeEnum::kCast:
     case KernelTypeEnum::kWrite:
     case KernelTypeEnum::kRead:
       return NRTA_XU_TENSOR_OP;
@@ -795,6 +799,29 @@ class CopyDirectKernelExecution
   size_t src_offset_bytes_;
   size_t dst_offset_bytes_;
   size_t size_bytes_;
+};
+
+class CastDirectKernelExecution
+    : public NeuronKernelExecutionTyped<KernelTypeEnum::kCast, c10::DeviceType::PrivateUse1,
+                                        c10::DeviceType::PrivateUse1> {
+ public:
+  CastDirectKernelExecution(const std::string& op_name, TensorDataRef src_ref,
+                            TensorDataRef dst_ref, uint64_t src_offset_elements,
+                            uint64_t dst_offset_elements, c10::ScalarType src_dtype,
+                            c10::ScalarType dst_dtype, uint64_t num_elements, int device_id);
+
+  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                c10::StreamId stream_id) const override;
+
+ protected:
+  bool ValidateImpl() const override;
+
+ private:
+  uint64_t src_offset_elements_;
+  uint64_t dst_offset_elements_;
+  c10::ScalarType src_dtype_;
+  c10::ScalarType dst_dtype_;
+  uint64_t num_elements_;
 };
 
 class WriteDirectKernelExecution

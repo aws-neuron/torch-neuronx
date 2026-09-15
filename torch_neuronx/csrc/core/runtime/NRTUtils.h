@@ -335,6 +335,19 @@ inline NRT_STATUS ScheduleTensorCopy(nrt_tensor_t* src, uint64_t src_offset, nrt
 }
 
 /**
+ * Enqueue an asynchronous cross-dtype tensor cast.
+ *
+ * Descriptor offsets are measured in elements of their respective dtypes.
+ * The referenced tensors must remain allocated until the request completes.
+ */
+inline NRT_STATUS ScheduleTensorCast(const nrt_compute_tensor_t& src,
+                                     const nrt_compute_tensor_t& dst, uint64_t num_elements,
+                                     int lnc_idx, int queue, NRT_STATUS* ret,
+                                     SequenceId* req_sequence) {
+  return nrta_tensor_cast(&src, &dst, num_elements, lnc_idx, queue, ret, req_sequence);
+}
+
+/**
  * Prepare a collective communication operation (blocking)
  * @param comm Communication handle (contains replica group info)
  * @param input Input tensor list
