@@ -139,6 +139,12 @@ DTYPE_MISMATCH_FLOAT64_DOWNCAST = [
     "test_type_promotion.py::TestTypePromotionNEURON::test_bfloat16_neuron",
     "test_ops.py::TestFakeTensorNEURON::test_fake_autocast_pinverse_neuron_float32",
     "test_tensor_creation_ops.py::TestRandomTensorCreationNEURON::test_uniform_from_to_neuron_float64",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_glu_neuron_bfloat16",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_glu_neuron_float16",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_glu_neuron_float64",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_mish_neuron_bfloat16",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_mish_neuron_float16",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_mish_neuron_float64",
     # Neuron has no float64 (docs/packed_int64_design.md). It runs these ops in
     # float32. The forward and gradient results, and the test_decomp float64
     # reference, do not match the float64 CPU value. Same limit as the entries

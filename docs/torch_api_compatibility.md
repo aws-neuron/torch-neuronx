@@ -580,11 +580,11 @@
 |136|torch.nn.ConstantPad1d|Y|Forward runs on Neuron|
 |137|torch.nn.ConstantPad2d|Y|Forward runs on Neuron|
 |138|torch.nn.ConstantPad3d|Y|Forward runs on Neuron|
-|139|torch.nn.ELU|CPU_FALLBACK|Falls back (aten::elu.out)|
-|140|torch.nn.Hardshrink|CPU_FALLBACK|Falls back (aten::hardshrink.out)|
+|139|torch.nn.ELU|Y|Native MLIR impl (aten::elu)|
+|140|torch.nn.Hardshrink|Y|Native MLIR impl (aten::hardshrink)|
 |141|torch.nn.Hardsigmoid|Y|Native MLIR impl|
-|142|torch.nn.Hardtanh|CPU_FALLBACK|Falls back (aten::hardtanh)|
-|143|torch.nn.Hardswish|CPU_FALLBACK|Falls back (aten::hardswish)|
+|142|torch.nn.Hardtanh|Y|Native MLIR impl (aten::hardtanh)|
+|143|torch.nn.Hardswish|Y|Native MLIR impl (aten::hardswish)|
 |144|torch.nn.LeakyReLU|Y|Native MLIR impl|
 |145|torch.nn.LogSigmoid|CPU_FALLBACK|Falls back (aten::log_sigmoid_forward)|
 |146|torch.nn.MultiheadAttention|Y|Forward runs on Neuron|
@@ -592,21 +592,21 @@
 |148|torch.nn.MultiheadAttention.merge_masks|Y|Forward runs on Neuron|
 |149|torch.nn.PReLU|CPU_FALLBACK|Falls back (aten::_prelu_kernel)|
 |150|torch.nn.ReLU|Y|Forward runs on Neuron|
-|151|torch.nn.ReLU6|CPU_FALLBACK|Falls back (aten::hardtanh)|
+|151|torch.nn.ReLU6|Y|Native MLIR impl (decomposes to aten::hardtanh)|
 |152|torch.nn.RReLU|CPU_FALLBACK|Falls back (aten::rrelu_with_noise)|
-|153|torch.nn.SELU|CPU_FALLBACK|Falls back (aten::elu.out)|
+|153|torch.nn.SELU|Y|Native MLIR impl (aten::selu)|
 |154|torch.nn.CELU|Y|Native MLIR impl|
 |155|torch.nn.GELU|Y|Forward runs on Neuron|
 |156|torch.nn.Sigmoid|Y|Forward runs on Neuron|
 |157|torch.nn.SiLU|Y|Forward runs on Neuron|
-|158|torch.nn.Mish|CPU_FALLBACK|Falls back (aten::mish.out)|
+|158|torch.nn.Mish|Y|Native MLIR impl (aten::mish)|
 |159|torch.nn.Softplus|Y|Forward runs on Neuron|
 |160|torch.nn.Softshrink|CPU_FALLBACK|Falls back (aten::softshrink.out)|
 |161|torch.nn.Softsign|Y|Forward runs on Neuron (via F.softsign)|
 |162|torch.nn.Tanh|Y|Forward runs on Neuron|
 |163|torch.nn.Tanhshrink|Y|Forward runs on Neuron (via F.tanhshrink)|
 |164|torch.nn.Threshold|Y|Forward runs on Neuron|
-|165|torch.nn.GLU|CPU_FALLBACK|Falls back (aten::glu.out)|
+|165|torch.nn.GLU|Y|Native MLIR impl (aten::glu)|
 |166|torch.nn.Softmin|Y|Forward runs on Neuron (via F.softmin)|
 |167|torch.nn.Softmax|Y|Forward runs on Neuron|
 |168|torch.nn.Softmax2d|Y|Forward runs on Neuron (via F.softmax)|
@@ -838,23 +838,23 @@
 |30|F.threshold_|CPU_FALLBACK|torch_threshold() got unexpected keyword argument 'out'|
 |31|F.relu|Y|Uses aten::relu (registered on Neuron)|
 |32|F.relu_|Y|In-place variant|
-|33|F.hardtanh|CPU_FALLBACK|Falls back to CPU (aten::hardtanh)|
-|34|F.hardtanh_|CPU_FALLBACK|Falls back to CPU (aten::hardtanh)|
-|35|F.hardswish|CPU_FALLBACK|Falls back to CPU (aten::hardswish)|
-|36|F.relu6|CPU_FALLBACK|Falls back to CPU (aten::hardtanh)|
-|37|F.elu|CPU_FALLBACK|Falls back to CPU (aten::elu.out)|
-|38|F.elu_|CPU_FALLBACK|Falls back to CPU (aten::elu.out)|
-|39|F.selu|CPU_FALLBACK|Falls back to CPU (aten::elu.out)|
+|33|F.hardtanh|Y|Native MLIR impl (aten::hardtanh)|
+|34|F.hardtanh_|Y|Native MLIR impl (aten::hardtanh_)|
+|35|F.hardswish|Y|Native MLIR impl (aten::hardswish)|
+|36|F.relu6|Y|Native MLIR impl (decomposes to aten::hardtanh)|
+|37|F.elu|Y|Native MLIR impl (aten::elu)|
+|38|F.elu_|Y|Native MLIR impl (aten::elu_)|
+|39|F.selu|Y|Native MLIR impl (aten::selu)|
 |40|F.celu|Y|Native MLIR impl|
 |41|F.leaky_relu|Y|Native MLIR impl|
 |42|F.leaky_relu_|Y|Native MLIR impl|
 |43|F.prelu|CPU_FALLBACK|Falls back to CPU (aten::_prelu_kernel)|
 |44|F.rrelu|CPU_FALLBACK|Falls back to CPU (aten::rrelu_with_noise)|
 |45|F.rrelu_|CPU_FALLBACK|Falls back to CPU (aten::rrelu_with_noise)|
-|46|F.glu|CPU_FALLBACK|Falls back to CPU (aten::glu.out)|
+|46|F.glu|Y|Native MLIR impl (aten::glu)|
 |47|F.gelu|Y|Uses aten::gelu (registered on Neuron)|
 |48|F.logsigmoid|CPU_FALLBACK|Falls back to CPU (aten::log_sigmoid_forward)|
-|49|F.hardshrink|CPU_FALLBACK|Falls back to CPU (aten::hardshrink.out)|
+|49|F.hardshrink|Y|Native MLIR impl (aten::hardshrink)|
 |50|F.tanhshrink|Y|Decomposes to tanh + sub (supported)|
 |51|F.softsign|Y|Decomposes to div + abs (supported)|
 |52|F.softplus|Y|Uses aten::softplus (registered on Neuron)|
@@ -867,7 +867,7 @@
 |59|F.sigmoid|Y|Uses aten::sigmoid (registered on Neuron)|
 |60|F.hardsigmoid|Y|Native MLIR impl|
 |61|F.silu|Y|Uses aten::silu (registered on Neuron)|
-|62|F.mish|CPU_FALLBACK|Falls back to CPU (aten::mish.out)|
+|62|F.mish|Y|Native MLIR impl (aten::mish)|
 |63|F.batch_norm|CPU_FALLBACK|Falls back to CPU (aten::native_batch_norm)|
 |64|F.group_norm|CPU_FALLBACK|Falls back to CPU (aten::native_batch_norm)|
 |65|F.instance_norm|CPU_FALLBACK|Falls back to CPU (aten::native_batch_norm)|
@@ -1138,7 +1138,7 @@
 |215|Tensor.greater|Y|Native MLIR impl|
 |216|Tensor.greater_|Y|Native MLIR impl|
 |217|Tensor.half|Y|Uses to(float16)|
-|218|Tensor.hardshrink|CPU_FALLBACK|No native Neuron impl|
+|218|Tensor.hardshrink|Y|Native MLIR impl (aten::hardshrink)|
 |219|Tensor.heaviside|CPU_FALLBACK|No native Neuron impl|
 |220|Tensor.histc|CPU_FALLBACK|Falls back to CPU|
 |221|Tensor.histogram|CPU_FALLBACK|Falls back to CPU|

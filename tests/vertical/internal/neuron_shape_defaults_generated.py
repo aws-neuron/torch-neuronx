@@ -2609,6 +2609,7 @@ def register_all_defaults(r, smoke_subsets=()):
     )
     r("aten::relu.out", {"self": (256, 4096)}, source="builtin")
     r("aten::relu6", {"self": (256, 4096)}, source="builtin")
+    r("aten::relu6_.default", {"self": (256, 4096)}, source="builtin")
     r("aten::relu_", {"self": (256, 4096)}, source="builtin")
     r("aten::remainder.Scalar", {"self": (256, 4096), "other": 1.0}, source="builtin")
     r("aten::remainder.Scalar_Tensor", {"self": 1.0, "other": (256, 4096)}, source="builtin")

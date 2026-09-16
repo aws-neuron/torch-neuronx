@@ -67,7 +67,9 @@ honors `kwarg_only` args only), so two values silently reuse one stale NEFF (cel
 ### One decorator for functional + `.out`; call the aten op, never inline the ref
 Symptom: a separate `_out` function with `output_params=("out",)` (#1579), or an
 `out.copy_(<op>_ref(...))` inside `register_decomposition([aten.<op>.out])`, or a
-lowering body that returns `<op>_ref(a, b)` (#1775, repeated). Root cause: the
+lowering body that returns `<op>_ref(a, b)` (#1775, repeated), or a BACKWARD
+handler that inlines the gradient math when the backward op is itself in the
+decomposition table (`glu_backward`, `hardshrink_backward`, #1810). Root cause: the
 `register_aten` path and the decomp table already handle `out=` OUTSIDE the lowering
 (alias or copy), so a hand-written `out.copy_` is redundant and a separate `_out`
 is dead weight. Fix: fold functional + `.out` into one decorator/decomposition; in
@@ -272,3 +274,33 @@ it is deprecated and goes away. Fix: register on the C++ dispatch path (a plain
 static arg), use `relower_every_call=True` with `preprocessing=` (PR #1065) —
 execution stays in C++ and the HLO/NEFF cache still applies. Reject a new op that
 uses `python_dispatch=True`.
+
+### Do not comment what a SkipGroup reason already says
+Symptom: a multi-line comment above a SkipGroup or an xfail list restated the
+`reason=` string. Root cause: the comment duplicated the reason, which is the real
+documentation the verifier and reviewers read. Fix: put the justification in the
+`reason=` string, then delete the comment. The float64-downcast entries need no
+comment either; the file docstring plus the reason is enough.
+
+### Use the "Native MLIR impl" doc convention, not new prose
+Symptom: new `torch_api_compatibility.md` rows read "Forward and backward run on
+Neuron", diverging from the table's convention. Root cause: inventing per-op prose
+instead of matching the surrounding rows. Fix: for an op that lowers via a torch-mlir
+passthrough, write `Native MLIR impl (aten::<op>)`, like the existing native rows.
+Match the established column style; do not coin a new phrasing.
+
+### A compiler bug that blocks a lowering gets a packaged repro, not a bare xfail
+Symptom: an op stayed xfailed with a prose "compiler limitation" reason and no
+evidence, so a reviewer and the allowlist could not accept it. Root cause: the claim
+was asserted, not proven standalone. Fix: use `compiler-artifact-repro` — dump the
+offending `module.mlir` + `.neff` (`TORCH_NEURONX_DEBUG_DIR` + the preserve flag),
+prove it reproduces STANDALONE through neuronx-cc (no aten, no decomposition), and
+`gen_ticket.py` a draft `ticket.md` under `agent_space/`. Cite the ticket in the reason.
+
+### Do not hard-wrap a PR or issue body; let GitHub soft-wrap it
+Symptom: a PR description showed short lines with a large empty right margin in the
+GitHub panel. Root cause: GitHub renders each newline as a line break, so hard-wrapped
+prose stops at the wrap column and does not fill the width. Fix: put each paragraph and
+each list item on ONE physical line; let GitHub soft-wrap to the panel width. Keep a
+wide table as a real table (GitHub wraps the cells). Hard-wrap only a file that a plain
+text viewer shows, for example `ticket.md` and a commit message body.
