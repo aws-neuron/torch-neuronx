@@ -422,4 +422,45 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_state_dict_stager.py::TestStateDictStager::test_tensor_pinned_and_shared",
         ],
     ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][unsupported_feature] ProcessGroupNeuron does not support"
+            " process group splitting. Pipelining PerDirectionSchedule"
+            " tests require backend splitting support."
+        ),
+        tests=[
+            "test_schedule_multiproc.py::PerDirectionScheduleTest::test_creates_distinct_direction_groups",
+            "test_schedule_multiproc.py::PerDirectionScheduleTest::test_grad_with_manual_per_direction_ScheduleClass0",
+            "test_schedule_multiproc.py::PerDirectionScheduleTest::test_grad_with_manual_per_direction_ScheduleClass1",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] New test_addmm_partial_redistribute test creates a CPU"
+            " DeviceMesh which calls init_process_group without RANK env var"
+            " set in the multi-process test harness."
+        ),
+        tests=[
+            "test_op_strategy.py::TestCostModel::test_addmm_partial_redistribute",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] Test uses CompileCounterWithBackend('inductor')"
+            " which raises KeyError on Neuron. Test is Inductor-specific."
+        ),
+        tests=[
+            "test_dtensor_compile.py::TestDTensorCompile::test_compile_waits_act_nested_in_dtensor_local_tensor",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] Unbacked symbolic strides in DTensor backward"
+            " cause Neuron compilation error. Compiler cannot handle"
+            " dynamic stride expressions in the backward graph."
+        ),
+        tests=[
+            "test_dtensor_compile.py::TestDTensorCompile::test_to_local_backward_unbacked_symbolic_stride",
+        ],
+    ),
 ]

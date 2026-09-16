@@ -64,4 +64,11 @@ UNSUPPORTED_OP_SPARSE = [
     # test_fake_tensor.py
     "FakeTensorTest::test_sparse_spdiags_compile_backend_eager",
     "PropagateRealTensorsFakeTensorTest::test_sparse_spdiags_compile_backend_eager_propagate_real_tensors",
+    # PT 2.14: new test variants hitting sparse ops
+    "test_ops.py::TestCommonNEURON::test_compare_cpu_sparse_sampled_addmm_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_compare_cpu_to_sparse_neuron_float32",
+    "test_view_ops.py::TestOldViewOpsNEURON::test_crow_col_indices_neuron",
+    "test_view_ops.py::TestOldViewOpsNEURON::test_t_neuron",
+    # PT 2.14: SparseAdam cross-device uses sparse tensors
+    "test_optim.py::TestOptimRenewedNEURON::test_state_dict_cross_device_SparseAdam_neuron_float32",
 ]

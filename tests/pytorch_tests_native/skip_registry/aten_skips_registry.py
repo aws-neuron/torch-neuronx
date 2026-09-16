@@ -272,15 +272,7 @@ SKIP_GROUPS: list[SkipGroup] = [
             " when complex intermediate tensors flow through aten::stack,"
             " aten::abs, or aten::contiguous."
         ),
-        tests=[
-            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_batch_vs_slicing__refs__conversions_polar_neuron_float32",
-            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_batch_vs_slicing__refs__conversions_polar_neuron_float64",
-            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_batch_vs_slicing_polar_neuron_float32",
-            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_batch_vs_slicing_polar_neuron_float64",
-            "test_decomp.py::TestDecompNEURON::test_comprehensive_linalg_eig_neuron_float32",
-            "test_decomp.py::TestDecompNEURON::test_comprehensive_linalg_eig_neuron_float64",
-            "test_ops.py::TestCommonNEURON::test_out_linalg_eig_neuron_float32",
-        ],
+        tests=s.COMPLEX_OUTPUT_OPS,
     ),
     SkipGroup(
         reason=(
@@ -370,6 +362,17 @@ SKIP_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "Upstream OpInfo declares @expectedFailure for test_compare_cpu"
+            " on these ops (linalg.lu family and special polynomials)."
+            " Neuron correctly computes the result, so the test passes —"
+            " but pytest reports 'Unexpected success' as a failure."
+            " PT 2.14 widened test_compare_cpu from @onlyCUDA to"
+            " @onlyAccelerator, exposing this on Neuron for the first time."
+        ),
+        tests=s.ATEN_COMPARE_CPU_UNEXPECTED_SUCCESS,
+    ),
+    SkipGroup(
+        reason=(
             "neuronx-cc assertion NCC_IBCG901 'Incorrect partition set!'"
             " when compiling aten::convolution_backward for 3D conv-transpose"
             " with non-contiguous layout. Test also takes an extreme amount"
@@ -449,6 +452,21 @@ SKIP_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "[PT 2.14][platform.float64] float64 gradgrad tests added in PT 2.14."
+            " Neuron does not support native float64; the float64->float32"
+            " precision loss causes gradcheck failures. xfail (not skip)"
+            " so a future float64 story would xpass and flag it."
+        ),
+        tests=[
+            "test_autograd.py::TestAutogradDeviceTypeNEURON::test_cdist_gradgrad_neuron_float64",
+            "test_autograd.py::TestAutogradDeviceTypeNEURON::test_pdist_gradgrad_neuron_float64",
+            # test_pdist_neuron uses torch.double internally; gradcheck fails
+            # due to float64→float32 precision loss (same root cause)
+            "test_nn.py::TestNNDeviceTypeNEURON::test_pdist_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "Neuron registers ops without schemas (schemaless boxed dispatch)."
             " test_find_dangling_impls expects all registered ops to have a schema."
         ),
@@ -462,5 +480,25 @@ SKIP_GROUPS: list[SkipGroup] = [
         tests=[
             "TestSymbolicTracing::test_constant_specialization",
         ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][platform.float64] New NEURON device-type test instantiations added"
+            " in PT 2.14. Neuron does not support native float64; the"
+            " float64->float32 precision loss causes accuracy mismatches,"
+            " Jacobian failures, or compilation errors. xfail (not skip)"
+            " so a future float64 story would xpass and flag it."
+        ),
+        tests=s.ATEN_PLATFORM_FLOAT64_NEW_INSTANTIATIONS,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][platform.float64] New NEURON device-type test instantiations added"
+            " in PT 2.14 iter2. Neuron does not support native float64; the"
+            " float64->float32 precision loss causes accuracy mismatches,"
+            " Jacobian failures, ComplexDouble cast errors, or compilation"
+            " errors. xfail (not skip) so a future float64 story would xpass."
+        ),
+        tests=s.ATEN_PLATFORM_FLOAT64_NEW_INSTANTIATIONS_ITER2,
     ),
 ]

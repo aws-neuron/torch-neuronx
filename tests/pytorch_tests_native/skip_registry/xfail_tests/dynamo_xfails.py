@@ -443,3 +443,73 @@ DYNAMO_INPLACE_METADATA_PROPAGATION = [
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_bfloat16",
     "test_dynamo_ops.py::TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_float16",
 ]
+
+DYNAMO_NCC_EMOD023_COMPILATION_FAILURE = [
+    "dynamo/test_dicts.py::DictTests::test_canonical_graph_overlapping_unsqueeze_with_mutation",
+    "dynamo/test_misc.py::MiscTests::test_check_compiles_when_predicate_true_and_message_module_level_fn",
+    "dynamo/test_misc.py::MiscTests::test_check_compiles_when_predicate_true_and_message_non_str_constant",
+    "dynamo/test_misc.py::MiscTests::test_check_compiles_when_predicate_true_and_message_string",
+    "dynamo/test_modules.py::NNModuleTests::test_lazy_module_symbolic_shapes",
+    "dynamo/test_nb_power.py::TestNbPower::test_pow_symnode_and_int",
+    "dynamo/test_nested_graph_breaks.py::NestedGraphBreakTests::test_tree_map_functools_partial_graph_break_preserves_structure",
+    "dynamo/test_nested_graph_breaks.py::NestedGraphBreakTests::test_tree_map_no_grad_nested_fn_graph_break_preserves_structure",
+    "dynamo/test_nested_graph_breaks.py::NestedGraphBreakTests::test_tree_map_no_grad_wrapped_graph_break_preserves_structure",
+    "dynamo/test_nested_graph_breaks.py::NestedGraphBreakTests::test_tree_map_only_graph_break_preserves_structure",
+    "dynamo/test_unspec.py::UnspecTests::test_module_random_random_fullgraph",
+    "dynamo/test_unspec.py::UnspecTests::test_random_module_seed_shuffle",
+    "dynamo/test_unspec.py::UnspecTests::test_random_module_shuffle_sample",
+    "dynamo/test_unspec.py::UnspecTests::test_random_object_sample",
+    "dynamo/test_unspec.py::UnspecTests::test_random_object_shuffle",
+]
+
+DYNAMO_GRAPH_STRUCTURE_ASSERTION_MISMATCH = [
+    "dynamo/test_fwd_loss_bwd.py::TestForwardLossBackward::test_autograd_grad_basic",
+    "dynamo/test_fwd_loss_bwd.py::TestForwardLossBackward::test_autograd_grad_single_tensor",
+    "dynamo/test_fwd_loss_bwd.py::TestForwardLossBackward::test_autograd_grad_with_ingraph_nn_parameter",
+    "dynamo/test_fwd_loss_bwd.py::TestForwardLossBackward::test_autograd_grad_with_kwargs",
+    "dynamo/test_fwd_loss_bwd.py::TestForwardLossBackward::test_autograd_grad_with_unrelated_requires_grad_output",
+    "dynamo/test_fwd_loss_bwd.py::TestForwardLossBackward::test_backward_dict_inputs",
+    "dynamo/test_fwd_loss_bwd.py::TestForwardLossBackward::test_tensor_backward_accumulates_grads",
+    "dynamo/test_fwd_loss_bwd.py::TestForwardLossBackward::test_tensor_backward_basic",
+    "dynamo/test_fwd_loss_bwd.py::TestForwardLossBackward::test_tensor_backward_with_gradient",
+    "dynamo/test_fwd_loss_bwd.py::TestForwardLossBackward::test_tensor_backward_without_inputs",
+    "dynamo/test_str_protocol.py::TpStrUserDefinedTests::test_structseq_str_with_tensor_graph_breaks",
+]
+
+DYNAMO_MISC_FAILURES = [
+    "dynamo/test_autograd_function.py::AutogradFunctionTests::test_duplicate_input_accumulates_grad",
+    "dynamo/test_deviceguard.py::TestDeviceGuardWithInterfaceNEURON::test_device_guard_no_index_neuron",
+    "dynamo/test_functions.py::FunctionTests::test_itertools_compress_tensors",
+    "dynamo/test_hooks.py::HooksTests::test_input_hooks_same",
+    "dynamo/test_logging.py::PartitionedScatterLoggingTests::test_partitioned_scatter",
+    "dynamo/test_misc.py::MiscTests::test_fstring_dynamic_symint_across_graph_break",
+    "dynamo/test_misc.py::MiscTests::test_module_hooks_dict_reconstructed_as_ordered_dict",
+    "dynamo/test_misc.py::MiscTestsDeviceNEURON::test_legacy_cuda_tensor_neuron",
+    "dynamo/test_modules.py::OptimizedModuleTest::test_celu_matches_eager",
+    "dynamo/test_nb_power.py::TestNbPower::test_pow_inplace_tensor",
+    "dynamo/test_nb_unary.py::NbUnaryTests::test_double_apply_tensor_integer_dtype_inv",
+    "dynamo/test_nb_unary.py::NbUnaryTests::test_double_apply_tensor_integer_dtype_neg",
+    "dynamo/test_reorder_logs.py::ReorderLogsTests::test_reorder_logger_method",
+    "dynamo/test_subclasses.py::SubclassTests::test_tensor_subclass_tensor_metadata_requires_custom_guard",
+]
+
+DYNAMO_NESTED_GRAPH_BREAKS_WRAPPED = [
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksCtxManagerTests::test__enter__exit_autocast_graph_break_explicit_dtype_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksDictTests::test_canonical_graph_overlapping_unsqueeze_with_mutation_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksFunctionTests::test_itertools_compress_tensors_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksHooksTests::test_input_hooks_same_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksMiscTests::test_check_compiles_when_predicate_true_and_message_module_level_fn_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksMiscTests::test_check_compiles_when_predicate_true_and_message_non_str_constant_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksMiscTests::test_check_compiles_when_predicate_true_and_message_string_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksMiscTests::test_fstring_dynamic_symint_across_graph_break_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksMiscTests::test_module_hooks_dict_reconstructed_as_ordered_dict_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksMiscTests::test_tensor_share_memory_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksNNModuleTests::test_lazy_module_symbolic_shapes_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_gather_out_dynamic_shapes_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_grid_sampler_2d_cpu_fallback_backward_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_grid_sampler_2d_cpu_fallback_inductor_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_intermediate_leaf_requires_grad_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_metaclass_descriptor_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_out_overload_channels_last_nested_graph_breaks",
+    "dynamo/test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_preserve_stride_with_clone_nested_graph_breaks",
+]
