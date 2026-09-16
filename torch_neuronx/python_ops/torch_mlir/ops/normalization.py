@@ -434,3 +434,25 @@ def torch_native_batch_norm_backward(
         eps,
         output_mask,
     )
+
+
+@register_aten(
+    ["aten::_weight_norm_interface", "aten::_weight_norm_interface.out"],
+    static_argnums=(2,),
+    output_params=("out0", "out1"),
+)
+def torch_weight_norm_interface(v, g, dim=0, out0=None, out1=None):
+    return torch.ops.aten._weight_norm_interface(v, g, dim)
+
+
+@register_aten(
+    ["aten::_weight_norm_interface_backward", "aten::_weight_norm_interface_backward.out"],
+    static_argnums=(4,),
+    output_params=("out0", "out1"),
+)
+def torch_weight_norm_interface_backward(
+    grad_w, saved_v, saved_g, saved_norms, dim, out0=None, out1=None
+):
+    return torch.ops.aten._weight_norm_interface_backward(
+        grad_w, saved_v, saved_g, saved_norms, dim
+    )

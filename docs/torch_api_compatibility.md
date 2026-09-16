@@ -766,8 +766,8 @@
 |322|torch.nn.utils.prune.custom_from_mask|Y|Pure Python pruning utility|
 |323|torch.nn.utils.prune.remove|Y|Pure Python pruning utility|
 |324|torch.nn.utils.prune.is_pruned|Y|Pure Python pruning utility|
-|325|torch.nn.utils.weight_norm|CPU_FALLBACK|Falls back (aten::_weight_norm_interface)|
-|326|torch.nn.utils.remove_weight_norm|CPU_FALLBACK|Falls back (aten::_weight_norm_interface)|
+|325|torch.nn.utils.weight_norm|Y|Native MLIR impl|
+|326|torch.nn.utils.remove_weight_norm|Y|Native MLIR impl|
 |327|torch.nn.utils.spectral_norm|Y||
 |328|torch.nn.utils.remove_spectral_norm|Y||
 |329|torch.nn.utils.skip_init|Y||
