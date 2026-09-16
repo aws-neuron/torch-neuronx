@@ -38,10 +38,21 @@ _original_allclose = torch.allclose
 
 
 def _cross_device_allclose(input, other, rtol=1e-05, atol=1e-08, equal_nan=False):
-    """Patch torch.allclose to handle cross-device comparison (neuron vs cpu)"""
-    if input.device != other.device:
-        other = other.to(input.device)
-    return _original_allclose(input, other, rtol=rtol, atol=atol, equal_nan=equal_nan)
+    """Patch torch.allclose to handle cross-device comparison (neuron vs cpu).
+
+    The body runs under ``DisableTorchFunction`` for the same reason as
+    ``_cross_device_equal`` below. ``test_meta.py`` keys its
+    ``meta_function_expected_failures`` table by function identity at import
+    time, which happens after this patch. The table therefore holds this shim,
+    but the meta crossref mode intercepts the original builtin. The lookup
+    misses the entry, so the mode runs the meta comparison and fails:
+    ``allclose`` calls ``item()``, and ``aten::_local_scalar_dense`` has no
+    meta kernel. Hide the inner call to keep the expected-failure semantics.
+    """
+    with torch._C.DisableTorchFunction():
+        if input.device != other.device:
+            other = other.to(input.device)
+        return _original_allclose(input, other, rtol=rtol, atol=atol, equal_nan=equal_nan)
 
 
 _original_equal = torch.equal

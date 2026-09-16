@@ -1,11 +1,6 @@
 DEVICE_MISMATCH_CPU_VS_NEURON = [
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_comparison_ops_type_promotion_and_broadcasting_neuron_uint8_float16",
-    "test_decomp.py::TestDecompNEURON::test_comprehensive___getitem___neuron_bfloat16",
-    "test_decomp.py::TestDecompNEURON::test_comprehensive___getitem___neuron_float16",
-    "test_decomp.py::TestDecompNEURON::test_comprehensive___getitem___neuron_float32",
     "test_decomp.py::TestDecompNEURON::test_comprehensive___getitem___neuron_float64",
-    "test_ops.py::TestCommonNEURON::test_noncontiguous_samples___getitem___neuron_float32",
-    "test_ops.py::TestCommonNEURON::test_variant_consistency_eager___getitem___neuron_float32",
     "test_reductions.py::TestReductionsNEURON::test_all_any_vs_numpy_neuron_float16",
     "test_reductions.py::TestReductionsNEURON::test_all_any_vs_numpy_neuron_float32",
     "test_reductions.py::TestReductionsNEURON::test_all_any_vs_numpy_neuron_float64",

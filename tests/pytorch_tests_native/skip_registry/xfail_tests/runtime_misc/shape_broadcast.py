@@ -1,6 +1,4 @@
 RUNTIME_MISC_SHAPE_BROADCAST = [
-    "test_decomp.py::TestDecompNEURON::test_comprehensive_linalg_qr_neuron_float64",
-    "test_decomp.py::TestDecompNEURON::test_comprehensive_qr_neuron_float64",
     "test_foreach.py::TestForeachNEURON::test_binary_op_list_error_cases__foreach_clamp_max_neuron_bfloat16",
     "test_foreach.py::TestForeachNEURON::test_binary_op_list_error_cases__foreach_clamp_max_neuron_bool",
     "test_foreach.py::TestForeachNEURON::test_binary_op_list_error_cases__foreach_clamp_max_neuron_float16",

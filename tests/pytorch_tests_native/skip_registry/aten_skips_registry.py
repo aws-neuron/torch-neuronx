@@ -201,6 +201,12 @@ SKIP_GROUPS: list[SkipGroup] = [
             "TestSparseMaskedReductionsNEURON",
             "TestSparseNEURON",
             "TestSparseUnaryUfuncsNEURON",
+            # to_sparse builds a sparse result, so the real op raises before the
+            # meta comparison starts: aten::_sparse_coo_tensor_with_dims_and_tensors
+            # has no kernel for the Sparseneuron backend.
+            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_to_sparse_neuron_*",
+            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_to_sparse_neuron_*",
+            "test_meta.py::TestMetaNEURON::test_meta_outplace_to_sparse_neuron_*",
         ],
     ),
     SkipGroup(
@@ -547,5 +553,17 @@ SKIP_GROUPS: list[SkipGroup] = [
             " errors. xfail (not skip) so a future float64 story would xpass."
         ),
         tests=s.ATEN_PLATFORM_FLOAT64_NEW_INSTANTIATIONS_ITER2,
+    ),
+    SkipGroup(
+        reason=(
+            "float8_e4m3fnuz and float8_e5m2fnuz are AMD ROCm-specific float8"
+            " variants not supported on Neuron hardware. Unlike the standard OCP"
+            " float8 formats (e4m3fn, e5m2), these fnuz variants use a different"
+            " NaN/zero encoding and are not a Neuron roadmap item."
+        ),
+        patterns=[
+            "*float8_e4m3fnuz*",
+            "*float8_e5m2fnuz*",
+        ],
     ),
 ]

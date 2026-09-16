@@ -2285,10 +2285,19 @@ def nonzero_with_count(
     if size is None:
         size = num_nonzero
 
+    # A 0-d input has no dimension to index. CPU returns shape (n, 0). The
+    # coords path below cannot build this, because torch.stack needs one tensor.
+    if tensor.dim() == 0:
+        result = torch.zeros((size, 0), dtype=torch.long, device=tensor.device)
+        if with_count:
+            return result, num_nonzero
+        return result
+
     if tensor.numel() == 0 or size == 0:
-        coords = tuple(
-            torch.zeros(size, dtype=torch.long, device=tensor.device) for _ in tensor.shape
-        )
+        # An empty input has no nonzero element, so every slot is padding.
+        # Reuse the shared helper to apply fill_value the same way as below.
+        coords = [torch.zeros(size, dtype=torch.long, device=tensor.device) for _ in tensor.shape]
+        coords = _apply_fill_value(coords, size, num_nonzero, fill_value, tensor.device)
         result = torch.stack(coords, dim=1)
         if with_count:
             return result, num_nonzero
