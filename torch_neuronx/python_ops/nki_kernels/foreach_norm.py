@@ -43,7 +43,7 @@ except (ImportError, ModuleNotFoundError):
 
 
 def foreach_norm_nki(tensors, ord=2, dtype=None):
-    """Foreach norm using NKI kernels. Supports ord=1, 2, inf."""
+    """Foreach norm. NKI kernels serve ord=1, 2, and inf. Any other ord uses vector_norm."""
     if not tensors:
         return ()
 
@@ -68,9 +68,22 @@ def foreach_norm_nki(tensors, ord=2, dtype=None):
         elif ord == 2:
             output = l2_norm_nki(data)
         elif ord == float("inf"):
-            output = linf_norm_nki(data)
+            # linf_norm_kernel returns the largest finite magnitude and drops a
+            # NaN. Restore the NaN, else clip_grad_norm_(error_if_nonfinite=True)
+            # accepts a NaN gradient.
+            value = linf_norm_nki(data)[0, 0]
+            result.append(torch.where(data.isnan().any(), float("nan"), value))
+            continue
         else:
-            raise ValueError(f"Unsupported ord={ord}, expected 1, 2, or inf")
+            # Use the generic op for any other ord
+            # Reject an integral input, as vector_norm does. Check t: dtype cast data.
+            if not (t.dtype.is_floating_point or t.dtype.is_complex):
+                raise RuntimeError(
+                    "linalg.vector_norm: Expected a floating point or complex tensor "
+                    f"as input. Got {t.dtype}"
+                )
+            result.append(torch.linalg.vector_norm(data.flatten(), ord=ord))
+            continue
 
         result.append(output[0, 0])
 

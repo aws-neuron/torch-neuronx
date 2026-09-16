@@ -373,19 +373,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "Upstream test bug: TestDifferentiableOptimizer uses beta=1.0 which"
-            " is rejected by Adam/AdamW validation (must be < 1.0). This is not"
-            " Neuron-specific - test needs to be fixed upstream."
-        ),
-        tests=[
-            "test_optim.py::TestDifferentiableOptimizer::test_adam_differentiable_betas",
-            "test_optim.py::TestDifferentiableOptimizer::test_adam_differentiable_all_hyperparams",
-            "test_optim.py::TestDifferentiableOptimizer::test_adamw_differentiable_betas",
-            "test_optim.py::TestDifferentiableOptimizer::test_adamw_differentiable_all_hyperparams",
-        ],
-    ),
-    SkipGroup(
-        reason=(
             "Backward ops (huber_loss, logit, binary_cross_entropy, softplus) are"
             " not decomposed on Neuron - test sees aten.zeros_like.default instead"
             " of the expected decomposed backward. Need to add to CROSS_REF_EXCLUDE_SET"

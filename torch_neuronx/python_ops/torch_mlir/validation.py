@@ -52,3 +52,45 @@ def validate_float_only_dtype(self, *_operands, **_kwargs):
     """Reject bool/integer inputs for round(decimals=) and frac() (float-only)."""
     if isinstance(self, torch.Tensor) and self.dtype in _FLOAT_ONLY_UNSUPPORTED_DTYPES:
         raise RuntimeError(f'"round/frac" not implemented for {self.dtype}')
+
+
+def is_bool_operand(operand):
+    """True when an operand is bool. An operand is a tensor, a number, or a list."""
+    if isinstance(operand, torch.Tensor):
+        return operand.dtype == torch.bool
+    if isinstance(operand, bool):
+        return True
+    if isinstance(operand, int | float | complex):
+        return False
+    if isinstance(operand, list | tuple):
+        return any(is_bool_operand(x) for x in operand)
+    return False
+
+
+def check_bool_sub(*operands):
+    """Reject subtraction that involves a bool operand, the same as Tensor.sub.
+
+    Each operand is one argument slot. Two bool operands and one bool operand get
+    the two different messages that ``sub_check`` in ATen ``BinaryOps.h`` raises.
+    """
+    is_bool = [is_bool_operand(o) for o in operands]
+    if all(is_bool):
+        raise RuntimeError(
+            "Subtraction, the `-` operator, with two bool tensors is not supported. "
+            "Use the `^` or `logical_xor()` operator instead."
+        )
+    if any(is_bool):
+        raise RuntimeError(
+            "Subtraction, the `-` operator, with a bool tensor is not supported. "
+            "If you are trying to invert a mask, use the `~` or `logical_not()` operator instead."
+        )
+
+
+def check_lerp_dtype(start, weight):
+    """Reject bool for lerp, which has no bool kernel in ATen.
+
+    The kernel name in the message follows the weight form, the same as ATen.
+    """
+    if isinstance(start, torch.Tensor) and start.dtype == torch.bool:
+        kernel = "lerp_kernel_tensor" if isinstance(weight, torch.Tensor) else "lerp_kernel_scalar"
+        raise NotImplementedError(f"\"{kernel}\" not implemented for 'Bool'")

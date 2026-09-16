@@ -3,7 +3,7 @@
 import torch
 
 from ..operation_registry import register_aten
-from ..validation import validate_inplace_broadcast
+from ..validation import check_bool_sub, validate_inplace_broadcast
 from .unary import _validate_float_promoting_out
 
 
@@ -145,6 +145,7 @@ def torch_mul_inplace(x, y, out=None):
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_sub(x, y, alpha=1, out=None):
+    check_bool_sub(x, y)
     return torch.sub(x, y, alpha=alpha)
 
 
@@ -155,6 +156,7 @@ def torch_sub(x, y, alpha=1, out=None):
 )
 def torch_sub_inplace(x, y, alpha=1, out=None):
     """In-place sub — no type promotion; result follows self's dtype."""
+    check_bool_sub(x, y)
     return _inplace_result(torch.sub(x, y, alpha=alpha), x)
 
 
@@ -282,6 +284,7 @@ def torch_ldexp(self, other, out=None):
 
 @register_aten(["aten::rsub.Tensor", "aten::rsub.Tensor_out"], static_argnames=("alpha",))
 def torch_rsub(self, other, alpha=1, out=None):
+    check_bool_sub(self, other)
     return torch.ops.aten.rsub(self, other, alpha=alpha)
 
 

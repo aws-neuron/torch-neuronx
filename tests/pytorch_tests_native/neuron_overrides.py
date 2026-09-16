@@ -86,6 +86,52 @@ def _cross_device_assert_equal(self, x, y, *args, **kwargs):
     return _original_assert_equal(self, x, y, *args, **kwargs)
 
 
+_original_gradcheck = _common_utils.gradcheck
+_original_gradgradcheck = _common_utils.gradgradcheck
+
+# Capture the upstream defaults before override_gradcheck_defaults() replaces them.
+_UPSTREAM_GRADCHECK_DEFAULTS = {
+    "eps": _common_utils.GRADCHECK_DEFAULT_EPS,
+    "atol": _common_utils.GRADCHECK_DEFAULT_ATOL,
+    "rtol": _common_utils.GRADCHECK_DEFAULT_RTOL,
+}
+
+
+def _has_neuron_input(inputs) -> bool:
+    """True when any tensor in a nested gradcheck input is on a Neuron device."""
+    stack = [inputs]
+    while stack:
+        obj = stack.pop()
+        if isinstance(obj, torch.Tensor):
+            if obj.device.type == "neuron":
+                return True
+        elif isinstance(obj, dict):
+            stack.extend(obj.values())
+        elif isinstance(obj, list | tuple | set):
+            stack.extend(obj)
+    return False
+
+
+def _dtype_aware_gradcheck(original):
+    """Keep the upstream gradcheck defaults for a check that no Neuron tensor reaches.
+
+    ``override_gradcheck_defaults`` widens eps and atol for the whole session. A
+    test that runs only on the CPU keeps true float64 precision and does not need
+    the wider values. The wider eps also breaks such a test: it perturbs an input
+    far enough to leave the valid range. For example, gradcheck of a
+    differentiable Adam moves beta2 from 0.999 to 1.0, and Adam then rejects it.
+    """
+
+    def wrapper(fn, inputs, *args, **kwargs):
+        if not _has_neuron_input(inputs):
+            for key, value in _UPSTREAM_GRADCHECK_DEFAULTS.items():
+                if kwargs.get(key) is None:
+                    kwargs[key] = value
+        return original(fn, inputs, *args, **kwargs)
+
+    return wrapper
+
+
 def override_gradcheck_defaults():
     """Relax gradcheck tolerances for Neuron's float32 precision.
 
@@ -107,10 +153,15 @@ def override_gradcheck_defaults():
     Also forces ``TEST_WITH_SLOW_GRADCHECK=False`` as a safety net in
     case ``PYTORCH_TEST_WITH_SLOW_GRADCHECK=1`` leaks in from the
     environment.
+
+    Installs ``_dtype_aware_gradcheck`` so a CPU-only check keeps the
+    upstream values.
     """
     _common_utils.GRADCHECK_DEFAULT_EPS = 1e-3
     _common_utils.GRADCHECK_DEFAULT_ATOL = _FLOAT32_GRAD_NOISE_FLOOR
     _common_utils.TEST_WITH_SLOW_GRADCHECK = False
+    _common_utils.gradcheck = _dtype_aware_gradcheck(_original_gradcheck)
+    _common_utils.gradgradcheck = _dtype_aware_gradcheck(_original_gradgradcheck)
 
 
 def override_split_backward_grad_tolerances():

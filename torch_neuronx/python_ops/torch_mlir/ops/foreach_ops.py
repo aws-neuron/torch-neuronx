@@ -31,6 +31,7 @@ from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
 )
 
 from ..operation_registry import Preprocessing, register_aten
+from ..validation import check_bool_sub, check_lerp_dtype
 
 # --- Validation helpers ---
 
@@ -154,15 +155,10 @@ def _make_div_inplace_validator(variant):
     return validate
 
 
-def _check_bool_sub(op, *tensor_lists):
-    """Match Tensor.sub's rejection of subtraction involving bool tensors."""
-    if op != "sub":
-        return
-    if any(t.dtype == torch.bool for tensors in tensor_lists for t in tensors):
-        raise RuntimeError(
-            "Subtraction, the `-` operator, with two bool tensors is not supported. "
-            "Use the `^` or `logical_xor()` operator instead."
-        )
+def _check_bool_sub(op, *operands):
+    """Reject a bool operand for sub. Each operand is one argument slot."""
+    if op == "sub":
+        check_bool_sub(*operands)
 
 
 _DTYPE_NAMES = {}
@@ -353,6 +349,7 @@ def _make_scalar_op(op):
 
     def fn(tensors, scalar, out=None):
         _check_tensors(tensors)
+        _check_bool_sub(op, tensors, scalar)
         # NOTE: do NOT eagerly promote the (non-empty) tensors here. compute_fn
         # promotes in-graph and infer_outputs_from_meta runs compute_fn, so the
         # inferred output dtype is already correct (bool x float -> float, ...).
@@ -386,6 +383,7 @@ def _make_scalar_inplace_op(op):
 
     def fn(tensors, scalar, out=None):
         _check_tensors(tensors)
+        _check_bool_sub(op, tensors, scalar)
         _check_div_inplace_dtype(op, tensors)
         _check_inplace_dtype_casting(tensors, scalar)
         # Keep the list full-length: replace each empty with a fresh empty
@@ -476,6 +474,7 @@ def _make_scalarlist_op(op):
 
     def fn(tensors, scalars, out=None):
         _check_tensors_scalars(tensors, scalars)
+        _check_bool_sub(op, tensors, scalars)
         # Promotion is per (tensor, scalar) pair. No eager outside branch as in
         # _make_scalar_op: scalars stay Python numbers into compute_fn, so
         # _promote_inside there already yields the CPU-matching output dtype.
@@ -501,6 +500,7 @@ def _make_scalarlist_inplace_op(op):
 
     def fn(tensors, scalars, out=None):
         _check_tensors_scalars(tensors, scalars)
+        _check_bool_sub(op, tensors, scalars)
         _check_div_inplace_dtype(op, tensors)
         _check_inplace_dtype_casting(tensors, scalars)
         # Keep the list full-length (see _make_scalar_inplace_op). scalars stays
@@ -529,6 +529,7 @@ def _make_tensor_op(op):
     def fn(tensors, tensor, *args, out=None, alpha=1):
         _check_tensors(tensors)
         _check_scalar_tensor(tensor)
+        _check_bool_sub(op, tensors, tensor)
         # The 0-dim `tensor` plays the scalar's role for promotion (result_type
         # per list element against it), same as _make_scalar_op.
         if is_div:
@@ -556,6 +557,7 @@ def _make_tensor_inplace_op(op):
     def fn(tensors, tensor, *args, out=None, alpha=1):
         _check_tensors(tensors)
         _check_scalar_tensor(tensor)
+        _check_bool_sub(op, tensors, tensor)
         _check_div_inplace_dtype(op, tensors)
         # Keep the list full-length (see _make_scalar_inplace_op).
         tensors = _replace_empty(tensors)
@@ -653,11 +655,39 @@ def _check_three_tensor_lists(self, tensor1, tensor2):
                 raise
 
 
-def _make_addcop_scalar(nki_fn):
+def _check_addcop_dtypes(op, self, tensor1, tensor2):
+    """Reject the dtypes that Tensor.addcmul and Tensor.addcdiv also reject.
+
+    addcdiv rejects two integral divisors. See ``torch_addcdiv`` in
+    ``ops/binary.py`` for the single-tensor form of the same check.
+    """
+    if self and self[0].dtype == torch.bool:
+        raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
+    if op != "addcdiv":
+        return
+    if _all_integral(tensor1) and _all_integral(tensor2):
+        raise RuntimeError(
+            "Integer division with addcdiv is no longer supported, and in a future "
+            "release addcdiv will perform a true division of tensor1 and tensor2. "
+            "The historic addcdiv behavior can be implemented as "
+            "(input + value * torch.trunc(tensor1 / tensor2)).to(input.dtype) for "
+            "integer inputs and as (input + value * tensor1 / tensor2) for float inputs. "
+            "The future addcdiv behavior is just the latter implementation: "
+            "(input + value * tensor1 / tensor2), for all dtypes."
+        )
+
+
+def _all_integral(tensors):
+    """True when every tensor has an integral dtype. Bool counts as integral."""
+    return bool(tensors) and all(
+        not (t.dtype.is_floating_point or t.dtype.is_complex) for t in tensors
+    )
+
+
+def _make_addcop_scalar(nki_fn, op):
     def fn(self, tensor1, tensor2, value=1, out=None):
         _check_three_tensor_lists(self, tensor1, tensor2)
-        if self and self[0].dtype == torch.bool:
-            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
+        _check_addcop_dtypes(op, self, tensor1, tensor2)
         if self and not self[0].dtype.is_floating_point:
             out_dtype = torch.result_type(self[0], value)
             self = [t.to(out_dtype) for t in self]
@@ -675,11 +705,10 @@ def _make_addcop_scalar(nki_fn):
     return fn
 
 
-def _make_addcop_scalar_inplace(nki_fn):
+def _make_addcop_scalar_inplace(nki_fn, op):
     def fn(self, tensor1, tensor2, value=1, out=None):
         _check_three_tensor_lists(self, tensor1, tensor2)
-        if self and self[0].dtype == torch.bool:
-            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
+        _check_addcop_dtypes(op, self, tensor1, tensor2)
         _check_inplace_dtype_casting(self, value)
         # Keep all three lists full-length (see _make_scalar_inplace_op): empties
         # become FX passthroughs that capture_backend drops, so self[i]/tensor1[i]/
@@ -699,12 +728,11 @@ def _make_addcop_scalar_inplace(nki_fn):
     return fn
 
 
-def _make_addcop_scalarlist(nki_fn):
+def _make_addcop_scalarlist(nki_fn, op):
     def fn(self, tensor1, tensor2, scalars, out=None):
         _check_three_tensor_lists(self, tensor1, tensor2)
         _check_tensors_scalars(self, scalars)
-        if self and self[0].dtype == torch.bool:
-            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
+        _check_addcop_dtypes(op, self, tensor1, tensor2)
         if self and scalars and not self[0].dtype.is_floating_point:
             out_dtype = torch.result_type(self[0], scalars[0])
             self = [t.to(out_dtype) for t in self]
@@ -722,12 +750,11 @@ def _make_addcop_scalarlist(nki_fn):
     return fn
 
 
-def _make_addcop_scalarlist_inplace(nki_fn):
+def _make_addcop_scalarlist_inplace(nki_fn, op):
     def fn(self, tensor1, tensor2, scalars, out=None):
         _check_three_tensor_lists(self, tensor1, tensor2)
         _check_tensors_scalars(self, scalars)
-        if self and self[0].dtype == torch.bool:
-            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
+        _check_addcop_dtypes(op, self, tensor1, tensor2)
         _check_inplace_dtype_casting(self, scalars)
         # Keep all lists full-length (see _make_scalar_inplace_op); scalars stays
         # paired 1:1 with self.
@@ -746,13 +773,12 @@ def _make_addcop_scalarlist_inplace(nki_fn):
     return fn
 
 
-def _make_addcop_tensor(nki_scalarlist_fn):
+def _make_addcop_tensor(nki_scalarlist_fn, op):
     """Tensor variant: scalars is a 1-dim packed tensor with one value per tensor."""
 
     def fn(self, tensor1, tensor2, scalars, out=None):
         _check_three_tensor_lists(self, tensor1, tensor2)
-        if self and self[0].dtype == torch.bool:
-            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
+        _check_addcop_dtypes(op, self, tensor1, tensor2)
         self = _replace_empty(self)
 
         def compute_fn(self, tensor1, tensor2, scalars):
@@ -770,7 +796,7 @@ def _make_addcop_tensor(nki_scalarlist_fn):
     return fn
 
 
-def _make_addcop_tensor_inplace(nki_scalarlist_fn):
+def _make_addcop_tensor_inplace(nki_scalarlist_fn, op):
     """Inplace tensor variant of _make_addcop_tensor (same scalars-as-tensor
     handling). The lists are kept full-length: empties become FX passthroughs
     that capture_backend drops, so list[i] still pairs with scalars[i] and no
@@ -779,8 +805,7 @@ def _make_addcop_tensor_inplace(nki_scalarlist_fn):
 
     def fn(self, tensor1, tensor2, scalars, out=None):
         _check_three_tensor_lists(self, tensor1, tensor2)
-        if self and self[0].dtype == torch.bool:
-            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
+        _check_addcop_dtypes(op, self, tensor1, tensor2)
         self = _replace_empty(self)
 
         def compute_fn(self, tensor1, tensor2, scalars):
@@ -823,7 +848,7 @@ for _op_name, _nki_fns in _ADDCOP_NKI_FNS.items():
         if _base == "tensor":
             _base = "scalarlist"
         _nki_fn = _nki_fns[_base]
-        _fn = _factory(_nki_fn)
+        _fn = _factory(_nki_fn, _op_name)
         _fn.__name__ = f"torch_foreach_{_op_name}_{_variant_name}"
         _aten_names = [f"aten::_foreach_{_op_name}{s}" for s in _suffixes]
         # shape_only for non-inplace Scalar variant only.
@@ -836,12 +861,19 @@ for _op_name, _nki_fns in _ADDCOP_NKI_FNS.items():
 # --- foreach_lerp ---
 
 
+def _check_lerp_dtype(self, weight_is_tensor):
+    """Reject a bool tensor list for lerp, the same as Tensor.lerp."""
+    if self:
+        check_lerp_dtype(self[0], self[0] if weight_is_tensor else 0.0)
+
+
 @register_aten(
     ["aten::_foreach_lerp.Scalar", "aten::_foreach_lerp.Scalar_out"],
     preprocessing=Preprocessing.SHAPE_ONLY,
 )
 def torch_foreach_lerp_scalar(self, tensors1, weight, out=None):
     _check_tensors_tensors(self, tensors1)
+    _check_lerp_dtype(self, weight_is_tensor=False)
     self = _replace_empty(self)
 
     def compute_fn(self, tensors1, weight):
@@ -855,6 +887,7 @@ def torch_foreach_lerp_scalar(self, tensors1, weight, out=None):
 @register_aten(["aten::_foreach_lerp_.Scalar"], preprocessing=Preprocessing.VALUE_DEPENDENT)
 def torch_foreach_lerp_scalar_inplace(self, tensors1, weight, out=None):
     _check_tensors_tensors(self, tensors1)
+    _check_lerp_dtype(self, weight_is_tensor=False)
     # Keep both lists full-length (see _make_scalar_inplace_op).
     self = _replace_empty(self)
 
@@ -876,6 +909,7 @@ def torch_foreach_lerp_scalar_inplace(self, tensors1, weight, out=None):
 def torch_foreach_lerp_list(self, tensors1, weights, out=None):
     _check_tensors_tensors(self, tensors1)
     _check_tensors_tensors(self, weights)
+    _check_lerp_dtype(self, weight_is_tensor=True)
     self = _replace_empty(self)
 
     def compute_fn(self, tensors1, weights):
@@ -890,6 +924,7 @@ def torch_foreach_lerp_list(self, tensors1, weights, out=None):
 def torch_foreach_lerp_list_inplace(self, tensors1, weights, out=None):
     _check_tensors_tensors(self, tensors1)
     _check_tensors_tensors(self, weights)
+    _check_lerp_dtype(self, weight_is_tensor=True)
     # Keep all three lists full-length (see _make_scalar_inplace_op).
     self = _replace_empty(self)
 
@@ -906,6 +941,7 @@ def torch_foreach_lerp_list_inplace(self, tensors1, weights, out=None):
 def torch_foreach_lerp_scalarlist(self, tensors1, weight, out=None):
     _check_tensors_tensors(self, tensors1)
     _check_tensors_scalars(self, weight)
+    _check_lerp_dtype(self, weight_is_tensor=False)
     self = _replace_empty(self)
 
     def compute_fn(self, tensors1, weight):
@@ -920,6 +956,7 @@ def torch_foreach_lerp_scalarlist(self, tensors1, weight, out=None):
 def torch_foreach_lerp_scalarlist_inplace(self, tensors1, weight, out=None):
     _check_tensors_tensors(self, tensors1)
     _check_tensors_scalars(self, weight)
+    _check_lerp_dtype(self, weight_is_tensor=False)
     # Keep all lists full-length (see _make_scalar_inplace_op); weight (scalar
     # list) stays paired 1:1 with self.
     self = _replace_empty(self)
