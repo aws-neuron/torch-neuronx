@@ -613,16 +613,22 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "hardtanh (and relu6, which decomposes to hardtanh(0,6)) lowers to the"
-            " Neuron clamp. On the extremal OpInfo reference sample the torch._refs"
-            " decomposition runs on the Neuron clamp, which does not propagate a"
-            " NaN input (it returns a clamp bound). test_python_ref then measures"
-            " the _refs reference as farther (nan) from the float64-precise result"
-            " than the eager op (distance 0.0). The eager lowering is exact on real"
-            " ranges (unit tests and vertical coverage pass). Do not mask the NaN"
-            " with torch.where."
+            "hardtanh, and relu6 which decomposes to hardtanh(0,6), lower to the"
+            " Neuron clamp. The Neuron clamp does not propagate a NaN and does not"
+            " keep a signed zero. It returns a clamp bound, so relu6(NaN) gives 0.0"
+            " and relu6(-0.0) gives 0.0. On the PT 2.14 extremal OpInfo sample the"
+            " eager op and the torch._refs decomposition both diverge from CPU."
+            " test_compare_cpu, test_python_ref, and the _refs executor tests fail."
+            " The lowering stays exact on finite ranges; the unit tests and the"
+            " vertical coverage pass. The compile path xfails the same extremal"
+            " cases (test_reference_numerics_extremal). Do not mask the NaN with"
+            " torch.where."
         ),
         tests=[
+            "test_ops.py::TestCommonNEURON::test_compare_cpu_nn_functional_hardtanh_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_compare_cpu__refs_nn_functional_hardtanh_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_compare_cpu_nn_functional_relu6_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_compare_cpu__refs_nn_functional_relu6_neuron_float32",
             "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardtanh_neuron_bfloat16",
             "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardtanh_neuron_float16",
             "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardtanh_neuron_float32",
@@ -631,20 +637,30 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_relu6_neuron_float16",
             "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_relu6_neuron_float32",
             "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_relu6_neuron_float64",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_nn_functional_hardtanh_executor_aten_neuron_bfloat16",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_nn_functional_hardtanh_executor_aten_neuron_float16",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_nn_functional_hardtanh_executor_aten_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_nn_functional_hardtanh_executor_aten_neuron_float64",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_nn_functional_relu6_executor_aten_neuron_bfloat16",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_nn_functional_relu6_executor_aten_neuron_float16",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_nn_functional_relu6_executor_aten_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_nn_functional_relu6_executor_aten_neuron_float64",
         ],
     ),
     SkipGroup(
         reason=(
-            "hardshrink lowers to a Neuron compare. On the extremal OpInfo"
-            " reference sample the torch._refs decomposition runs on the Neuron"
-            " compare, which treats a NaN input as inside the shrink band and zeros"
-            " it, while aten keeps the NaN. test_python_ref then measures the _refs"
-            " reference as farther (nan) from the float64-precise result than the"
-            " eager op (distance 0.0). The eager lowering is exact on real ranges"
-            " (unit tests and vertical coverage pass). Do not mask the NaN with"
-            " torch.where."
+            "hardshrink lowers to a Neuron compare. The Neuron compare treats a NaN"
+            " as inside the shrink band and zeros it, while aten keeps the NaN. On"
+            " the PT 2.14 extremal OpInfo sample the eager op and the torch._refs"
+            " decomposition both diverge from CPU. test_compare_cpu,"
+            " test_python_ref, test_python_ref_torch_fallback, and the _refs executor"
+            " tests fail. The lowering stays exact on finite ranges; the unit tests"
+            " and the vertical coverage pass. The compile path xfails the same"
+            " extremal cases (test_reference_numerics_extremal). Do not mask the NaN"
+            " with torch.where."
         ),
         tests=[
+            "test_ops.py::TestCommonNEURON::test_compare_cpu_nn_functional_hardshrink_neuron_float32",
             "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardshrink_neuron_bfloat16",
             "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardshrink_neuron_float16",
             "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardshrink_neuron_float32",
@@ -653,6 +669,10 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_nn_functional_hardshrink_neuron_float16",
             "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_nn_functional_hardshrink_neuron_float32",
             "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_nn_functional_hardshrink_neuron_float64",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_nn_functional_hardshrink_executor_aten_neuron_bfloat16",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_nn_functional_hardshrink_executor_aten_neuron_float16",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_nn_functional_hardshrink_executor_aten_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_nn_functional_hardshrink_executor_aten_neuron_float64",
         ],
     ),
     SkipGroup(
