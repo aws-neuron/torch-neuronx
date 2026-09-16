@@ -621,6 +621,50 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "hardtanh (and relu6, which decomposes to hardtanh(0,6)) lowers to the"
+            " Neuron clamp. On the extremal OpInfo reference sample the torch._refs"
+            " decomposition runs on the Neuron clamp, which does not propagate a"
+            " NaN input (it returns a clamp bound). test_python_ref then measures"
+            " the _refs reference as farther (nan) from the float64-precise result"
+            " than the eager op (distance 0.0). The eager lowering is exact on real"
+            " ranges (unit tests and vertical coverage pass). Do not mask the NaN"
+            " with torch.where."
+        ),
+        tests=[
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardtanh_neuron_bfloat16",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardtanh_neuron_float16",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardtanh_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardtanh_neuron_float64",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_relu6_neuron_bfloat16",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_relu6_neuron_float16",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_relu6_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_relu6_neuron_float64",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "hardshrink lowers to a Neuron compare. On the extremal OpInfo"
+            " reference sample the torch._refs decomposition runs on the Neuron"
+            " compare, which treats a NaN input as inside the shrink band and zeros"
+            " it, while aten keeps the NaN. test_python_ref then measures the _refs"
+            " reference as farther (nan) from the float64-precise result than the"
+            " eager op (distance 0.0). The eager lowering is exact on real ranges"
+            " (unit tests and vertical coverage pass). Do not mask the NaN with"
+            " torch.where."
+        ),
+        tests=[
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardshrink_neuron_bfloat16",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardshrink_neuron_float16",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardshrink_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_nn_functional_hardshrink_neuron_float64",
+            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_nn_functional_hardshrink_neuron_bfloat16",
+            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_nn_functional_hardshrink_neuron_float16",
+            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_nn_functional_hardshrink_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_nn_functional_hardshrink_neuron_float64",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "Neuron sqrt is not IEEE-754 correctly rounded (undershoots exact"
             " squares); sqrt is a mandated correctly-rounded op. tril/triu_indices"
             " floor(sqrt) drops to the wrong integer at row boundaries, and"
