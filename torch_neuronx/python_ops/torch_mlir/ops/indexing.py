@@ -405,6 +405,52 @@ def torch_masked_fill(x, mask, value, out=None):
     return torch.masked_fill(x, mask, value)
 
 
+def _masked_scatter_true_count(self, mask):
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    if not isinstance(mask, torch.Tensor) or mask.is_meta or isinstance(mask, FakeTensor):
+        return None
+    shape = torch.broadcast_shapes(self.shape, mask.shape)
+    return int(mask.broadcast_to(shape).sum())
+
+
+def _validate_masked_scatter(self, mask, source, out=None, **_kwargs):
+    if isinstance(mask, torch.Tensor) and mask.dtype != torch.bool:
+        raise RuntimeError(
+            f"masked_scatter_ only supports boolean masks, but got mask with dtype {mask.dtype}"
+        )
+    if isinstance(source, torch.Tensor):
+        n_true = _masked_scatter_true_count(self, mask)
+        if n_true is not None and source.numel() < n_true:
+            raise RuntimeError(
+                f"masked_scatter: source has {source.numel()} elements, but the mask "
+                f"needs {n_true}. Provide a source with at least {n_true} elements."
+            )
+
+
+def _validate_masked_scatter_inplace(self, mask, source, out=None, **kwargs):
+    """masked_scatter_: the mask contract plus the no-expanding-destination rule."""
+    _validate_masked_scatter(self, mask, source, out=out, **kwargs)
+    validate_inplace_broadcast(self, mask, **kwargs)
+
+
+@register_aten(
+    ["aten::masked_scatter", "aten::masked_scatter.out"],
+    validate_static_inputs=_validate_masked_scatter,
+)
+@register_aten(
+    ["aten::masked_scatter_"],
+    validate_static_inputs=_validate_masked_scatter_inplace,
+)
+def torch_masked_scatter(self, mask, source, out=None):
+    return torch.ops.aten.masked_scatter(self, mask, source)
+
+
+@register_aten(["aten::masked_scatter_backward"], static_argnums=(2,))
+def torch_masked_scatter_backward(grad_output, mask, sizes):
+    return torch.ops.aten.masked_scatter_backward(grad_output, mask, sizes)
+
+
 # NOTE: where.ScalarOther, where.ScalarSelf, and where.Scalar are NOT registered
 # because they are CompositeImplicitAutograd ops that decompose to where.self:
 # - ScalarOther: converts scalar to tensor, calls where.self

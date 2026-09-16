@@ -1232,8 +1232,8 @@
 |309|Tensor.lu_solve|CPU_FALLBACK|CPU fallback registered|
 |310|Tensor.as_subclass|Y|Metadata only|
 |311|Tensor.map_|CPU_FALLBACK|No native Neuron impl|
-|312|Tensor.masked_scatter_|CPU_FALLBACK|No native Neuron impl|
-|313|Tensor.masked_scatter|CPU_FALLBACK|No native Neuron impl|
+|312|Tensor.masked_scatter_|Y|Native MLIR impl|
+|313|Tensor.masked_scatter|Y|Native MLIR impl|
 |314|Tensor.masked_fill_|Y|Native MLIR impl|
 |315|Tensor.masked_fill|Y|Native MLIR impl|
 |316|Tensor.masked_select|Y|Supported via decomposition/torch-mlir lowering|
