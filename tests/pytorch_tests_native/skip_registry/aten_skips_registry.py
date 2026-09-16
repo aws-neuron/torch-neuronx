@@ -43,6 +43,53 @@ SKIP_GROUPS: list[SkipGroup] = [
         tests=s.ATEN_COMPLEX_DTYPE_UNSUPPORTED,
     ),
     SkipGroup(
+        reason=(
+            "uint16, uint32 and uint64 are not supported on Neuron hardware."
+            " Tensor creation already raises 'Unsupported ScalarType', and the"
+            " dispatcher cast policy has no target for them: unlike int64 they"
+            " cannot fold to int32 without changing the value range."
+        ),
+        tests=[
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_unique_neuron_uint16",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_unique_neuron_uint32",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_unique_neuron_uint64",
+            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_unique_neuron_uint16",
+            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_unique_neuron_uint32",
+            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_unique_neuron_uint64",
+            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_unique_neuron_uint16",
+            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_unique_neuron_uint32",
+            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_unique_neuron_uint64",
+            "test_meta.py::TestMetaNEURON::test_meta_outplace_unique_neuron_uint16",
+            "test_meta.py::TestMetaNEURON::test_meta_outplace_unique_neuron_uint32",
+            "test_meta.py::TestMetaNEURON::test_meta_outplace_unique_neuron_uint64",
+            "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_cat_out_fast_path_dim0_dim1_neuron_uint16",
+            "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_cat_out_fast_path_dim0_dim1_neuron_uint32",
+            "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_cat_out_fast_path_dim0_dim1_neuron_uint64",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_item_neuron_uint16",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_item_neuron_uint32",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_item_neuron_uint64",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "float8_e4m3fnuz and float8_e5m2fnuz are AMD ROCm-specific float8"
+            " variants. Neuron implements the OCP float8 types, so tensor"
+            " creation raises 'Unsupported ScalarType' for these two."
+        ),
+        tests=[
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_eye_neuron_float8_e4m3fnuz",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_eye_neuron_float8_e5m2fnuz",
+            "test_decomp.py::TestDecompNEURON::test_quick_eye_neuron_float8_e4m3fnuz",
+            "test_decomp.py::TestDecompNEURON::test_quick_eye_neuron_float8_e5m2fnuz",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_eye_neuron_float8_e4m3fnuz",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_eye_neuron_float8_e5m2fnuz",
+            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_eye_neuron_float8_e4m3fnuz",
+            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_eye_neuron_float8_e5m2fnuz",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_item_neuron_float8_e4m3fnuz",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_item_neuron_float8_e5m2fnuz",
+        ],
+    ),
+    SkipGroup(
         reason="CUDA graphs are not supported on Neuron hardware",
         patterns=["*cuda_graph*"],
         match_target="test_method",

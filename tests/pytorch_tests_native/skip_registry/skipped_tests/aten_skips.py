@@ -119,6 +119,8 @@ ATEN_FOREACH_WORKER_CRASH = [
 # These are added alongside the *complex*/*fft_* pattern-based skip because
 # their test method names don't match those patterns.
 ATEN_COMPLEX_DTYPE_UNSUPPORTED = [
+    # test_ones iterates every dtype, including complex32 (ScalarType 8)
+    "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_ones_neuron",
     # polar: outputs complex by definition (re^iθ → complex)
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_size1__refs__conversions_polar_neuron_float32",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_size1__refs__conversions_polar_neuron_float64",

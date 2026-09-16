@@ -122,3 +122,48 @@ def test_explicit_then_wrapped_cache_order_is_safe():
         strong.cpu(), torch.ops.aten.add.Tensor(x_cpu, torch.tensor(2, dtype=torch.int64))
     )
     torch.testing.assert_close(weak.cpu(), torch.ops.aten.add.Tensor(x_cpu, 2))
+
+
+# ── Promotion-boundary cases ────────────────────────────────────────────────
+# The rows above pin the exact upstream reference routes. These pin the
+# boundaries of the normalization, i.e. the operand shapes where a weak integer
+# scalar must NOT take the ordinary operand's dtype. CPU is the contract.
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.uint8, torch.int16, torch.int32])
+def test_multidim_int_tensor_with_int_scalar_keeps_dtype(dtype):
+    """A dim>0 operand already anchors inference, so it must stay unchanged."""
+    cpu = torch.ones(4, dtype=dtype)
+    assert (cpu.to("neuron") * 1).dtype == (cpu * 1).dtype == dtype
+
+
+def test_bool_tensor_with_int_scalar_promotes_to_int64():
+    """Bool is not an anchor: CPU gives int64, so the scalar stays int64."""
+    cpu = torch.tensor(True)
+    assert (cpu.to("neuron") + 1).dtype == (cpu + 1).dtype == torch.int64
+
+
+def test_int_scalar_out_of_tensor_range_still_narrows():
+    """CPU narrows the scalar and wraps rather than widening the result."""
+    cpu = torch.tensor(3, dtype=torch.int8)
+    assert (cpu.to("neuron") + 200).dtype == (cpu + 200).dtype == torch.int8
+
+
+def test_float_scalar_on_int_tensor_still_promotes_to_float():
+    """A float scalar bumps the category; the wrapped-double path owns this."""
+    cpu = torch.tensor(3, dtype=torch.int16)
+    assert (cpu.to("neuron") + 1.5).dtype == (cpu + 1.5).dtype
+
+
+def test_float_tensor_anchor_wins_over_int_scalar():
+    """A floating operand makes the result float, so the int scalar cannot change it."""
+    cpu = torch.tensor(3, dtype=torch.float16)
+    assert (cpu.to("neuron") + 1).dtype == (cpu + 1).dtype == torch.float16
+
+
+def test_widest_int_operand_anchors_the_scalar():
+    """With mixed integer widths the result follows the widest operand."""
+    a = torch.tensor(3, dtype=torch.int16)
+    b = torch.tensor(4, dtype=torch.int32)
+    actual = a.to("neuron") + b.to("neuron") + 1
+    assert actual.dtype == (a + b + 1).dtype == torch.int32
