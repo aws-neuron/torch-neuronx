@@ -663,18 +663,9 @@ class TorchMlirKernel(BaseNeuronKernel):
             capture_backend(decomposed_gm, flat_args)
             gm = captured_gm
 
-        # Build aliasing info for inplace ops.
-        # For inplace ops (e.g. add_, mul_), output[0] aliases the first input
-        # (the "self" tensor). We map the flattened input position 0 to its IR
-        # parameter index via kept_input_indices so the StableHLO module gets
-        # the correct mhlo.input_output_alias attribute.
-        aliasing_info = None
-        # if self._is_inplace_op() and 0 in kept_input_indices:
-        #     ir_param_idx = list(kept_input_indices).index(0)
-        #     aliasing_info = AliasingInfo()
-        #     aliasing_info.add(
-        #         parameter_number=ir_param_idx, parameter_index=[], output_index=0
-        #     )
+        # Emit mhlo.input_output_alias for NKI kernels that alias outputs to
+        # inputs so the NEFF writes in place instead of copying back.
+        aliasing_info = self._nki_output_input_alias_map(kept_input_indices)
 
         # Pure input passthrough: every output was a bare placeholder,
         # so capture_backend removed them all. convert_fx_to_stablehlo rejects a
@@ -1438,6 +1429,21 @@ class TorchMlirKernel(BaseNeuronKernel):
                 )
         return input_specs, kw_input_specs
 
+    def _nki_output_input_alias_map(self, kept_input_indices):
+        """Return {neff_output_index: neff_input_param} for a NKI kernel's declared
+        operand_output_aliases ({input_index: output_index}), or None if it has none.
+        """
+        nki_aliases = getattr(self, "operand_output_aliases", None)
+        if not nki_aliases or not kept_input_indices:
+            return None
+        param_of_input = {inp: p for p, inp in enumerate(kept_input_indices)}
+        alias_map = {
+            out_idx: param_of_input[in_idx]
+            for in_idx, out_idx in nki_aliases.items()
+            if in_idx in param_of_input
+        }
+        return alias_map or None
+
     def _build_input_output_aliases(
         self,
         kept_input_indices,
@@ -1457,6 +1463,10 @@ class TorchMlirKernel(BaseNeuronKernel):
         fused_adam's updated params from its read-only grads, and reduces to i -> i for
         foreach. Ops with no out= (add_, relu_) donate output 0 to self.
         """
+        nki_map = self._nki_output_input_alias_map(kept_input_indices)
+        if nki_map:
+            return [(param, out) for out, param in nki_map.items() if 0 <= out < num_outputs]
+
         if not self._is_inplace_op() or not kept_input_indices or num_outputs == 0:
             return []
 

@@ -403,5 +403,37 @@ class TestNkiKernel:
             assert len(call_args[1]) == 1  # Only actual outputs, not aliased
 
 
+class TestNKIInPlaceAliasLowering:
+    """Declared operand_output_aliases lower to buffer-donation aliases so the
+    eager NEFF writes in place instead of copying outputs back to inputs."""
+
+    @pytest.fixture
+    def kernel(self):
+        def mock_fn(*args, **kwargs):
+            return torch.empty(10, dtype=torch.float32, device="meta")
+
+        with patch("torch_neuronx.python_ops.torch_mlir.nki_op_impl.nki_torch_fn", mock_fn):
+            return NKITorchMlirOpImpl().kernel
+
+    def test_alias_map_inverts_and_maps_to_neff_params(self, kernel):
+        kernel.operand_output_aliases = {0: 0, 2: 1}
+        assert kernel._nki_output_input_alias_map([0, 1, 2, 3]) == {0: 0, 1: 2}
+
+    def test_build_input_output_aliases_donates_buffers(self, kernel):
+        kernel.operand_output_aliases = {0: 0, 2: 1}
+        aliases = kernel._build_input_output_aliases([0, 1, 2, 3], num_outputs=2)
+        assert sorted(aliases) == [(0, 0), (2, 1)]
+
+    def test_no_aliases_when_kernel_declares_none(self, kernel):
+        kernel.operand_output_aliases = {}
+        assert kernel._nki_output_input_alias_map([0, 1]) is None
+        assert kernel._build_input_output_aliases([0, 1], num_outputs=1) == []
+
+    def test_alias_skipped_when_input_not_a_neff_param(self, kernel):
+        # Input 2 was dropped from the NEFF params, so its alias cannot bind.
+        kernel.operand_output_aliases = {0: 0, 2: 1}
+        assert kernel._nki_output_input_alias_map([0, 1, 3]) == {0: 0}
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
