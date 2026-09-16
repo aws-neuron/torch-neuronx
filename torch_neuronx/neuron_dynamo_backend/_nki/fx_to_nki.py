@@ -403,6 +403,7 @@ def identity_lowering(ctx, *args, **kwargs):
 
 
 register_all_overload(lowerings, aten.detach, identity_lowering)
+register_all_overload(lowerings, aten.alias, identity_lowering)
 
 
 def to_copy_lowering(ctx, *args, **kwargs):

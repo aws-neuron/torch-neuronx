@@ -45,7 +45,7 @@ build:linux --config=posix
 
 ## Pytorch variables.
 # Pytorch version, when local is not available.
-build --action_env=PYTORCH_VERSION="2.13.0"
+build --action_env=PYTORCH_VERSION="2.14.0"
 
 # Default to use local Pytorch installation.
 # Set to "1" to download from source.

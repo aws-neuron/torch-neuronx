@@ -14,14 +14,28 @@ from torch.distributed.tensor._op_schema import (
     RuntimeSchemaInfo,
 )
 from torch.distributed.tensor._ops import (
-    expand_to_full_mesh_op_strategy,
-    generate_redistribute_costs,
-    infer_broadcast_dims_map,
-    is_tensor_shardable,
-    map_placements_after_broadcast,
     register_op_strategy,
 )
 from torch.distributed.tensor._ops._einsum_strategy import gen_einsum_strategies
+
+# PT 2.14 moved these utils from torch.distributed.tensor._ops to
+# torch.distributed.tensor._ops.utils
+try:
+    from torch.distributed.tensor._ops.utils import (
+        expand_to_full_mesh_op_strategy,
+        generate_redistribute_costs,
+        infer_broadcast_dims_map,
+        is_tensor_shardable,
+        map_placements_after_broadcast,
+    )
+except ImportError:
+    from torch.distributed.tensor._ops import (
+        expand_to_full_mesh_op_strategy,
+        generate_redistribute_costs,
+        infer_broadcast_dims_map,
+        is_tensor_shardable,
+        map_placements_after_broadcast,
+    )
 from torch.distributed.tensor.placement_types import (
     Partial,
     Placement,

@@ -8633,12 +8633,20 @@ class TestSdpaDecompositionMatchesEager:
         out, _, _ = decompositions.scaled_dot_product_attention_decomposition(
             query, key, value, attn_mask=attn_mask, is_causal=True
         )
+        # Compute reference by combining both masks manually. PT 2.14
+        # (pytorch/pytorch#187966) rejects passing attn_mask together with
+        # is_causal=True to F.scaled_dot_product_attention. The validation
+        # was moved from the math backend to the common entry point, so it
+        # now raises before dispatch on all backends. We merge the causal
+        # mask into attn_mask ourselves and pass only attn_mask.
+        L, S = query.shape[-2], key.shape[-2]
+        causal_mask = torch.ones(L, S, dtype=torch.bool).tril()
+        combined_mask = attn_mask.double().masked_fill(~causal_mask, float("-inf"))
         reference = torch.nn.functional.scaled_dot_product_attention(
             query.double(),
             key.double(),
             value.double(),
-            attn_mask=attn_mask.double(),
-            is_causal=True,
+            attn_mask=combined_mask,
         )
         torch.testing.assert_close(out.double(), reference, rtol=1e-5, atol=1e-5)
 

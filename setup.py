@@ -77,6 +77,17 @@ def _get_version():
         exec(f.read(), version_info)
 
     parts = version_info["__version__"].split(".")
+    torch_ver = f"{parts[0]}.{parts[1]}"
+
+    # Validate _version.py matches pyproject.toml torch dependency
+    pyproject = (Path(__file__).parent / "pyproject.toml").read_text()
+    m = re.search(r'"torch==(\d+\.\d+)', pyproject)
+    if m and m.group(1) != torch_ver:
+        sys.exit(
+            f"error: _version.py has torch {torch_ver} but "
+            f"pyproject.toml has torch=={m.group(1)}. Update both."
+        )
+
     parts[4] = _get_build_counter()
 
     sha = _get_git_sha() or "unknown"
