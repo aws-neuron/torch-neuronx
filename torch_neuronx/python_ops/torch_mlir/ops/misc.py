@@ -3,7 +3,7 @@
 import torch
 
 from ..operation_registry import Preprocessing, register_aten
-from ..validation import validate_inplace_broadcast
+from ..validation import check_lerp_dtype, validate_inplace_broadcast
 from .unary import _validate_float_promoting_out
 
 
@@ -100,6 +100,7 @@ def torch_log_softmax_backward_data(grad_output, output, dim, input_dtype, out=N
     validate_static_inputs=validate_inplace_broadcast,
 )
 def torch_lerp(start, end, weight, out=None):
+    check_lerp_dtype(start, weight)
     return torch.ops.aten.lerp(start, end, weight)
 
 

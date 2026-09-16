@@ -192,6 +192,8 @@ DTYPE_MISMATCH_FLOAT64_DOWNCAST = [
     "test_foreach.py::TestForeachNEURON::test_parity__foreach_add_fastpath_outplace_neuron_float64",
     # int64 inputs downcast to int32 on Neuron; sqrt result diverges from CPU int64.
     "test_foreach.py::TestForeachNEURON::test_parity__foreach_sqrt_fastpath_inplace_neuron_int64",
-    # uint8 addcdiv: integer division semantics differ after downcast.
-    "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcdiv_fastpath_inplace_neuron_uint8",
+    # clip_grad_norm: the test uses a 2e22 float64 grad. After the downcast to
+    # float32, (2e22)^2 overflows to inf, so the order-2 norm is non-finite and
+    # clip_grad_norm_ raises. CPU keeps float64 and returns a finite 6.32e22.
+    "test_nn.py::TestNNDeviceTypeNEURON::test_clip_grad_norm_error_if_nonfinite_neuron",
 ]
