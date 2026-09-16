@@ -54,7 +54,7 @@ jobs:
       linux,
       neuron.build-nightly-image,
       "neuron.run-${{ github.run_id }}-build-tests-image",
-      "neuron.dockerfile:Dockerfile.nightly-test",
+      "neuron.dockerfile:Dockerfile.upstream-test",
       "neuron.base-image:684844594039.dkr.ecr.us-west-2.amazonaws.com/neuron-image-builder-public:torch-neuronx-main-nightly-base-stable",
       "neuron.build-arg:PYTORCH_CHANNEL:stable"
     ]
