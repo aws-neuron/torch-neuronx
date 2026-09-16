@@ -1,6 +1,6 @@
-"""HuggingFace model wrapper for ModuScope.
+"""HuggingFace model wrapper for the model test harness.
 
-This module provides classes and utilities for working with HuggingFace models in ModuScope.
+This module provides classes and utilities for working with HuggingFace models in these tests.
 
 Task Mappings:
 --------------
@@ -115,10 +115,10 @@ TASK_MAPPINGS = {
 
 class HuggingFaceModelManager:
     """
-    Manager class for HuggingFace models in ModuScope.
+    Manager class for HuggingFace models used by these tests.
 
     This class provides methods to download, initialize, and create wrapper classes
-    for HuggingFace models to be used with ModuScope.
+    for HuggingFace models to be used by the test harness.
 
     Models can be initialized by downloading the model config file or by downloading the
     model weights from HuggingFace. Set download_mode='config_only' or 'full_model' in the
@@ -384,7 +384,7 @@ class HuggingFaceModelManager:
         Wraps and creates a Hugging Face model class using a full model id.
 
         This function dynamically creates a class that wraps a HuggingFace model
-        for use with ModuScope. The created class will handle initialization,
+        for use by the test harness. The created class will handle initialization,
         sharding strategies, and forward pass for the model. Currently inherits
         from NotAnnotated class since no sharding strategies are defined.
 
