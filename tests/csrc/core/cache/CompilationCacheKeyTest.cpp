@@ -371,9 +371,9 @@ TEST_F(CompilationCacheKeyTest, WloAndNonWloAreDistinctMapEntries) {
 }
 
 // ============================================================================
-// Legacy key path: TORCH_NEURONX_NEFF_KEY_FROM_HLO unset/!="1".
-// Persistent key derives from base_key + compiler_config (production default).
-// HLO bytes are not required, and changing them does not affect the key.
+// Legacy key path: the explicit opt-out TORCH_NEURONX_NEFF_KEY_FROM_HLO=0.
+// Persistent key derives from base_key + compiler_config. HLO bytes are not required,
+// and changing them does not affect the key. This path is for diagnosis only.
 // ============================================================================
 
 class CompilationCacheKeyLegacyKeyTest : public ::testing::Test {
@@ -394,7 +394,9 @@ class CompilationCacheKeyLegacyKeyTest : public ::testing::Test {
     const char* existing = std::getenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO");
     saved_flag_value_ = existing ? std::string(existing) : "";
     had_flag_value_ = existing != nullptr;
-    ::unsetenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO");
+    // Select the legacy key explicitly. Content addressing is the default, so an unset
+    // variable no longer selects the legacy path.
+    ::setenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "0", /*overwrite=*/1);
   }
 
   void TearDown() override {
@@ -466,7 +468,7 @@ TEST_F(CompilationCacheKeyLegacyKeyTest, FlagSwitchProducesDifferentPersistentKe
 }
 
 TEST_F(CompilationCacheKeyLegacyKeyTest, WloDistinctPersistentKey) {
-  // Flag-off (default/prod) mode hashes base_key || config. The "|wlo" suffix is folded
+  // Legacy mode (opt-out) hashes base_key || config. The "|wlo" suffix is folded
   // into both, so WLO and non-WLO get distinct persistent keys here too.
   auto non_wlo = CompilationCacheKey("op", "--flag", "-O2", nullptr, CacheKeySource::TORCH_COMPILE);
   auto wlo = CompilationCacheKey("op|wlo", "--flag", "-O2", nullptr, CacheKeySource::TORCH_COMPILE);

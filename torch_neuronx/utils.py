@@ -31,36 +31,56 @@ def deterministic_hash(obj) -> str:
     return hashlib.sha256(repr(obj).encode()).hexdigest()[:16]
 
 
+_LOWERING_SOURCE_SUFFIXES = frozenset({".py", ".cpp", ".h", ".hpp", ".cc", ".td", ".mlir"})
+
+
+def _hash_source_tree(hasher, directory: Path, base: Path) -> None:
+    """Fold every lowering source file under directory into hasher.
+
+    A missing directory contributes nothing. An installed wheel ships no csrc/ and no
+    vendored torch-mlir sources, so those trees are absent there and cost no time.
+    """
+    if not directory.exists():
+        return
+    for path in sorted(directory.rglob("*")):
+        if path.suffix not in _LOWERING_SOURCE_SUFFIXES or not path.is_file():
+            continue
+        hasher.update(str(path.relative_to(base)).encode())
+        hasher.update(path.read_bytes())
+
+
 @functools.lru_cache(maxsize=1)
 def global_version_hash() -> str:
     """Version hash combining source code + package versions.
 
-    Hashes all .py files in torch_neuronx lowering directories plus
-    package versions into a single SHA-256 digest. Used to invalidate
-    persistent caches when code or package versions change.
-
+    Hashes every lowering source file plus the package versions into one SHA-256 digest.
+    This salts the in-memory cache key and the persistent HLO cache key, so a lowering
+    change cannot give a stale HLO hit. The persistent NEFF key does not use it: that key
+    is content-addressed on the lowered IR (see CompilationCacheKey).
     """
     import torch_neuronx
 
     hasher = hashlib.sha256()
 
-    # Hash source files
     root = Path(torch_neuronx.__file__).parent
-    for d in [root / "python_ops", root / "neuron_dynamo_backend"]:
-        if d.exists():
-            for py_file in sorted(d.rglob("*.py")):
-                hasher.update(str(py_file.relative_to(root)).encode())
-                hasher.update(py_file.read_bytes())
+    for path in sorted(root.glob("*.py")):
+        hasher.update(path.name.encode())
+        hasher.update(path.read_bytes())
+    for d in [
+        root / "python_ops",
+        root / "neuron_dynamo_backend",
+        root / "distributed",
+        root / "kernels",
+        root / "csrc",
+    ]:
+        _hash_source_tree(hasher, d, root)
+
+    # torch-mlir is vendored, so its version string never moves. Hash the sources instead.
+    _hash_source_tree(hasher, root.parent / "third_party" / "torch-mlir", root.parent)
 
     # Hash package versions
     hasher.update(torch.__version__.encode())
     hasher.update(getattr(torch_neuronx, "__version__", "unknown").encode())
-    try:
-        import torch_mlir
-
-        hasher.update(getattr(torch_mlir, "__version__", "unknown").encode())
-    except Exception:
-        pass
     try:
         import neuronxcc
 

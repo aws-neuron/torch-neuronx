@@ -130,9 +130,11 @@ class CompilationCacheTest : public ::testing::Test {
     for (const auto& [name, value] : saved_env_vars_) {
       setenv(name.c_str(), value.c_str(), 1);
     }
-    // Unset any vars that weren't originally set
+    // Unset any vars that weren't originally set. Every name that SetUp() saves must
+    // appear here, or SetUp()'s value leaks into a later suite in the same binary.
     for (const char* name : {"TORCH_NEURONX_NEFF_CACHE_DIR", "TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR",
-                             "TORCH_NEURONX_NEFF_DISABLE_CACHE"}) {
+                             "TORCH_NEURONX_NEFF_DISABLE_CACHE", "NEURON_COMPILE_SERVICE",
+                             "TORCH_NEURONX_NEFF_KEY_FROM_HLO"}) {
       if (saved_env_vars_.find(name) == saved_env_vars_.end()) {
         unsetenv(name);
       }
@@ -287,9 +289,14 @@ class LimitedCompilationCacheTest : public ::testing::Test {
     SaveEnvVar("NEURON_COMPILATION_CACHE_MAX_SIZE_MB");
     SaveEnvVar("NEURON_COMPILATION_CACHE_MAX_ENTRIES");
     SaveEnvVar("TORCH_NEURONX_NEFF_DISABLE_CACHE");
+    SaveEnvVar("NEURON_COMPILE_SERVICE");
 
     // Disable persistent caching for in-memory cache tests
     setenv("TORCH_NEURONX_NEFF_DISABLE_CACHE", "true", 1);
+
+    // Force the local backend. The mock kernels return dummy NEFF bytes, so the
+    // service backend would send the dummy IR to the real neuronx-cc and fail.
+    setenv("NEURON_COMPILE_SERVICE", "0", 1);
 
     // Set test-specific limits
     setenv("NEURON_COMPILATION_CACHE_MAX_ENTRIES", std::to_string(max_entries).c_str(), 1);
@@ -316,10 +323,11 @@ class LimitedCompilationCacheTest : public ::testing::Test {
     for (const auto& [name, value] : saved_env_vars_) {
       setenv(name.c_str(), value.c_str(), 1);
     }
-    // Unset any vars that weren't originally set
+    // Unset any vars that weren't originally set. Every name that SetUpWithLimits()
+    // saves must appear here, or its value leaks into a later suite in the same binary.
     for (const char* name :
          {"NEURON_COMPILATION_CACHE_MAX_SIZE_MB", "NEURON_COMPILATION_CACHE_MAX_ENTRIES",
-          "TORCH_NEURONX_NEFF_DISABLE_CACHE"}) {
+          "TORCH_NEURONX_NEFF_DISABLE_CACHE", "NEURON_COMPILE_SERVICE"}) {
       if (saved_env_vars_.find(name) == saved_env_vars_.end()) {
         unsetenv(name);
       }
@@ -2394,6 +2402,38 @@ TEST_F(CompilationCacheTest, GracefulSkip_NoHloBytesNotPersistedAcrossCacheInsta
   NoHloKernelExecution k2("no_hlo_key_3");
   fresh_cache->GetOrCompileNeff(k2, /*stream_id=*/1);
   EXPECT_EQ(NoHloKernelExecution::GetCompileCounter().load(), 2);  // recompiled
+}
+
+TEST_F(CompilationCacheTest, KeyHint_NoHloKernelResolvesPersistentKeyFromCompileStep) {
+  // NeffDirectKernelExecution carries no IR, so it cannot compute the content key.
+  // The compile step records base_key -> persistent_key. A later IR-less execution
+  // with the same base_key must resolve that key and read the NEFF from disk.
+  MockNeuronKernelExecution::ResetCompileCounter();
+  NoHloKernelExecution::ResetCompileCounter();
+  const std::string base_key = "shared_base_key_for_hint";
+
+  // Compile with IR. This writes the NEFF to disk and records the hint.
+  // Scope the kernel: it holds the NEFF pointer, which keeps the entry active and
+  // therefore not evictable.
+  std::vector<uint8_t> compiled_neff;
+  {
+    MockNeuronKernelExecution with_hlo(base_key);
+    cache_->GetOrCompileNeff(with_hlo, /*stream_id=*/1);
+    EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+    compiled_neff = with_hlo.GetCachedNeff();
+  }
+
+  // Drop the NEFF but keep the hint, which is what LRU eviction does.
+  EXPECT_EQ(cache_->EvictLruEntries(/*target_entries=*/0), 1u);
+
+  // The IR-less kernel must not reach CompileToNeff().
+  NoHloKernelExecution no_hlo(base_key);
+  EXPECT_EQ(no_hlo.GetCompilationCacheKey().GetPersistentKey(), nullptr);
+  cache_->GetOrCompileNeff(no_hlo, /*stream_id=*/1);
+
+  EXPECT_TRUE(no_hlo.HasCachedNeff());
+  EXPECT_EQ(NoHloKernelExecution::GetCompileCounter().load(), 0);
+  EXPECT_EQ(no_hlo.GetCachedNeff(), compiled_neff);
 }
 
 TEST_F(CompilationCacheTest, CrossCommitReuse_SameHloDifferentBaseKeyHitsPersistentCache) {

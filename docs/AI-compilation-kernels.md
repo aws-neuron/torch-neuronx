@@ -18,33 +18,44 @@ directory management.
 
 ## Contracts
 
-**NEFF cache is two-tier and multi-process safe.** `CompilerSubprocess.get_or_compile`
-guards compilation with: NFS-cache check → `FileLock` at
-`{local_cache_dir}/{hash}/locks/compile.lock` → **double-check NFS under the
-lock** (another process may have just compiled) → compile → **atomic write**
-(temp file + rename, so concurrent readers never see a partial NEFF) →
-processes blocked on the lock read the finished NFS path *outside* the lock.
-Lock timeout is `TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT` (default in
-`docs/environment_variables.md`). This
-ordering is the correctness contract — don't reorder the double-check or the
-atomic write.
+**NEFF cache is two-tier and multi-process safe.** `CompilationCache` guards
+compilation with: in-memory check → persistent-cache check → `FileLock` on the
+persistent key → **double-check the persistent cache under the lock** (another
+process may have just compiled) → compile → **atomic write** (temp file + rename, so
+concurrent readers never see a partial NEFF). Lock timeout is
+`TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT` (default in
+`docs/environment_variables.md`). This ordering is the correctness contract — don't
+reorder the double-check or the atomic write.
 
-**Cache-key gate `TORCH_NEURONX_NEFF_KEY_FROM_HLO`.** Controls whether the key
-includes a compiler/version salt:
-- **Python / Dynamo** (`neuron_dynamo_backend/compile.py`, `CompileGraph.compile`):
-  off (**default**) = `sha256(mlir_bytes) + ':' + global_version_hash()`;
-  on = `sha256(mlir_bytes)` alone, so benign Python edits that don't change the
-  lowered HLO still hit the on-disk cache.
-- **C++ persistent** (`CompilationCacheKey`): on = HLO bytes + compiler config
-  (compiler version from `NEURONXCC_VERSION` via
-  `PlatformUtils::GetCompilerVersion()`); off = in-memory base key.
+**The persistent NEFF key is content-addressed.**
+`CompilationCacheKey::ComputePersistentKey` = `XXH3_128(hlo_bytes || 0xFF || compiler_config)`,
+where `compiler_config` = `BuildCompilerExtension()` =
+`platform_target_lnc_optlevel_compilerargs_v<compilerversion>[_wlo]` (compiler version
+from `NEURONXCC_VERSION` via `PlatformUtils::GetCompilerVersion()`). A change in the
+lowering, the compiler, or the IR gives different bytes and a different key, so
+invalidation needs no source salt.
 
-**`NEFFCacheKey` = HLO hash ⊕ config hash.** `_hash = sha256("{hlo_hash}:{config_hash}")`,
-where `config_hash` folds in `target|model_type|opt_level|auto_cast|framework|lnc|version|sorted_flags`.
-The split is deliberate: when only compiler flags change, `_hlo_hash` stays
-constant while `_config_hash` moves — useful when debugging a spurious cache
-miss. `CompilerConfig` defaults (`-O1`, `auto_cast="none"`, `model_type="transformer"`)
-live in the dataclass.
+`TORCH_NEURONX_NEFF_KEY_FROM_HLO=0` selects the legacy key
+(`XXH3_128(base_key || 0xFF || compiler_config)`), which breaks on any source or version
+change because `base_key` carries `global_version_hash()`. Use it only to diagnose a
+key problem. The Python gate in `neuron_dynamo_backend/compile.py::_content_key` must
+stay identical to `utils::IsHloContentKeyEnabled()`.
+
+**An IR-less kernel resolves its key from a hint.** `NeffDirectKernelExecution` carries
+no IR, so it cannot recompute the content key. `CompilationCache` keeps an in-memory
+`base_key -> persistent_key` map that the compile step records. LRU eviction drops the
+NEFF but keeps the hint, so a later execution still finds the NEFF on disk.
+
+**Two frontends do NOT share a NEFF today**, even for identical logical graphs. Two
+things differ: the serialization (eager `str(module).encode()`, dynamo
+`write_bytecode`) and the compiler config that the key folds in (eager
+`GetXLAAdditionalArgs` + `-O1`; torch.compile
+`--model-type transformer --auto-cast=none` + `NEURON_CC_FLAGS` + `-O2`). Sharing needs
+both to agree.
+
+**`torch_neuronx/kernels/compiler_subprocess.py` and `neuronx_cc_wrapper.py` are dead.**
+`NEFFCacheKey` and `CompilerSubprocess.get_or_compile` have no production caller;
+`NeuronCompiler.cpp` runs `neuronx-cc` directly. Do not treat them as the NEFF cache.
 
 ## Integration — who feeds this layer
 
@@ -54,8 +65,8 @@ Three lowering paths converge on the same NEFF cache:
   it to the C++ `OperationExecutionEngine`, which drives compilation and NEFF
   caching through the C++ `CompilationCache` (see `AI-csrc.md`).
 - **Dynamo** — `CompileGraph.compile` computes its own content key and calls
-  `_C.compile_graph`; the C++ `CompilationCache` → `LocalCompilationBackend`
-  runs `neuronx-cc` via the wrapper.
+  `_C.compile_graph`; the C++ `CompilationCache` → `LocalCompilationBackend` →
+  `NeuronCompiler` runs the `neuronx-cc` executable directly.
 - **NKI HOP** — `nki_hop.py::TorchNeuronNKIKernelV3.CompileKernel` flows through
   the same C++ `compile_graph`.
 
@@ -78,8 +89,11 @@ NEFF cache: stores StableHLO bytes + IO spec so AOTAutograd's
 - **Force recompile**: `TORCH_NEURONX_NEFF_DISABLE_CACHE=1`.
 - **Stale lock**: a crashed compile leaves `{local_cache_dir}/{hash}/locks/compile.lock`;
   it blocks others for up to the lock timeout.
-- **Spurious cache miss**: compare `_hlo_hash` vs `_config_hash` — if only the
-  config moved, a flag changed, not the graph.
+- **Spurious cache miss**: the persistent key hashes the IR bytes and
+  `BuildCompilerExtension()`. Compare the two across the runs: if the IR bytes match,
+  a compiler flag, the platform, the LNC count, or the compiler version moved.
+- **Suspected key problem**: `TORCH_NEURONX_NEFF_KEY_FROM_HLO=0` selects the legacy
+  key. If that changes the behavior, the content key is the cause.
 
 ## See also
 

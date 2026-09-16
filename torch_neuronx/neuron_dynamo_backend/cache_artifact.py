@@ -41,7 +41,9 @@ class NeuronNeffCacheArtifact(CacheArtifact):
     def populate_cache(self) -> None:
         """Write NEFF to persistent cache during load_cache_artifacts().
 
-        Logs warning on failure (consistent with PyTorch's silent-success API contract).
+        ``self.key`` is the persistent cache key that _collect_neuron_artifacts
+        recorded. Logs a warning on failure, which keeps PyTorch's silent-success API
+        contract.
         """
         if not torch_neuronx._C.put_neff_cache(self.key, self.content):
             logger.warning(f"Failed to write NEFF to persistent cache: {self.key}")
@@ -169,10 +171,10 @@ class NeuronOutputCode(OutputCode):
 def _collect_neuron_artifacts() -> None:
     """Record compiled NEFFs as MegaCache artifacts.
 
-    Records each NEFF under its base cache key; ``put_neff_cache`` /
-    ``get_neff_cache`` derive the persistent-cache key internally, so
-    callers on both sides only ever deal with the base key.
-    Keys are cleared after collection to prevent unbounded memory growth.
+    Records each NEFF under its persistent cache key, which ``get_neff_info``
+    returns. The persistent key is content-addressed on the lowered IR, so a base
+    cache key cannot derive it. Keys are cleared after collection to prevent
+    unbounded memory growth.
     """
     # Import here to avoid circular dependency: compile.py imports ArtifactType from this module
     from torch_neuronx.neuron_dynamo_backend.compile import (
@@ -183,9 +185,12 @@ def _collect_neuron_artifacts() -> None:
     for cache_key in get_compiled_cache_keys(ArtifactType.NEURON_NEFF):
         result = torch_neuronx._C.get_neff_info(cache_key)
         if result:
-            _persistent_key, neff_bytes = result
+            persistent_key, neff_bytes = result
+            if not persistent_key:
+                logger.warning(f"No persistent cache key for {cache_key}. Skipped the NEFF.")
+                continue
             CacheArtifactManager.record_artifact(
-                ArtifactType.NEURON_NEFF.value, cache_key, neff_bytes
+                ArtifactType.NEURON_NEFF.value, persistent_key, neff_bytes
             )
     clear_compiled_cache_keys(ArtifactType.NEURON_NEFF)
 

@@ -22,10 +22,10 @@ via the `torch_dynamo_backends` → `neuron` entry point in `pyproject.toml`.
 
 ## Contracts & gated behaviors
 
-**`CompileGraph` cache key** = `SHA256(mlir_bytes) + ':' + global_version_hash()`.
-It first strips non-deterministic MLIR attrs (e.g. `torch.debug_dump_path`)
-so keys are consistent across ranks. (The `TORCH_NEURONX_NEFF_KEY_FROM_HLO`
-gate that drops the version salt is documented in `AI-compilation-kernels.md`.)
+**`CompileGraph` cache key** = `SHA256(mlir_bytes)`. It first strips non-deterministic
+MLIR attrs (e.g. `torch.debug_dump_path`) so keys are consistent across ranks. With
+`TORCH_NEURONX_NEFF_KEY_FROM_HLO=0` the key gains a `':' + global_version_hash()`
+salt; see `AI-compilation-kernels.md`.
 
 **Eager fallback defaults OFF.** `TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION`
 is `setdefault`-ed to `"1"` at import, so the backend **re-raises by default**
@@ -72,7 +72,7 @@ can alias I/O. Use `settings.py` typed getters, not raw `os.environ`.
 ## See also
 
 - `AI-python-ops.md` — shared MLIR lowering + NKI impls.
-- `AI-compilation-kernels.md` — `CompilerSubprocess` + NEFF cache + the
-  `NEFF_KEY_FROM_HLO` gate.
+- `AI-compilation-kernels.md` — the NEFF cache, the content-addressed persistent key,
+  and the `NEFF_KEY_FROM_HLO` gate.
 - `AI-csrc.md` — `compile_graph` / `execute_compiled_graph` bindings.
 - `AI-distributed.md` — how collectives survive the pipeline.
