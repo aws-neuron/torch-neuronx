@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from packaging.version import Version
 
 from torch_neuronx.neuron_dynamo_backend.cache_artifact import NeuronOutputCode
 
@@ -222,10 +223,15 @@ class TestNeuronOutputCodeWLO:
 class TestLoadGuardsStateTracingFix:
     """Tests for the load_guards_state patch from _apply_precompile_patches()."""
 
+    # PT 2.14 removed ImportSource.__post_init__ (which called install_guard),
+    # so unpickling no longer requires a TracingContext.
+    _PT_214_PLUS = Version(torch.__version__.split("+")[0]) >= Version("2.14")
+
     @staticmethod
     def _pickle_import_source():
         # ImportSource.__post_init__ calls install_guard, which needs a trace,
         # so build it inside one to get bytes whose unpickle re-runs __post_init__.
+        # PT 2.14 removed __post_init__, but wrapping in a trace is harmless.
         from torch._dynamo.source import ImportSource
         from torch._guards import TracingContext, tracing
 
@@ -234,14 +240,24 @@ class TestLoadGuardsStateTracingFix:
         return pickle.dumps(src)
 
     def test_unpatched_load_guards_state_raises(self):
-        """Without the patch, unpickling an ImportSource with no trace raises."""
+        """Without the patch, unpickling an ImportSource with no trace raises on PT<=2.13.
+        On PT 2.14+, __post_init__ was removed upstream so it succeeds without a trace."""
         import torch._dynamo.package as pkg
+        from torch._dynamo.source import ImportSource
         from torch._guards import TracingContext
 
         payload = self._pickle_import_source()
         assert TracingContext.try_get() is None
-        with pytest.raises(RuntimeError, match="must be called within an ongoing trace"):
-            pkg.load_guards_state(payload)
+
+        if self._PT_214_PLUS:
+            # PT 2.14: ImportSource.__post_init__ removed; no trace needed
+            result = pkg.load_guards_state(payload)
+            assert isinstance(result, ImportSource)
+            assert result.module_name == "torch"
+        else:
+            # PT 2.13: __post_init__ calls install_guard() which needs a trace
+            with pytest.raises(RuntimeError, match="must be called within an ongoing trace"):
+                pkg.load_guards_state(payload)
 
     def test_unpickle_importsource_no_trace_does_not_raise(self):
         """The patch lets the same unpickle succeed with no active trace."""

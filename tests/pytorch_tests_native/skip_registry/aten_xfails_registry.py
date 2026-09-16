@@ -168,31 +168,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " and NaN handling. Real-range inputs pass. These boundary cases are"
             " not wrong lowerings."
         ),
-        tests=[
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_nn_functional_hardsigmoid_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_nn_functional_hardsigmoid_neuron_float16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_nn_functional_hardsigmoid_neuron_float32",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_round_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_round_neuron_float16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_round_neuron_float32",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_logit_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_nn_functional_celu_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_nn_functional_celu_neuron_float16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_nn_functional_celu_neuron_float32",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_nn_functional_hardsigmoid_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_nn_functional_hardsigmoid_neuron_float16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_nn_functional_hardsigmoid_neuron_float32",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_0_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_0_neuron_float16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_0_neuron_float32",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_3_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_3_neuron_float32",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_neg_3_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_neg_3_neuron_float32",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_neuron_float16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_neuron_float32",
-        ],
+        tests=x.EXTREMAL_REF_NUMERICS,
     ),
     SkipGroup(
         reason=(
@@ -200,22 +176,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " mantissa has no fraction bits, so the result is precision-bound, not"
             " incorrect. The normal and small ranges pass."
         ),
-        tests=[
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large__refs_frac_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large__refs_frac_neuron_float32",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large__refs_round_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large__refs_round_neuron_float32",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_frac_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_frac_neuron_float32",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_0_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_0_neuron_float32",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_3_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_3_neuron_float32",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_neg_3_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_decimals_neg_3_neuron_float32",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_round_neuron_float32",
-        ],
+        tests=x.LARGE_ROUND_FRAC,
     ),
     SkipGroup(
         reason=(
@@ -341,6 +302,25 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=x.RUNTIME_MISC_SHAPE_BROADCAST,
     ),
     SkipGroup(
+        reason=(
+            "[PT 2.14][runtime_misc.foreach_norm_integer] foreach_norm on integer/bool"
+            " inputs calls linalg.vector_norm which requires floating-point."
+            " CPU casts to float first; Neuron's foreach dispatch does not."
+        ),
+        tests=x.FOREACH_NORM_INTEGER,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][runtime_misc.foreach_copy_mixed_dtype] foreach_copy with mixed"
+            " dtypes within a tensor list produces incorrect results on Neuron."
+        ),
+        tests=[
+            "test_foreach.py::TestForeachNEURON::test_foreach_copy_with_mixed_dtypes_within_tensor__foreach_copy_neuron_bfloat16",
+            "test_foreach.py::TestForeachNEURON::test_foreach_copy_with_mixed_dtypes_within_tensor__foreach_copy_neuron_float16",
+            "test_foreach.py::TestForeachNEURON::test_foreach_copy_with_mixed_dtypes_within_tensor__foreach_copy_neuron_float32",
+        ],
+    ),
+    SkipGroup(
         reason="[runtime_nrt_error] Neuron Runtime execution error during op execution",
         tests=x.RUNTIME_NRT_ERROR,
     ),
@@ -461,7 +441,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " is ever added, these xfails will xpass and flag the change."
         ),
         patterns=[
-            "test_scaled_dot_product_attention_batch_size_0_*",
+            "test_scaled_dot_product_attention_batch_size_*",
         ],
     ),
     SkipGroup(
@@ -646,25 +626,436 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " tolerance. Compiler bug P496209905 / NCC-9408; temp xfail until sqrt"
             " is correctly rounded."
         ),
+        tests=x.SQRT_NOT_IEEE754,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][platform.exception_type] Neuron raises RuntimeError for"
+            " .imag on non-complex tensors; upstream 2.14+ changed the"
+            " expected exception to TypeError. xfail so a dispatch fix"
+            " would xpass and flag it."
+        ),
         tests=[
-            # tril_indices -- floor(sqrt) off-by-one at exact-square boundaries
-            "test_decomp.py::TestDecompNEURON::test_quick_tril_indices_neuron_int32",
-            "test_decomp.py::TestDecompNEURON::test_quick_tril_indices_neuron_int64",
-            "test_ops.py::TestCommonNEURON::test_python_ref__refs_tril_indices_neuron_int32",
-            "test_ops.py::TestCommonNEURON::test_python_ref__refs_tril_indices_neuron_int64",
-            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_tril_indices_neuron_int32",
-            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_tril_indices_neuron_int64",
-            # triu_indices -- same decomposition (relocated from accuracy.tensor_not_equal)
-            "test_decomp.py::TestDecompNEURON::test_comprehensive_triu_indices_neuron_int32",
-            "test_decomp.py::TestDecompNEURON::test_comprehensive_triu_indices_neuron_int64",
-            "test_decomp.py::TestDecompNEURON::test_quick_triu_indices_neuron_int32",
-            "test_decomp.py::TestDecompNEURON::test_quick_triu_indices_neuron_int64",
-            "test_ops.py::TestCommonNEURON::test_python_ref__refs_triu_indices_neuron_int32",
-            "test_ops.py::TestCommonNEURON::test_python_ref__refs_triu_indices_neuron_int64",
-            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_triu_indices_neuron_int32",
-            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_triu_indices_neuron_int64",
-            # linalg_vector_norm -- pow(.,0.5) == the same sqrt kernel, vs fp64 tol
-            "test_decomp.py::TestDecompNEURON::test_quick_linalg_vector_norm_neuron_float64",
+            "test_autograd.py::TestAutograd::test_dir",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][accuracy.decomp_reference] New test_python_ref instantiations in"
+            " PT 2.14. The test computes the op in float64 as a reference and"
+            " checks that the device result is closer to it than the PyTorch"
+            " CPU decomposition result. Neuron's reduced-precision hardware"
+            " (float16/bfloat16/float32) produces results farther from the"
+            " float64 reference than CPU. Platform precision limitation."
+        ),
+        tests=x.DECOMP_REFERENCE_PRECISION,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][refs_executor.type_cast] _refs.linspace integer-output path calls"
+            " _refs.fill which rejects float->int cast that ATen allows."
+            " Only hits the refs executor tracing path, not direct op calls."
+        ),
+        tests=[
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_linspace_executor_aten_neuron_int16",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_linspace_executor_aten_neuron_int32",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_linspace_executor_aten_neuron_int64",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_linspace_executor_aten_neuron_int8",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_linspace_executor_aten_neuron_uint8",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_linspace_tensor_overload_executor_aten_neuron_int16",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_linspace_tensor_overload_executor_aten_neuron_int32",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_linspace_tensor_overload_executor_aten_neuron_int64",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_linspace_tensor_overload_executor_aten_neuron_int8",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_linspace_tensor_overload_executor_aten_neuron_uint8",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][platform.output_stride] FakeTensor crossref backward stride mismatch."
+            " PT 2.14 widened these tests from @onlyCUDA to @onlyAccelerator."
+            " Neuron's XLA compilation makes inputs contiguous before lowering,"
+            " so outputs are always row-major. ATen contract requires elementwise"
+            " ops to preserve input strides (e.g. column-major in, column-major"
+            " out). The correct fix is to fuse the output transpose into the NEFF"
+            " via the epilogue, avoiding a post-hoc device copy. xfail (not skip)"
+            " so the epilogue fix gives xpass."
+        ),
+        tests=x.OUTPUT_STRIDE_MISMATCH,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][runtime_misc.nki_rng_meta] NKI set_rng_state kernel cannot run"
+            " in meta crossref dispatch path. PT 2.14 widened these tests"
+            " from @onlyCUDA to @onlyAccelerator."
+        ),
+        tests=[
+            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_randint_like_neuron_bool",
+            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_randint_neuron_bool",
+            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_randint_like_neuron_bool",
+            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_randint_neuron_bool",
+            "test_meta.py::TestMetaNEURON::test_meta_outplace_randint_like_neuron_bool",
+            "test_meta.py::TestMetaNEURON::test_meta_outplace_randint_neuron_bool",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][unsupported_op.lbfgs] LBFGS optimizer hits IndexError at"
+            " lbfgs.py:199 on Neuron. PT 2.14 new test."
+        ),
+        tests=[
+            "test_optim.py::TestOptimRenewedNEURON::test_tensor_lr_num_dim_0_LBFGS_neuron_float32",
+            "test_optim.py::TestOptimRenewedNEURON::test_tensor_lr_num_dim_1_LBFGS_neuron_float32",
+            "test_optim.py::TestOptimRenewedNEURON::test_tensor_lr_num_dim_2_LBFGS_neuron_float32",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][accuracy.tensor_not_close] PT 2.14 cpu_gpu_parity tests:"
+            " CrossEntropyLoss fp16 tolerance and fp32 grad None mismatch."
+        ),
+        tests=[
+            "test_modules.py::TestModuleNEURON::test_cpu_gpu_parity_nn_CrossEntropyLoss_neuron_float16",
+            "test_modules.py::TestModuleNEURON::test_cpu_gpu_parity_nn_CrossEntropyLoss_neuron_float32",
+            "test_optim.py::TestOptimRenewedNEURON::test_state_dict_cross_device_Muon_neuron_float32",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][runtime_misc.serialization] PT 2.14 serialization tests:"
+            " Unsupported ScalarType 8 (float8) and dtype view restrictions."
+        ),
+        tests=[
+            "test_serialization.py::TestSerializationDeviceTypeNEURON::test_save_different_dtype_unallocated_neuron",
+            "test_serialization.py::TestSerializationDeviceTypeNEURON::test_skip_data_serialization_materialize_fake_False_neuron",
+            "test_serialization.py::TestSerializationDeviceTypeNEURON::test_skip_data_serialization_materialize_fake_True_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] _refs.special.logit integer/bool: decomposition path"
+            " produces different results than aten on Neuron for non-float"
+            " dtypes. Direct torch.special.logit works correctly."
+        ),
+        tests=x.LOGIT_INTEGER_BOOL,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] refs executor: arange negative step boundary produces"
+            " shape [2] vs [3] on CI. Not reproduced locally."
+        ),
+        tests=[
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_arange_executor_aten_neuron_bfloat16",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_arange_executor_aten_neuron_float16",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_arange_executor_aten_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_arange_executor_aten_neuron_int16",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_arange_executor_aten_neuron_int32",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_arange_executor_aten_neuron_int64",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_arange_executor_aten_neuron_int8",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_arange_executor_aten_neuron_uint8",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] test_compare_cpu numerical mismatches on new"
+            " @onlyAccelerator tests. Not reproduced locally."
+        ),
+        tests=x.COMPARE_CPU_NUMERICAL,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] refs executor: integer type mismatches in"
+            " addcmul, floor_divide, triu/tril_indices, constant_pad_nd,"
+            " rsqrt bool, alpha_dropout dtype, nll_loss tracing."
+        ),
+        tests=x.REFS_EXECUTOR_INTEGER,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] test_decomp logit decomposition: same root cause as"
+            " test_ops logit — decomposition produces wrong results for"
+            " integer/bool/float dtypes. Direct op works correctly."
+        ),
+        tests=x.DECOMP_LOGIT,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] neuron_compile_ops: logit decomposition + matrix_sqrth"
+            " NEFF execution + max_reduction int64 overflow + abs int64."
+        ),
+        tests=[
+            "neuron_compile_ops/test_neuron_compile_ops.py::TestCompileLinalgOpInfoNEURON::test_compile_linalg_linalg_matrix_sqrth_neuron_float32",
+            "neuron_compile_ops/test_neuron_compile_ops.py::TestCompileOpInfoGradNEURON::test_compile_fn_grad_linalg_matrix_sqrth_neuron_float32",
+            "neuron_compile_ops/test_neuron_compile_ops.py::TestCompileOpInfoNEURON::test_compile_matches_eager_abs_neuron_int64",
+            "neuron_compile_ops/test_neuron_compile_ops.py::TestCompileOpInfoNEURON::test_compile_matches_eager_linalg_matrix_sqrth_neuron_float32",
+            "neuron_compile_ops/test_neuron_compile_ops.py::TestCompileOpInfoNEURON::test_compile_matches_eager_logit_neuron_bfloat16",
+            "neuron_compile_ops/test_neuron_compile_ops.py::TestCompileOpInfoNEURON::test_compile_matches_eager_logit_neuron_float32",
+            "neuron_compile_ops/test_neuron_compile_ops.py::TestCompileOpInfoNEURON::test_compile_matches_eager_logit_neuron_float64",
+            "neuron_compile_ops/test_neuron_compile_ops.py::TestCompileOpInfoNEURON::test_compile_matches_eager_logit_neuron_int64",
+            "neuron_compile_ops/test_neuron_compile_ops.py::TestCompileOpInfoNEURON::test_compile_matches_eager_max_reduction_no_dim_neuron_int64",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] test_modules cpu_gpu_parity: LPPool 88-100% mismatch,"
+            " Conv1d backward compiler error, ReplicationPad3d numerical."
+            " Not reproduced locally with basic inputs."
+        ),
+        tests=[
+            "test_modules.py::TestModuleNEURON::test_cpu_gpu_parity_nn_Conv1d_neuron_float32",
+            "test_modules.py::TestModuleNEURON::test_cpu_gpu_parity_nn_LPPool1d_neuron_float32",
+            "test_modules.py::TestModuleNEURON::test_cpu_gpu_parity_nn_LPPool2d_neuron_float32",
+            "test_modules.py::TestModuleNEURON::test_cpu_gpu_parity_nn_LPPool3d_neuron_float32",
+            "test_modules.py::TestModuleNEURON::test_cpu_gpu_parity_nn_LazyConv1d_neuron_float32",
+            "test_modules.py::TestModuleNEURON::test_cpu_gpu_parity_nn_ReplicationPad3d_neuron_float32",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] test_reductions: NRT errors on large inputs,"
+            " sum device mismatch error text, sum_noncontig timeout."
+            " min_max_nan: stablehlo.maximum/minimum use quiet NaN"
+            " semantics (NaN loses to any real number) instead of IEEE"
+            " 754 propagating NaN. Fix requires neuronx-cc compiler"
+            " change to emit NaN-propagating reduce; a Python-level"
+            " workaround would add isnan+where overhead to every"
+            " min/max call. xfail pending compiler fix."
+        ),
+        tests=[
+            "test_reductions.py::TestReductionsNEURON::test_argminmax_large_axis_neuron",
+            "test_reductions.py::TestReductionsNEURON::test_min_max_nan_neuron",
+            "test_reductions.py::TestReductionsNEURON::test_quantile_large_input_neuron_float32",
+            "test_reductions.py::TestReductionsNEURON::test_sum_cpu_device_mismatch_neuron",
+            "test_reductions.py::TestReductionsNEURON::test_sum_noncontig_lowp_neuron_bfloat16",
+            "test_reductions.py::TestReductionsNEURON::test_sum_noncontig_lowp_neuron_float16",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] test_ops_gradients: float64 Jacobian mismatches"
+            " for nn_functional_linear and matrix_sqrth."
+        ),
+        tests=[
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_nn_functional_linear_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_linalg_matrix_sqrth_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_linear_neuron_float64",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] misc remaining: foreach_l2_norm precision,"
+            " foreach_neg bool different-devices, bmm COW inputs,"
+            " checkpoint, profiler, type_promotion, native_mha,"
+            " FSDP prefetch_writeback, distributed checkpoint."
+        ),
+        tests=x.PT214_MISC_REMAINING,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][signed_zero.relu] Neuron loses the -0.0 sign bit through relu."
+            " relu(-0.0) should return -0.0 per IEEE 754 but Neuron returns"
+            " +0.0. Signed-zero handling difference on Neuron hardware."
+        ),
+        tests=[
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_relu_signed_zero_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_relu_signed_zero_neuron_float16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_relu_signed_zero_neuron_float32",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][signed_zero.clamp] Neuron loses the -0.0 sign bit through clamp."
+            " clamp(-0.0, min=0) should return -0.0 per IEEE 754 but Neuron"
+            " returns +0.0. Signed-zero handling difference on Neuron hardware."
+        ),
+        tests=[
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_clamp_signed_zero_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_clamp_signed_zero_neuron_float16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_clamp_signed_zero_neuron_float32",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] scatter_add_large triggers NRT allocator crash on"
+            " large tensor inputs. The test creates tensors exceeding"
+            " the default allocation threshold."
+        ),
+        tests=[
+            "test_scatter_gather_ops.py::TestScatterGatherNEURON::test_scatter_add_large_neuron_bfloat16",
+            "test_scatter_gather_ops.py::TestScatterGatherNEURON::test_scatter_add_large_neuron_float16",
+            "test_scatter_gather_ops.py::TestScatterGatherNEURON::test_scatter_add_large_neuron_float32",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][foreach_norm] foreach_reduce_large_input norm tests fail on"
+            " bf16/fp16 due to reduced-precision accumulation on Neuron."
+        ),
+        tests=[
+            "test_foreach.py::TestForeachNEURON::test_foreach_reduce_large_input__foreach_norm_w_empty_False_neuron_bfloat16",
+            "test_foreach.py::TestForeachNEURON::test_foreach_reduce_large_input__foreach_norm_w_empty_False_neuron_float16",
+            "test_foreach.py::TestForeachNEURON::test_foreach_reduce_large_input__foreach_norm_w_empty_True_neuron_bfloat16",
+            "test_foreach.py::TestForeachNEURON::test_foreach_reduce_large_input__foreach_norm_w_empty_True_neuron_float16",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][CTCLoss] test_CTCLoss_long_targets triggers precision loss"
+            " on Neuron due to reduced-precision log-sum-exp accumulation"
+            " over long target sequences."
+        ),
+        tests=[
+            "test_nn.py::TestNNDeviceTypeNEURON::test_CTCLoss_long_targets_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][foreach_different_devices] Test creates interleaved"
+            " [device_t, cpu_t] tensor lists. foreach raises for mixed"
+            " devices, then asserts element-wise native_op also raises."
+            " On Neuron, element-wise pairs are same-device (device+device,"
+            " cpu+cpu) so no error is raised. Platform difference, not a bug."
+        ),
+        tests=x.FOREACH_DIFFERENT_DEVICES,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][baddbmm_out] PT 2.14 added dtype guard for out= argument."
+            " Test expects RuntimeError for float32->long unsafe cast"
+            " but Neuron dispatch does not enforce the same out-dtype check."
+        ),
+        tests=[
+            "test_ops.py::TestCommonNEURON::test_out_baddbmm_neuron_float32",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][resize_overflow] PT 2.14 resize overflow check not raised"
+            " on Neuron — Neuron's resize_ implementation does not validate"
+            " the product of dimensions for overflow."
+        ),
+        tests=[
+            "test_view_ops.py::TestOldViewOpsNEURON::test_resize_overflow_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][foreach_sub_autodiff] foreach_sub outplace float64 — test"
+            " expects RuntimeError for autodiff on float64 but Neuron"
+            " does not raise because the op falls back to CPU for float64."
+        ),
+        tests=[
+            "test_foreach.py::TestForeachNEURON::test_autodiff__foreach_sub_outplace_neuron_float64",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][foreach_different_devices_misc] foreach_sub bool and"
+            " foreach pointwise different-devices — same mixed-device"
+            " pattern as binary_op_tensors_on_different_devices."
+        ),
+        tests=[
+            "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_sub_neuron_bool",
+            "test_foreach.py::TestForeachNEURON::test_pointwise_op_tensors_on_different_devices__foreach_addcdiv_neuron_float32",
+            "test_foreach.py::TestForeachNEURON::test_pointwise_op_tensors_on_different_devices__foreach_addcmul_neuron_float32",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][isin_different_devices] Test expects RuntimeError for"
+            " mixed-device isin but Neuron does not raise because the"
+            " element-wise comparison pairs are same-device."
+        ),
+        tests=[
+            "test_sort_and_select.py::TestSortAndSelectDeviceNEURON::test_isin_different_devices_neuron_float32",
+            "test_sort_and_select.py::TestSortAndSelectDeviceNEURON::test_isin_different_devices_neuron_int16",
+            "test_sort_and_select.py::TestSortAndSelectDeviceNEURON::test_isin_different_devices_neuron_int32",
+            "test_sort_and_select.py::TestSortAndSelectDeviceNEURON::test_isin_different_devices_neuron_int64",
+            "test_sort_and_select.py::TestSortAndSelectDeviceNEURON::test_isin_different_devices_neuron_int8",
+            "test_sort_and_select.py::TestSortAndSelectDeviceNEURON::test_isin_different_devices_neuron_uint8",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][error_message_mismatch] Neuron raises a valid error but"
+            " with different wording than the regex the test expects."
+        ),
+        tests=[
+            "test_indexing.py::TestIndexingNEURON::test_gather_take_along_dim_cross_device_neuron_float32",
+            "test_indexing.py::TestIndexingNEURON::test_index_put_deterministic_with_optional_tensors_neuron",
+            "test_nn.py::TestNNDeviceTypeNEURON::test_cosine_embedding_loss_error_on_nonexpandable_shapes_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][unsupported_dtype] eye float8_e4m3fnuz/e5m2fnuz"
+            " — ScalarType 25/26 not supported on Neuron."
+        ),
+        tests=[
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_eye_executor_aten_neuron_float8_e4m3fnuz",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_eye_executor_aten_neuron_float8_e5m2fnuz",
+        ],
+    ),
+    SkipGroup(
+        reason="[PT 2.14][unsupported_dtype] uint64 ScalarType not supported on Neuron.",
+        tests=[
+            "test_indexing.py::TestIndexingNEURON::test_setitem_uint64_above_int64_max_neuron",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_fill_barebones_unsigned_neuron_uint64",
+        ],
+    ),
+    SkipGroup(
+        reason="[PT 2.14][not_implemented] Fused GRU cell not implemented on Neuron backend.",
+        tests=[
+            "test_nn.py::TestNNDeviceTypeNEURON::test_RNN_input_size_zero_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason="[PT 2.14][not_implemented] avg_pool3d not implemented for BFloat16 on Neuron.",
+        tests=[
+            "nn/test_pooling.py::TestPoolingNNDeviceTypeNEURON::test_pooling_bfloat16_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][not_implemented] Unbatched dilated conv not supported"
+            " — Neuron expects batched input."
+        ),
+        tests=[
+            "nn/test_convolution.py::TestConvolutionNNDeviceTypeNEURON::test_slow_conv_dilated2d_unbatched_neuron",
+            "nn/test_convolution.py::TestConvolutionNNDeviceTypeNEURON::test_slow_conv_dilated3d_unbatched_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][not_implemented] geometric check_uniform_bounds"
+            " not implemented for integer types on Neuron."
+        ),
+        tests=[
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_geometric_executor_aten_neuron_int16",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_geometric_executor_aten_neuron_int32",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_geometric_executor_aten_neuron_int64",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_geometric_executor_aten_neuron_int8",
+            "test_ops.py::TestCommonNEURON::test_python_ref_executor__refs_geometric_executor_aten_neuron_uint8",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][unsupported_dtype] gather uint16/32/64 — ScalarType"
+            " not supported in Torch-MLIR lowering."
+        ),
+        tests=[
+            "test_scatter_gather_ops.py::TestScatterGatherNEURON::test_gather_neuron_uint16",
+            "test_scatter_gather_ops.py::TestScatterGatherNEURON::test_gather_neuron_uint32",
+            "test_scatter_gather_ops.py::TestScatterGatherNEURON::test_gather_neuron_uint64",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][foreach_0dim] Test expects RuntimeError for CPU scalar"
+            " tensor passed to foreach op with device tensors. Neuron"
+            " does not raise the same scalar-device validation error."
+        ),
+        tests=[
+            "test_foreach.py::TestForeachNEURON::test_0dim_tensor_overload_exception_neuron",
         ],
     ),
 ]
