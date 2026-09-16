@@ -5,7 +5,7 @@ description = "Neuron Backend for PyTorch"
 authors = [{name = "AWS Neuron Team"}]
 requires-python = ">=3.10,<3.14"
 dependencies = [
-    "torch==2.13.0",
+    "torch==2.14.0",
     "numpy<2; python_version < '3.12'",
     "numpy>=2; python_version >= '3.12'",
     "grpcio-tools",

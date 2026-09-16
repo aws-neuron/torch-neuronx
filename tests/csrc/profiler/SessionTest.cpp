@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <libkineto.h>
 #include <output_base.h>
+#include <torch/headeronly/version.h>
 
 #include <atomic>
 #include <chrono>
@@ -766,8 +767,13 @@ class NoOpLogger : public libkineto::ActivityLogger {
   void handleTraceStart(const std::unordered_map<std::string, std::string>&,
                         const std::string&) override {}
   void finalizeMemoryTrace(const std::string&, const libkineto::Config&) override {}
-  void finalizeTrace(const libkineto::Config&, std::unique_ptr<libkineto::ActivityBuffers>, int64_t,
-                     std::unordered_map<std::string, std::vector<std::string>>&) override {}
+  void finalizeTrace(const libkineto::Config&, std::unique_ptr<libkineto::ActivityBuffers>, int64_t
+#if TORCH_VERSION_MINOR < 14
+                     ,
+                     std::unordered_map<std::string, std::vector<std::string>>&
+#endif
+                     ) override {
+  }
 
   int activityCount() const { return activityCount_; }
 
