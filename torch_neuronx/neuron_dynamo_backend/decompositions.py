@@ -256,6 +256,49 @@ def bmm_dtype(self, mat2, out_dtype):
     return torch.bmm(self.to(out_dtype), mat2.to(out_dtype))
 
 
+@register_decomposition([aten._weight_norm_interface.default])
+def _weight_norm_interface(v, g, dim=0):
+    """Fused weight-norm forward, computed in fp32 to match aten's C++ kernel.
+
+    PyTorch's built-in decomp casts the fp32 norm back to the input dtype before
+    the division (``g / norm.to(g.dtype)``), so a bf16 weight-norm roundtrip
+    drifts past the test tolerance, and an fp16 norm is not upcast at all. aten's
+    C++ kernel keeps the norm and the division in fp32 and returns the norm as
+    fp32 for every floating input dtype. Match it: reduce and divide in fp32,
+    then cast only the weight back.
+    """
+    dim = dim % v.dim()
+    keep_dim = tuple(i for i in range(v.dim()) if i != dim)
+    vf = v.to(torch.float32)
+    norm = vf.norm(2, keep_dim, keepdim=True)
+    w = (vf * (g.to(torch.float32) / norm)).to(v.dtype)
+    return w, norm
+
+
+@register_decomposition([aten._weight_norm_interface_backward.default])
+def _weight_norm_interface_backward(grad_w, saved_v, saved_g, saved_norms, dim):
+    """Decompose the fused weight-norm backward, which torch-mlir cannot lower.
+
+    AOTAutograd emits ``_weight_norm_interface_backward`` in the compiled
+    backward graph (the autograd formula for the still-fused forward op), so a
+    forward-only decomposition is not enough. With ``w = g * v / ||v||`` (norm
+    reduced over every dim except ``dim``) the gradients are:
+
+        per_dim = sum_{d != dim}(grad_w * v)   (keepdim, shape of g)
+        grad_g  = per_dim / norm
+        grad_v  = (g / norm) * grad_w - (g / norm**3) * per_dim * v
+    """
+    ndim = saved_v.dim()
+    dim = dim % ndim
+    reduce_dims = [d for d in range(ndim) if d != dim]
+    per_dim_sums = (grad_w * saved_v).sum(reduce_dims, keepdim=True)
+    grad_g = per_dim_sums / saved_norms
+    grad_v = (saved_g / saved_norms) * grad_w - (
+        saved_g / saved_norms.pow(3)
+    ) * per_dim_sums * saved_v
+    return grad_v, grad_g
+
+
 @register_decomposition([aten.angle])
 def angle_decomp(x):
     """Decompose real-valued aten::angle; torch-mlir has no StableHLO lowering.

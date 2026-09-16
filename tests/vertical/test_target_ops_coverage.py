@@ -98,7 +98,16 @@ METRICS_DIR = (
 
 # Ops for which the CPU correctness reference is too expensive or fails to
 # run on CPU.
-_OPS_SKIP_CPU_CORRECTNESS: tuple[str, ...] = ("convolution_backward",)
+#   - _weight_norm_interface_backward: the harness fills saved_norms with
+#     independent randn, violating the saved_norms==‖saved_v‖ precondition; the
+#     1/norm**3 term then diverges and the compare is meaningless. Correctness is
+#     covered by upstream gradcheck + unit/e2e tests; the lowering is verified
+#     exact vs CPU with consistent inputs. (Substring match also covers the .out
+#     overload; it does NOT match the forward "aten::_weight_norm_interface".)
+_OPS_SKIP_CPU_CORRECTNESS: tuple[str, ...] = (
+    "convolution_backward",
+    "aten::_weight_norm_interface_backward",
+)
 
 # Session timestamp — set by conftest.py pytest_sessionstart
 if "NEURON_COVERAGE_TIMESTAMP" not in os.environ:

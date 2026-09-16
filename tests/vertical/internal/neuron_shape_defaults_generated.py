@@ -608,6 +608,27 @@ def register_all_defaults(r, smoke_subsets=()):
         source="builtin",
     )
     r("aten::batch_norm_stats", {"input": (32, 64, 4096), "eps": 1e-5}, source="builtin")
+    r(
+        "aten::_weight_norm_interface",
+        {"v": (8192, 8192), "g": (8192, 1), "dim": 0},
+        source="manual",
+    )
+    # CPU correctness is skipped for this op (see _OPS_SKIP_CPU_CORRECTNESS): the
+    # harness fills saved_norms with independent randn, violating
+    # saved_norms==‖saved_v‖; the 1/norm**3 term then diverges. Correctness is
+    # covered by upstream gradcheck + unit/e2e tests; lowering verified exact vs
+    # CPU with consistent inputs.
+    r(
+        "aten::_weight_norm_interface_backward",
+        {
+            "grad_w": (8192, 8192),
+            "saved_v": (8192, 8192),
+            "saved_g": (8192, 1),
+            "saved_norms": (8192, 1),
+            "dim": 0,
+        },
+        source="manual",
+    )
 
     # Bitwise shift with scalar LHS
     r(
@@ -4390,6 +4411,29 @@ def register_all_defaults(r, smoke_subsets=()):
         "aten::batch_norm_stats.out",
         {"input": _bn_in, "eps": 1e-5, "out0": _bn_c, "out1": _bn_c},
         source="builtin",
+    )
+    r(
+        "aten::_weight_norm_interface.out",
+        {"v": (8192, 8192), "g": (8192, 1), "dim": 0, "out0": (8192, 8192), "out1": (8192, 1)},
+        source="manual",
+    )
+    # CPU correctness is skipped for this op (see _OPS_SKIP_CPU_CORRECTNESS): the
+    # harness fills saved_norms with independent randn, violating
+    # saved_norms==‖saved_v‖; the 1/norm**3 term then diverges. Correctness is
+    # covered by upstream gradcheck + unit/e2e tests; lowering verified exact vs
+    # CPU with consistent inputs.
+    r(
+        "aten::_weight_norm_interface_backward.out",
+        {
+            "grad_w": (8192, 8192),
+            "saved_v": (8192, 8192),
+            "saved_g": (8192, 1),
+            "saved_norms": (8192, 1),
+            "dim": 0,
+            "out0": (8192, 8192),
+            "out1": (8192, 1),
+        },
+        source="manual",
     )
     r(
         "aten::native_batch_norm_backward.out",
