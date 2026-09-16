@@ -1486,6 +1486,7 @@ def _can_use_nki_flash_attention(
     value: torch.Tensor,
     attn_bias: torch.Tensor | None = None,
     dropout_p: float = 0.0,
+    scale: float | None = None,
 ) -> bool:
     """Check if NKI flash attention kernel can be used.
 
@@ -1495,11 +1496,17 @@ def _can_use_nki_flash_attention(
         value (torch.Tensor): Value tensor of shape (B, H, S, E).
         attn_bias (torch.Tensor | None): Optional attention bias.
         dropout_p (float): Dropout probability.
+        scale (float | None): Softmax scale. None selects 1/sqrt(E).
 
     Returns:
         bool: True if NKI kernel constraints are satisfied.
     """
     if not _getenv_bool("TORCH_NEURONX_ENABLE_NKI_SDPA", True):
+        return False
+
+    # attention_bwd resolves `softmax_scale or 1/sqrt(d)`, so an explicit scale=0.0 would
+    # become the default scale. Reject it in both gates so fwd and bwd take the same path.
+    if scale == 0.0:
         return False
 
     B, H, L, E = query.shape
@@ -1618,7 +1625,7 @@ def sdpa_fused_overrideable(
         philox_seed = (query.flatten()[0] * 0).to(torch.int32)
         philox_offset = (query.flatten()[0] * 0).to(torch.int32)
 
-    if _can_use_nki_flash_attention(query, key, value, attn_bias, dropout_p):
+    if _can_use_nki_flash_attention(query, key, value, attn_bias, dropout_p, scale):
         try:
             output, logsumexp = _compute_attention_nki(
                 query, key, value, is_causal, scale, training=True
@@ -1674,6 +1681,7 @@ def _can_use_nki_flash_attention_backward(
     value: torch.Tensor,
     attn_bias: torch.Tensor | None = None,
     dropout_p: float = 0.0,
+    scale: float | None = None,
 ) -> bool:
     """Check if NKI flash attention backward kernel can be used.
 
@@ -1683,6 +1691,7 @@ def _can_use_nki_flash_attention_backward(
         value (torch.Tensor): Value tensor of shape (B, H, S, E).
         attn_bias (torch.Tensor | None): Optional attention bias.
         dropout_p (float): Dropout probability.
+        scale (float | None): Softmax scale. None selects 1/sqrt(E).
 
     Returns:
         bool: True if NKI kernel constraints are satisfied.
@@ -1690,7 +1699,8 @@ def _can_use_nki_flash_attention_backward(
     if not _getenv_bool("TORCH_NEURONX_ENABLE_NKI_SDPA", True):
         return False
 
-    if attn_bias is not None:
+    # See _can_use_nki_flash_attention: attention_bwd cannot express scale=0.0.
+    if attn_bias is not None or scale == 0.0:
         return False
 
     _, _, L, E = query.shape
@@ -1914,7 +1924,9 @@ def scaled_dot_product_fused_attention_overrideable_backward_decomposition(
     Returns:
         tuple: (grad_query, grad_key, grad_value, grad_attn_bias).
     """
-    can_use_nki = _can_use_nki_flash_attention_backward(query, key, value, attn_bias, dropout_p)
+    can_use_nki = _can_use_nki_flash_attention_backward(
+        query, key, value, attn_bias, dropout_p, scale
+    )
     # Try NKI
     if can_use_nki:
         try:
