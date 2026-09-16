@@ -2066,6 +2066,55 @@ void NeuronDispatcher::DispatchSdpaFwdImpl(const c10::OperatorHandle& op,
     }
   }
 
+  // Reject an explicit mask together with is_causal, as ATen does. Upstream
+  // raises this from _scaled_dot_product_attention_math, so CPU raises whenever
+  // the math backend runs (a float64 query rules out flash). Neuron always runs
+  // its fused kernel, so the check has to live here to keep the same contract.
+  {
+    const auto& schema_args = schema.arguments();
+    const size_t base = stack->size() - num_args;
+    bool has_mask = false;
+    bool is_causal = false;
+    for (size_t i = 0; i < num_args && i < schema_args.size(); ++i) {
+      const auto& name = schema_args[i].name();
+      const auto& slot = (*stack)[base + i];
+      if (name == "attn_bias" || name == "attn_mask") {
+        has_mask = slot.isTensor() && slot.toTensor().defined();
+      } else if (name == "is_causal" && slot.isBool()) {
+        is_causal = slot.toBool();
+      }
+    }
+    TORCH_CHECK(!(has_mask && is_causal),
+                "_scaled_dot_product_attention: Explicit attn_mask should not be set when "
+                "is_causal=True");
+  }
+
+  // Neuron computes SDPA in float32. Every other op reaches float32 through
+  // DowncastArgs, but DispatchSdpaCore skips it ("PreprocessArgs only"), so a
+  // float64 query used to fail the dtype guard below while add/matmul/softmax
+  // accept float64. Downcast the floating tensor operands here and restore the
+  // query dtype on the output, which matches the documented platform policy
+  // that float64 is computed as float32. Every Double tensor slot is rewritten
+  // rather than a fixed index, because the mask/bias position differs between
+  // the flash and efficient-attention overloads.
+  c10::ScalarType sdpa_orig_dtype = c10::ScalarType::Undefined;
+  {
+    const size_t base = stack->size() - num_args;
+    const auto& q_in = (*stack)[base];
+    if (q_in.isTensor() && q_in.toTensor().defined() &&
+        q_in.toTensor().scalar_type() == c10::ScalarType::Double) {
+      sdpa_orig_dtype = c10::ScalarType::Double;
+      for (size_t i = 0; i < num_args; ++i) {
+        auto& slot = (*stack)[base + i];
+        if (!slot.isTensor()) continue;
+        const auto& t = slot.toTensor();
+        if (t.defined() && t.scalar_type() == c10::ScalarType::Double) {
+          slot = c10::IValue(t.to(c10::ScalarType::Float));
+        }
+      }
+    }
+  }
+
   // Capture query tensor reference before DispatchSdpaCore pops args from stack
   {
     // Validate SDPA input dtypes and shapes
@@ -2123,6 +2172,14 @@ void NeuronDispatcher::DispatchSdpaFwdImpl(const c10::OperatorHandle& op,
         final_outputs[0] = fixed;
       }
     }
+  }
+
+  // Restore the caller's dtype after the float32 compute. This runs after the
+  // stride fixup because alloc_with_matching_layout allocates with the (already
+  // downcast) query dtype, so an earlier upcast would be undone by its copy_.
+  if (sdpa_orig_dtype != c10::ScalarType::Undefined && !final_outputs.empty() &&
+      final_outputs[0].defined()) {
+    final_outputs[0] = final_outputs[0].to(sdpa_orig_dtype);
   }
 
   // Push 9-tuple with SymInt and None slots

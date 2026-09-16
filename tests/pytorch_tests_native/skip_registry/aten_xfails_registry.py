@@ -447,6 +447,21 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "Neuron dropout does not propagate NaN through dropped positions."
+            " native_dropout computes 'input * mask * scale', but the compiler"
+            " folds the multiply by a 0/1 mask into a select, so a dropped NaN"
+            " becomes 0.0 while CPU keeps NaN. This test builds a random bool"
+            " attn_mask, and when a row is fully masked the softmax reference is"
+            " all-NaN. Dropout then zeroes part of that row, so its"
+            " 'expected_all_nan' assertion fails depending on the RNG draw."
+            " Only the dropout_p>0 rows are affected; the dropout_p=0 rows pass."
+        ),
+        tests=[
+            "test_transformers.py::TestTransformersNEURON::test_scaled_dot_product_attention_batch_size_5_4D_input_dim_4D_attn_mask_dropout_p_0_5_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "masked_sum on Neuron fp16 returns NaN when masked-out positions"
             " contain Inf, while torch CPU and numpy references correctly"
             " return Inf"

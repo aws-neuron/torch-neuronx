@@ -1198,3 +1198,53 @@ def test_scaled_dot_product_attention_empty_value():
         assert q.grad.shape == q.shape, label
         assert k.grad.shape == k.shape, label
         assert v.grad.shape == v.shape, label
+
+
+def test_scaled_dot_product_attention_float64_downcasts():
+    """A float64 query computes in float32 and returns float64.
+
+    Neuron computes SDPA in float32, and the platform casts float64 to float32
+    for every other op (add, matmul, softmax all accept float64). SDPA used to
+    reject Double outright because it skips DowncastArgs.
+    """
+    if not torch.neuron.is_available():
+        pytest.skip("Neuron device not available")
+
+    torch.manual_seed(42)
+    device = torch.device("neuron", 0)
+    cpu_q = torch.randn(1, 2, 8, 16, dtype=torch.float64)
+
+    with torch.no_grad():
+        actual = F.scaled_dot_product_attention(
+            cpu_q.to(device), cpu_q.to(device), cpu_q.to(device)
+        )
+        expected = F.scaled_dot_product_attention(cpu_q, cpu_q, cpu_q)
+
+    assert actual.dtype == torch.float64
+    assert actual.shape == expected.shape
+    # Compared at float32 precision: the values are computed in float32 on Neuron.
+    torch.testing.assert_close(
+        actual.cpu().to(torch.float32), expected.to(torch.float32), rtol=1e-2, atol=1e-2
+    )
+
+
+def test_scaled_dot_product_attention_float64_with_mask():
+    """A float64 attn_mask is downcast alongside query, key and value."""
+    if not torch.neuron.is_available():
+        pytest.skip("Neuron device not available")
+
+    torch.manual_seed(42)
+    device = torch.device("neuron", 0)
+    cpu_q = torch.randn(1, 2, 8, 8, dtype=torch.float64)
+    cpu_mask = torch.zeros(8, 8, dtype=torch.float64)
+
+    with torch.no_grad():
+        actual = F.scaled_dot_product_attention(
+            cpu_q.to(device), cpu_q.to(device), cpu_q.to(device), cpu_mask.to(device)
+        )
+        expected = F.scaled_dot_product_attention(cpu_q, cpu_q, cpu_q, cpu_mask)
+
+    assert actual.dtype == torch.float64
+    torch.testing.assert_close(
+        actual.cpu().to(torch.float32), expected.to(torch.float32), rtol=1e-2, atol=1e-2
+    )
