@@ -898,6 +898,28 @@ def register_all_defaults(r, smoke_subsets=()):
         source="builtin",
     )
 
+    # masked_scatter_ and its backward have no OpInfo. Give the in-place variant a
+    # source that is large enough for any mask, and give the backward a source
+    # buffer size (sizes) that holds every True position.
+    r(
+        "aten::masked_scatter_",
+        {
+            "self": (128, 256),
+            "mask": {"shape": (128, 256), "dtype": "bool"},
+            "source": (32768,),
+        },
+        source="builtin",
+    )
+    r(
+        "aten::masked_scatter_backward",
+        {
+            "grad_output": (128, 256),
+            "mask": {"shape": (128, 256), "dtype": "bool"},
+            "sizes": [128, 256],
+        },
+        source="builtin",
+    )
+
     r(
         "aten::div_.Scalar_mode",
         {"self": (256, 4096), "other": 2.0, "rounding_mode": "floor"},

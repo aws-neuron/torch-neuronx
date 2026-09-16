@@ -2755,6 +2755,25 @@ def _true_rank(flat_mask):
     )
 
 
+def _blocked_prefix_sum(x):
+    # Inclusive prefix sum over a 1-D tensor. A flat cumsum lowers to an [N, N]
+    # triangular matmul; block into [R, C] with C ~ sqrt(N) so compile cost is
+    # ~sqrt(N), not N^2. Stays in fp32, like the flat cumsum.
+    n = x.shape[0]
+    c = int(math.isqrt(n - 1)) + 1  # ceil(sqrt(n)) for n >= 1
+    r = (n + c - 1) // c
+    pad = r * c - n
+    if pad:
+        x = torch.cat([x, x.new_zeros(pad)])
+    xm = x.reshape(r, c)
+    tri_c = torch.ones(c, c, dtype=xm.dtype, device=xm.device).triu()
+    row_csum = torch.matmul(xm, tri_c)  # inclusive within each row
+    tri_r = torch.ones(r, r, dtype=xm.dtype, device=xm.device).triu(1)  # exclusive over rows
+    row_offset = torch.matmul(row_csum[:, -1], tri_r)
+    full = row_csum + row_offset.unsqueeze(1)
+    return full.reshape(-1)[:n]
+
+
 @register_decomposition([aten.masked_scatter.default])
 def masked_scatter_decomposition(self, mask, source):
     """Decompose masked_scatter into flatten + prefix-sum gather + where.
@@ -2775,12 +2794,23 @@ def masked_scatter_decomposition(self, mask, source):
     """
     mask = mask.to(torch.bool)
     shape = torch.broadcast_shapes(self.shape, mask.shape)  # == result shape
-    self_b = self.broadcast_to(shape)
-    mask_b = mask.broadcast_to(shape)
+    self_flat = self.broadcast_to(shape).flatten()
+    mask_flat = mask.broadcast_to(shape).flatten()
+    if mask_flat.numel() == 0:
+        return self_flat.reshape(shape)
 
-    gather_idx = _true_rank(mask_b.flatten())
-    picked = torch.index_select(source.flatten(), 0, gather_idx).reshape(shape)
-    return torch.where(mask_b, picked, self_b)
+    # Derive the select mask from the prefix sum, not from mask_flat directly. The
+    # compiler mis-folds a select whose condition and whose gathered operand both
+    # trace to one broadcast of the mask. For some partial broadcast masks the
+    # fused select and gather then collapse toward source[0] and give wrong
+    # results. The prefix-sum chain gives the condition a separate origin and
+    # stops the fold.
+    csum = _blocked_prefix_sum(mask_flat.to(torch.float32))
+    prev = torch.cat([csum.new_zeros(1), csum[:-1]])
+    is_true = (csum - prev) > 0.5
+    gather_idx = torch.clamp(csum - 1.0, min=0).to(torch.int64)
+    picked = torch.index_select(source.flatten(), 0, gather_idx)
+    return torch.where(is_true, picked, self_flat).reshape(shape)
 
 
 @register_decomposition([aten.masked_scatter_backward.default])
