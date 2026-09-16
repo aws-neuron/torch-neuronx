@@ -593,6 +593,9 @@ const FillValueConfig* GetFillValueConfig(const std::string& op_name) {
       {"isin", {"invert", 0.0, false}},
       // linear(input, weight, bias=None) — bias is a tensor
       {"linear", {"bias", 0.0, true}},
+      // nonzero_static(input, size, fill_value=-1): an empty input has no
+      // nonzero element, so every row of the (size, ndim) output is padding
+      {"nonzero_static", {"fill_value", -1.0, false}},
   };
   auto base = ExtractBaseOpName(op_name);
   auto it = kConfigs.find(base);

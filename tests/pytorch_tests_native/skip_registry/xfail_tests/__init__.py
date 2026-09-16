@@ -125,13 +125,11 @@ from .index_error import INDEX_ERROR as INDEX_ERROR
 from .large_round_frac import LARGE_ROUND_FRAC as LARGE_ROUND_FRAC
 from .logit_integer_bool import LOGIT_INTEGER_BOOL as LOGIT_INTEGER_BOOL
 from .meta_mismatch import META_MISMATCH_OUTPUT as META_MISMATCH_OUTPUT
-from .opinfo_broken import OPINFO_BROKEN as OPINFO_BROKEN
 from .other import OTHER as OTHER
 from .output_stride_mismatch import OUTPUT_STRIDE_MISMATCH as OUTPUT_STRIDE_MISMATCH
 from .pt214_misc_remaining import PT214_MISC_REMAINING as PT214_MISC_REMAINING
 from .refs_executor_integer import REFS_EXECUTOR_INTEGER as REFS_EXECUTOR_INTEGER
 from .runtime_misc.comparison import RUNTIME_MISC_COMPARISON as RUNTIME_MISC_COMPARISON
-from .runtime_misc.failed_to_run import RUNTIME_MISC_FAILED_TO_RUN as RUNTIME_MISC_FAILED_TO_RUN
 from .runtime_misc.module_input_count import (
     RUNTIME_MISC_MODULE_INPUT_COUNT as RUNTIME_MISC_MODULE_INPUT_COUNT,
 )

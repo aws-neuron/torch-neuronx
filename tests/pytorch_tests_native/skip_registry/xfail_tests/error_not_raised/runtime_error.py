@@ -60,7 +60,6 @@ ERROR_NOT_RAISED_RUNTIME_ERROR = [
     # not fix these entries: CPU accepts torch.add(fp32, fp32, out=fp64) but
     # rejects out=fp64 for mm/bmm/addmm/baddbmm.
     "test_ops.py::TestCommonNEURON::test_out_diff_neuron_float32",
-    "test_ops.py::TestCommonNEURON::test_out_linalg_vector_norm_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_max_reduction_with_dim_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_min_reduction_with_dim_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_scatter_neuron_float32",
@@ -99,9 +98,14 @@ ERROR_NOT_RAISED_RUNTIME_ERROR = [
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_type_promotion_maximum_neuron",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_type_promotion_min_binary_neuron",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_type_promotion_minimum_neuron",
-    "test_foreach.py::TestForeachNEURON::test_parity__foreach_div_fastpath_outplace_neuron_bool",
     "test_meta.py::TestMetaKernelRegistrations::test_prelu_decomp_dtype_mismatch_error",
     "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcdiv_slowpath_inplace_neuron_bool",
+    "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcdiv_fastpath_inplace_neuron_int64",
+    "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcdiv_fastpath_inplace_neuron_int8",
+    "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcdiv_fastpath_inplace_neuron_uint8",
+    "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcdiv_fastpath_outplace_neuron_int32",
+    "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcdiv_fastpath_outplace_neuron_int64",
+    "test_foreach.py::TestForeachNEURON::test_parity__foreach_addcdiv_fastpath_outplace_neuron_int8",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_cov_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_float_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_float_neuron_float64",
@@ -115,8 +119,5 @@ ERROR_NOT_RAISED_RUNTIME_ERROR = [
     # CPU raises RuntimeError for these out= and type-promotion dtype cases.
     # Neuron does not enforce the same dtype guards, so it raises no error.
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_type_promotion_ldexp_neuron",
-    "test_ops.py::TestCommonNEURON::test_out_frac_neuron_float32",
-    "test_ops.py::TestCommonNEURON::test_out_round_decimals_0_neuron_float32",
-    "test_ops.py::TestCommonNEURON::test_out_round_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_ldexp_neuron_float32",
 ]

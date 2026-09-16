@@ -267,20 +267,12 @@ XFAIL_GROUPS: list[SkipGroup] = [
         tests=x.META_MISMATCH_OUTPUT,
     ),
     SkipGroup(
-        reason="[opinfo_broken] Upstream OpInfo is broken, not Neuron-specific",
-        tests=x.OPINFO_BROKEN,
-    ),
-    SkipGroup(
         reason="[other] Miscellaneous failures not fitting other categories",
         tests=x.OTHER,
     ),
     SkipGroup(
         reason="[runtime_misc.comparison] RuntimeError during tensor comparison on Neuron",
         tests=x.RUNTIME_MISC_COMPARISON,
-    ),
-    SkipGroup(
-        reason="[runtime_misc.failed_to_run] Op execution returned None on Neuron",
-        tests=x.RUNTIME_MISC_FAILED_TO_RUN,
     ),
     SkipGroup(
         reason=(
