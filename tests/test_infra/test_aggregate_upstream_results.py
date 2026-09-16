@@ -28,6 +28,9 @@ from aggregate_upstream_results import (
     flatten_reports,
     write_run_metadata_csv,
 )
+from aggregate_upstream_results import (
+    main as aggregate_main,
+)
 
 
 def _write_pytest_json(path: Path, test_class: str, test_methods: list[tuple[str, str]]) -> None:
@@ -75,6 +78,82 @@ def test_two_distinct_artifacts_count_independently(tmp_path: Path) -> None:
 
     result = aggregate_summary(tmp_path, tmp_path / "summary.csv")
     assert result["total_stats"]["passed"] == 2
+
+
+def test_soft_fail_artifact_excluded_from_aggregate_reports(tmp_path: Path) -> None:
+    """A soft-fail suite stays out of all aggregate report rows."""
+    _write_pytest_json(
+        _node_json(tmp_path, "upstream-pytorch-test_ops", "test_results_test_ops.json"),
+        test_class="TestOps",
+        test_methods=[("test_pass", "passed"), ("test_fail", "failed")],
+    )
+    _write_pytest_json(
+        _node_json(
+            tmp_path,
+            "upstream-pytorch-torch_test_root_files",
+            "test_results_torch_test_root_files.json",
+        ),
+        test_class="TestAutoDiscovered",
+        test_methods=[("test_pass", "passed"), ("test_fail", "failed")],
+    )
+
+    summary_path = tmp_path / "summary.csv"
+    result = aggregate_summary(
+        tmp_path,
+        summary_path,
+        excluded_labels={"torch_test_root_files"},
+    )
+
+    assert result["total_stats"] == {"passed": 1, "failed": 1}
+    assert {row["test_class"] for row in result["test_rows"]} == {"TestOps"}
+    assert result["failures_by_label"] == {"test_ops": 1}
+
+    summary_rows = list(csv.DictReader(summary_path.open()))
+    assert {row["test_class"] for row in summary_rows} == {"TestOps", "TOTAL"}
+
+
+def test_soft_fail_only_run_has_zero_reportable_failures(tmp_path: Path, monkeypatch) -> None:
+    """A run with only soft-fail suites passes a zero-failure gate."""
+    _write_pytest_json(
+        _node_json(
+            tmp_path,
+            "upstream-pytorch-torch_test_root_files",
+            "test_results_torch_test_root_files.json",
+        ),
+        test_class="TestAutoDiscovered",
+        test_methods=[("test_fail", "failed")],
+    )
+    config_path = tmp_path / "distribution.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {
+                        "items": ["torch_test_root_files"],
+                        "soft_fail": True,
+                    }
+                ]
+            }
+        )
+    )
+    github_output = tmp_path / "github_output.txt"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
+
+    exit_code = aggregate_main(
+        [
+            str(tmp_path),
+            "--dist-config",
+            str(config_path),
+            "--max-failures",
+            "0",
+        ]
+    )
+
+    assert exit_code == 0
+    assert github_output.read_text().splitlines() == [
+        "failure_count=0",
+        "gate_passed=true",
+    ]
 
 
 def test_sharded_artifacts_count_all_shards(tmp_path: Path) -> None:
@@ -141,14 +220,8 @@ def test_dedupe_outputs_and_test_results_mirror(tmp_path: Path) -> None:
 def test_bundle_artifact_not_double_counted(tmp_path: Path) -> None:
     """The ``upstream-pytorch-all`` convenience bundle must not be aggregated.
 
-    It is a re-copy of every suite's reports, uploaded by the aggregate job for
-    debugging. On a workflow *re-run*, ``actions/download-artifact`` fetches it
-    back into results_dir (its old name matched the ``upstream-pytorch-*``
-    download pattern), so its nested copy of a suite's report would be counted a
-    SECOND time — under the bogus ``all`` label, which is not in the soft_fail
-    set and therefore bypasses the merge-gate soft_fail exclusion. That is how a
-    flaky ``test_foreach`` SIGSEGV blocked the merge queue in run 29132121866
-    (PR #1102) even though ``test_foreach`` is a soft_fail suite.
+    The bundle copy uses the ``all`` label. It must not bypass the soft-fail
+    report filter during a workflow rerun.
     """
     # Real per-suite artifact: one failing foreach test.
     _write_pytest_json(
@@ -167,24 +240,16 @@ def test_bundle_artifact_not_double_counted(tmp_path: Path) -> None:
         test_methods=[("test_crashes_flaky", "failed")],
     )
 
-    result = aggregate_summary(tmp_path, tmp_path / "summary.csv")
+    result = aggregate_summary(
+        tmp_path,
+        tmp_path / "summary.csv",
+        excluded_labels={"test_foreach"},
+    )
 
-    # Counted once, and ONLY under the real suite label — never under "all".
-    assert result["failures_by_label"] == {"test_foreach": 1}
-    assert result["stats"]["TestForeachNEURON"]["failed"] == 1
-    assert result["total_stats"]["failed"] == 1
-
-    # End-to-end: the merge-gate soft_fail arithmetic (see ``main``) now nets
-    # zero. soft_fail excludes ``failures_by_label[<soft label>]``; with the
-    # bundle ignored, the single foreach failure is fully attributed to the
-    # soft_fail ``test_foreach`` label, so nothing counts toward the gate.
-    failure_count = result["total_stats"].get("failed", 0)
-    soft_labels = {"test_foreach"}
-    soft_fail_failures = sum(result["failures_by_label"].get(lbl, 0) for lbl in soft_labels)
-    gate_failure_count = max(0, failure_count - soft_fail_failures)
-    assert gate_failure_count == 0
-    # The gate verdict itself passes (exit 0) at the strictest max-failures=0.
-    assert evaluate_gate(gate_failure_count, max_failures=0)[0] == 0
+    assert result["test_rows"] == []
+    assert result["stats"] == {}
+    assert result["total_stats"] == {}
+    assert evaluate_gate(0, max_failures=0)[0] == 0
 
 
 def test_pass_rate_correct(tmp_path: Path) -> None:
