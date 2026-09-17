@@ -145,8 +145,8 @@ def _final_exit_code(exit_code: int, soft_fail: bool) -> int:
     """Final process exit code.
 
     Advisory (``--soft-fail``) suites always return 0 regardless of test outcome:
-    they still run and upload results for the dashboard/aggregator, but must never
-    fail the CI job. Non-soft_fail suites keep their real exit code.
+    they cannot fail the CI job. The workflow excludes configured soft-fail suites
+    from aggregate reports. Other suites keep their real exit code.
     """
     return 0 if soft_fail else exit_code
 
@@ -386,8 +386,7 @@ Examples:
     parser.add_argument(
         "--soft-fail",
         action="store_true",
-        help="Advisory suite: run and upload results, but always exit 0 so a "
-        "failure does not block CI (run-but-don't-block).",
+        help="Return 0 for an advisory suite. The distribution config controls reporting.",
     )
     parser.add_argument(
         "--download-neff-cache",
