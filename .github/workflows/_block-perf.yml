@@ -1,0 +1,144 @@
+name: Block Perf Tests (reusable)
+
+# =============================================================================
+# Reusable workflow for block performance + collective performance tests.
+#
+# Invoked by:
+#   - pull.yml            (PR checks, TRN2, enforce=true, multiplier=1.0)
+#   - dependency-guard.yml (dependency validation, TRN2 + TRN3PDS B1)
+#   - nightly.yml          (wheel validation, TRN2 + TRN3PDS B1)
+#   - nightly-cp313.yml    (wheel validation, TRN2)
+#
+# Tests are grouped by model and run sequentially on a single node per
+# group via run_group.py. This reduces each platform's node usage from 8 to 3.
+#
+# Platform-specific MFU goldens live in the JSON config files under
+# tests/blocks/block_perf/group_configs/. Each test entry has an mfu object
+# keyed by platform; every platform entry records its measured baseline,
+# capture date, and threshold. New captures use threshold = baseline × 0.90.
+#
+# Thresholds are enforced when enforce-mfu-threshold is true. The
+# mfu-threshold-multiplier input scales every per-test threshold:
+#   PR:       enforce=true,  multiplier=1.0   (full strictness)
+#   nightly:  enforce=true,  multiplier=0.95  (~5% looser to absorb fleet noise)
+# Set enforce=false to disable gates entirely (legacy escape hatch).
+#
+# How to update a golden (when perf legitimately improves):
+#   1. Measure the new MFU from a CI run.
+#   2. In the relevant JSON config:
+#      - Set mfu.<platform>.threshold to new_mfu × 0.90.
+#      - Set mfu.<platform>.baseline to the new measured MFU.
+#      - Set mfu.<platform>.baseline_date to today's date.
+#   3. Call out the change in the PR description and torch-neuron-eager-committers channel
+#
+# See tests/blocks/block_perf/group_configs/README.md for full details.
+# =============================================================================
+
+on:
+  workflow_call:
+    inputs:
+      runner-labels:
+        description: 'Optional JSON runs-on override; pull.yml uses this for build-image/no-op runners'
+        required: false
+        type: string
+        default: ''
+      image:
+        description: 'Docker image URI for generated internal-compute runners; ignored when runner-labels is set'
+        required: false
+        type: string
+        default: ''
+      artifact-prefix:
+        description: 'Prefix for uploaded artifacts (e.g. "block-perf" or "wheel-block-perf")'
+        required: true
+        type: string
+      runner-label-prefix:
+        description: 'Prefix for generated neuron.run labels; defaults to artifact-prefix'
+        required: false
+        type: string
+        default: ''
+      include-trn3pds-b1:
+        description: 'Run the matrix on TRN3PDS B1 in addition to TRN2'
+        required: false
+        type: boolean
+        default: false
+      enforce-mfu-threshold:
+        description: 'If true, enforce the selected platform MFU regression gates'
+        required: false
+        type: boolean
+        default: false
+      mfu-threshold-multiplier:
+        description: 'Multiplier on the selected platform threshold (<1.0 loosens). PR uses 1.0; nightly uses 0.95.'
+        required: false
+        type: string
+        default: '1.0'
+      checkout-ref:
+        description: 'Git ref/SHA to checkout. PR-review-triggered callers pass the PR head SHA; empty string falls back to default checkout (e.g. nightly).'
+        required: false
+        type: string
+        default: ''
+      noop:
+        description: 'If true, skip the perf run and pass instantly (satisfies required merge-queue checks without re-running on the merge-group commit).'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write  # required by the internal-compute dispatcher (OIDC auth for StartWorkload)
+
+jobs:
+  block-perf:
+    name: ${{ matrix.group.display_name }} (${{ matrix.platform == 'trn2' && 'trn2' || 'trn3pds B1' }})
+    env:
+      MATRIX_LABEL: ${{ format('{0}{1}', matrix.group.id, matrix.platform != 'trn2' && format('-{0}', matrix.platform) || '') }}
+    # Pull checks provide a complete label override. Image-based callers use
+    # this template, selecting the instance and unique run suffix by platform.
+    runs-on: >-
+      ${{ fromJSON(inputs.runner-labels || format(
+      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:{0}","neuron.run-{1}-{2}{3}","neuron.image:{4}","neuron.timeout:32400"]',
+      matrix.platform == 'trn2' && 'trn2.48xlarge' || 'trn3-dev1.48xlarge',
+      github.run_id,
+      inputs.runner-label-prefix || inputs.artifact-prefix,
+      matrix.platform != 'trn2' && format('-{0}', matrix.platform) || '',
+      inputs.image
+      )) }}
+    timeout-minutes: 600
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(inputs.include-trn3pds-b1 && '["trn2","trn3pds-b1"]' || '["trn2"]') }}
+        group:
+          - id: qwen3-group
+            display_name: Block Perf Qwen3
+            config: tests/blocks/block_perf/group_configs/qwen3.json
+
+          - id: gpt-oss-group
+            display_name: Block Perf GPT-OSS
+            config: tests/blocks/block_perf/group_configs/gpt_oss.json
+
+          - id: infra-group
+            display_name: Block Perf Infra
+            config: tests/blocks/block_perf/group_configs/infra.json
+
+    steps:
+      - uses: actions/checkout@v4
+        if: ${{ !inputs.noop }}
+        with:
+          # Empty string => default checkout. PR-review-triggered runs pass the
+          # PR head SHA so we test the PR code, not the base branch (the default
+          # checkout ref for pull_request_review events is the base branch).
+          ref: ${{ inputs.checkout-ref }}
+
+      - name: Merge-queue no-op
+        if: ${{ inputs.noop }}
+        run: echo "Ran on PR head before queue entry; pass as no-op in merge queue."
+
+      - uses: ./.github/actions/run-test-suite
+        if: ${{ !inputs.noop }}
+        with:
+          test-command: >-
+            python tests/blocks/block_perf/run_group.py
+            --config ${{ matrix.group.config }}
+            --platform ${{ matrix.platform }}
+            ${{ !inputs.enforce-mfu-threshold && '--skip-mfu-threshold' || format('--mfu-threshold-multiplier {0}', inputs.mfu-threshold-multiplier) }}
+          artifact-name: ${{ format('{0}-{1}{2}-results', inputs.artifact-prefix, matrix.platform != 'trn2' && format('{0}-', matrix.platform) || '', matrix.group.id) }}
