@@ -1,14 +1,16 @@
 # torch-neuronx Code Owners
-# Converted from CODE_APPROVERS.yaml
 #
 # GitHub CODEOWNERS uses last-match-wins, so the catch-all goes FIRST
 # and more specific rules override it below.
 #
-# Owners: @aws-singhada, @galaind
-# Override approvers: @aws-rhsoln, @indhub
+# Patterns are gitignore-style: an unanchored rule like `tools/` matches that
+# directory at ANY depth. File and extension rules are therefore anchored with a
+# leading `/` so they match only the repository root and cannot override the
+# directory rules above them.
 #
-# Teams must exist as GitHub teams under the org. Adjust @org/ prefix
-# to match your actual GitHub organization name.
+# Each team must exist under the org AND have write access to this repository,
+# or GitHub silently ignores the rule. Verify with:
+#   gh api repos/aws-neuron/torch-neuronx/codeowners/errors?ref=main
 
 # -- Catch-all --
 *                                                   @aws-neuron/torch-neuronx-approvers
@@ -40,6 +42,9 @@ torch_neuronx/csrc/c10/                             @aws-neuron/torch-distribute
 # -- Dynamo / Compile --
 torch_neuronx/neuron_dynamo_backend/                @aws-neuron/torch-compile-approvers
 
+# -- torch-mlir (vendored) --
+third_party/torch-mlir/                             @aws-neuron/torch-compile-approvers
+
 # -- Tests (catch-all for unowned test dirs) --
 tests/**                                            @aws-neuron/torch-tests-approvers
 
@@ -52,11 +57,22 @@ tests/kernels/                                      @aws-neuron/torch-ops-approv
 tests/nki/                                          @aws-neuron/torch-ops-approvers
 tests/distributed/                                  @aws-neuron/torch-distributed-approvers
 tests/neuron_dynamo_backend/                        @aws-neuron/torch-compile-approvers
+tests/distributed/neuron_dynamo_backend/            @aws-neuron/torch-compile-approvers
 
-# -- Build Infra --
-bazel/                                              @aws-neuron/torch-infra-approvers
-build-tools/                                        @aws-neuron/torch-infra-approvers
-CMakeLists.txt                                      @aws-neuron/torch-infra-approvers
-setup.py                                            @aws-neuron/torch-infra-approvers
-pyproject.toml                                      @aws-neuron/torch-infra-approvers
-*.sh                                                @aws-neuron/torch-infra-approvers
+# Upstream PyTorch test infra (runner, conftest, dist config, registries)
+# requires top-level torch-neuronx-approvers because changes here can
+# affect the entire upstream test surface.
+tests/pytorch_tests_native/                         @aws-neuron/torch-neuronx-approvers
+
+# -- Build Infra (anchored: root only, so these do not override the rules above) --
+/bazel/                                             @aws-neuron/torch-infra-approvers
+/tools/                                             @aws-neuron/torch-infra-approvers
+/CMakeLists.txt                                     @aws-neuron/torch-infra-approvers
+/BUILD.bazel                                        @aws-neuron/torch-infra-approvers
+/MODULE.bazel                                       @aws-neuron/torch-infra-approvers
+/WORKSPACE                                          @aws-neuron/torch-infra-approvers
+/.bazelrc                                           @aws-neuron/torch-infra-approvers
+/.bazelversion                                      @aws-neuron/torch-infra-approvers
+/setup.py                                           @aws-neuron/torch-infra-approvers
+/pyproject.toml                                     @aws-neuron/torch-infra-approvers
+/*.sh                                               @aws-neuron/torch-infra-approvers

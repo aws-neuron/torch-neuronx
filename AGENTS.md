@@ -6,6 +6,9 @@ the skills (see "Skills" below).
 
 ## Critical rules (MANDATORY)
 
+Read [AI_POLICY.md](AI_POLICY.md). The person who directs you must follow it. You
+must follow these rules every time you touch GitHub.
+
 - Never act autonomously on GitHub. Do not open, edit, comment on, or merge a PR
   or issue unless the user reviewed and approved the exact content.
 - Do not create a PR on your own. Push a branch and stop. If you open a PR, open
@@ -15,6 +18,31 @@ the skills (see "Skills" below).
 - Do not commit to `main`. Branch first.
 - Confirm before any destructive or outward-facing action (delete, force-push,
   upload, file a ticket).
+
+## Before you open a pull request (MANDATORY)
+
+Check that the work is not already done, or already in progress:
+
+```bash
+gh issue view <issue_number> --repo aws-neuron/torch-neuronx --comments
+gh pr list --repo aws-neuron/torch-neuronx --state open --search "<issue_number> in:body"
+gh pr list --repo aws-neuron/torch-neuronx --state open --search "<area keywords>"
+```
+
+- If an open PR already does this work, do not open a second one.
+- If your approach is different, explain the difference in the issue first.
+
+Do not open a PR for one typo, one isolated style change, or a mechanical cleanup on
+its own. Put those changes together with substantive work.
+
+If the work is a duplicate, or it is busywork, **stop**. Report what you found and
+why you stopped. Do not open the PR.
+
+State these three things in the PR description:
+
+- Why this work does not duplicate an open PR.
+- The exact test commands you ran, and the results.
+- That an AI assistant helped to write the change.
 
 ## Writing style: Simplified Technical English (MANDATORY)
 
@@ -118,6 +146,10 @@ raise ValueError(f"n={n} exceeds the limit {limit}. Pass a smaller n.")
 - Do not commit files from `agent_space/`.
 
 ## Skills
+
+All skills and agent definitions live in `.kiro/skills/` and `.kiro/agents/`. The
+`.claude/` and `.codex/` directories are symlinks to them, so there is one set of
+files, not three. `.claude/settings.json` is the only file specific to one tool.
 
 Route these tasks to the matching skill in `.kiro/skills/` (`SKILL.md` in each):
 
