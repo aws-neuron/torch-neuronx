@@ -1,0 +1,63 @@
+name: 💬 RFC (Design Proposal)
+description: Get a design reviewed before you write the code
+title: "[RFC] "
+labels: [rfc]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        An RFC gets a design reviewed **before** the code is written, so alternatives are still
+        cheap to choose between.
+
+        **Open an RFC if the change is any of:**
+        - A semantic change to shared machinery — allocator, streams, events, dispatcher,
+          collectives. The blast radius is "every model", not "this op".
+        - A new public API or environment variable, or a change to what an existing one means.
+        - A behavioural change that is hard to reverse — on by default, or a serialization format.
+        - A fix with more than one plausible design, where picking one forecloses the others.
+
+        **Not needed for:** bug fixes with one obvious form, new op coverage, tests, docs,
+        behaviour-preserving refactors, or performance work that callers cannot observe. Send a
+        normal pull request.
+
+        If you are unsure, open the RFC. It is cheaper than a rejected pull request.
+  - type: textarea
+    attributes:
+      label: Motivation
+      description: >
+        What problem does this solve, and who hits it? A two or three sentence summary of
+        what changes is welcome here too. If there is a bug, paste the actual error text
+        and the configuration that produces it.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed change
+      description: >
+        What you intend to build. Name the files or components you expect to change.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Alternatives considered
+      description: What else could solve this, and why you did not choose it.
+  - type: textarea
+    attributes:
+      label: Feedback period
+      description: How long you want to collect feedback before you start. Usually at least one week.
+  - type: textarea
+    attributes:
+      label: Open questions
+      description: Anything you want the reviewers to decide.
+  - type: textarea
+    attributes:
+      label: CC list
+      description: Anyone you want to pull into the discussion.
+  - type: textarea
+    attributes:
+      label: Any other things
+      description: Anything else worth saying.
+  - type: markdown
+    attributes:
+      value: >
+        Thanks for contributing 🎉!
