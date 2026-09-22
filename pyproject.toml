@@ -1,16 +1,9 @@
 [project]
 name = "torch-neuronx"
-dynamic = ["version"]
+dynamic = ["version", "dependencies"]
 description = "Neuron Backend for PyTorch"
 authors = [{name = "AWS Neuron Team"}]
-requires-python = ">=3.10,<3.14"
-dependencies = [
-    "torch==2.14.0",
-    "numpy<2; python_version < '3.12'",
-    "numpy>=2; python_version >= '3.12'",
-    "grpcio-tools",
-    "wheel",
-]
+requires-python = ">=3.10,<3.15"
 
 [project.scripts]
 neuron-numa-launch = "torch_neuronx.numa:numa_launch_main"
@@ -22,7 +15,8 @@ torch_neuronx = "torch_neuronx:_autoload"
 neuron = "torch_neuronx.neuron_dynamo_backend.backend:neuron_backend"
 
 [build-system]
-requires = ["setuptools", "wheel", "torch", "grpcio-tools"]
+# Use this PyTorch version for uv and isolated builds.
+requires = ["setuptools", "wheel", "torch==2.14.0", "grpcio-tools"]
 build-backend = "setuptools.build_meta"
 
 [project.optional-dependencies]
@@ -81,7 +75,7 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM", "RUF"]
 addopts = "--dist=loadgroup"
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.14"
 files = ["torch_neuronx"]
 ignore_missing_imports = true
 no_error_summary = true

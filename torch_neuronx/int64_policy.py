@@ -114,74 +114,18 @@ def is_s64_passthrough() -> bool:
     return get_int64_mode() in (Int64Mode.NATIVE, Int64Mode.NATIVE_STRICT)
 
 
-def native_int64_guard_allows(inputs) -> bool:
-    """Central guard for *when* native int64 (S64) is safe to use for an op.
-
-    Native S64 execution deadlocks the compiler for certain input structures, so
-    a native-capable op runs as S64 only when its int64 operands match the cases
-    the compiler is known to handle; every other case falls back to the packed
-    int32[..., 2] path (correct, just low-word for magnitudes > 2**31).
-
-    This is the single place to widen native int64 coverage — as compiler hangs
-    are fixed, relax a criterion here (a future PR need only touch this guard).
-    Must stay in lockstep with the C++ ``NativeInt64GuardAllows`` in
-    Int64Policy.h so the traced graph (fake) and the execution binding agree.
-
-    Current safe criteria (conservative first version):
-      1. every int64 tensor operand is contiguous, AND
-      2. at most one int64 operand needs broadcasting to the common shape — a
-         native S64 binary op with BOTH operands broadcast (e.g. kron's
-         outer-product ``mul``) hangs the device.
-    """
-    import torch
-
-    int64_tensors: list = []
-
-    def _collect(x):
-        if isinstance(x, torch.Tensor):
-            if x.dtype == torch.int64 and x.dim() > 0:
-                int64_tensors.append(x)
-        elif isinstance(x, list | tuple):
-            for e in x:
-                _collect(e)
-
-    for a in inputs:
-        _collect(a)
-
-    if not int64_tensors:
-        return True
-    if any(not t.is_contiguous() for t in int64_tensors):
-        return False
-    try:
-        common = tuple(torch.broadcast_shapes(*[tuple(t.shape) for t in int64_tensors]))
-    except Exception:
-        return True
-    # Dual-broadcast (>=2 int64 operands differ from the common shape) hangs
-    # native S64 arithmetic; keep at most one broadcast operand on the native path.
-    return sum(1 for t in int64_tensors if tuple(t.shape) != common) < 2
-
-
-def use_packed_int64_view_for_op(op_name: str, inputs=None) -> bool:
+def use_packed_int64_view_for_op(op_name: str) -> bool:
     """Whether ``op_name``'s int64 tensors execute on the packed int32[..., 2]
     physical view rather than as S64.
 
     True for explicit packed mode (every int64 op) and for the native cascade's
-    non-native (DOWNCAST) ops. A NATIVE op returns False (keeps S64) only when
-    the input guard allows it (see ``native_int64_guard_allows``); otherwise it
-    falls back to the packed view for this invocation. Python mirror of the C++
-    ``UsePackedInt64ViewForOp`` — the two must agree so the traced graph's int64
-    parameters (faked as int32[..., 2] here) match the physical view the C++
-    dispatcher binds at execution.
+    non-native (DOWNCAST) ops. A NATIVE op returns False (keeps S64).
     """
     if is_packed_int64_mode():
         return True
     if not is_s64_passthrough():
         return False
-    if Int64Policy.get().decide(op_name) == Int64Decision.DOWNCAST:
-        return True
-    # NATIVE-capable op: fall back to the packed view when the input guard
-    # rejects this invocation (non-contiguous / dual-broadcast); else keep S64.
-    return inputs is not None and not native_int64_guard_allows(inputs)
+    return Int64Policy.get().decide(op_name) == Int64Decision.DOWNCAST
 
 
 def reset_int64_mode_cache() -> None:
@@ -205,17 +149,13 @@ _NATIVE_INT64_OPS: frozenset[str] = frozenset(
         "aten::maximum",
         "aten::minimum",
         "aten::floor_divide",
-        # Comparison — DISABLED: native S64 comparison hangs the device on
-        # non-contiguous int64. The hang is driven by the *output* transpose
-        # epilogue (inputs are contiguous at the binding), so the input-based
-        # native_int64_guard_allows can't gate it — keep these packed until the
-        # strided S64 compare+transpose codegen hang is fixed.
-        # "aten::eq",
-        # "aten::ne",
-        # "aten::gt",
-        # "aten::ge",
-        # "aten::lt",
-        # "aten::le",
+        # Comparison
+        "aten::eq",
+        "aten::ne",
+        "aten::gt",
+        "aten::ge",
+        "aten::lt",
+        "aten::le",
         # Bitwise
         "aten::bitwise_and",
         "aten::bitwise_or",
@@ -240,6 +180,7 @@ _NATIVE_INT64_OPS: frozenset[str] = frozenset(
         "aten::ones",
         "aten::full",
         "aten::empty",
+        "aten::eye",
         # Data movement
         "aten::slice",
         "aten::cat",

@@ -78,9 +78,11 @@ class TestNeuronDevice(unittest.TestCase):
         assert torch.neuron.current_device() == initial_device
 
         # Test invalid device raises error
-        with self.assertRaises(ValueError):
-            device_ctx = torch.neuron.device(1)
-            device_ctx.__enter__()
+        with (
+            self.assertRaises(ValueError),
+            torch.neuron.device(torch_neuronx.device_count()),
+        ):
+            pass
 
 
 if __name__ == "__main__":

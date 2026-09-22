@@ -273,6 +273,28 @@ def torch_linalg_vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None, out=
     return torch.linalg.vector_norm(x, ord, dim, keepdim, dtype=dtype)
 
 
+def _validate_solve_triangular(a, b, *args, out=None, **kwargs):
+    """Reject an out= tensor whose dtype is not a.dtype (LAPACK result dtype)."""
+    out_tensor = out[0] if isinstance(out, tuple | list) else out
+    if isinstance(out_tensor, torch.Tensor) and out_tensor.dtype != a.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype "
+            f"{_TYPE_META_NAMES.get(a.dtype, a.dtype)}, but got "
+            f"{_TYPE_META_NAMES.get(out_tensor.dtype, out_tensor.dtype)} instead"
+        )
+
+
+@register_aten(
+    ["aten::linalg_solve_triangular", "aten::linalg_solve_triangular.out"],
+    static_argnames=("upper", "left", "unitriangular"),
+    validate_static_inputs=_validate_solve_triangular,
+)
+def torch_linalg_solve_triangular(a, b, *, upper, left=True, unitriangular=False, out=None):
+    return torch.ops.aten.linalg_solve_triangular(
+        a, b, upper=upper, left=left, unitriangular=unitriangular
+    )
+
+
 @register_aten(["aten::linear"])
 def torch_linear(input, weight, bias=None):
     """

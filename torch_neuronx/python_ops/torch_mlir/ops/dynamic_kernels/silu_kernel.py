@@ -51,7 +51,7 @@ def silu_kernel(input_tensor, num_m_tiles):
     m_tile_start = nl.ndarray((1, 1), nl.int32, buffer=nl.sbuf)
     nisa.memset(m_tile_start, 0.0)
 
-    for _ in nl.dynamic_range(0, num_m_tiles_reg, 1):
+    def body(_i):
         for seg in range(len(h_starts)):
             h_start = h_starts[seg]
             h_width = h_widths[seg]
@@ -87,5 +87,7 @@ def silu_kernel(input_tensor, num_m_tiles):
             )
 
         nisa.tensor_scalar(m_tile_start, m_tile_start, nl.add, tile_size_m)
+
+    nl.fori_loop(0, num_m_tiles_reg, body)
 
     return result

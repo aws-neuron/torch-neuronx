@@ -102,8 +102,12 @@ def _flat_gather_lane(grouped_in, out, stride=2, lane=0):
     """
     numel = out.shape[0]
 
-    num_progs = nl.num_programs(0)
-    prog_id = nl.program_id(0)
+    # A launch without a grid has no axis 0.
+    if nl.program_ndim() == 0:
+        num_progs, prog_id = 1, 0
+    else:
+        num_progs = nl.num_programs(0)
+        prog_id = nl.program_id(0)
     per_prog = div_ceil(div_ceil(numel, num_progs), P_MAX) * P_MAX
     core_base = prog_id * per_prog
     core_n = min(per_prog, numel - core_base)
@@ -164,8 +168,12 @@ def _flat_scatter_lane(grouped_io, vals, stride=2, lane=0):
     """
     numel = vals.shape[0]
 
-    num_progs = nl.num_programs(0)
-    prog_id = nl.program_id(0)
+    # A launch without a grid has no axis 0.
+    if nl.program_ndim() == 0:
+        num_progs, prog_id = 1, 0
+    else:
+        num_progs = nl.num_programs(0)
+        prog_id = nl.program_id(0)
     per_prog = div_ceil(div_ceil(numel, num_progs), P_MAX) * P_MAX
     core_base = prog_id * per_prog
     core_n = min(per_prog, numel - core_base)
@@ -328,11 +336,14 @@ _wrapped_flat_gather = wrap_nki(stride2_flat_gather_kernel)
 
 
 @nki_op("nki_kernels::packed_gather", mutates_args={})
-def packed_gather_nki(packed: torch.Tensor, parity: int = 0, lnc: int = 1) -> torch.Tensor:
+def packed_gather_nki(packed: torch.Tensor, parity: int = 0, lnc: int = 0) -> torch.Tensor:
     """Gather one lane (low words by default) from a packed int32[..., 2] tensor.
 
     Called inside a traced ``torch_fn`` so the gather co-compiles into the op's
     NEFF. Returns int32 with the input's logical shape.
+
+    ``lnc=0`` takes the grid from the target LNC. The grid must equal the
+    ``neuronx-cc`` ``--lnc`` value, or the compile fails with NCC_EVRF066.
     """
     logical_shape = packed.shape[:-1]
     # Empty operand (e.g. cat / foreach with a size-0 int64 tensor): the NKI
@@ -343,5 +354,5 @@ def packed_gather_nki(packed: torch.Tensor, parity: int = 0, lnc: int = 1) -> to
     if packed.numel() == 0:
         return torch.empty(logical_shape, dtype=torch.int32, device=packed.device)
     flat = packed.reshape(-1)
-    lane = _wrapped_flat_gather[(lnc,)](flat, parity)
+    lane = _wrapped_flat_gather[(lnc or int(get_logical_neuron_cores()),)](flat, parity)
     return lane.reshape(logical_shape)

@@ -122,7 +122,6 @@ from .extremal_ref_numerics import EXTREMAL_REF_NUMERICS as EXTREMAL_REF_NUMERIC
 from .foreach_different_devices import FOREACH_DIFFERENT_DEVICES as FOREACH_DIFFERENT_DEVICES
 from .foreach_norm_integer import FOREACH_NORM_INTEGER as FOREACH_NORM_INTEGER
 from .index_error import INDEX_ERROR as INDEX_ERROR
-from .large_round_frac import LARGE_ROUND_FRAC as LARGE_ROUND_FRAC
 from .logit_integer_bool import LOGIT_INTEGER_BOOL as LOGIT_INTEGER_BOOL
 from .meta_mismatch import META_MISMATCH_OUTPUT as META_MISMATCH_OUTPUT
 from .other import OTHER as OTHER

@@ -6,18 +6,14 @@ TorchTitan on AWS Trainium instances.
 ## Setup TorchTitan
 
 ```shell
-cd ~
+cd /workspace
 git clone https://github.com/pytorch/torchtitan.git
 cd torchtitan
 git checkout 8d4f65a3
-git apply ~/torch-neuronx/docs/torchtitan/neuron_attention_patch.diff
-uv pip install --system -r requirements.txt
-uv pip install -e .
+pip install -r requirements.txt
+pip install -e .
+pip install --no-deps triton
 ```
-
-The patch adds a `force_local_contiguous` workaround in the SDPA attention path
-so DTensor local shards are made contiguous under `torch.compile`. See
-[neuron_attention_patch.diff](../neuron_attention_patch.diff) for the full diff.
 
 ## Download Tokenizer
 
@@ -25,7 +21,8 @@ Download the tokenizer from Hugging Face. A Hugging Face token is required for
 Llama models:
 
 ```shell
-python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B --assets tokenizer --hf_token=...
+export HF_TOKEN=...
+python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B --assets tokenizer
 ```
 
 Tokenizers are saved to `./assets/hf/<model-name>/` by default.
@@ -44,7 +41,8 @@ torchrun --nnodes 1 --nproc_per_node $NEURON_RT_NUM_CORES \
 --parallelism.tensor-parallel-degree 4 \
 --parallelism.data-parallel-shard-degree -1 \
 --training.local-batch-size 1 \
---training.global-batch-size 16
+--training.global-batch-size 16 \
+--profiling.no-enable-profiling
 ```
 
 ## Train Llama3-8B with torch.compile
@@ -62,6 +60,7 @@ torchrun --nnodes 1 --nproc_per_node $NEURON_RT_NUM_CORES \
 --parallelism.data-parallel-shard-degree -1 \
 --training.local-batch-size 1 \
 --training.global-batch-size 16 \
+--profiling.no-enable-profiling \
 --compile.enable --compile.backend neuron
 ```
 
@@ -79,5 +78,6 @@ torchrun --nnodes 1 --nproc_per_node $NEURON_RT_NUM_CORES \
 --parallelism.data-parallel-shard-degree -1 \
 --training.global-batch-size 16 \
 --training.local-batch-size 1 \
+--profiling.no-enable-profiling \
 --compile.enable --compile.backend neuron
 ```

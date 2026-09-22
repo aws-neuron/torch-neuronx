@@ -401,7 +401,7 @@ Examples:
         action="store_true",
         help="After the run, upload the local NEFF cache back to the shared store. "
         "Only effective with --download-neff-cache AND on the main branch. Set by "
-        "the nightly seeding run; readers (merge-queue, dep-guard) leave it off.",
+        "main Nightly and main Dependency Guard. PR and Merge Queue runs leave it off.",
     )
     parser.add_argument("items", nargs="+")
     args = parser.parse_args(argv)

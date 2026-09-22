@@ -10,9 +10,12 @@
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
 
+#include <algorithm>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <sstream>
+#include <vector>
 
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
@@ -29,6 +32,7 @@
 #include "torch_neuronx/csrc/core/dispatch/OutputProcessing.h"
 #include "torch_neuronx/csrc/core/dispatch/ParseLoweringResult.h"
 #include "torch_neuronx/csrc/core/dispatch/PreprocessArgs.h"
+#include "torch_neuronx/csrc/core/dispatch/StructuralComplexOps.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/Transformations.h"
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 #include "torch_neuronx/csrc/core/streams/StreamConfig.h"
@@ -1094,8 +1098,9 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
                                           *memory_format_opt == c10::MemoryFormat::ChannelsLast3d);
 
     // ===== Phase 1: dtype conversion → `converted` (target_dtype) =====
-    // `converted` is contiguous except for the same-dtype passthrough, which may
-    // keep self's (possibly non-contiguous) layout; Phase 2 fixes the layout.
+    // `converted` can be non-contiguous. The same-dtype passthrough keeps self's
+    // layout, and the MLIR lowering keeps the ATen output layout of a permuted
+    // input. Phase 2 applies the requested memory_format.
     const bool mlir_can_handle = IsToCopyMlirDtypeSupported(self_tensor.scalar_type()) &&
                                  IsToCopyMlirDtypeSupported(target_dtype);
     torch::Tensor converted;
@@ -1142,8 +1147,8 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
       converted = self_tensor;
       converted_contiguous = self_tensor.is_contiguous();
     } else if (mlir_can_handle) {
-      // MLIR _to_copy (contiguous output; it ignores memory_format — Phase 2
-      // applies the requested layout).
+      // MLIR _to_copy. It ignores memory_format and returns the ATen output
+      // layout, so Phase 2 applies the requested layout.
       TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] N2N phase1 MLIR",
                                    " src_dtype=", self_tensor.scalar_type(),
                                    " target_dtype=", target_dtype);
@@ -1168,20 +1173,31 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
     torch::Tensor result;
     if (is_channels_last) {
       result = MakeChannelsLast(converted, *memory_format_opt);
-    } else if (preserve_fmt && !self_tensor.is_contiguous() &&
-               self_tensor.is_non_overlapping_and_dense()) {
-      // Preserve: replay the source's (dense) strides. Reached only with a dtype
-      // change — a same-dtype Preserve is a no-op handled at the top.
-      result =
-          torch::empty_strided(self_tensor.sizes(), self_tensor.strides(), converted.options());
-      if (IsCopyMlirDtypeSupported(result.scalar_type())) {
-        result.copy_(converted);
+    } else if (preserve_fmt && !self_tensor.is_contiguous()) {
+      // Preserve: replay the dim order of the source. Reached only with a dtype
+      // change. The top of the function handles a same-dtype Preserve.
+      //
+      // infer_dense_strides is the ATen rule for Preserve. It gives the strides
+      // of the source when the source is dense. It densifies the dim order when
+      // the source is a strided view of a bigger buffer. A plain replay of the
+      // strides of the source is wrong in the second case.
+      auto preserved = at::infer_dense_strides(self_tensor.sizes(), self_tensor.strides());
+      if (converted.sizes().equals(self_tensor.sizes()) && converted.strides().equals(preserved)) {
+        // Phase 1 already gives this layout for a permuted input. Skip the copy.
+        TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] N2N phase2 preserve already applied",
+                                     " strides=", converted.strides());
+        result = converted;
       } else {
-        // Unsupported dtype (complex, 8-byte): byte-wise copy — the aten::copy_
-        // redispatch would detour through CopyToNonContiguous / aten::contiguous
-        // (hard error for complex when fallback is restricted; downcast risk
-        // for 8-byte dtypes). See the CPU→Neuron strided branch above.
-        torch_neuronx::utils::nki_copy_strided_neuron_to_neuron(converted, result);
+        result = torch::empty_strided(self_tensor.sizes(), preserved, converted.options());
+        if (IsCopyMlirDtypeSupported(result.scalar_type())) {
+          result.copy_(converted);
+        } else {
+          // Unsupported dtype (complex, 8-byte): byte-wise copy. The aten::copy_
+          // redispatch would detour through CopyToNonContiguous / aten::contiguous
+          // (hard error for complex when fallback is restricted; downcast risk
+          // for 8-byte dtypes). See the CPU to Neuron strided branch above.
+          torch_neuronx::utils::nki_copy_strided_neuron_to_neuron(converted, result);
+        }
       }
     } else if (!converted_contiguous) {
       // contiguous_format requested but `converted` is the non-contiguous
@@ -1359,6 +1375,9 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
   //   - decomposition enabled: decompose before lowering;
   //   - decomposition disabled: use verified native lowerings, otherwise fallback.
   if (HasComplexInput(args)) {
+    if (TryDispatchStructuralComplexOp(lookup_name, args, stack, op_name)) {
+      return;
+    }
     if (ShouldUseComplexDecomposition(!reg.lower_func.is_none())) {
       std::string decomp_cache_key = GenerateCacheKey(lookup_name, schema, args, reg);
       decomp_cache_key += ":complex_decomp";
@@ -1507,6 +1526,8 @@ void NeuronDispatcher::DispatchContiguousImpl(const c10::OperatorHandle& op,
     return;
   }
 
+  // Complex default-format contiguous can preserve real/imag pairs through an
+  // interleaved real view. Unsupported complex layouts retain CPU fallback.
   // Complex: `contiguous` is an allocate-and-copy, and TryComplexNeuronToNeuronCopy
   // reconciles the conj/neg bits on device, so route through it instead of the host —
   // this is the op ATen's Conjugate key materializes a non-contiguous conjugated view
@@ -1530,6 +1551,9 @@ void NeuronDispatcher::DispatchContiguousImpl(const c10::OperatorHandle& op,
 
   // Complex dtypes: fall back to CPU
   if (HasComplexInput(args)) {
+    if (TryDispatchStructuralComplexOp(lookup_name, args, stack, op_name)) {
+      return;
+    }
     if (kFallbackOnlyForUnimplemented && HasComplexNonOutputInput(args, schema)) {
       RaiseComplexFallbackDisabled(op_name);
     }
@@ -1792,6 +1816,52 @@ void NeuronDispatcher::DispatchNonzeroImpl(const c10::OperatorHandle& op,
                                " result_shape=", result.sizes());
 }
 
+namespace {
+
+// Result sizes for an advanced index that selects nothing, e.g. an all-false
+// boolean mask. The index broadcast replaces the indexed dimensions and the
+// un-indexed ones are kept, so (8, 4) indexed by an all-false (8,) mask is
+// (0, 4), not (0,). Indexed dimensions stay in place when their positions are
+// contiguous and otherwise collapse to the front.
+std::vector<int64_t> ZeroSizeIndexResultSizes(const at::Tensor& self,
+                                              const c10::List<c10::optional<at::Tensor>>& indices) {
+  TORCH_CHECK_INDEX(static_cast<int64_t>(indices.size()) <= self.dim(),
+                    "too many indices for tensor of dimension ", self.dim());
+
+  std::vector<int64_t> broadcast;
+  std::vector<int64_t> indexed_dims;
+  for (size_t i = 0; i < indices.size(); ++i) {
+    const auto index = indices.get(i);
+    if (!index.has_value() || !index->defined()) continue;
+    broadcast =
+        indexed_dims.empty() ? index->sizes().vec() : at::infer_size(broadcast, index->sizes());
+    indexed_dims.push_back(static_cast<int64_t>(i));
+  }
+  TORCH_INTERNAL_ASSERT(!indexed_dims.empty());
+
+  const bool positions_contiguous =
+      indexed_dims.back() - indexed_dims.front() + 1 == static_cast<int64_t>(indexed_dims.size());
+
+  std::vector<int64_t> sizes;
+  if (positions_contiguous) {
+    for (int64_t dim = 0; dim < indexed_dims.front(); ++dim) sizes.push_back(self.size(dim));
+    sizes.insert(sizes.end(), broadcast.begin(), broadcast.end());
+    for (int64_t dim = indexed_dims.back() + 1; dim < self.dim(); ++dim) {
+      sizes.push_back(self.size(dim));
+    }
+  } else {
+    sizes = broadcast;
+    for (int64_t dim = 0; dim < self.dim(); ++dim) {
+      if (std::find(indexed_dims.begin(), indexed_dims.end(), dim) == indexed_dims.end()) {
+        sizes.push_back(self.size(dim));
+      }
+    }
+  }
+  return sizes;
+}
+
+}  // namespace
+
 // ═══════════════════════════════════════════════════════════════
 //  aten::index.Tensor — convert boolean indices to integer indices
 //  BEFORE cache key generation (data-dependent shapes).
@@ -1814,16 +1884,6 @@ void NeuronDispatcher::DispatchIndexImpl(const c10::OperatorHandle& op,
   auto args = torch::jit::pop(*stack, schema.arguments().size());
 
   if (TryHandleEmptyTensors(op, stack, args, schema, op_name, reg)) {
-    return;
-  }
-
-  if (HasComplexInput(args)) {
-    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchIndex] complex dtype → CPU fallback", " op=", op_name);
-    for (auto& arg : args) {
-      torch::jit::push(*stack, arg);
-    }
-    at::native::cpu_fallback(op, stack);
-    torch_neuronx::markFallbackLogged(op_name);
     return;
   }
 
@@ -1859,11 +1919,11 @@ void NeuronDispatcher::DispatchIndexImpl(const c10::OperatorHandle& op,
   // Boolean indices produce data-dependent shapes via nonzero, so this
   // conversion must happen BEFORE cache key generation.
   // Also move CPU indices to Neuron device.
-  auto self_device = args[0].toTensor().device();
+  const auto& self = args[0].toTensor();
+  auto self_device = self.device();
   if (args.size() > 1 && args[1].isList()) {
     auto indices_list = args[1].toListRef();
     c10::List<c10::optional<at::Tensor>> converted;
-    bool has_bool_index = false;
     bool needs_update = false;
 
     for (const auto& elem : indices_list) {
@@ -1872,8 +1932,17 @@ void NeuronDispatcher::DispatchIndexImpl(const c10::OperatorHandle& op,
       } else if (elem.isTensor()) {
         auto idx = elem.toTensor();
         if (idx.defined() && idx.scalar_type() == c10::ScalarType::Bool) {
-          has_bool_index = true;
           needs_update = true;
+          const int64_t start_dim = static_cast<int64_t>(converted.size());
+          TORCH_CHECK_INDEX(start_dim + idx.dim() <= self.dim(),
+                            "too many indices for tensor of dimension ", self.dim());
+          for (const auto j : c10::irange(idx.dim())) {
+            const int64_t src_dim = start_dim + j;
+            TORCH_CHECK_INDEX(idx.size(j) == self.size(src_dim), "The shape of the mask ",
+                              idx.sizes(), " at index ", j,
+                              " does not match the shape of the indexed tensor ", self.sizes(),
+                              " at index ", src_dim);
+          }
           auto nonzero_indices = at::nonzero_numpy(idx);
           for (auto& nz_idx : nonzero_indices) {
             converted.push_back(std::move(nz_idx));
@@ -1906,12 +1975,38 @@ void NeuronDispatcher::DispatchIndexImpl(const c10::OperatorHandle& op,
         }
       }
       if (has_empty_index) {
-        auto self = args[0].toTensor();
-        auto result = torch::empty({0}, self.options());
-        torch::jit::push(*stack, result);
+        auto sizes = ZeroSizeIndexResultSizes(self, converted);
+        torch::jit::push(*stack, torch::empty(sizes, self.options()));
         return;
       }
     }
+  }
+
+  // Complex index shares the same decomposition policy as generic ops. Keep
+  // this after boolean/index normalization so the structural decomposition sees
+  // valid on-device integer indices. Without decomposition, honor the global
+  // no-fallback policy instead of silently bouncing to CPU.
+  if (HasComplexInput(args)) {
+    if (TryDispatchStructuralComplexOp(lookup_name, args, stack, op_name)) {
+      return;
+    }
+    if (ShouldUseComplexDecomposition(!reg.lower_func.is_none())) {
+      std::string decomp_cache_key = GenerateCacheKey(lookup_name, schema, args, reg);
+      decomp_cache_key += ":complex_decomp";
+      DispatchWithCasting(op, dispatch_keys, stack, args, schema, reg, dispatcher, op_name,
+                          decomp_cache_key, false, true);
+      return;
+    }
+    if (kFallbackOnlyForUnimplemented && HasComplexNonOutputInput(args, schema)) {
+      RaiseComplexFallbackDisabled(op_name);
+    }
+    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchIndex] complex dtype → CPU fallback", " op=", op_name);
+    torch_neuronx::markFallbackLogged(op_name);
+    for (auto& arg : args) {
+      torch::jit::push(*stack, arg);
+    }
+    at::native::cpu_fallback(op, stack);
+    return;
   }
 
   // ── Dynamic-NKI pre-check ──
@@ -2513,6 +2608,58 @@ void NeuronDispatcher::DispatchWithCasting(const c10::OperatorHandle& op,
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  ApplyAtenOutputLayouts
+// ═══════════════════════════════════════════════════════════════
+//
+// ATen gives an op that has a permuted input an output with the same
+// permutation. A TensorIterator kernel gets this for free, because it
+// allocates its own output while it holds the input strides.
+//
+// The Neuron dispatcher allocates from DispatchCacheEntry::output_specs, which
+// the Python lowering fills with a shape and a dtype only. The ATen rule has no
+// field to live in, so AllocateExecutionOutputs falls back to a contiguous
+// output and the permutation is lost.
+//
+// This function fills output_specs[i].target_strides. AllocateExecutionOutputs
+// then allocates a physical-shape buffer plus an as_strided view, and
+// ProcessOutputTransformations merges the inverse transpose into the MLIR. The
+// NEFF writes the permuted layout directly, so no copy runs.
+//
+// The cache key holds the strides of each non-contiguous input
+// (CacheKeyGenerator::AppendTensor), and Dispatch builds the key before
+// PreprocessArgs makes the inputs contiguous. One cache entry therefore serves
+// one input layout, so the output layout is a property of the entry. One Meta
+// dispatch for each cache miss is enough.
+static void ApplyAtenOutputLayouts(DispatchCacheEntry& entry, const c10::FunctionSchema& schema,
+                                   const std::vector<c10::IValue>& original_args) {
+  if (original_args.empty() || entry.output_specs.empty()) return;
+
+  auto handle = c10::Dispatcher::singleton().findOp(schema.operator_name());
+  if (!handle.has_value()) return;
+
+  auto layouts = AtenOutputLayouts(*handle, schema, original_args);
+
+  // The Meta returns and output_specs disagree for an op that drops or repacks
+  // a return. Keep the contiguous output unless the count and the shape both
+  // agree, so a mismatch can never apply a layout to the wrong output.
+  if (layouts.size() != entry.output_specs.size()) return;
+
+  for (size_t i = 0; i < layouts.size(); ++i) {
+    auto& spec = entry.output_specs[i];
+    if (layouts[i].strides.empty()) continue;
+    if (layouts[i].shape != spec.shape) continue;
+    // A lowering that sets target_strides itself already knows the layout of
+    // its NEFF. Do not overrule it.
+    if (spec.target_strides.has_value()) continue;
+
+    spec.target_strides = layouts[i].strides;
+    TORCH_NEURONX_DISPATCH_DEBUG("[ApplyAtenOutputLayouts] keeping the ATen layout",
+                                 " op=", entry.op_name, " output_idx=", i, " shape=", spec.shape,
+                                 " target_strides=", spec.target_strides.value());
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  GetOrLowerOperation (cache hit or miss)
 // ═══════════════════════════════════════════════════════════════
 
@@ -2591,6 +2738,7 @@ std::shared_ptr<DispatchCacheEntry> NeuronDispatcher::GetOrLowerOperation(
     auto entry = ParseLoweringResult(result);
 
     if (entry) {
+      ApplyAtenOutputLayouts(*entry, schema, original_args);
       if (!reg.skip_cache) {
         TORCH_NEURONX_DISPATCH_DEBUG("[GetOrLowerOperation] caching result",
                                      " cache_key=", cache_key, " op_name=", entry->op_name,
@@ -2790,46 +2938,6 @@ static void FlattenScalarListToTensors(const c10::IValue& val, std::vector<torch
   }
 }
 
-// Mirror of Python ``native_int64_guard_allows`` (int64_policy.py). Native S64
-// is safe only when every int64 operand is contiguous and at most one needs
-// broadcasting to the common shape (a native S64 binary op with BOTH operands
-// broadcast — e.g. kron's outer-product mul — hangs the device). Kept in
-// lockstep with the Python guard so the traced graph (fake) and this binding
-// agree on which invocations are packed.
-static bool NativeInt64GuardAllows(const std::vector<torch::Tensor>& tensors) {
-  std::vector<const torch::Tensor*> i64;
-  for (const auto& t : tensors) {
-    if (t.defined() && t.scalar_type() == c10::ScalarType::Long && t.dim() > 0) {
-      i64.push_back(&t);
-    }
-  }
-  if (i64.empty()) return true;
-  for (const auto* t : i64) {
-    if (!t->is_contiguous()) return false;
-  }
-  // Right-aligned broadcast shape.
-  size_t maxdim = 0;
-  for (const auto* t : i64) maxdim = std::max(maxdim, static_cast<size_t>(t->dim()));
-  std::vector<int64_t> common(maxdim, 1);
-  for (const auto* t : i64) {
-    auto sizes = t->sizes();
-    for (size_t k = 0; k < sizes.size(); ++k) {
-      size_t idx = maxdim - sizes.size() + k;
-      if (sizes[k] != 1) common[idx] = sizes[k];
-    }
-  }
-  int broadcast_count = 0;
-  for (const auto* t : i64) {
-    auto sizes = t->sizes();
-    bool differs = (static_cast<size_t>(t->dim()) != maxdim);
-    for (size_t k = 0; !differs && k < sizes.size(); ++k) {
-      if (sizes[k] != common[k]) differs = true;
-    }
-    if (differs) ++broadcast_count;
-  }
-  return broadcast_count < 2;
-}
-
 std::vector<torch::Tensor> NeuronDispatcher::FlattenAndFilterInputs(
     const std::vector<c10::IValue>& args, const c10::FunctionSchema& schema,
     const std::vector<int>& kept_input_indices, const std::string& op_name,
@@ -2837,6 +2945,16 @@ std::vector<torch::Tensor> NeuronDispatcher::FlattenAndFilterInputs(
     const std::unordered_set<std::string>& static_argnames) {
   const auto& schema_args = schema.arguments();
   std::vector<torch::Tensor> flattened;
+  // A zero-input factory NEFF must drop write-aliased args (see the empty
+  // kept_input_indices branch below), so track which flattened tensors they are.
+  std::vector<char> flattened_is_write_aliased;
+  auto mark_write_aliased = [&](size_t schema_idx, size_t before) {
+    flattened_is_write_aliased.resize(flattened.size(), false);
+    const auto& ai = schema_args[schema_idx].alias_info();
+    if (ai != nullptr && ai->isWrite()) {
+      for (size_t k = before; k < flattened.size(); ++k) flattened_is_write_aliased[k] = true;
+    }
+  };
 
   // Determine target device for scalar→tensor conversion (same logic as PreprocessArgs).
   // Also capture the first integer tensor operand's dtype so Scalar[] elements are
@@ -2856,6 +2974,7 @@ std::vector<torch::Tensor> NeuronDispatcher::FlattenAndFilterInputs(
   // Positional (non-kwarg-only) tensor args
   for (size_t i = 0; i < args.size() && i < schema_args.size(); ++i) {
     if (schema_args[i].kwarg_only()) continue;
+    size_t before = flattened.size();
     // A non-static number list (Scalar[]) is a runtime input: the NEFF was lowered
     // with each element as its own 0-dim tensor, so expand it the same way here.
     // A static number list (e.g. normalized_shape int[]) is a compile-time
@@ -2868,44 +2987,37 @@ std::vector<torch::Tensor> NeuronDispatcher::FlattenAndFilterInputs(
       // Extracts real tensors only; for a static number list this adds nothing.
       FlattenTensorsFromIValue(args[i], flattened);
     }
+    mark_write_aliased(i, before);
   }
   // Kwarg-only tensor args
   for (size_t i = 0; i < args.size() && i < schema_args.size(); ++i) {
     if (!schema_args[i].kwarg_only()) continue;
+    size_t before = flattened.size();
     FlattenTensorsFromIValue(args[i], flattened);
+    mark_write_aliased(i, before);
   }
 
   TORCH_NEURONX_DISPATCH_DEBUG("[FlattenAndFilterInputs] flattened", " op=", op_name,
                                " num_flattened=", flattened.size(),
                                " num_kept=", kept_input_indices.size());
 
-  // Packed int64 graph inputs are kept logical int64 through dispatch (so
-  // host-level shape reads see the correct shape); bind their int32[..., 2]
-  // physical view to the NEFF here. This matches the int32 graph parameter
-  // (the fake input is generated as int32[..., 2]) — the in-graph NKI gather
-  // then extracts the low words. Zero-copy reinterpret.
-  //
-  // A NATIVE op is additionally demoted to the packed view when its int64
-  // operands fail the native-int64 guard (non-contiguous / dual-broadcast) —
-  // native S64 hangs the compiler for those. This MUST match the Python fake
-  // generation (use_packed_int64_view_for_op + native_int64_guard_allows), so
-  // the graph parameters (int32[...,2]) and this binding agree.
-  const bool guard_demotes_to_packed = IsS64Passthrough() &&
-                                       DecideInt64(op_name) == Int64Decision::NATIVE &&
-                                       !NativeInt64GuardAllows(flattened);
-  if (UsePackedInt64ViewForOp(op_name) || guard_demotes_to_packed) {
-    for (auto& t : flattened) {
-      if (t.defined() && t.scalar_type() == c10::ScalarType::Long &&
-          t.device().type() == c10::DeviceType::PrivateUse1 && t.is_contiguous() && t.numel() > 0) {
-        // Empty int64 is kept unpacked (clean int64[0]) to match the fake input
-        // (create_fake_recursive) — a packed (…, 2) view of a 0-element tensor
-        // is elided by the compiler and shifts the inplace output binding.
-        t = torch_neuronx::packed_int64::physical_view(t);
+  if (kept_input_indices.empty()) {
+    // Empty means the NEFF uses no inputs (a factory op: arange/ones/zeros with
+    // out=). A write-aliased out=/self is an output binding, not a NEFF input.
+    // Keeping it makes a phantom input and trips an NRT arity check. Drop the
+    // write-aliased args; keep any read-only inputs.
+    bool any_write_aliased = false;
+    for (char w : flattened_is_write_aliased) any_write_aliased |= (w != 0);
+    if (!any_write_aliased) return flattened;
+    std::vector<torch::Tensor> read_only;
+    read_only.reserve(flattened.size());
+    for (size_t k = 0; k < flattened.size(); ++k) {
+      if (k >= flattened_is_write_aliased.size() || flattened_is_write_aliased[k] == 0) {
+        read_only.push_back(flattened[k]);
       }
     }
+    return read_only;
   }
-
-  if (kept_input_indices.empty()) return flattened;
 
   std::vector<torch::Tensor> filtered;
   filtered.reserve(kept_input_indices.size());

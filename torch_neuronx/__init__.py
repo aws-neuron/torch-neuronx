@@ -1,9 +1,10 @@
 try:
+    from importlib.metadata import PackageNotFoundError
     from importlib.metadata import version as _pkg_version
 
     __version__ = _pkg_version("torch-neuronx")
-except Exception:
-    from torch_neuronx._version import __version__
+except PackageNotFoundError:
+    __version__ = "0.0.0"
 
 
 import os
@@ -160,9 +161,6 @@ if "NEURONXCC_VERSION" not in os.environ:
 
 # Disable artifact preservation by default
 os.environ.setdefault("TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS", "0")
-
-# Lazy allocations by default.
-os.environ.setdefault("TORCH_NEURONX_ENABLE_LAZY_ALLOC", "1")
 
 # Enable NKI colz for intermediate NKI artifacts
 os.environ.setdefault("NKI_USE_COLZ", "1")

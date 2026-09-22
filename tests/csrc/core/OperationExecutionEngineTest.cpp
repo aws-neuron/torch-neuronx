@@ -593,7 +593,7 @@ TEST_F(OperationExecutionEngineTest, ProcessAsyncErrorsConcatenatedOpFailsAllCas
 }
 
 // Test that DecrementExecutionQueueDepth decrements for device kernel types (kHLO, kCollective,
-// kCopy) and is a no-op for non-device kernel types (kEvent, kHint).
+// kCopy) and is a no-op for non-device kernel types (kEvent).
 // The device-op check is encapsulated inside DecrementExecutionQueueDepth so callers
 // don't need to branch externally.
 TEST_F(OperationExecutionEngineTest, DecrementQueueDepthSkipsNonDeviceOps) {
@@ -624,16 +624,6 @@ TEST_F(OperationExecutionEngineTest, DecrementQueueDepthSkipsNonDeviceOps) {
     op->stream = stream.get();
     engine.DecrementExecutionQueueDepth(op.get());
     EXPECT_EQ(engine.GetExecutionQueueDepth(), 2) << "kEvent should NOT decrement";
-  }
-
-  // Non-device op (kHint) should NOT decrement
-  {
-    auto kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
-    ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kHint));
-    auto op = std::make_shared<OperationContext>(std::move(kernel));
-    op->stream = stream.get();
-    engine.DecrementExecutionQueueDepth(op.get());
-    EXPECT_EQ(engine.GetExecutionQueueDepth(), 2) << "kHint should NOT decrement";
   }
 
   // Device op (kCollective) should decrement
@@ -809,7 +799,7 @@ TEST_F(OperationExecutionEngineTest, ProcessCompletionsStopsAtFirstIncomplete) {
   engine.pending_async_ops_count_.store(0);
 }
 
-// Test that pending_signal ops (events/hints) are completed without seq comparison.
+// Test that pending_signal ops (events) are completed without seq comparison.
 TEST_F(OperationExecutionEngineTest, ProcessCompletionsPendingSignalOps) {
   unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
   at::neuron::testing::ScopedTestEngine scoped(compilation_cache_.get(), model_handle_cache_.get());
@@ -817,7 +807,7 @@ TEST_F(OperationExecutionEngineTest, ProcessCompletionsPendingSignalOps) {
 
   auto stream = std::make_shared<StreamImpl>(0, 1);
 
-  // Create a host op (event/hint — no NRT scheduling)
+  // Create a host op (event — no NRT scheduling)
   auto kernel = std::make_unique<at::neuron::testing::MockNeuronKernelExecution>();
   ON_CALL(*kernel, GetKernelType()).WillByDefault(Return(KernelTypeEnum::kEvent));
   ON_CALL(*kernel, Schedule(_, _, _)).WillByDefault(Return(true));
@@ -873,195 +863,13 @@ TEST_F(OperationExecutionEngineTest, ProcessCompletionsZeroWatermarkCompletesNot
   engine.pending_async_ops_count_.store(0);
 }
 
-// =============================================================================
-// Hint Short-Circuit Tests (RecordHint)
-// =============================================================================
-
-// Test that RecordHint is a no-op when concatenation is disabled
-TEST_F(OperationExecutionEngineTest, RecordHintNoOpWhenConcatenationDisabled) {
-  // Engine created without TORCH_NEURONX_ENABLE_CONCATENATION, so concatenation_enabled_ = false
-  EXPECT_FALSE(engine_->IsConcatenationEnabled());
-
-  auto hint_kernel = std::make_unique<at::neuron::HintDirectKernelExecution>(
-      "neuron::hint::alloc", reinterpret_cast<void*>(0xDEAD), 1024, 0,
-      at::neuron::HintDirectKernelExecution::HintType::kAllocation);
-  auto hint_ctx = std::make_unique<OperationContext>(std::move(hint_kernel));
-
-  // RecordHint should silently return without crashing
-  NeuronStream stream = NeuronStream::getDefaultStream(0);
-  EXPECT_NO_THROW(engine_->RecordHint(std::move(hint_ctx), stream));
-
-  // The unique_ptr should have been consumed (moved), but since concat is disabled,
-  // RecordHint returns early — the unique_ptr is NOT moved (early return before move)
-  // We just verify no crash occurred.
-}
-
-// Test that RecordHint is safe to call during shutdown
-TEST_F(OperationExecutionEngineTest, RecordHintSafeDuringShutdown) {
-  setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
-
-  CompilationCache compilation_cache;
-  ModelHandleCache model_handle_cache;
-  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
-
-  // Shutdown first
-  engine.Shutdown();
-
-  // RecordHint after shutdown should be a safe no-op
-  auto hint_kernel = std::make_unique<at::neuron::HintDirectKernelExecution>(
-      "neuron::hint::dealloc", reinterpret_cast<void*>(0x1234), 256, 0,
-      at::neuron::HintDirectKernelExecution::HintType::kDeallocation);
-  auto hint_ctx = std::make_unique<OperationContext>(std::move(hint_kernel));
-
-  NeuronStream stream = NeuronStream::getDefaultStream(0);
-  EXPECT_NO_THROW(engine.RecordHint(std::move(hint_ctx), stream));
-
-  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
-}
-
-// Test that hints submitted via RecordHint do NOT enter the per-stream runtime
-// queue. Hints flow through dispatch_queue_, are consumed by the concatenation
-// engine, and dropped at transfer time — they never reach runtime_queue_.
-TEST_F(OperationExecutionEngineTest, RecordHintDoesNotEnterRuntimeQueue) {
-  setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
-
-  CompilationCache compilation_cache;
-  ModelHandleCache model_handle_cache;
-  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
-
-  auto stream_impl = GetDefaultStreamImpl(0);  // default stream on device 0
-
-  EXPECT_EQ(engine.RuntimeQueueSize(stream_impl), 0u);
-
-  // Submit multiple hints via RecordHint
-  for (int i = 0; i < 5; ++i) {
-    auto hint_kernel = std::make_unique<at::neuron::HintDirectKernelExecution>(
-        "neuron::hint::alloc", reinterpret_cast<void*>(0x1000 + i * 0x100), 1024, 0,
-        at::neuron::HintDirectKernelExecution::HintType::kAllocation);
-    auto hint_ctx = std::make_unique<OperationContext>(std::move(hint_kernel));
-
-    NeuronStream stream = NeuronStream::getDefaultStream(0);
-    engine.RecordHint(std::move(hint_ctx), stream);
-  }
-
-  // Give the concatenation worker a moment to process
-  std::this_thread::sleep_for(50ms);
-
-  EXPECT_EQ(engine.RuntimeQueueSize(stream_impl), 0u)
-      << "Hints submitted via RecordHint must NOT appear in runtime_queue_";
-
-  engine.Shutdown();
-  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
-}
-
-// Test that concurrent RecordHint calls are thread-safe
-TEST_F(OperationExecutionEngineTest, RecordHintThreadSafety) {
-  setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
-
-  CompilationCache compilation_cache;
-  ModelHandleCache model_handle_cache;
-  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
-
-  std::vector<std::thread> threads;
-  constexpr int kThreadCount = 10;
-  constexpr int kHintsPerThread = 20;
-
-  for (int t = 0; t < kThreadCount; ++t) {
-    threads.emplace_back([&engine, t]() {
-      for (int i = 0; i < kHintsPerThread; ++i) {
-        auto hint_kernel = std::make_unique<at::neuron::HintDirectKernelExecution>(
-            "neuron::hint::alloc", reinterpret_cast<void*>(0x1000 + t * 0x1000 + i * 0x100), 512, 0,
-            at::neuron::HintDirectKernelExecution::HintType::kAllocation);
-        auto hint_ctx = std::make_unique<OperationContext>(std::move(hint_kernel));
-        NeuronStream stream = NeuronStream::getDefaultStream(0);
-        engine.RecordHint(std::move(hint_ctx), stream);
-      }
-    });
-  }
-
-  for (auto& thread : threads) {
-    thread.join();
-  }
-
-  // Should complete without crashes or deadlocks
-  EXPECT_NO_THROW(engine.Shutdown());
-  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
-}
-
-// Test that execution_queue_depth is NOT incremented for hint operations
-// Hints are not device operations and should not affect queue depth tracking
-TEST_F(OperationExecutionEngineTest, RecordHintDoesNotAffectExecutionQueueDepth) {
-  setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
-
-  CompilationCache compilation_cache;
-  ModelHandleCache model_handle_cache;
-  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
-
-  int64_t initial_depth = engine.GetExecutionQueueDepth();
-
-  // Submit hints
-  for (int i = 0; i < 10; ++i) {
-    auto hint_kernel = std::make_unique<at::neuron::HintDirectKernelExecution>(
-        "neuron::hint::dealloc", reinterpret_cast<void*>(0x2000 + i * 0x100), 256, 0,
-        at::neuron::HintDirectKernelExecution::HintType::kDeallocation);
-    auto hint_ctx = std::make_unique<OperationContext>(std::move(hint_kernel));
-    NeuronStream stream = NeuronStream::getDefaultStream(0);
-    engine.RecordHint(std::move(hint_ctx), stream);
-  }
-
-  // Give concatenation worker time to process
-  std::this_thread::sleep_for(100ms);
-
-  // Queue depth should not have changed — hints are filtered out before submitToNextStage
-  EXPECT_EQ(engine.GetExecutionQueueDepth(), initial_depth)
-      << "Hint operations should not affect execution queue depth";
-
-  engine.Shutdown();
-  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
-}
-
-// Test that hints are destroyed immediately after consumption by the
-// concatenation worker, not accumulated until the queue drains.
-TEST_F(OperationExecutionEngineTest, RecordHintDoesNotAccumulateOwnership) {
-  setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
-
-  CompilationCache compilation_cache;
-  ModelHandleCache model_handle_cache;
-  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
-
-  // Submit a batch of hints
-  for (int i = 0; i < 100; ++i) {
-    auto hint_kernel = std::make_unique<at::neuron::HintDirectKernelExecution>(
-        "neuron::hint::alloc", reinterpret_cast<void*>(0x1000 + i * 0x100), 1024, 0,
-        at::neuron::HintDirectKernelExecution::HintType::kAllocation);
-    auto hint_ctx = std::make_unique<OperationContext>(std::move(hint_kernel));
-    NeuronStream stream = NeuronStream::getDefaultStream(0);
-    engine.RecordHint(std::move(hint_ctx), stream);
-  }
-
-  // Give the worker time to process all hints
-  std::this_thread::sleep_for(200ms);
-
-  // dispatch_queue_ should be empty — each hint destroyed on consumption (its
-  // shared_ptr is dropped during transfer-to-runtime since hints never make
-  // it to runtime_queue_).
-  {
-    std::lock_guard<std::mutex> lock(engine.dispatch_mutex_);
-    EXPECT_EQ(engine.dispatch_queue_.size(), 0u)
-        << "Hints should be destroyed immediately after consumption, not accumulated";
-  }
-
-  engine.Shutdown();
-  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
-}
-
 // --- Same-stream kWait bypass ---
 
 namespace {
 
-std::shared_ptr<OperationContext> MakeKWaitOp(StreamImpl* stream, int64_t recorded_sid) {
+std::shared_ptr<OperationContext> MakeKWaitOp(StreamImpl* stream, StreamImpl* recorded_on) {
   NeuronEvent event(/*device_id=*/0);
-  event.get_impl()->recorded_stream_id.store(recorded_sid, std::memory_order_relaxed);
+  event.get_impl()->recorded_stream_impl.store(recorded_on, std::memory_order_relaxed);
   event.get_impl()->is_recorded.store(true, std::memory_order_relaxed);
   auto kernel = std::make_unique<EventDirectKernelExecution>(
       "test_event_wait", event, EventDirectKernelExecution::EventAction::kWait,
@@ -1095,7 +903,7 @@ TEST_F(OperationExecutionEngineTest, ScheduleOperationKWaitSameStreamBypassesGua
   PushPendingDeviceOp(stream.get(), engine);
   ASSERT_TRUE(stream->HasPendingAsyncOperations());
 
-  auto kwait = MakeKWaitOp(stream.get(), /*recorded_sid=*/stream->stream_id);
+  auto kwait = MakeKWaitOp(stream.get(), /*recorded_on=*/stream.get());
   engine.InjectIntoRuntimeQueue(stream.get(), kwait);
   ASSERT_TRUE(engine.SetRuntimeCursorTo(stream.get(), kwait.get()));
   ASSERT_FALSE(kwait->IsSchedulable());
@@ -1116,7 +924,9 @@ TEST_F(OperationExecutionEngineTest, ScheduleOperationKWaitCrossStreamStillGates
   PushPendingDeviceOp(stream.get(), engine);
   ASSERT_TRUE(stream->HasPendingAsyncOperations());
 
-  auto kwait = MakeKWaitOp(stream.get(), /*recorded_sid=*/99);
+  // Event recorded on a different stream — must not bypass the gate.
+  auto other_stream = std::make_shared<StreamImpl>(0, 2);
+  auto kwait = MakeKWaitOp(stream.get(), /*recorded_on=*/other_stream.get());
   engine.InjectIntoRuntimeQueue(stream.get(), kwait);
   ASSERT_TRUE(engine.SetRuntimeCursorTo(stream.get(), kwait.get()));
   ASSERT_FALSE(kwait->IsSchedulable());
@@ -1862,14 +1672,13 @@ TEST_F(OperationExecutionEngineTest, DeferredAllocCountUnchangedWhenTryDeferFail
 // =============================================================================
 // MoveToRuntimeQueueInOrder mechanics.
 //
-// Drives a known interleaved partition (allocs + computes + deallocs + a hint)
-// through an owners map, calls MoveToRuntimeQueueInOrder directly with the
-// reordered raw-pointer list, and asserts:
+// Drives a known interleaved partition (allocs + computes + deallocs) through
+// an owners map, calls MoveToRuntimeQueueInOrder directly with the reordered
+// raw-pointer list, and asserts:
 //   1) stream->runtime_queue_ ends up exactly in the partition order given.
-//   2) The hint's OperationContext is destroyed at the move boundary.
-//   3) The owners map is empty afterward.
+//   2) The owners map is empty afterward.
 // =============================================================================
-TEST_F(OperationExecutionEngineTest, MoveToRuntimeQueueInOrderCommitsPartitionAndDropsHint) {
+TEST_F(OperationExecutionEngineTest, MoveToRuntimeQueueInOrderCommitsPartitionInOrder) {
   setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
 
   CompilationCache compilation_cache;
@@ -1886,40 +1695,30 @@ TEST_F(OperationExecutionEngineTest, MoveToRuntimeQueueInOrderCommitsPartitionAn
     return op;
   };
 
-  // Build an interleaved submission: alloc, hlo, hint, alloc, hlo, dealloc.
+  // Build an interleaved submission: alloc, hlo, alloc, hlo, dealloc.
   auto a1 = make_op(KernelTypeEnum::kAlloc);
   auto h1 = make_op(KernelTypeEnum::kHLO);
-  auto hint = make_op(KernelTypeEnum::kHint);
   auto a2 = make_op(KernelTypeEnum::kAlloc);
   auto h2 = make_op(KernelTypeEnum::kHLO);
   auto d1 = make_op(KernelTypeEnum::kDealloc);
-
-  std::weak_ptr<OperationContext> hint_observer = hint;
-  OperationContext* hint_raw = hint.get();
 
   // Build the owners map (raw → shared_ptr) — this is what the worker hands
   // to MoveToRuntimeQueueInOrder after draining dispatch_queue_.
   std::unordered_map<OperationContext*, std::shared_ptr<OperationContext>> owners;
   owners.emplace(a1.get(), a1);
   owners.emplace(h1.get(), h1);
-  owners.emplace(hint_raw, std::move(hint));
   owners.emplace(a2.get(), a2);
   owners.emplace(h2.get(), h2);
   owners.emplace(d1.get(), d1);
 
-  // The local `hint` shared_ptr was moved into owners, so dropping any other
-  // refs leaves owners as the sole holder of the hint. The weak_ptr observer
-  // must still be alive — ownership has not moved out of the map yet.
-  ASSERT_FALSE(hint_observer.expired());
-
   // Reordered output as ConcatenationEngine would produce: allocs first,
-  // computes, then deallocs, with the hint mixed in (typical post-flush shape).
-  std::list<OperationContext*> partitioned_raws = {a1.get(), a2.get(), hint_raw,
-                                                   h1.get(), h2.get(), d1.get()};
+  // computes, then deallocs.
+  std::list<OperationContext*> partitioned_raws = {a1.get(), a2.get(), h1.get(), h2.get(),
+                                                   d1.get()};
 
   engine.MoveToRuntimeQueueInOrder(partitioned_raws, owners);
 
-  // 1) Runtime queue holds the non-hint ops in partition order.
+  // 1) Runtime queue holds the ops in partition order.
   auto snapshot = engine.RuntimeQueueSnapshot(stream.get());
   ASSERT_EQ(snapshot.size(), 5u);
   EXPECT_EQ(snapshot[0], a1.get());
@@ -1928,14 +1727,31 @@ TEST_F(OperationExecutionEngineTest, MoveToRuntimeQueueInOrderCommitsPartitionAn
   EXPECT_EQ(snapshot[3], h2.get());
   EXPECT_EQ(snapshot[4], d1.get());
 
-  // 2) The hint's OperationContext is destroyed: owners erased its entry,
-  //    and no one else held a shared_ptr to it.
-  EXPECT_TRUE(hint_observer.expired()) << "Hint shared_ptr should be released at the move boundary";
-
-  // 3) Owners map is drained.
+  // 2) Owners map is drained.
   EXPECT_TRUE(owners.empty());
 
   engine.ClearRuntimeQueue(stream.get());
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+}
+
+TEST_F(OperationExecutionEngineTest, QueueDepthSnapshotKeepsDecisionsConsistent) {
+  setenv("TORCH_NEURONX_ENABLE_CONCATENATION", "1", 1);
+
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  at::neuron::testing::MockOperationExecutionEngine engine(&compilation_cache, &model_handle_cache);
+  engine.Shutdown();
+
+  engine.execution_queue_depth_.store(DEFAULT_QUEUE_LOW_THRESHOLD + 1);
+  auto snapshot = engine.SnapshotConcatenationQueueDepth(false);
+
+  // Simulate a completion after the worker takes its depth snapshot.
+  engine.execution_queue_depth_.store(DEFAULT_QUEUE_LOW_THRESHOLD);
+
+  EXPECT_EQ(snapshot.current_depth, DEFAULT_QUEUE_LOW_THRESHOLD + 1);
+  EXPECT_FALSE(snapshot.needs_flush);
+  EXPECT_FALSE(snapshot.ShouldBypassConcatenation(0, engine.GetQueueLowThreshold()));
+
   unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
 }
 

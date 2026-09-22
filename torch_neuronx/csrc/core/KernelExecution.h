@@ -32,6 +32,7 @@ inline void* GetBaseTensorPtr(void* ptr, size_t offset_bytes) {
 
 // Forward declarations
 class CompilationCache;
+struct StreamImpl;
 
 enum class KernelTypeEnum {
   kHLO,
@@ -42,7 +43,6 @@ enum class KernelTypeEnum {
   kRead,
   kEvent,
   kBarrier,
-  kHint,  // Merely a non-functional hint
   kAlloc,
   kDealloc,
   kHost,
@@ -50,7 +50,7 @@ enum class KernelTypeEnum {
 
 // Check if a kernel type represents a device operation (vs host-side operation).
 // Device operations: kHLO, kCollective, kCopy, kCast, kWrite, kRead
-// Host-side operations: kEvent, kBarrier, kHint, kAlloc, kDealloc, kHost
+// Host-side operations: kEvent, kBarrier, kAlloc, kDealloc, kHost
 inline bool IsDeviceKernelType(KernelTypeEnum kernel_type) {
   switch (kernel_type) {
     case KernelTypeEnum::kHLO:
@@ -62,7 +62,6 @@ inline bool IsDeviceKernelType(KernelTypeEnum kernel_type) {
       return true;
     case KernelTypeEnum::kEvent:
     case KernelTypeEnum::kBarrier:
-    case KernelTypeEnum::kHint:
     case KernelTypeEnum::kAlloc:
     case KernelTypeEnum::kDealloc:
     case KernelTypeEnum::kHost:
@@ -71,12 +70,11 @@ inline bool IsDeviceKernelType(KernelTypeEnum kernel_type) {
   return false;
 }
 
-// kHint/kAlloc/kDealloc are bufferable because the merge path consumes their
+// kAlloc/kDealloc are bufferable because the merge path consumes their
 // lifetime info; only kHLO is fusible. Everything else flushes the buffer.
 inline bool IsConcatBufferableKernelType(KernelTypeEnum kernel_type) {
   switch (kernel_type) {
     case KernelTypeEnum::kHLO:
-    case KernelTypeEnum::kHint:
     case KernelTypeEnum::kAlloc:
     case KernelTypeEnum::kDealloc:
       return true;
@@ -287,18 +285,11 @@ class NeuronKernelExecutionTyped : public NeuronKernelExecution {
     StorageVec data_ptrs;
     data_ptrs.reserve(refs.size());
     if constexpr (std::is_same_v<StorageType, nrt_tensor_t*>) {
-      // TODO(rpsilva): Simplify once converged
-      if (c10_neuron::NeuronCachingAllocator::IsLazyAllocEnabled()) {
-        for (const auto& ref : refs) {
-          nrt_tensor_t* data_ptr = c10_neuron::NeuronCachingAllocator::findTensor(ref.ptr);
-          EXECUTION_RUNTIME_CHECK(data_ptr,
-                                  "Tensor not bound: lazy alloc kAlloc may not have executed");
-          data_ptrs.push_back(data_ptr);
-        }
-      } else {
-        for (const auto& ref : refs) {
-          data_ptrs.push_back(ref.tensor_ptr.get());
-        }
+      for (const auto& ref : refs) {
+        nrt_tensor_t* data_ptr = c10_neuron::NeuronCachingAllocator::findTensor(ref.ptr);
+        EXECUTION_RUNTIME_CHECK(data_ptr,
+                                "Tensor not bound: lazy alloc kAlloc may not have executed");
+        data_ptrs.push_back(data_ptr);
       }
     } else {
       for (const auto& ref : refs) {
@@ -631,11 +622,12 @@ class CollectiveDirectKernelExecution
   int GetMyRank() const { return my_rank_; }
   const nrt::NRTCollectiveComm& GetComm() const { return comm_; }
 
-  void Prepare() const override;
   bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
                 c10::StreamId stream_id) const override;
   KernelTypeEnum GetKernelType() const override { return KernelTypeEnum::kCollective; }
-  bool RequiresPrepare() const override { return true; }
+  // Device memory is bound on the runtime worker, so the NRT tensors are not
+  // resolvable on the caller thread; collective prepare happens in Schedule().
+  bool RequiresPrepare() const override { return false; }
 
  protected:
   bool ValidateImpl() const override;
@@ -661,38 +653,6 @@ class CollectiveDirectKernelExecution
   mutable nrt::NRTTensorList input_tensor_list_{};
   mutable nrt::NRTTensorList output_tensor_list_{};
   mutable nrt::NRTCollectiveComm comm_{};
-};
-
-// Hint primitive for fusion optimizations. It merely signals lifecycle events.
-class HintDirectKernelExecution : public NeuronKernelExecution {
- public:
-  enum class HintType {
-    kAllocation,    // Tensor was allocated
-    kDeallocation,  // Tensor was deallocated
-  };
-
-  HintDirectKernelExecution(const std::string& op_name, void* ptr, size_t size_bytes, int device_id,
-                            HintType hint_type);
-
-  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
-                c10::StreamId stream_id) const override {
-    // No-op for hints - nothing to execute or schedule
-    return false;
-  }
-  bool RequiresCompilation() const override { return false; }
-  KernelTypeEnum GetKernelType() const override { return KernelTypeEnum::kHint; }
-
-  HintType GetHintType() const { return hint_type_; }
-  size_t GetSizeBytes() const { return size_bytes_; }
-  void* GetPtr() const { return ptr_; }
-
- protected:
-  bool ValidateImpl() const override { return size_bytes_ > 0; }
-
- private:
-  void* ptr_;
-  size_t size_bytes_;
-  HintType hint_type_;
 };
 
 class EventDirectKernelExecution : public NeuronKernelExecution {
@@ -721,7 +681,8 @@ class EventDirectKernelExecution : public NeuronKernelExecution {
   EventAction GetEventAction() const { return action_; }
   const NeuronEvent& GetEvent() const { return event_; }
   virtual bool IsReady() const;
-  c10::StreamId GetSignalStreamId() const { return signal_stream_id_; }
+  // StreamImpl that recorded this event; used for same-stream-wait bypass.
+  at::neuron::StreamImpl* GetSignalStreamImpl() const { return signal_stream_impl_; }
 
  protected:
   bool ValidateImpl() const override;
@@ -729,7 +690,7 @@ class EventDirectKernelExecution : public NeuronKernelExecution {
  private:
   NeuronEvent event_;
   EventAction action_;
-  c10::StreamId signal_stream_id_;
+  at::neuron::StreamImpl* signal_stream_impl_;
 };
 
 class AllocDirectKernelExecution

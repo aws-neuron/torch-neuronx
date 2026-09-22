@@ -62,8 +62,6 @@ DTYPE_MISMATCH_FLOAT64_DOWNCAST = [
     "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_frac_neuron_float64",
     # foreach ops: float64 inputs downcast to float32 on Neuron; parity check
     # against CPU float64 reference fails due to precision loss.
-    # int64 inputs downcast to int32 on Neuron; sqrt result diverges from CPU int64.
-    "test_foreach.py::TestForeachNEURON::test_parity__foreach_sqrt_fastpath_inplace_neuron_int64",
     # clip_grad_norm: the test uses a 2e22 float64 grad. After the downcast to
     # float32, (2e22)^2 overflows to inf, so the order-2 norm is non-finite and
     # clip_grad_norm_ raises. CPU keeps float64 and returns a finite 6.32e22.

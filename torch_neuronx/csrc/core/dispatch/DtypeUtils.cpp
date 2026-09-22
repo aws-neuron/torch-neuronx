@@ -82,7 +82,7 @@ torch::Tensor NeuronSafeCast(const torch::Tensor& t, c10::ScalarType target_dtyp
   // materialize_from_i32 uses torch::empty (the empty_strided_neuron factory),
   // which does NOT redispatch — this is essential to avoid infinite recursion
   // back through UpcastExecutionOutputs -> NeuronSafeCast.
-  if (packed_int64 && t.scalar_type() == c10::ScalarType::Int &&
+  if (UsePackedInt64() && t.scalar_type() == c10::ScalarType::Int &&
       target_dtype == c10::ScalarType::Long && t.device().type() == c10::DeviceType::PrivateUse1) {
     return torch_neuronx::packed_int64::materialize_from_i32(t);
   }
@@ -167,12 +167,20 @@ void CopyBackToOriginal(torch::Tensor& orig, const torch::Tensor& result,
                                " orig_dtype=", orig.scalar_type(), " result_shape=", result.sizes(),
                                " orig_shape=", orig.sizes());
 
-  // Resize if shape changed (e.g., some out ops allow shape inference).
-  ResizeOutputWithWarning(orig, result.sizes());
+  // A resize flattens a non-contiguous same-numel view and drops its stride.
+  // Reshape the result to the view shape instead, so the copy respects it.
+  torch::Tensor src = result;
+  if (orig.sizes() != result.sizes()) {
+    if (orig.is_contiguous() || orig.numel() != result.numel()) {
+      ResizeOutputWithWarning(orig, result.sizes());
+    } else {
+      src = result.reshape(orig.sizes());
+    }
+  }
 
   // Copy with dtype conversion if needed.
-  if (orig.scalar_type() != result.scalar_type()) {
-    auto casted = NeuronSafeCast(result, orig.scalar_type());
+  if (orig.scalar_type() != src.scalar_type()) {
+    auto casted = NeuronSafeCast(src, orig.scalar_type());
     if (!orig.is_contiguous() && orig.is_privateuseone() && casted.is_contiguous() &&
         casted.is_privateuseone()) {
       // Non-contiguous Neuron dst: use CopyToNonContiguous directly to avoid
@@ -183,14 +191,14 @@ void CopyBackToOriginal(torch::Tensor& orig, const torch::Tensor& result,
       orig.copy_(casted);
     }
   } else {
-    if (!orig.is_contiguous() && orig.is_privateuseone() && result.is_contiguous() &&
-        result.is_privateuseone()) {
+    if (!orig.is_contiguous() && orig.is_privateuseone() && src.is_contiguous() &&
+        src.is_privateuseone()) {
       // Non-contiguous Neuron dst: use CopyToNonContiguous directly to avoid
       // re-dispatching aten::copy_ through DispatchCopy, which can infinitely
       // recurse when the epilogue fallback path leads back here.
-      torch_neuronx::utils::CopyToNonContiguous(orig, result);
+      torch_neuronx::utils::CopyToNonContiguous(orig, src);
     } else {
-      orig.copy_(result);
+      orig.copy_(src);
     }
   }
 }

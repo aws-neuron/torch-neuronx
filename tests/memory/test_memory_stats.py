@@ -13,13 +13,11 @@ from tests.utils.defer_retry_helpers import (
     floats_for_mib,
     n_chunks,
     oversize_mib,
-    requires_lazy_alloc,
     stage_pending_kdeallocs,
     staged_mib,
     vnc_hbm_mib,
 )
 
-_requires_lazy_alloc = requires_lazy_alloc
 _skip_nrt_oom_report_regression = pytest.mark.skip(
     reason=(
         "NRT-6217: NRT 2.x.77388.0 aborts in nrt_debug_log_oom_report when the "
@@ -103,7 +101,6 @@ class TestMemoryStats:
         assert isinstance(max_reserved, int)
         assert max_reserved >= 0
 
-    @_requires_lazy_alloc
     def test_lazy_alloc_memory_stats_after_dealloc(self):
         """After alloc + dealloc + sync, the block is freed back to the segment pool.
 
@@ -124,7 +121,6 @@ class TestMemoryStats:
         assert torch_neuronx.memory_allocated() == 0
         assert torch_neuronx.memory_reserved() > 0
 
-    @_requires_lazy_alloc
     def test_empty_cache_frees_reserved_bytes(self):
         """empty_cache() releases unused segments, freeing reserved bytes to NRT."""
         x = torch.randn(1024, device="neuron")
@@ -144,7 +140,6 @@ class TestMemoryStats:
         assert stats["active_bytes.all.current"] == 0
         assert torch_neuronx.memory_reserved() == 0
 
-    @_requires_lazy_alloc
     def test_allocated_exceeds_active_for_rounded_up_size(self):
         """A request that does not hit a block boundary should show
         allocated_bytes > active_bytes.
@@ -496,7 +491,6 @@ class TestLazyAllocDeferRetry:
     release NRT memory, then retries. Sizing + staging helpers live in
     ``tests.utils.defer_retry_helpers``."""
 
-    @_requires_lazy_alloc
     def test_defer_retry_silent_recovery(self):
         """A pressure kAlloc with kDeallocs queued behind compute defers,
         recovers silently via stage-2 drain-retry or stage-3 cache-drain,
@@ -521,7 +515,6 @@ class TestLazyAllocDeferRetry:
         assert stage2_ok != stage3_ok, f"stages must be mutually exclusive: stats={stats}"
         del big
 
-    @_requires_lazy_alloc
     def test_defer_retry_counters_sync_baseline(self):
         """Negative control: synchronizing before the pressure alloc must
         not engage defer-retry, catching regressions that inflate counters
@@ -542,7 +535,6 @@ class TestLazyAllocDeferRetry:
         assert stats["num_ooms"] == 0, f"unexpected OOM: stats={stats}"
         del big
 
-    @_requires_lazy_alloc
     @pytest.mark.xfail(
         reason="Flaky signal-6 crash from a KaenaRuntime assertion (tdrv/db.c:235) in the "
         "OOM-report path under parallel CI; passes serially. Xfailing to unblock CI."
@@ -566,7 +558,6 @@ class TestLazyAllocDeferRetry:
         assert stats["num_alloc_retries"] == 1, f"stats={stats}"
         assert stats["num_ooms"] == 1, f"stats={stats}"
 
-    @_requires_lazy_alloc
     @_skip_nrt_oom_report_regression
     def test_hard_oom_records_counters(self):
         """Bottom of the funnel: defer → RetryReady → AttemptOOMRecovery →
@@ -584,7 +575,6 @@ class TestLazyAllocDeferRetry:
         assert stats["num_alloc_retries"] >= 1, f"stats={stats}"
         assert stats["num_ooms"] == 1, f"stats={stats}"
 
-    @_requires_lazy_alloc
     def test_repeated_defer_retry_cycles(self):
         """Per-OperationContext AllocState must not leak across allocations:
         N pressure cycles must each defer once and recover silently."""
@@ -611,7 +601,6 @@ class TestLazyAllocDeferRetry:
             f"{stats['num_alloc_deferred']}"
         )
 
-    @_requires_lazy_alloc
     def test_synchronize_returns_when_deferred_alloc_completes(self):
         """synchronize() must return once a Deferred kAlloc completes or escalates."""
         stage_pending_kdeallocs()
@@ -623,7 +612,6 @@ class TestLazyAllocDeferRetry:
         assert big.shape[0] == floats_for_mib(big_mib())
         del big
 
-    @_requires_lazy_alloc
     def test_compute_behind_deferred_alloc_sees_bound_memory(self):
         """FIFO invariant: a compute op submitted behind a Deferred kAlloc
         must run against the bound buffer after retry, not before."""
@@ -650,7 +638,6 @@ class TestLazyAllocDeferRetry:
         ), f"FIFO violated: cpu[-1]={cpu[-1].item()} (expected {sentinel})"
         del big
 
-    @_requires_lazy_alloc
     @_skip_nrt_oom_report_regression
     def test_alone_on_stream_oom_surfaces_oom_error_first(self):
         """First-exception ordering: when an OOM'd kAlloc has a dependent
@@ -673,7 +660,6 @@ class TestLazyAllocDeferRetry:
         assert stats["num_alloc_retries"] == 1, f"stats={stats}"
         assert stats["num_ooms"] == 1, f"stats={stats}"
 
-    @_requires_lazy_alloc
     @_skip_nrt_oom_report_regression
     def test_oom_report_fires_on_unrecoverable_oom(self):
         """Unrecoverable OOM should produce a detailed NRT diagnostic dump
@@ -701,7 +687,6 @@ class TestLazyAllocDeferRetry:
 
         assert "log_dev_mem" in captured, "Detailed OOM report should fire on unrecoverable OOM"
 
-    @_requires_lazy_alloc
     def test_oom_report_suppressed_on_recoverable_oom(self):
         """A recoverable OOM (defer-retry succeeds) must NOT produce a detailed
         NRT dump — only true terminal OOMs should report."""

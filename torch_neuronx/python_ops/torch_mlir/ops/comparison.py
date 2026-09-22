@@ -3,8 +3,22 @@
 import torch
 
 from ..operation_registry import register_aten
+from ..validation import check_broadcast_shapes
 from .constants import INT_DTYPES
 from .unary import _validate_float_promoting_out
+
+
+def _validate_broadcast_and_out(x, other=None, *args, out=None, **kwargs):
+    """Reject a non-broadcastable pair, then check the out= dtype.
+
+    minimum/maximum and the clamp_min/clamp_max tensor overloads report a
+    broadcast failure from the lowering, with different wording than ATen. The
+    foreach list overloads dispatch here for each element, so this also gives
+    _foreach_clamp_max and its family the ATen message.
+    """
+    if isinstance(x, torch.Tensor) and isinstance(other, torch.Tensor):
+        check_broadcast_shapes(x, other)
+    _validate_float_promoting_out(x, other, *args, out=out, **kwargs)
 
 
 @register_aten(["aten::eq", "aten::eq.Scalar_out", "aten::eq.Tensor_out"])
@@ -65,7 +79,7 @@ def torch_clamp(x, min=None, max=None, out=None):
         "aten::clamp_max.Tensor",
         "aten::clamp_max.Tensor_out",
     ],
-    validate_static_inputs=_validate_float_promoting_out,
+    validate_static_inputs=_validate_broadcast_and_out,
 )
 def torch_clamp_max(x, max, out=None):
     # Ensure tensor max has same dtype as input
@@ -84,7 +98,7 @@ def torch_clamp_max(x, max, out=None):
         "aten::clamp_min.Tensor",
         "aten::clamp_min.Tensor_out",
     ],
-    validate_static_inputs=_validate_float_promoting_out,
+    validate_static_inputs=_validate_broadcast_and_out,
 )
 def torch_clamp_min(x, min, out=None):
     # Ensure tensor min has same dtype as input
@@ -149,7 +163,7 @@ def torch_isin_out(elements, test_elements, assume_unique=False, invert=False, o
 
 @register_aten(
     ["aten::minimum", "aten::minimum.out"],
-    validate_static_inputs=_validate_float_promoting_out,
+    validate_static_inputs=_validate_broadcast_and_out,
 )
 def torch_minimum(self, other, out=None):
     return torch.minimum(self, other)
@@ -157,7 +171,7 @@ def torch_minimum(self, other, out=None):
 
 @register_aten(
     ["aten::maximum", "aten::maximum.out"],
-    validate_static_inputs=_validate_float_promoting_out,
+    validate_static_inputs=_validate_broadcast_and_out,
 )
 def torch_maximum(self, other, out=None):
     return torch.maximum(self, other)

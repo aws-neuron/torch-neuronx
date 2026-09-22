@@ -277,12 +277,6 @@ TEST_F(NeuronCachingAllocatorTest, GetSegmentPoolReturnsSameInstanceForSameDevic
   EXPECT_EQ(&pool1, &pool2);
 }
 
-TEST_F(NeuronCachingAllocatorTest, GetTensorPoolReturnsSameInstanceForSameDevice) {
-  auto& pool1 = c10_neuron::GetTensorPool(0);
-  auto& pool2 = c10_neuron::GetTensorPool(0);
-  EXPECT_EQ(&pool1, &pool2);
-}
-
 TEST_F(NeuronCachingAllocatorTest, EmptyCacheDoesNotCrash) {
   EXPECT_NO_THROW(NeuronCachingAllocator::emptyCache());
 }

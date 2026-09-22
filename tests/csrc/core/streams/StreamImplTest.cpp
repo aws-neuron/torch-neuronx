@@ -269,9 +269,9 @@ namespace {
 // IsReady() defaults to false so the bypass path is exercised; execution is
 // marked ready so IsSchedulable() depends only on IsReady().
 std::shared_ptr<OperationContext> MakeEventOp(EventDirectKernelExecution::EventAction action,
-                                              c10::StreamId recorded_stream_id) {
+                                              StreamImpl* recorded_on) {
   NeuronEvent event;
-  event.get_impl()->recorded_stream_id.store(recorded_stream_id, std::memory_order_relaxed);
+  event.get_impl()->recorded_stream_impl.store(recorded_on, std::memory_order_relaxed);
   auto kernel = std::make_unique<MockEventDirectKernelExecution>("test_event", event, action, 0);
   auto op = std::make_shared<OperationContext>(std::move(kernel));
   op->MarkExecutionReady();
@@ -285,20 +285,82 @@ std::shared_ptr<OperationContext> MakeEventOp(EventDirectKernelExecution::EventA
 // rather than test-only injection.
 TEST_F(StreamImplTest, GetNextOperationToScheduleSameStreamKWaitBypass) {
   unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
-  auto op = MakeEventOp(EventDirectKernelExecution::EventAction::kWait, stream_->stream_id);
-  EXPECT_TRUE(StreamImpl::IsSameStreamWaitBypass(op.get(), stream_->stream_id));
+  auto op = MakeEventOp(EventDirectKernelExecution::EventAction::kWait, stream_.get());
+  EXPECT_TRUE(StreamImpl::IsSameStreamWaitBypass(op.get(), stream_.get()));
 }
 
 TEST_F(StreamImplTest, GetNextOperationToScheduleCrossStreamKWaitGated) {
   unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
-  auto op = MakeEventOp(EventDirectKernelExecution::EventAction::kWait, stream_->stream_id + 1);
-  EXPECT_FALSE(StreamImpl::IsSameStreamWaitBypass(op.get(), stream_->stream_id));
+  auto other_stream = std::make_shared<StreamImpl>(0, 2);
+  auto op = MakeEventOp(EventDirectKernelExecution::EventAction::kWait, other_stream.get());
+  EXPECT_FALSE(StreamImpl::IsSameStreamWaitBypass(op.get(), stream_.get()));
 }
 
 TEST_F(StreamImplTest, GetNextOperationToScheduleKSignalNotBypassed) {
   unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
-  auto op = MakeEventOp(EventDirectKernelExecution::EventAction::kSignal, stream_->stream_id);
-  EXPECT_FALSE(StreamImpl::IsSameStreamWaitBypass(op.get(), stream_->stream_id));
+  auto op = MakeEventOp(EventDirectKernelExecution::EventAction::kSignal, stream_.get());
+  EXPECT_FALSE(StreamImpl::IsSameStreamWaitBypass(op.get(), stream_.get()));
+}
+
+// Regression test: pre-fix, the bypass compared a counter-encoded c10::StreamId
+// (>= 32 for pool streams) against StreamImpl::stream_id (slot index, <= 8),
+// which never matched. Test fails pre-fix, passes post-fix via StreamImpl*
+// pointer compare.
+TEST_F(StreamImplTest, BypassFiresForPoolStreamRecordedThroughProductionPath) {
+  unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION");
+
+  // Counter-encoded pool-slot c10::StreamId, same shape as createStream emits.
+  constexpr int kPoolIndex = 0;
+  constexpr int kPriority = 0;
+  constexpr uint32_t kCounter = 1;
+  c10::StreamId encoded = (static_cast<c10::StreamId>(kCounter) << 5) |
+                          ((static_cast<c10::StreamId>(kPriority) & 0x3) << 3) |
+                          (static_cast<c10::StreamId>(kPoolIndex) & 0x7);
+  ASSERT_GE(encoded, 32);
+  NeuronStream pool_stream(encoded, /*device_index=*/0, NeuronStream::UNCHECKED);
+
+  StreamImpl* pool_impl = pool_stream.get_stream_impl();
+  ASSERT_NE(pool_impl, nullptr);
+  // StreamImpl::stream_id is 1-based for pool slots (default is 0).
+  EXPECT_EQ(pool_impl->stream_id, kPoolIndex + 1);
+  // Sanity: the two ID spaces don't coincide for pool streams.
+  EXPECT_NE(encoded, static_cast<c10::StreamId>(pool_impl->stream_id));
+
+  NeuronEvent event;
+  event.get_impl()->is_recorded.store(true, std::memory_order_relaxed);
+  event.get_impl()->recorded_stream_impl.store(pool_impl, std::memory_order_relaxed);
+
+  auto kernel = std::make_unique<MockEventDirectKernelExecution>(
+      "regression_event_wait", event, EventDirectKernelExecution::EventAction::kWait,
+      /*device_id=*/0);
+  auto op = std::make_shared<OperationContext>(std::move(kernel));
+  op->MarkExecutionReady();
+
+  // Same-stream wait must bypass.
+  EXPECT_TRUE(StreamImpl::IsSameStreamWaitBypass(op.get(), pool_impl));
+
+  // Cross-stream wait must still gate.
+  StreamImpl* other_impl = at::neuron::GetDefaultStreamImpl(0);
+  ASSERT_NE(other_impl, pool_impl);
+  NeuronEvent cross_event;
+  cross_event.get_impl()->is_recorded.store(true, std::memory_order_relaxed);
+  cross_event.get_impl()->recorded_stream_impl.store(other_impl, std::memory_order_relaxed);
+  auto cross_kernel = std::make_unique<MockEventDirectKernelExecution>(
+      "regression_event_wait_cross", cross_event, EventDirectKernelExecution::EventAction::kWait,
+      /*device_id=*/0);
+  auto cross_op = std::make_shared<OperationContext>(std::move(cross_kernel));
+  cross_op->MarkExecutionReady();
+  EXPECT_FALSE(StreamImpl::IsSameStreamWaitBypass(cross_op.get(), pool_impl));
+}
+
+// NeuronEvent::record() must capture the StreamImpl identity used by the
+// bypass. Guards the recording path against ID-space regressions.
+TEST_F(StreamImplTest, EventRecordCapturesStreamImplIdentity) {
+  NeuronStream default_stream = NeuronStream::getDefaultStream(/*device_index=*/0);
+  NeuronEvent event;
+  event.record(default_stream);
+  EXPECT_EQ(event.recorded_stream_impl(), default_stream.get_stream_impl());
+  EXPECT_NE(event.recorded_stream_impl(), nullptr);
 }
 
 namespace {

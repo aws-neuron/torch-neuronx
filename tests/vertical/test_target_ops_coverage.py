@@ -51,6 +51,9 @@ from internal.common import (
     flatten_tensors as _flatten_tensors,  # re-export for tests/vertical/test_probe.py
 )
 from internal.common import (
+    gate_enabled as _gate_enabled,
+)
+from internal.common import (
     probe_output_meta as _probe_output_meta,
 )
 from internal.common import (
@@ -58,6 +61,7 @@ from internal.common import (
 )
 from internal.neuron_op_info import _resolve_op
 from internal.roofline import compute_roofline
+from known_coverage_gaps import EAGER_GAPS
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +202,23 @@ def _save_result(result: dict):
         json.dump(result, f)
 
 
+# Eager statuses that mean a shipped kernel did not run on Neuron.
+_EAGER_BLOCKING = frozenset({"cpu_fallback", "failed_lowering"})
+
+
+def _gate_check(op_name: str, status: str, error: str) -> None:
+    """Merge-queue gate: fail on a registered eager kernel that regressed.
+
+    The eager gate covers only a registered kernel (a shipped PrivateUse1 op).
+    A known gap is on the allowlist, so it reports xfail, not a failure.
+    """
+    if _classify_op(op_name) != "registered" or status not in _EAGER_BLOCKING:
+        return
+    if op_name in EAGER_GAPS:
+        pytest.xfail(f"known eager gap: {EAGER_GAPS[op_name]}")
+    pytest.fail(f"{op_name}: eager regression ({status}). {error}", pytrace=False)
+
+
 def _build_params():
     db = neuron_op_db
     ops_filter = os.environ.get("NEURON_OPS_FILTER", "").strip()
@@ -334,14 +355,27 @@ def _run_one_sample(op, op_name: str, classification: str, sample) -> dict:
 
     # NUM_EXEC_ITERATIONS + 1 iterations; discard the first (warmup) so
     # exec_{avg,min,max}_ms reflect steady-state execution.
-    for i in range(NUM_EXEC_ITERATIONS + 1):
-        torch_neuronx.synchronize()
-        start = time.perf_counter()
-        with torch.no_grad():
-            _ = op(*neuron_args, **neuron_kwargs)
-        torch_neuronx.synchronize()
-        if i > 0:  # skip warmup
-            out["exec_times"].append((time.perf_counter() - start) * 1000)
+    #
+    # Guard the loop with compile_time_limit. The ttf block above bounds the
+    # cold compile, but a warmup call here can still trigger a compile (a cache
+    # miss or a decomposition variant). Without the guard a runaway compile
+    # hangs the worker for the rest of the run. The watchdog kills the
+    # neuronx-cc subprocess, so the wrapped call raises.
+    try:
+        for i in range(NUM_EXEC_ITERATIONS + 1):
+            torch_neuronx.synchronize()
+            start = time.perf_counter()
+            with torch.no_grad(), compile_time_limit():
+                _ = op(*neuron_args, **neuron_kwargs)
+                torch_neuronx.synchronize()
+            if i > 0:  # skip warmup
+                out["exec_times"].append((time.perf_counter() - start) * 1000)
+    except CompileTimeoutError as e:
+        kill_compile_subprocesses()
+        out["error"] = str(e)
+        out["status"] = "compile_timeout"
+        out["exec_times"] = []
+        return out
 
     if out["status"] == "runs_on_neuron":
         # Some ops have CPU references that burn through hours of compute
@@ -567,6 +601,9 @@ class TestTargetOpsCoverage:
         per_shape = [_run_one_sample(op, op_name, classification, s) for s in samples]
         _aggregate_into(result, per_shape, classification)
         _save_result(result)
+
+        if _gate_enabled():
+            _gate_check(op_name, result["status"], result["error"])
 
         all_fallback = sorted({f for r in per_shape for f in r["fallback"]})
         if all_fallback:

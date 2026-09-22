@@ -12,7 +12,6 @@ This document provides an overview of the different environment variables availa
 | `TORCH_NEURONX_COMPLEX_DECOMPOSE` | bool | `False` | Enables framework decomposition of complex operations before lowering. Requires PyTorch 2.13 or newer. When disabled, verified native complex operations use compiler lowering and other operations follow the existing fallback policy. |
 | `TORCH_NEURONX_RETAIN_DEVICE_MODE` | bool | `False` | When `1`, outputs retain original device placement instead of Neuron device. |
 | `TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY` | bool | `False` | When `1`, raises error if CPU tensors are passed as inputs instead of auto-copying to Neuron. |
-| `TORCH_NEURONX_ENABLE_LAZY_ALLOC` | bool | `False` | When `1`, defers NRT tensor allocation to execution time; otherwise allocates eagerly. |
 | `TORCH_NEURONX_COMPILE_ONLY` | bool | `False` | When `1`, compile to NEFF without device execution. Ops compile but never run; `nrt_init` failure is non-fatal. Also set by `torch_neuronx.compiler.compile_only()`. |
 | `NEURON_PLATFORM_TARGET_OVERRIDE` | str | (query live instance) | Target platform (e.g. `trn2`, `trn3`) for cross-compilation on a device-less host. Also set via `CompileOptions(target=...)`. |
 | `TORCH_NEURONX_ATEN_HIERARCHY` | bool | `False` | When `1`, appends aten op hierarchy metadata to the graph for hierarchy based micro-modules flow compilation. |

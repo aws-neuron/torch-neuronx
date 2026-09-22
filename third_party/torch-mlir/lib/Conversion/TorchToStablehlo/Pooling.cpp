@@ -61,6 +61,7 @@ static Value createInitialValueForAtenPoolingOp(Operation *op, Type elementTy,
                                            constAttr);
     } else if (isa<mlir::IntegerType>(elementTy) &&
                elementTy.getIntOrFloatBitWidth() != 8) {
+      // TODO: SignedMinValue can tie with real input. Promote to wider type first.
       auto constAttr = DenseElementsAttr::get(
           constType,
           {APInt::getSignedMinValue(elementTy.getIntOrFloatBitWidth())});
@@ -436,6 +437,7 @@ LogicalResult ConvertAtenOp<AtenMaxPool2dWithIndicesOp>::matchAndRewrite(
           rewriter.getI64Type()),
       noPadding);
   DenseI64ArrayAttr baseDilations;
+  // TODO: dilation parameter is unused; windowDilations is never populated.
   DenseI64ArrayAttr windowDilations;
 
   auto reduceWindowOp = stablehlo::ReduceWindowOp::create(

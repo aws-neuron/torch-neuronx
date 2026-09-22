@@ -350,13 +350,13 @@ def _generate_tile_types(
 def _compute_lnc(k_shape):
     """Compute effective LNC based on batch dimensions.
 
-    Falls back to lnc=1 if the batch dimension (product of all dims except
-    the last two) is not divisible by 2.
+    Returns 0 ("launch gridless", so the kernel runs unsharded) if the batch
+    dimension (product of all dims except the last two) is not divisible by 2.
+    A gridless launch declares no LNC, which a sharded launch must match.
     """
-    lnc = int(get_logical_neuron_cores())
     if math.prod(k_shape[:-2]) % 2 == 1:
-        lnc = 1
-    return lnc
+        return 0
+    return int(get_logical_neuron_cores())
 
 
 def add_metadata_to_node(node: fx.Node, example_tensor=None, shape=None, dtype=None) -> fx.Node:
@@ -395,7 +395,7 @@ def get_fwd_dumped_config(fwd_kernel, q, k, v, scale, other_buffers=None):
         positional_values.append(torch.empty(buf_val.shape, dtype=buf_val.dtype, device="meta"))
     meta_args = dict(zip(arg_names, positional_values))  # noqa: B905
 
-    dconfig = get_config(kernel[lnc], **meta_args)
+    dconfig = get_config(kernel[lnc] if lnc else kernel, **meta_args)
     logger.debug(f"FWD Kernel return types: {return_types_of(dconfig)}")
     return (
         backend_config_str(dconfig),
@@ -432,7 +432,7 @@ def get_bwd_dumped_config(bwd_kernel, q, k, v, o, dy, lse, scale, other_buffers=
     if "softmax_scale" in arg_names:
         meta_args["softmax_scale"] = scale
 
-    dconfig = get_config(kernel[lnc], **meta_args)
+    dconfig = get_config(kernel[lnc] if lnc else kernel, **meta_args)
     logger.debug(f"BWD Kernel return types: {return_types_of(dconfig)}")
     return (
         backend_config_str(dconfig),
@@ -960,7 +960,7 @@ class FlexAttentionNKILowering(NeuronFXPass):
 
                 nki_kernel_args = {
                     "kernel_idx": fwd_kernel.kernel_idx,
-                    "grid": [lnc],
+                    "grid": [lnc] if lnc else [],
                     "backend_config": backend_config,
                     "operand_output_aliases": operand_output_aliases,
                     "args": [q, k, v, *extra_buf_nodes],
@@ -1196,7 +1196,7 @@ class FlexAttentionNKILowering(NeuronFXPass):
 
                 nki_kernel_args = {
                     "kernel_idx": bwd_kernel.kernel_idx,
-                    "grid": [lnc],
+                    "grid": [lnc] if lnc else [],
                     "backend_config": backend_config,
                     "operand_output_aliases": operand_output_aliases,
                     "args": [q, k, v, o, dy, lse_transposed, *extra_buf_nodes],

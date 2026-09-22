@@ -74,6 +74,12 @@ def compile_time_limit(seconds: int = COMPILE_TIMEOUT_S):
         Python runs no handler, so the signal is lost. The watchdog does not
         depend on the compile thread. It kills the neuronx-cc subprocess, the
         wrapped call then raises, and this manager reports a CompileTimeoutError.
+      - A hard abort (NEURON_COMPILE_HARD_ABORT=1) ends the whole process when
+        the two mechanisms above do not release the block. It bounds a hang in
+        an in-process native call that ignores SIGALRM and has no subprocess.
+        Use it only in the --forked compile suite, where each test owns its
+        process. The test pre-writes a compile_timeout row so the status
+        survives the abort.
 
     A value of 0 or less disables the limit.
     """
@@ -89,6 +95,14 @@ def compile_time_limit(seconds: int = COMPILE_TIMEOUT_S):
         if not done.wait(seconds):
             timed_out.set()
             kill_compile_subprocesses()
+            # A hang in an in-process native call ignores SIGALRM and has no
+            # subprocess to kill. In the --forked compile suite each test owns
+            # its process, so end it. The test pre-writes a compile_timeout row,
+            # so the status survives. Enable with NEURON_COMPILE_HARD_ABORT=1.
+            if os.environ.get("NEURON_COMPILE_HARD_ABORT") == "1" and not done.wait(
+                min(seconds, 15)
+            ):
+                os.kill(os.getpid(), signal.SIGKILL)
 
     watcher = threading.Thread(target=_watch, name="neuron-compile-timeout", daemon=True)
 
@@ -239,6 +253,50 @@ def classify_op(op_name: str) -> str:
     if is_composite(op_name):
         return "composite"
     return "unknown"
+
+
+# ── torch.compile static support surface (merge-queue gate) ──────────────────
+
+_COMPILE_SUPPORTED_OPS: frozenset[str] | None = None
+
+
+def _decomp_key_op_name(op) -> str | None:
+    """Map a decomposition-table key to the ``aten::name[.overload]`` form.
+
+    The key is an ``OpOverload`` (has ``_schema``) or an ``OpOverloadPacket``.
+    """
+    schema = getattr(op, "_schema", None)
+    if schema is not None:
+        return f"{schema.name}.{schema.overload_name}" if schema.overload_name else schema.name
+    text = str(op)  # OpOverloadPacket, e.g. "aten.take"
+    return "aten::" + text[len("aten.") :] if text.startswith("aten.") else None
+
+
+def compile_supported_ops() -> frozenset[str]:
+    """Op names the torch.compile backend lowers through a decomposition.
+
+    Static: read the Neuron decomposition table at import time, not a run
+    result. The merge-queue gate uses this so a decomposition-only op that stops
+    compiling still counts as "expected supported" and gates.
+    """
+    global _COMPILE_SUPPORTED_OPS
+    if _COMPILE_SUPPORTED_OPS is None:
+        from torch_neuronx.neuron_dynamo_backend.decompositions import (
+            get_compile_decomposition_table,
+        )
+
+        names = {
+            name
+            for op in get_compile_decomposition_table()
+            if (name := _decomp_key_op_name(op)) is not None
+        }
+        _COMPILE_SUPPORTED_OPS = frozenset(names)
+    return _COMPILE_SUPPORTED_OPS
+
+
+def gate_enabled() -> bool:
+    """True when the suite runs as the merge-queue gate (asserts on regressions)."""
+    return os.environ.get("NEURON_COVERAGE_GATE", "") == "1"
 
 
 # ── Exception classification ────────────────────────────────────────────────

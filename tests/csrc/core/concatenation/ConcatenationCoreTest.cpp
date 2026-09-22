@@ -35,9 +35,6 @@ class ConcatenationCoreTest : public ::testing::Test {
         .Times(::testing::AnyNumber())
         .WillRepeatedly(DoAll(SetArgPointee<0>(info), Return(NRT_SUCCESS)));
 
-    // Disable lazy alloc for concatenation unit tests — test tensors are CPU-only
-    // and not registered with NeuronCachingAllocator.
-    setenv("TORCH_NEURONX_ENABLE_LAZY_ALLOC", "0", 1);
     core = ConcatenationCoreFactory::CreateInstance();
     stream_mock = std::make_unique<at::neuron::testing::MockStreamImpl>();
 

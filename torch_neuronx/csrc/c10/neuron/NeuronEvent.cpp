@@ -8,7 +8,7 @@ namespace at::neuron {
 
 void NeuronEvent::record(const NeuronStream& stream) {
   impl_->device_index = stream.device_index();
-  impl_->recorded_stream_id.store(stream.id(), std::memory_order_relaxed);
+  impl_->recorded_stream_impl.store(stream.get_stream_impl(), std::memory_order_relaxed);
 
   if (impl_->enable_timing) {
     impl_->record_time = std::chrono::steady_clock::now();

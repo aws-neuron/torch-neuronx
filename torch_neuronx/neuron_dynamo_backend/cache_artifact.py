@@ -23,6 +23,9 @@ from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import FunctionIO
 
 logger = logging.getLogger(__name__)
 
+# A CPython type accepts an attribute assignment only if it is a heap type.
+_PY_TPFLAGS_HEAPTYPE = 1 << 9
+
 
 class ArtifactType(Enum):
     """MegaCache artifact types for Neuron compilation caches."""
@@ -209,6 +212,304 @@ def _wrapped_serialize(cls):
 CacheArtifactManager.serialize = classmethod(_wrapped_serialize)
 
 
+# ---------------------------------------------------------------------------
+# Per-rank precompile package directory
+# ---------------------------------------------------------------------------
+
+
+def _resolve_package_element() -> str | None:
+    """Return a directory element unique to this process, or None.
+
+    Each rank saves rank-specific guard state, so ranks must not share a package
+    directory. Prefer NEURON_RT_VISIBLE_CORES: it is unique per host process
+    even with data parallelism, and a launcher repeats it across a cold and a
+    warm run. Fall back to the torch.distributed rank, then RANK.
+
+    NEURON_RT_VISIBLE_CORES must be disjoint per rank. A launcher that gives each
+    rank the same core range makes each rank return the same element. The ranks
+    then share one directory with no warning, which is the collision this patch
+    prevents.
+    """
+    cores = os.environ.get("NEURON_RT_VISIBLE_CORES")
+    if cores:
+        return "cores_" + cores.replace(" ", "").replace(",", "_").replace("-", "_")
+
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        return f"rank_{dist.get_rank()}"
+
+    env_rank = os.environ.get("RANK")
+    if env_rank is not None and env_rank.isdigit():
+        return f"rank_{env_rank}"
+    return None
+
+
+def _install_per_rank_package_dir() -> None:
+    """Patch DiskDynamoCache.path_prefix so each rank gets its own package dir.
+
+    The rank is unknown at import time (vLLM passes it as an argument, so RANK
+    reads 0 for every rank), but path_prefix runs at each save and load. Patch
+    path_prefix rather than TORCHINDUCTOR_CACHE_DIR: the env var compounds to
+    .../rank_0/rank_0 across the process generations a vLLM server starts. A
+    shared directory breaks a warm restore, because a rank loads another rank's
+    package whose guard state names an absent process group.
+    """
+    from torch._dynamo.package import DiskDynamoCache
+
+    if getattr(DiskDynamoCache.path_prefix, "_neuron_patched", False):
+        return
+    original_path_prefix = DiskDynamoCache.path_prefix
+    warned = False
+
+    def path_prefix(self) -> str:
+        nonlocal warned
+        base = original_path_prefix(self)
+        element = _resolve_package_element()
+        if element is None:
+            if not warned:
+                warned = True
+                logger.warning(
+                    "Kept the shared package directory %s. This process has no "
+                    "known rank, so each rank reads the same torch.compile "
+                    "package. A warm restore can stop with an error on a process "
+                    "group name. Set NEURON_RT_VISIBLE_CORES or RANK, or "
+                    "initialize torch.distributed before the first compile.",
+                    base,
+                )
+            return base
+        return os.path.join(base, element)
+
+    path_prefix._neuron_patched = True
+    DiskDynamoCache.path_prefix = path_prefix
+    logger.debug(
+        "Patched DiskDynamoCache.path_prefix. Each rank now has its own "
+        "torch.compile package directory."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Guard state that a distributed runtime owns
+# ---------------------------------------------------------------------------
+
+
+class _UnresolvedObject:
+    """A stand-in for an object the guard state cannot hold.
+
+    Each guard that reads it fails to match, so Dynamo recompiles. That is the
+    correct result for a package that does not match this process.
+    """
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+
+    def __getattr__(self, name: str) -> "_UnresolvedObject":
+        return _UnresolvedObject(f"{self._label}.{name}")
+
+    def __repr__(self) -> str:
+        return f"_UnresolvedObject({self._label!r})"
+
+
+def _rebuild_unresolved(label: str) -> "_UnresolvedObject":
+    """Return a stand-in for ``label``. The unpickle step calls this function."""
+    return _UnresolvedObject(label)
+
+
+def _rebuild_process_group(group_name: str):
+    """Return the live process group named group_name, or a stand-in.
+
+    Keep this at module level: pickle saves it by qualified name. Return a
+    stand-in instead of raising, because the unpickle runs inside
+    CompilePackage.install where no caller catches an exception; the stand-in
+    makes the guard fail and Dynamo recompiles.
+    """
+    try:
+        from torch.distributed.distributed_c10d import _resolve_process_group
+
+        return _resolve_process_group(group_name)
+    except Exception:
+        logger.warning(
+            "Replaced the process group %r with a stand-in. This process has no "
+            "group with this name, so the torch.compile package belongs to "
+            "another rank or to an older run. Dynamo compiles the graph again. "
+            "Check that each rank has its own package directory.",
+            group_name,
+        )
+        return _UnresolvedObject(f"process_group_{group_name}")
+
+
+def _install_process_group_reducer() -> None:
+    """Save a ProcessGroup by its name during guard pickling.
+
+    A guard reads the group name through the group, so the group is on the
+    guard's path. Dynamo lists ProcessGroup in _get_unsupported_types, so the
+    pickler saves the _Missing sentinel and the warm restore fails on
+    _Missing.group_name. Give ProcessGroup a __reduce__ that saves the name, and
+    drop it from _get_unsupported_types so reducer_override does not shadow
+    __reduce__.
+    """
+    import torch._dynamo.guards as dynamo_guards
+
+    try:
+        from torch._C._distributed_c10d import ProcessGroup
+    except ImportError:
+        return
+
+    # A static extension type refuses a __reduce__ assignment, so gate on the flag.
+    if "__reduce__" not in ProcessGroup.__dict__:
+        if not ProcessGroup.__flags__ & _PY_TPFLAGS_HEAPTYPE:
+            logger.warning(
+                "Skipped the process group reducer. This torch build defines "
+                "ProcessGroup as a static type that refuses a __reduce__ "
+                "assignment. A warm restore recompiles instead of a package "
+                "match. Check the torch version."
+            )
+            return
+        ProcessGroup.__reduce__ = lambda self: (
+            _rebuild_process_group,
+            (self.group_name,),
+        )
+
+    original_unsupported_types = getattr(dynamo_guards, "_get_unsupported_types", None)
+    if original_unsupported_types is None:
+        logger.warning(
+            "Skipped the process group reducer. This torch version has no "
+            "_get_unsupported_types in torch._dynamo.guards. A warm restore can "
+            "stop with an AttributeError on _Missing. Check the torch version."
+        )
+        return
+
+    if getattr(original_unsupported_types, "_neuron_patched", False):
+        return
+
+    def drop_process_group():
+        # Call the original each time, so a later addition to the list survives.
+        return tuple(t for t in original_unsupported_types() if t is not ProcessGroup)
+
+    drop_process_group._neuron_patched = True
+    dynamo_guards._get_unsupported_types = drop_process_group
+    logger.debug("Patched _get_unsupported_types to drop ProcessGroup.")
+
+
+def _transport_types() -> tuple[type, ...]:
+    """Return the types that hold a transport and refuse to pickle.
+
+    A traced model can reach one through a collective helper (a vLLM
+    GroupCoordinator owns a zmq.Socket via its message queue). Import each
+    optional module in a try block, so the tuple holds installed types only.
+    """
+    import mmap
+    import socket
+    import threading
+
+    types_found: list[type] = [
+        socket.socket,
+        mmap.mmap,
+        type(threading.Lock()),
+        type(threading.RLock()),
+    ]
+
+    try:
+        import zmq
+
+        types_found += [zmq.Socket, zmq.Poller, zmq.Context]
+    except ImportError:
+        pass  # zmq is optional; skip its types when it is absent.
+
+    try:
+        from multiprocessing.shared_memory import SharedMemory
+
+        types_found.append(SharedMemory)
+    except ImportError:
+        pass  # SharedMemory is unavailable on some runtimes; skip it.
+
+    return tuple(types_found)
+
+
+def _install_transport_reducer() -> None:
+    """Replace a transport object with a stand-in during guard pickling.
+
+    The guard state holds every object the graph can reach; a socket or lock is
+    on that path and refuses to pickle, so the whole package save fails. A
+    stand-in makes any guard that reads it fail to match, and Dynamo recompiles.
+    """
+    from torch._dynamo.guards import GuardsStatePickler
+
+    transport_types = _transport_types()
+    if not transport_types:
+        return
+
+    original_reducer_override = getattr(GuardsStatePickler, "reducer_override", None)
+    if original_reducer_override is None:
+        logger.warning(
+            "Skipped the transport reducer. This torch version has no "
+            "GuardsStatePickler.reducer_override. A package save can stop on an "
+            "unpicklable transport object. Check the torch version."
+        )
+        return
+    if getattr(original_reducer_override, "_neuron_patched", False):
+        return
+
+    def reducer_override(self, obj):
+        if isinstance(obj, transport_types):
+            label = f"{type(obj).__module__}.{type(obj).__name__}"
+            return _rebuild_unresolved, (label,)
+        return original_reducer_override(self, obj)
+
+    reducer_override._neuron_patched = True
+    GuardsStatePickler.reducer_override = reducer_override
+    logger.debug(
+        "Patched GuardsStatePickler.reducer_override. The pickler replaces %d "
+        "transport types with a stand-in.",
+        len(transport_types),
+    )
+
+
+# ---------------------------------------------------------------------------
+# A name that a package restore installs, and a fresh compile then needs
+# ---------------------------------------------------------------------------
+
+
+def _install_builtins_dict_share() -> None:
+    """Reuse the builtins-dict name that a package restore installed.
+
+    Dynamo puts builtins.__dict__ into the module globals under a mangled name
+    (e.g. __builtins_dict___0). CompilePackage.install writes that name with no
+    cleanup, so a later compile in the same module regenerates the same name and
+    CleanupHook.create fails on the existing name. Return the existing name
+    instead; one module has one builtins dict.
+    """
+    from torch._dynamo.output_graph import OutputGraph, get_builtins_dict
+
+    original = getattr(OutputGraph, "install_builtins_dict_in_fglobals", None)
+    if original is None:
+        logger.warning(
+            "Skipped the builtins dict patch. This torch version has no "
+            "OutputGraph.install_builtins_dict_in_fglobals. A warm restore can "
+            "stop with an AssertionError on a name that already exists in the "
+            "scope. Check the torch version."
+        )
+        return
+    if getattr(original, "_neuron_patched", False):
+        return
+
+    prefix = "__builtins_dict__"
+
+    def install_builtins_dict_in_fglobals(self) -> str:
+        f_builtins = get_builtins_dict(self.global_scope)
+        for name, value in list(self.global_scope.items()):
+            if value is f_builtins and name.startswith(prefix):
+                return name
+        return original(self)
+
+    install_builtins_dict_in_fglobals._neuron_patched = True
+    OutputGraph.install_builtins_dict_in_fglobals = install_builtins_dict_in_fglobals
+    logger.debug(
+        "Patched OutputGraph.install_builtins_dict_in_fglobals. A fresh compile "
+        "now shares the builtins dict entry of a package restore."
+    )
+
+
 def _apply_precompile_patches():
     """Apply monkey-patches and config needed for caching_precompile.
 
@@ -219,11 +520,18 @@ def _apply_precompile_patches():
     torch._dynamo.config.enable_aot_compile = True
     torch._functorch.config.bypass_autograd_cache_key = True  # PT2.11 config
 
-    # Per-rank cache directories — each rank's guard state may contain
-    # rank-specific DeviceMesh data, so caches cannot be shared.
-    rank = int(os.environ.get("RANK", "0"))
-    cache_base = torch._inductor.runtime.cache_dir_utils.cache_dir()
-    os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(cache_base, f"rank_{rank}")
+    # Give each rank its own package directory. Rank-specific guard state must
+    # not be shared, and the rank is unknown at import time.
+    _install_per_rank_package_dir()
+
+    # Upstream torch has no guard-pickle reducer for a process group or a
+    # transport object, so the package save or restore fails without these.
+    _install_process_group_reducer()
+    _install_transport_reducer()
+
+    # A package restore installs a builtins-dict name with no cleanup; let a
+    # later compile in the same module reuse it.
+    _install_builtins_dict_share()
 
     # Fix precompile guard-state deserialization with no active trace.
     # load_guards_state() unpickles dynamo Sources; ImportSource.__post_init__

@@ -284,10 +284,9 @@ neff_cache_download() {
     echo "=== NEFF cache: $(neff_cache_file_count) entries local after $((SECONDS - start))s ==="
 }
 
-# Seed the shared cache with whatever this run compiled. Three independent gates,
-# all of which must pass, so a PR, a merge-queue run, a dependency bump or a
-# nightly on a custom branch can never publish NEFFs built from unmerged code:
-#   1. --refresh-persistent-cache, which only the nightly passes
+# Seed the shared cache with the compiled NEFFs. Three independent gates must pass.
+# A PR, Merge Queue run, or custom branch run cannot publish unmerged NEFFs:
+#   1. --refresh-persistent-cache, which main Nightly and main Dependency Guard pass
 #   2. the branch is main
 #   3. a storage bucket is present, i.e. the job carries persistent-storage:write
 neff_cache_upload() {

@@ -435,5 +435,36 @@ class TestNKIInPlaceAliasLowering:
         assert kernel._nki_output_input_alias_map([0, 1, 3]) == {0: 0}
 
 
+class TestAliasOutputsInPlaceOptIn:
+    """The alias_outputs_in_place opt-in dedups duplicate mutated-input outputs."""
+
+    def _count_graph_outputs(self, flag):
+        def torch_fn(x, y):
+            y.copy_(x)
+            return y
+
+        kernel = NkiKernel(
+            op_name="alias_optin_test",
+            torch_fn=torch_fn,
+            output_params=None,
+            static_argnums=(),
+            static_argnames=(),
+        )
+        kernel.alias_outputs_in_place = flag
+        fake = (torch.randn(4, device="meta"), torch.randn(4, device="meta"))
+        gm = kernel._generate_fx_graph(fake, {})
+        out_node = next(n for n in gm.graph.nodes if n.op == "output")
+        outs = out_node.args[0]
+        return len(outs) if isinstance(outs, tuple | list) else 1
+
+    def test_flag_off_keeps_duplicate_output(self):
+        # A kernel that returns its mutated input emits the tensor twice.
+        assert self._count_graph_outputs(False) == 2
+
+    def test_flag_on_dedups_output(self):
+        # The opt-in drops the duplicate so the NEFF writes in place.
+        assert self._count_graph_outputs(True) == 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

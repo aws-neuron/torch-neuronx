@@ -12,6 +12,7 @@ for PyTorch's built-in decompositions.
 
 import logging
 import math
+import warnings
 from collections.abc import Callable
 from typing import ParamSpec, TypeVar
 
@@ -765,6 +766,47 @@ def linalg_matrix_exp_decomposition(a, taylor_order: int = 10, s_max: int = 18):
     return R
 
 
+@register_decomposition([aten.linalg_solve_triangular.default])
+def linalg_solve_triangular_decomposition(a, b, *, upper, left=True, unitriangular=False):
+    b = b.to(a.dtype)
+    if not left:
+        x_t = linalg_solve_triangular_decomposition(
+            a.transpose(-1, -2),
+            b.transpose(-1, -2),
+            upper=not upper,
+            left=True,
+            unitriangular=unitriangular,
+        )
+        return x_t.transpose(-1, -2)
+
+    n = a.shape[-1]
+    device = a.device
+    dtype = a.dtype
+    eye = torch.eye(n, dtype=dtype, device=device)
+
+    if unitriangular:
+        u = a
+        d_inv_b = b
+    else:
+        d_inv = torch.reciprocal(torch.diagonal(a, dim1=-2, dim2=-1))
+        u = a * d_inv.unsqueeze(-1)
+        d_inv_b = d_inv.unsqueeze(-1) * b
+
+    ones = torch.ones(n, n, dtype=torch.bool, device=device)
+    strict_keep = ones.triu(1) if upper else ones.tril(-1)
+    u = torch.where(strict_keep, u, eye)
+
+    n_mat = eye - u
+    num_squarings = math.ceil(math.log2(max(n, 2)))
+    u_inv = eye.expand_as(u)
+    p = n_mat
+    for _ in range(num_squarings):
+        u_inv = torch.matmul(u_inv, eye + p)
+        p = torch.matmul(p, p)
+
+    return torch.matmul(u_inv, d_inv_b)
+
+
 # ``aten::_stack`` is the internal variant of ``stack`` (it assumes all inputs
 # already share a shape). Unlike ``aten::stack`` it ships no meta kernel, so
 # Dynamo can't trace it and it reaches the backend as an opaque ``torch.operator``
@@ -864,24 +906,22 @@ def _clamp_promoted_dtype(self_dtype, *bounds):
 
 @register_decomposition([aten.special_erfcx.default])
 def special_erfcx_decomp(self):
-    """Lower erfcx piecewise (erfc + exp lower natively).
-
-    exp(x^2)*erfc(x) is exact for small x but overflows to inf for large +x (where
-    erfcx->0). For x>3 use the asymptotic series (1/(x*sqrt(pi)))*(1 - 1/2x^2 + ...);
-    clamp the exp arg so the unselected exact lane can't overflow (f16-safe). Bounded
-    across f32/bf16.
-    """
-    x2 = self * self
-    exact = torch.exp(torch.clamp(x2, max=10.0)) * torch.erfc(self)
-    inv = 1.0 / (self * math.sqrt(math.pi))
+    """erfcx(x) = exp(x^2)*erfc(x). Bounded as x -> +inf; grows ~2*exp(x^2) as
+    x -> -inf. Compute erfcx(|x|) on the bounded non-negative argument, then
+    reflect for x < 0: erfcx(x) = 2*exp(x^2) - erfcx(|x|)."""
+    ax = torch.abs(self)
+    ax2 = ax * ax
+    exact = torch.exp(ax2) * torch.erfc(ax)
+    inv = 1.0 / (ax * math.sqrt(math.pi))
     asymp = inv * (
         1.0
-        - 1.0 / (2 * x2)
-        + 3.0 / (4 * x2 * x2)
-        - 15.0 / (8 * x2 * x2 * x2)
-        + 105.0 / (16 * x2 * x2 * x2 * x2)
+        - 1.0 / (2 * ax2)
+        + 3.0 / (4 * ax2 * ax2)
+        - 15.0 / (8 * ax2 * ax2 * ax2)
+        + 105.0 / (16 * ax2 * ax2 * ax2 * ax2)
     )
-    return torch.where(self > 3.0, asymp, exact)
+    erfcx_abs = torch.where(ax > 3.0, asymp, exact)
+    return torch.where(self < 0.0, 2.0 * torch.exp(ax2) - erfcx_abs, erfcx_abs)
 
 
 @register_decomposition([aten.mvlgamma.default])
@@ -1794,7 +1834,9 @@ def _compute_attention_backward_nki(
         lse_4d = logsumexp
 
     logical_neuron_cores = int(get_logical_neuron_cores())
-    grid = (logical_neuron_cores,) if B * kv_heads % logical_neuron_cores == 0 else (1,)
+    # Launch gridless when the work does not divide evenly: the kernel then runs
+    # unsharded, and it must not declare an LNC that the compile contradicts.
+    grid = (logical_neuron_cores,) if B * kv_heads % logical_neuron_cores == 0 else ()
 
     # Call NKI bwd kernel
     grad_q_nki, grad_k_nki, grad_v_nki = wrapped_flash_bwd[grid](
@@ -2639,10 +2681,10 @@ def _embedding_dense_backward_nki(
     src = grad_flat[order].contiguous()
 
     # D-shard the [E, D] table across logical cores (each owns a disjoint column
-    # slice). Fall back to single shard if embed_dim is not divisible by the core
-    # count (the kernel splits D evenly).
+    # slice). Launch gridless if embed_dim is not divisible by the core count (the
+    # kernel splits D evenly, and it must not declare a contradicting LNC).
     logical_neuron_cores = int(get_logical_neuron_cores())
-    grid = (logical_neuron_cores,) if embed_dim % logical_neuron_cores == 0 else (1,)
+    grid = (logical_neuron_cores,) if embed_dim % logical_neuron_cores == 0 else ()
     return wrapped_embedding_dense_backward_nki[grid](num_weights, idx_i32, src)
 
 
@@ -2891,31 +2933,58 @@ def masked_scatter_backward_decomposition(grad_output, mask, sizes):
 def grouped_mm_decomposition(a, b, offs):
     """Decompose grouped matmul for torch.compile/MLIR paths.
 
-    2D x 2D: a (d1, t), b (t, d2), offs (g,) -> (g, d1, d2) - calls NKI kernel
-    2D x 3D: a (t, d1), b (g, d1, d2), offs (g,) -> (t, d2) - decomposes to primitives
+    2D x 2D: a (d1, t), b (t, d2), offs (g,) -> (g, d1, d2)
+    2D x 3D: a (t, k), b (g, k, n), offs (g,) -> (t, n)
+
+    Prefers the ragged grouped_mm NKI kernels, which accept arbitrary ``offs`` (no
+    alignment requirement, no host-side padding). A shape whose per-expert weights do
+    not fit the ragged kernels' SBUF access patterns falls back to the aligned
+    lowering, which is correct only for ``offs`` on a ``get_gmm_align()`` boundary.
     """
-    # 2D x 2D case - call NKI kernel
-    if a.dim() == 2 and b.dim() == 2:
+    from torch_neuronx.python_ops.grouped_mm import ragged_grouped_mm_supported
+
+    if a.dim() != 2 or b.dim() not in (2, 3):
+        return NotImplemented
+
+    if ragged_grouped_mm_supported(a, b, offs):
+        if b.dim() == 2:
+            from torch_neuronx.python_ops.nki_kernels.grouped_mm_ragged import (
+                grouped_mm_ragged_2d_2d_nki,
+            )
+
+            return grouped_mm_ragged_2d_2d_nki(a, b, offs)
+
+        from torch_neuronx.python_ops.nki_kernels.grouped_mm_ragged import (
+            grouped_mm_ragged_2d_3d_nki,
+        )
+
+        return grouped_mm_ragged_2d_3d_nki(a, b, offs)[: a.shape[0]]
+
+    from torch_neuronx.utils import get_gmm_align
+
+    align = get_gmm_align()
+    # offs lives on device and dispatch caches on shapes only, so the alignment this
+    # path needs cannot be checked here; warn at trace time instead.
+    warnings.warn(
+        f"aten::_grouped_mm: a.shape={list(a.shape)}, b.shape={list(b.shape)} exceeds the "
+        f"ragged kernels' SBUF access-pattern limits; using the aligned lowering, which is "
+        f"correct only if offs is aligned to {align}.",
+        stacklevel=2,
+    )
+
+    if b.dim() == 2:
         from torch_neuronx.python_ops.nki_kernels.grouped_mm import grouped_mm_2d_2d_nki
 
         return grouped_mm_2d_2d_nki(a, b, offs)
 
-    # 2D x 3D case - decompose to primitives
-    if a.dim() == 2 and b.dim() == 3:
-        from torch_neuronx.utils import get_gmm_align
-
-        t, d1 = a.shape
-        g, _, d2 = b.shape
-        align = get_gmm_align()
-
-        b_index = (offs[:, None] // align <= torch.arange(t // align, device=a.device)).sum(0)
-        b_index = torch.clamp(b_index, 0, g - 1)
-        a_batched = a.reshape(t // align, align, d1)
-        b_batched = b[b_index]
-        r_batched = a_batched @ b_batched
-        return r_batched.reshape(t, d2)
-
-    return NotImplemented
+    t, d1 = a.shape
+    g, _, d2 = b.shape
+    b_index = (offs[:, None] // align <= torch.arange(t // align, device=a.device)).sum(0)
+    b_index = torch.clamp(b_index, 0, g - 1)
+    a_batched = a.reshape(t // align, align, d1)
+    b_batched = b[b_index]
+    r_batched = a_batched @ b_batched
+    return r_batched.reshape(t, d2)
 
 
 def _validate_convolution_inputs(
@@ -5875,7 +5944,7 @@ def _foreach_norm_decomp(self, ord=2):
             continue
         try:
             data = t.float() if t.dtype == torch.float64 else t
-            out = nki_kernel[(2,)](data, data.numel())[0, 0]
+            out = nki_kernel(data, data.numel())[0, 0]
             result.append(out.to(torch.float64) if t.dtype == torch.float64 else out)
         except Exception:
             # Fall back to the torch op if the NKI kernel fails

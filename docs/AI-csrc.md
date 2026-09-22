@@ -24,10 +24,10 @@ the path stays entirely in C++ with no GIL**. Cache miss: acquire GIL → call
 populate cache → hand to `CompilationCache`. `DispatchWithCasting` upcasts
 outputs when 64-bit inputs were downcast.
 
-**Allocators (`core/allocator/`).** Strategy selected by
-`TORCH_NEURONX_ENABLE_LAZY_ALLOC`: caching allocator (per-stream per-size LIFO
-freelist with `weak_ptr`, stream-safe frees) vs segment allocator (carves
-large NRT slabs into blocks; `lazy::AllocBind`/`DeallocRelease`). Pinned host
+**Allocators (`core/allocator/`).** Device memory is always lazily bound: the
+caller gets an `mmap` placeholder and the physical carve runs later on the
+runtime worker through the segment allocator (carves large NRT slabs into
+blocks; `lazy::AllocBind`/`DeallocRelease`). Pinned host
 allocator gated by `TORCH_NEURONX_USE_PINNED_MALLOC`.
 
 **Compilation cache (`core/compilation/`).** Thread-safe LRU with

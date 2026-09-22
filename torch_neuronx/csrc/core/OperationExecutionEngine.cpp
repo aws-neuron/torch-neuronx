@@ -718,22 +718,6 @@ void OperationExecutionEngine::SubmitOperation(
   }
 }
 
-void OperationExecutionEngine::RecordHint(std::unique_ptr<OperationContext> hint,
-                                          const NeuronStream& stream) {
-  if (shutdown_requested_.load()) return;
-  if (!concatenation_enabled_) return;
-
-  // Hints need a valid StreamImpl* for the concatenation engine's stream-change detection.
-  hint->stream = GetDefaultStreamImpl(stream.device_index());
-
-  std::shared_ptr<OperationContext> shared = std::move(hint);
-  {
-    std::lock_guard<std::mutex> lock(dispatch_mutex_);
-    dispatch_queue_.push_back(std::move(shared));
-  }
-  concatenation_cv_.notify_one();
-}
-
 void OperationExecutionEngine::SubmitCompilationTask(OperationContext* operation) {
   if (shutdown_requested_.load()) {
     TORCH_NEURONX_DEBUG("Rejecting compilation task submission during shutdown",
@@ -767,14 +751,15 @@ void OperationExecutionEngine::MoveToRuntimeQueueInOrder(
     EXECUTION_RUNTIME_CHECK(
         it != owners.end(),
         "MoveToRuntimeQueueInOrder: op missing from owners map. op_name=", raw->GetOpName());
-    if (raw->GetKernelType() == KernelTypeEnum::kHint) {
-      // Hints don't enter runtime_queue_; releasing the shared_ptr destroys the op.
-      owners.erase(it);
-      continue;
-    }
     EmitToRuntimeQueue(std::move(it->second));
     owners.erase(it);
   }
+}
+
+OperationExecutionEngine::ConcatenationQueueDepthSnapshot
+OperationExecutionEngine::SnapshotConcatenationQueueDepth(bool shutdown) const {
+  int64_t current_depth = execution_queue_depth_.load();
+  return {current_depth, current_depth <= queue_low_threshold_ || shutdown};
 }
 
 void OperationExecutionEngine::TestInjectIntoRuntimeQueue(StreamImpl* stream,
@@ -888,6 +873,7 @@ void OperationExecutionEngine::ConcatenationWorker() {
     OperationContext* new_op = nullptr;
     bool needs_flush = false;
     bool shutdown = false;
+    ConcatenationQueueDepthSnapshot depth_snapshot{};
 
     // Wait for new work or flush trigger; identify the next not-yet-buffered
     // op (if any) at the head of the unconsumed suffix.
@@ -917,7 +903,8 @@ void OperationExecutionEngine::ConcatenationWorker() {
         new_op = it->get();
       }
 
-      needs_flush = (execution_queue_depth_.load() <= queue_low_threshold_) || shutdown;
+      depth_snapshot = SnapshotConcatenationQueueDepth(shutdown);
+      needs_flush = depth_snapshot.needs_flush;
 
       if (shutdown && new_op == nullptr && buffered == 0) {
         // Nothing to drain and no new ops — exit.
@@ -928,7 +915,7 @@ void OperationExecutionEngine::ConcatenationWorker() {
     // engine's internal buffer is raw-pointer aliases into dispatch_queue_;
     // the worker is the sole consumer, so prefix pointers stay stable while
     // this thread doesn't mutate the queue.
-    int64_t current_depth = execution_queue_depth_.load();
+    int64_t current_depth = depth_snapshot.current_depth;
 
     if (needs_flush) {
       auto flushed = concatenation_engine_->Flush(SIZE_MAX);
@@ -959,7 +946,7 @@ void OperationExecutionEngine::ConcatenationWorker() {
 
       try {
         ProcessPreprocessingTask(new_op);
-        if (result_raws.size() + current_depth <= static_cast<size_t>(queue_low_threshold_)) {
+        if (depth_snapshot.ShouldBypassConcatenation(result_raws.size(), queue_low_threshold_)) {
           // Skip concatenation when total queue depth is low — keep the
           // device fed.
           new_op->CompleteConcatenation();
@@ -992,18 +979,10 @@ void OperationExecutionEngine::ConcatenationWorker() {
       }
     }
 
-    // Snapshot non-hints before drain_and_move releases hint owners.
     if (!result_raws.empty()) {
-      std::vector<OperationContext*> non_hint_ops;
-      non_hint_ops.reserve(result_raws.size());
-      for (auto* op : result_raws) {
-        if (op->GetKernelType() != KernelTypeEnum::kHint) {
-          non_hint_ops.push_back(op);
-        }
-      }
       drain_and_move(result_raws.size(), result_raws);
 
-      for (auto* op : non_hint_ops) {
+      for (auto* op : result_raws) {
         submit_compile_or_ready(op);
       }
     }
@@ -1023,15 +1002,8 @@ void OperationExecutionEngine::ConcatenationWorker() {
   // Final shutdown flush.
   auto final_flush = concatenation_engine_->Flush(SIZE_MAX);
   if (!final_flush.empty()) {
-    std::vector<OperationContext*> non_hint_ops;
-    non_hint_ops.reserve(final_flush.size());
-    for (auto* op : final_flush) {
-      if (op->GetKernelType() != KernelTypeEnum::kHint) {
-        non_hint_ops.push_back(op);
-      }
-    }
     drain_and_move(final_flush.size(), final_flush);
-    for (auto* op : non_hint_ops) {
+    for (auto* op : final_flush) {
       submit_compile_or_ready(op);
     }
   }
@@ -1170,7 +1142,7 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
     return true;
   }
 
-  // Host-side ops (events, barriers, hints, allocs, deallocs) don't use NRT device scheduling.
+  // Host-side ops (events, barriers, allocs, deallocs) don't use NRT device scheduling.
   bool is_pending_host_op = !IsDeviceKernelType(kernel_type);
 
   if (is_pending_host_op) {
@@ -1347,7 +1319,7 @@ void OperationExecutionEngine::ProcessCompletions(StreamImpl* stream,
       const KernelTypeEnum kernel_type = op->GetKernelType();
       try {
         // kAlloc is already scheduled in ScheduleAllocOperation; all other
-        // pending-signal host ops (events, hints, barriers, deallocs) Schedule here.
+        // pending-signal host ops (events, barriers, deallocs) Schedule here.
         if (kernel_type != KernelTypeEnum::kAlloc) {
           op->execute_start = std::chrono::steady_clock::now();
           op->neuron_stream_os_tid = getOsTid();

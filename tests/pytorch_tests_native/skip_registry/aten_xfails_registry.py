@@ -163,20 +163,11 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "Extremal inputs feed inf and NaN to celu, hardsigmoid, logit, round,"
-            " and round.decimals. Neuron and the CPU _refs golden disagree on inf"
-            " and NaN handling. Real-range inputs pass. These boundary cases are"
-            " not wrong lowerings."
+            "Extremal inputs feed inf and NaN to celu, hardsigmoid, and logit."
+            " Neuron and the CPU _refs golden disagree on inf and NaN handling."
+            " Real-range inputs pass. These boundary cases are not wrong lowerings."
         ),
         tests=x.EXTREMAL_REF_NUMERICS,
-    ),
-    SkipGroup(
-        reason=(
-            "Large finite inputs to round and frac. At that magnitude the float"
-            " mantissa has no fraction bits, so the result is precision-bound, not"
-            " incorrect. The normal and small ranges pass."
-        ),
-        tests=x.LARGE_ROUND_FRAC,
     ),
     SkipGroup(
         reason=(
@@ -191,8 +182,46 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_decomp.py::TestDecompNEURON::test_quick_ldexp_neuron_bfloat16",
             "test_decomp.py::TestDecompNEURON::test_quick_ldexp_neuron_float16",
             "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal_nn_functional_celu_neuron_bfloat16",
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal_round_decimals_3_neuron_bfloat16",
             "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_small_nn_functional_celu_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_round_decimals_3_neuron_bfloat16",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_normal_round_decimals_3_neuron_bfloat16",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Upstream meta of aten.nonzero_static has a device allowlist."
+            " torch/_meta_registrations.py:3803 gives contiguous strides to cpu,"
+            " mps and xpu. It gives column-major strides (1, size) to every other"
+            " device. Neuron is not in the allowlist, so the meta reports"
+            " (1, size). The Neuron result is contiguous, which agrees with CPU."
+            " The crossref test then finds a stride mismatch on"
+            " aten.nonzero_static.default, which torch.combinations calls."
+            " The dispatcher output-layout fix cannot repair this. The target"
+            " layout comes from the meta device branch, not from a permuted"
+            " input. Upstream must add the device, or Neuron must copy the CUDA"
+            " layout. xfail (not skip) so an upstream change gives an xpass."
+        ),
+        tests=[
+            "test_ops.py::TestFakeTensorNEURON::test_fake_crossref_backward_amp_combinations_neuron_float32",
+            "test_ops.py::TestFakeTensorNEURON::test_fake_crossref_backward_no_amp_combinations_neuron_float32",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "The upstream max_unpool2d decomposition has a device allowlist."
+            " torch/_decomp/decompositions.py:3198 applies suggest_memory_format"
+            " only to cpu and xpu, so the meta gives a contiguous output for"
+            " Neuron. Neuron has no max_unpool2d lowering, so the op runs the"
+            " native CPU kernel through the fallback. That kernel keeps the"
+            " channels-last layout of the input. The crossref test then finds a"
+            " stride mismatch on aten.max_unpool2d.default. The dispatcher"
+            " output-layout fix cannot repair this. The meta drops the layout,"
+            " and the real result already keeps it. xfail (not skip) so an"
+            " upstream change or a Neuron lowering gives an xpass."
+        ),
+        tests=[
+            "test_ops.py::TestFakeTensorNEURON::test_fake_crossref_backward_amp_nn_functional_max_unpool2d_grad_neuron_float32",
+            "test_ops.py::TestFakeTensorNEURON::test_fake_crossref_backward_no_amp_nn_functional_max_unpool2d_grad_neuron_float32",
         ],
     ),
     SkipGroup(
@@ -295,9 +324,10 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "[PT 2.14][runtime_misc.foreach_norm_integer] foreach_norm on integer/bool"
-            " inputs calls linalg.vector_norm which requires floating-point."
-            " CPU casts to float first; Neuron's foreach dispatch does not."
+            "[PT 2.14][runtime_misc.foreach_norm_integer] Upstream test bug, not a"
+            " Neuron limit. test_foreach_reduce_large_input compares ref(inputs) to"
+            " the device result, but foreach_norm rejects an integral input on every"
+            " backend. The reference raises on CPU too, so the test cannot pass."
         ),
         tests=x.FOREACH_NORM_INTEGER,
     ),
@@ -593,22 +623,6 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_nn.py::TestNN::test_batchnorm_nhwc_cpu",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "int64 comparison magnitude limitation. On the native-int64 path,"
-            " comparison ops (eq/ne/gt/ge/lt/le) are demoted to the packed int32"
-            " view (native S64 compare+transpose hangs the compiler), and the"
-            " packed compare uses the low 32 bits only. test_abs_big_number does"
-            " abs(2**31+1) (native, correct full-width = 2147483649) then '> 0',"
-            " whose low word (0x80000001) is negative as int32 -> False. On main"
-            " int64 is downcast at creation (value truncated below 2**31) so '> 0'"
-            " is trivially true. xfail (not skip) so it xpasses and flags the fix"
-            " once native int64 comparisons (or a sign-correct packed compare) land."
-        ),
-        tests=[
-            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_abs_big_number_neuron_int64",
         ],
     ),
     SkipGroup(
@@ -1114,6 +1128,27 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_foreach.py::TestForeachNEURON::test_0dim_tensor_overload_exception_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Compiler bug P513654345: stablehlo.convert i1 -> i64 does not write"
+            " all the high words of its i64 output. _foreach_pow on bool"
+            " decomposes to pow.Tensor_Scalar, whose graph converts a bool operand"
+            " to int64 on a 20x20 tensor, so the result keeps stale high words and"
+            " the int64 values are wrong (the low words are correct). The compiler"
+            " writes both lanes for any 1-D shape and for 4x4 and 8x8, and misses"
+            " some high words from 16x16 up (16x16 7/256, 20x20 9/400, 32x32"
+            " 120/1024). Framework widening (materialize_from_i32) and int64 copy_"
+            " were both verified correct, and the same corruption reproduces with"
+            " no ATen dispatch. These pass on main only because main compares int64"
+            " on the packed low 32 bits, which cannot see the corrupt high words."
+            " xfail (not skip) so they xpass and flag the fix once the compiler"
+            " writes both lanes."
+        ),
+        tests=[
+            "test_foreach.py::TestForeachNEURON::test_parity__foreach_pow_fastpath_outplace_neuron_bool",
+            "test_foreach.py::TestForeachNEURON::test_parity__foreach_pow_slowpath_outplace_neuron_bool",
         ],
     ),
 ]

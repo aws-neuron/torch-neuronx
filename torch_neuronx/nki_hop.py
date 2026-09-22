@@ -138,12 +138,16 @@ class NKIRegistry:
     and only consume tensor inputs.
     """
     constant_args: ClassVar[dict[int, dict[str, Any]]] = {}
+    # Per-kernel opt-in: the kernel returns its mutated inputs, so the eager
+    # lowering can drop the duplicate mutated-input outputs and write in place.
+    alias_in_place: ClassVar[dict[int, bool]] = {}
 
     def add_kernel(
         self,
         kernel: TorchNativeKernel,
         kernel_arg_names: list[str],
         kernel_default_args: dict[str, Any] | None = None,
+        alias_outputs_in_place: bool = False,
     ) -> int:
         # Returns index on the table
         if kernel_default_args is None:
@@ -157,6 +161,7 @@ class NKIRegistry:
         self.kernel_to_id[kernel] = idx
         self.kernel_arg_names[idx] = kernel_arg_names
         self.kernel_default_args[idx] = kernel_default_args
+        self.alias_in_place[idx] = alias_outputs_in_place
         return idx
 
     def get_kernel(self, idx: int) -> TorchNativeKernel:
@@ -171,6 +176,9 @@ class NKIRegistry:
     def get_kernel_default_args(self, idx: int) -> dict[str, Any]:
         assert idx in self.kernel_default_args
         return self.kernel_default_args[idx]
+
+    def get_alias_outputs_in_place(self, idx: int) -> bool:
+        return self.alias_in_place.get(idx, False)
 
     def add_constant_args(self, args: dict[str, Any], hash_key: int | str):
         assert hash_key != -1
@@ -188,6 +196,7 @@ class NKIRegistry:
         self.kernel_arg_names = {}
         self.kernel_default_args = {}
         self.constant_args = {}
+        self.alias_in_place = {}
 
 
 kernel_registry = NKIRegistry()
@@ -289,8 +298,9 @@ def get_kernel_config(
                 meta_args[k] = torch.empty(arg.shape, dtype=arg.dtype, device="meta")
             else:
                 meta_args[k] = arg
-        lnc = grid[0] if grid else 1
-        dconfig = get_config(kernel[lnc], **meta_args)
+        # Keep a gridless launch gridless. A forced LNC=1 contradicts an LNC=2
+        # compile and fails with NCC_EVRF066. Let NKI resolve the grid instead.
+        dconfig = get_config(kernel[grid[0]] if grid else kernel, **meta_args)
     return dconfig
 
 
@@ -727,12 +737,18 @@ class NKIHOPCaller:
 # This will execute the kernel registration during tracing
 # and fold it to the constant kernel idx.
 @torch._dynamo.assume_constant_result
-def register_kernel_to_torch(nki_func, k_fields, arg_names, kernel_default_args, **kwargs):
+def register_kernel_to_torch(
+    nki_func, k_fields, arg_names, kernel_default_args, alias_outputs_in_place=False, **kwargs
+):
     kernel = TorchNativeKernel(nki_func, **k_fields, target=get_platform_target(), **kwargs)
-    return kernel_registry.add_kernel(kernel, arg_names, kernel_default_args)
+    return kernel_registry.add_kernel(
+        kernel, arg_names, kernel_default_args, alias_outputs_in_place=alias_outputs_in_place
+    )
 
 
-def wrap_nki(nki_kernel, has_side_effect: bool = False, **kwargs) -> Any:
+def wrap_nki(
+    nki_kernel, has_side_effect: bool = False, alias_outputs_in_place: bool = False, **kwargs
+) -> Any:
     """Allows capture of a nki kernel into a graph via torch.compile
 
     These technologies perform Dispatcher-based tracing (via
@@ -745,6 +761,15 @@ def wrap_nki(nki_kernel, has_side_effect: bool = False, **kwargs) -> Any:
     kernels whose effect is the call itself (e.g. a bounds check that faults via
     ``oob_mode.error``); otherwise the optimizer drops the call and the effect
     never runs.
+
+    ``alias_outputs_in_place=True`` is an opt-in for a must-alias kernel that
+    returns the same tensors it mutates (for example a KV-cache copy that
+    returns its destination buffers). The eager lowering then drops the
+    duplicate mutated-input outputs and writes the result in place, which
+    removes the extra output buffer. Set this only when every returned tensor
+    that aliases an input is safe to write in place. Do not set it for a kernel
+    that needs the mutated input as a separate output (for example
+    ``scatter_add``); the default is off.
 
     Note on int64: ``wrap_nki`` is the kernel-compile primitive and
     deliberately has no policy gating. It just compiles and runs whatever
@@ -763,7 +788,12 @@ def wrap_nki(nki_kernel, has_side_effect: bool = False, **kwargs) -> Any:
     k_fields = {f.name: getattr(nki_kernel, f.name) for f in fields(nki_kernel) if f.name != "func"}
 
     kernel_idx = register_kernel_to_torch(
-        nki_kernel.func, k_fields, arg_names, kernel_default_args, **kwargs
+        nki_kernel.func,
+        k_fields,
+        arg_names,
+        kernel_default_args,
+        alias_outputs_in_place=alias_outputs_in_place,
+        **kwargs,
     )
 
     return NKIHOPCaller(

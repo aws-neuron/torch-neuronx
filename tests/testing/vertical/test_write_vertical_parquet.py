@@ -7,14 +7,10 @@ tested on a plain runner.
 
 from __future__ import annotations
 
-import sys
 from datetime import datetime
-from pathlib import Path
 
 import pyarrow.parquet as pq
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 import write_vertical_parquet as wv
 
 _METADATA = {

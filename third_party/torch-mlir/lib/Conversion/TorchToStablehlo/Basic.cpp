@@ -664,18 +664,77 @@ public:
         else
           result = stablehlo::FloorOp::create(rewriter, loc, result);
       } else if (!outElemTy.isUnsignedInteger()) {
-        Type defaultIntToFloatType = rewriter.getF64Type();
-        lhs =
-            hlo::promoteType(rewriter, op.getLoc(), lhs, defaultIntToFloatType);
-        rhs =
-            hlo::promoteType(rewriter, op.getLoc(), rhs, defaultIntToFloatType);
-        result = ChloOpT::create(
+        // Signed-integer floor division, computed in the integer domain.
+        //
+        // Promoting the operands to float first (the previous behaviour) is
+        // lossy for int64: f64 autocasts to f32 on Neuron, so the i64 -> f32
+        // convert drops the high word and the 24-bit mantissa cannot hold the
+        // value. floor_divide then returned 0 for any |operand| >= 2**32, e.g.
+        // floor_divide(INT_MIN, -1) == 0.
+        //
+        // `result` already holds the truncating integer quotient. Turn trunc
+        // into floor: subtract 1 when the remainder is non-zero and its sign
+        // differs from the divisor's (i.e. the true quotient was negative and
+        // got truncated towards zero).
+        DenseI64ArrayAttr bcast;
+        chlo::ComparisonTypeAttr cmpTy;
+        auto ne = chlo::ComparisonDirectionAttr::get(
+            rewriter.getContext(), chlo::ComparisonDirection::NE);
+        auto lt = chlo::ComparisonDirectionAttr::get(
+            rewriter.getContext(), chlo::ComparisonDirection::LT);
+        auto i1Ty = cast<TensorType>(outType.clone(rewriter.getI1Type()));
+
+        Value rem =
+            chlo::BroadcastRemOp::create(rewriter, loc, outType, lhs, rhs, bcast);
+        Value zero = stablehlo::ConstantOp::create(
             rewriter, loc,
-            outType.cloneWith(outType.getShape(), defaultIntToFloatType), lhs,
-            rhs, bcastDimensions);
-        result = stablehlo::FloorOp::create(rewriter, loc, result).getResult();
-        result = hlo::promoteType(rewriter, op.getLoc(), result,
-                                  outType.getElementType());
+            DenseElementsAttr::get(
+                cast<ShapedType>(outType),
+                APInt(cast<IntegerType>(outElemTy).getWidth(), 0)));
+        Value one = stablehlo::ConstantOp::create(
+            rewriter, loc,
+            DenseElementsAttr::get(
+                cast<ShapedType>(outType),
+                APInt(cast<IntegerType>(outElemTy).getWidth(), 1)));
+        Value remNonZero = chlo::BroadcastCompareOp::create(
+            rewriter, loc, i1Ty, rem, zero, bcast, ne, cmpTy);
+        Value remNeg = chlo::BroadcastCompareOp::create(rewriter, loc, i1Ty, rem,
+                                                        zero, bcast, lt, cmpTy);
+        Value rhsNeg = chlo::BroadcastCompareOp::create(rewriter, loc, i1Ty, rhs,
+                                                        zero, bcast, lt, cmpTy);
+        Value signsDiffer =
+            stablehlo::XorOp::create(rewriter, loc, remNeg, rhsNeg);
+        Value needAdjust =
+            stablehlo::AndOp::create(rewriter, loc, remNonZero, signsDiffer);
+        Value quotMinusOne =
+            stablehlo::SubtractOp::create(rewriter, loc, result, one);
+        result = stablehlo::SelectOp::create(rewriter, loc, needAdjust,
+                                            quotMinusOne, result)
+                     .getResult();
+
+        // INT_MIN / -1 is the one signed-division overflow. The true quotient
+        // 2**(w-1) is not representable; PyTorch (like C) wraps to INT_MIN,
+        // while the device divide saturates to INT_MAX. Select INT_MIN back.
+        unsigned width = cast<IntegerType>(outElemTy).getWidth();
+        auto eq = chlo::ComparisonDirectionAttr::get(
+            rewriter.getContext(), chlo::ComparisonDirection::EQ);
+        Value intMin = stablehlo::ConstantOp::create(
+            rewriter, loc,
+            DenseElementsAttr::get(cast<ShapedType>(outType),
+                                   APInt::getSignedMinValue(width)));
+        Value negOne = stablehlo::ConstantOp::create(
+            rewriter, loc,
+            DenseElementsAttr::get(cast<ShapedType>(outType),
+                                   APInt::getAllOnes(width)));
+        Value lhsIsIntMin = chlo::BroadcastCompareOp::create(
+            rewriter, loc, i1Ty, lhs, intMin, bcast, eq, cmpTy);
+        Value rhsIsNegOne = chlo::BroadcastCompareOp::create(
+            rewriter, loc, i1Ty, rhs, negOne, bcast, eq, cmpTy);
+        Value overflow =
+            stablehlo::AndOp::create(rewriter, loc, lhsIsIntMin, rhsIsNegOne);
+        result =
+            stablehlo::SelectOp::create(rewriter, loc, overflow, intMin, result)
+                .getResult();
       }
     }
     rewriter.replaceOp(op, result);

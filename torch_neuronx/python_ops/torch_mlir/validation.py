@@ -54,6 +54,28 @@ def validate_float_only_dtype(self, *_operands, **_kwargs):
         raise RuntimeError(f'"round/frac" not implemented for {self.dtype}')
 
 
+def check_broadcast_shapes(t1, t2):
+    """Reject a non-broadcastable pair with the message that TensorIterator raises.
+
+    Neuron reports a broadcast failure from the lowering, with different wording.
+    """
+    if t1.shape == t2.shape:
+        return
+    try:
+        torch.broadcast_shapes(t1.shape, t2.shape)
+    except RuntimeError:
+        for dim in range(max(t1.ndim, t2.ndim)):
+            d1 = t1.shape[-(dim + 1)] if dim < t1.ndim else 1
+            d2 = t2.shape[-(dim + 1)] if dim < t2.ndim else 1
+            if d1 != d2 and d1 != 1 and d2 != 1:
+                actual_dim = max(t1.ndim, t2.ndim) - 1 - dim
+                raise RuntimeError(
+                    f"The size of tensor a ({d1}) must match the size of "
+                    f"tensor b ({d2}) at non-singleton dimension {actual_dim}"
+                ) from None
+        raise
+
+
 def is_bool_operand(operand):
     """True when an operand is bool. An operand is a tensor, a number, or a list."""
     if isinstance(operand, torch.Tensor):

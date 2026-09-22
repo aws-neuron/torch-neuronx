@@ -16,7 +16,7 @@ op_coverage_torch_compile), the same split the dashboard already reads:
     custom-test-artifacts/vertical_ops/<table>/branch=<branch>/dt=<date>/run_<id>.parquet
 
 Usage:
-    python tests/vertical/tools/aggregate_vertical_results.py \
+    python testing/vertical/aggregate_vertical_results.py \
         --csv target_ops_coverage_20260908_120000.csv \
         --suite target_ops_coverage \
         --output-dir /tmp/vertical-results

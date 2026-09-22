@@ -78,6 +78,42 @@ def torch_sum(self, dim=None, keepdim=False, dtype=None, out=None):
     return _reduce_with_promotion(torch.sum, target_dtype, dtype, self, dim, keepdim)
 
 
+@register_aten(["aten::prod", "aten::prod.out"], static_argnames=("dtype",), output_params=("out",))
+def torch_prod(self, dtype=None, out=None):
+    """Full-reduction product.
+
+    Integer/bool inputs promote the result to int64 like CPU. Low-precision
+    floats accumulate in fp32 (CPU acc_type) then cast back to preserve the
+    output dtype.
+    """
+    if dtype is None and self.dtype in (torch.bfloat16, torch.float16):
+        return torch.prod(self.to(torch.float32)).to(self.dtype)
+    target_dtype = _infer_int64_promotion(dtype, self)
+    return _reduce_with_promotion(torch.prod, target_dtype, dtype, self)
+
+
+@register_aten(
+    ["aten::prod.dim_int", "aten::prod.int_out"],
+    static_argnums=(1, 2),
+    static_argnames=("dtype",),
+    output_params=("out",),
+)
+def torch_prod_dim(self, dim, keepdim=False, dtype=None, out=None):
+    """Dimension product reduction.
+
+    Same dtype semantics as torch_prod. Kept in a separate registration group
+    from the full-reduce out-variant so the divergent output shapes do not
+    share output-shape inference.
+    """
+    target_dtype = _infer_int64_promotion(dtype, self)
+    if self.ndim == 0:
+        _validate_scalar_dim(dim)
+        return self.clone().to(target_dtype) if target_dtype else self.clone()
+    if dtype is None and self.dtype in (torch.bfloat16, torch.float16):
+        return torch.prod(self.to(torch.float32), dim, keepdim).to(self.dtype)
+    return _reduce_with_promotion(torch.prod, target_dtype, dtype, self, dim, keepdim)
+
+
 @register_aten(
     ["aten::mean", "aten::mean.dim", "aten::mean.out", "aten::mean.dtype_out"],
     static_argnums=(1, 2),

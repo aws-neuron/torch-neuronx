@@ -482,6 +482,8 @@ struct MetaOutputSpec {
   std::vector<int64_t> shape;
   c10::ScalarType dtype;
   bool is_undefined;  // True for None/undefined tensor outputs
+  // The layout that ATen gives the output. Empty for an undefined output.
+  std::vector<int64_t> strides;
 };
 
 /**
@@ -500,6 +502,31 @@ std::vector<MetaOutputSpec> ExtractMetaOutputSpecs(torch::jit::Stack& stack);
  */
 std::vector<MetaOutputSpec> InferOutputsViaMeta(const c10::OperatorHandle& op,
                                                 const std::vector<c10::IValue>& args);
+
+/**
+ * Report the output layout that ATen gives this op for these arguments.
+ *
+ * ATen propagates the layout of the inputs to the output. A Neuron output is
+ * contiguous instead, because DispatchCacheEntry::OutputSpec holds a shape and
+ * a dtype only. Call this function on a cache miss to recover the layout.
+ *
+ * The result is empty when there is no layout to propagate. The reasons are:
+ * the epilogue is off, the op writes an argument, every input is contiguous,
+ * or the Meta kernel rejects the arguments.
+ *
+ * Each entry keeps the Meta shape and dtype. The strides field is non-empty
+ * only for a dense permutation that the epilogue can fuse into the NEFF. An
+ * empty strides field means keep the contiguous output.
+ *
+ * @param op             The operator handle
+ * @param schema         Op schema
+ * @param original_args  Arguments before DowncastArgs and PreprocessArgs. The
+ *                       tensors still carry the strides of the caller.
+ * @return               One entry for each Meta tensor return, or empty
+ */
+std::vector<MetaOutputSpec> AtenOutputLayouts(const c10::OperatorHandle& op,
+                                              const c10::FunctionSchema& schema,
+                                              const std::vector<c10::IValue>& original_args);
 
 /**
  * Resolve the narrow functional weak-integer-scalar route before Neuron

@@ -1,9 +1,9 @@
 """Grid assertion for a ModuScope run: does the result grid prove what ran?
 
 ModuScope's own exit code is a conjunction over the validators that ran, so it cannot encode
-WHICH models ran: a run that executed two of three requested ids exits 0. Run as a script by the
-grade-grid job in _moduscope-tests.yml against the downloaded artifact, so the grading logic can
-be unit tested without a pod.
+WHICH models ran: a run that executed two of three requested ids exits 0. The
+_reusable-moduscope-tests.yml grade-grid job runs this module as a script. The module checks the
+downloaded artifact. Unit tests can run without a pod.
 """
 
 from __future__ import annotations

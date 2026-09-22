@@ -102,7 +102,7 @@ def _soft_fail_labels(config_path: Path | None = None) -> set[str]:
 
 
 # Maps the GitHub workflow ``name:`` (``GITHUB_WORKFLOW`` — the *caller* of the shared
-# ``_upstream-tests.yml``) to a stable dashboard enum, so the upstream parquet records
+# ``_reusable-upstream-tests.yml``) to a stable dashboard enum, so the upstream parquet records
 # which kind of run produced it without a cross-table join. Add a new entry when a new
 # caller workflow is onboarded. Keys mirror ``job_metrics.github_workflow`` verbatim.
 #

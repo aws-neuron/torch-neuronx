@@ -186,16 +186,17 @@ try:
     _wrapped_nonzero = wrap_nki(flat_nonzero_kernel)
 
     @nki_op("nki_kernels::nonzero", mutates_args={})
-    def nonzero_nki(x: torch.Tensor, lnc: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+    def nonzero_nki(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Flat nonzero on a [1, N] int32/float32 tensor, for any N.
 
         The kernel handles any N (full tiles + a tail tile), so no host-side
-        padding is needed.
+        padding is needed. Launch without a grid: the kernel takes no SPMD axis,
+        so it must not declare an LNC that the compile contradicts.
 
         Returns (indices[1, N] int32, count[1, 1] int32) where the first
         ``count`` entries of ``indices`` are the ascending flat indices.
         """
-        return _wrapped_nonzero[(lnc,)](x, chunk_size=DEFAULT_CHUNK_SIZE)
+        return _wrapped_nonzero(x, chunk_size=DEFAULT_CHUNK_SIZE)
 
     _has_nki_nonzero = True
 except (ImportError, ModuleNotFoundError):

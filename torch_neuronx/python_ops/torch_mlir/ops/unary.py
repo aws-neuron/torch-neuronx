@@ -167,6 +167,12 @@ def torch_abs(x, out=None):
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_neg(x, out=None):
+    # neuronx-cc fails to compile an int32 negate that feeds the transpose
+    # epilogue alone (contiguous input, permuted output). A subtraction from
+    # zero compiles, gives the same result, and measures faster than negate
+    # for int32. Other dtypes compile with negate.
+    if x.dtype == torch.int32:
+        return 0 - x
     return torch.neg(x)
 
 

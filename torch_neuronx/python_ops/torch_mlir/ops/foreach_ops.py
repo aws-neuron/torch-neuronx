@@ -2,7 +2,10 @@
 
 import torch
 
-from torch_neuronx.python_ops.nki_kernels.foreach_norm import _has_nki_norm_kernels
+from torch_neuronx.python_ops.nki_kernels.foreach_norm import (
+    _has_nki_norm_kernels,
+    check_norm_inputs,
+)
 
 if _has_nki_norm_kernels:
     from torch_neuronx.python_ops.nki_kernels.foreach_norm import foreach_norm_nki
@@ -31,7 +34,7 @@ from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
 )
 
 from ..operation_registry import Preprocessing, register_aten
-from ..validation import check_bool_sub, check_lerp_dtype
+from ..validation import check_bool_sub, check_broadcast_shapes, check_lerp_dtype
 
 # --- Validation helpers ---
 
@@ -71,22 +74,7 @@ def _check_tensors_scalars(tensors, scalars):
         raise RuntimeError("Tensor list must have same number of elements as scalar list.")
 
 
-def _check_broadcastable_shapes(t1, t2):
-    if t1.shape == t2.shape:
-        return
-    try:
-        torch.broadcast_shapes(t1.shape, t2.shape)
-    except RuntimeError:
-        for dim in range(max(t1.ndim, t2.ndim)):
-            d1 = t1.shape[-(dim + 1)] if dim < t1.ndim else 1
-            d2 = t2.shape[-(dim + 1)] if dim < t2.ndim else 1
-            if d1 != d2 and d1 != 1 and d2 != 1:
-                actual_dim = max(t1.ndim, t2.ndim) - 1 - dim
-                raise RuntimeError(
-                    f"The size of tensor a ({d1}) must match the size of "
-                    f"tensor b ({d2}) at non-singleton dimension {actual_dim}"
-                ) from None
-        raise
+_check_broadcastable_shapes = check_broadcast_shapes
 
 
 def _check_tensors_tensors(tensors1, tensors2):
@@ -220,6 +208,25 @@ def _replace_empty_promoted(tensors, dtype=None, scalars=None):
         torch.empty(t.shape, dtype=_target(t, s), device=t.device) if t.numel() == 0 else t
         for t, s in zip(tensors, scalars, strict=False)
     ]
+
+
+def _promote_sqrt_inputs(tensors, *, empty_only=False):
+    """Promote an integral input to float32, as sqrt does. Keep float and complex.
+
+    Retype an empty tensor by allocation, not by a convert: the compiler rejects
+    a convert on a 0-size tensor (NCC_ISPP060).
+    """
+    out = []
+    for t in tensors:
+        keep = t.dtype.is_floating_point or t.dtype.is_complex
+        if t.numel() == 0:
+            dtype = t.dtype if keep else torch.float32
+            out.append(torch.empty(t.shape, dtype=dtype, device=t.device))
+        elif keep or empty_only:
+            out.append(t)
+        else:
+            out.append(t.float())
+    return out
 
 
 def _promote_inside(op, tensors, scalars=None):
@@ -590,6 +597,7 @@ def torch_foreach_norm(tensors, ord=2, dtype=None, out=None):
         return foreach_norm_nki(tensors, ord=ord, dtype=dtype)
 
     # MLIR fallback
+    check_norm_inputs(tensors, ord)
     result = []
     for t in tensors:
         if t.numel() == 0:
@@ -604,16 +612,40 @@ def torch_foreach_norm(tensors, ord=2, dtype=None, out=None):
 # --- foreach_sqrt (unary) ---
 
 
+def _check_sqrt_inplace_dtype(tensors, *_args, **_kwargs):
+    """Reject an integral input for inplace sqrt, the same as Tensor.sqrt_ does.
+
+    sqrt promotes an integral input to the default dtype, which an integral
+    destination cannot hold. A complex destination holds a complex result.
+    """
+    for t in tensors:
+        if not (t.dtype.is_floating_point or t.dtype.is_complex):
+            raise RuntimeError(
+                f"result type {_get_dtype_name(torch.get_default_dtype())} can't be cast "
+                f"to the desired output type {_get_dtype_name(t.dtype)}"
+            )
+
+
 @register_aten(
     ["aten::_foreach_sqrt", "aten::_foreach_sqrt.out"], preprocessing=Preprocessing.SHAPE_ONLY
 )
 def torch_foreach_sqrt(tensors, out=None):
     _check_tensors(tensors)
-    tensors = _replace_empty(tensors)
-    return foreach_sqrt_nki, (tensors,), {}, None
+    # sqrt promotes an integral input to float. Retype the empties up front and
+    # the rest in-graph, the same as div (see _promote_inside).
+    tensors = _promote_sqrt_inputs(tensors, empty_only=True)
+
+    def compute_fn(tensors):
+        return foreach_sqrt_nki(_promote_sqrt_inputs(tensors))
+
+    return compute_fn, (tensors,), {}, None
 
 
-@register_aten(["aten::_foreach_sqrt_"], preprocessing=Preprocessing.VALUE_DEPENDENT)
+@register_aten(
+    ["aten::_foreach_sqrt_"],
+    preprocessing=Preprocessing.VALUE_DEPENDENT,
+    validate_static_inputs=_check_sqrt_inplace_dtype,
+)
 def torch_foreach_sqrt_inplace(tensors, out=None):
     _check_tensors(tensors)
     # Keep the list full-length (see _make_scalar_inplace_op).

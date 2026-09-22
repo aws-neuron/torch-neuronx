@@ -3,9 +3,7 @@
 import torch
 
 from torch_neuronx.utils import (
-    get_gmm_align,
     get_logical_neuron_cores,
-    skip_op_preconditions,
     use_dynamic_nki_kernels,
 )
 
@@ -29,21 +27,6 @@ _FREE_MAX = 32767
 # the 2Dx3D kernel, three in the 2Dx2D one. These bound g by bytes and by free dim.
 _SCHED_VECS_2D3D = 5
 _SCHED_VECS_2D2D = 3
-
-
-def validate_offs(offs, t, align=128):
-    """Validate offs tensor against t and align constraints."""
-    if skip_op_preconditions():
-        return True
-    if t % align != 0:
-        raise ValueError(f"t must be divisible by {align}")
-    if (offs < 0).any() or (offs > t).any():
-        raise ValueError(f"offs must be between 0 and {t}")
-    if (offs % align != 0).any():
-        raise ValueError(f"offs must be divisible by {align}")
-    if len(offs) > 1 and (offs[1:] < offs[:-1]).any():
-        raise ValueError("offs must be sorted")
-    return True
 
 
 def _translate_grouped_mm_args(*args, **kwargs):
@@ -81,10 +64,6 @@ def _ragged_shapes_ok(a, b, offs) -> bool:
         return False
     if a.dim() != 2:
         return False
-    # Both kernels shift ``offs`` down one to get per-group starts, a copy of g - 1
-    # elements; at g == 1 that is a zero-length access pattern and fails to compile.
-    if offs.shape[0] < 2:
-        return False
     # Per-group schedule vectors put g on a free dim.
     if offs.shape[0] > _FREE_MAX:
         return False
@@ -93,14 +72,11 @@ def _ragged_shapes_ok(a, b, offs) -> bool:
     # NeuronCore, so that dim must divide evenly.
     lnc = int(get_logical_neuron_cores())
     if b.dim() == 3:  # 2Dx3D: a (r, d1) @ b (g, d1, d2) -> (r, d2)
-        r, d1 = a.shape
+        _r, d1 = a.shape
         g, d1b, d2 = b.shape
         if d1 != d1b or offs.shape[0] != g:
             return False
         if d2 % lnc != 0:
-            return False
-        # Untested below one tile; decline rather than guess.
-        if r < _TILE:
             return False
         # Widest free dims: the token tile spans d1, and the resident weights span
         # (d1 / 128) * (d2 / lnc). Byte budget alone does not imply either fits.
@@ -116,7 +92,7 @@ def _ragged_shapes_ok(a, b, offs) -> bool:
         d1, t = a.shape
         tb, d2 = b.shape
         g = offs.shape[0]
-        if t != tb or t < _TILE:
+        if t != tb:
             return False
         if d2 % lnc != 0:
             return False
@@ -141,9 +117,7 @@ def _ragged_shapes_ok(a, b, offs) -> bool:
 def ragged_grouped_mm_supported(a, b, offs) -> bool:
     """Whether the ragged (pad-free) kernels accept this call's shapes and dtypes.
 
-    Public for callers that must decide whether they may skip padding: a declined call
-    falls through to the aligned lowering, which requires aligned ``offs``. Says nothing
-    about whether dynamic kernels are enabled.
+    Says nothing about whether the dynamic-kernel flag is set.
     """
     return _ragged_shapes_ok(a, b, offs)
 
@@ -183,9 +157,8 @@ def _ragged_kernel(variant: str):
 class GroupedMMRaggedNKIImpl(TorchMlirOpImpl):
     """Ragged grouped_mm: arbitrary ``offs``, no padding, no host transfer.
 
-    Ordered above the aligned implementations, whose ``validate_offs`` raises on
-    unaligned boundaries rather than declining. Enabled by
-    TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS=1.
+    Calls the ragged kernels directly; the other implementations reach them through
+    ``grouped_mm_decomposition``. Enabled by TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS=1.
     """
 
     def __init__(self):
@@ -197,7 +170,7 @@ class GroupedMMRaggedNKIImpl(TorchMlirOpImpl):
         return (a, b, offs), {"bias": bias, "out_dtype": out_dtype}
 
     def can_handle(self, a, b, offs, bias=None, out_dtype=None) -> bool:
-        # Flag first so the aligned path costs only one env lookup.
+        # Flag first so a declined call costs only one env lookup.
         if not use_dynamic_nki_kernels():
             return False
         # The kernels add no bias and always return the input dtype.
@@ -209,8 +182,8 @@ class GroupedMMRaggedNKIImpl(TorchMlirOpImpl):
         """Route the C++ cache-miss path to the NKI kernel.
 
         Lowering, not ``execute()``, is the dispatch hook. Without this the inherited
-        TorchMlirOpImpl kernel wraps ``torch._grouped_mm`` and silently serves the op
-        from the aligned-only MLIR lowering.
+        TorchMlirOpImpl kernel wraps ``torch._grouped_mm`` and reaches the kernels
+        through the decomposition instead.
         """
 
         def grouped_mm_ragged_lower(*args, **kwargs):
@@ -256,7 +229,7 @@ class GroupedMMNKIImpl(TorchMlirOpImpl):
         return _translate_grouped_mm_args(*args, **kwargs)
 
     def can_handle(self, a, b, offs) -> bool:
-        return a.dim() == 2 and b.dim() == 2 and validate_offs(offs, a.shape[1])
+        return a.dim() == 2 and b.dim() == 2
 
     def execute(self, *args, **kwargs) -> ExecutionResult:
         try:
@@ -281,4 +254,4 @@ class GroupedMMMLIRImpl(TorchMlirOpImpl):
         return _translate_grouped_mm_args(*args, **kwargs)
 
     def can_handle(self, a, b, offs) -> bool:
-        return a.dim() == 2 and b.dim() == 3 and validate_offs(offs, a.shape[0], get_gmm_align())
+        return a.dim() == 2 and b.dim() == 3

@@ -23,15 +23,15 @@ The S3 location has no default because the bucket moves. Pass it every time with
 
 Usage:
     # Refresh from the latest available day (needs S3 credentials).
-    python tests/vertical/tools/refresh_cache_key_shapes.py \
+    python tests/vertical/internal/refresh_cache_key_shapes.py \
         --bucket <bucket> --prefix <prefix> --profile <aws-profile>
 
     # Refresh from a specific day.
-    python tests/vertical/tools/refresh_cache_key_shapes.py \
+    python tests/vertical/internal/refresh_cache_key_shapes.py \
         --bucket <bucket> --prefix <prefix> --date 20260904 --profile <aws-profile>
 
     # Rebuild from a local folder of *_cache_keys.txt files (no S3).
-    python tests/vertical/tools/refresh_cache_key_shapes.py --from-dir <dir>
+    python tests/vertical/internal/refresh_cache_key_shapes.py --from-dir <dir>
 """
 
 from __future__ import annotations
@@ -244,7 +244,7 @@ def render_block(registry: list[dict]) -> str:
     ops = len({e["op_name"] for e in registry})
     lines = [
         SENTINEL_BEGIN,
-        "# Do not edit by hand. Regenerate with tests/vertical/tools/refresh_cache_key_shapes.py.",
+        "# Do not edit. Regenerate with tests/vertical/internal/refresh_cache_key_shapes.py.",
         f'CACHE_KEY_SOURCE = "{CACHE_KEY_SOURCE}"',
         "",
         "",

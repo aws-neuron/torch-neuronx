@@ -119,7 +119,7 @@ struct AsyncSchedulingState {
   SequenceId sequence_id{0};  // Sequence number from Schedule()
   bool is_scheduled{false};   // Whether async scheduling was called (in-flight)
   // Host-side op pending completion via a completion hook (not NRT device
-  // scheduling). Set for kEvent/kHint/kBarrier/kAlloc/kDealloc; all advance the
+  // scheduling). Set for kEvent/kBarrier/kAlloc/kDealloc; all advance the
   // stream cursor past themselves once scheduled.
   bool is_pending_signal{false};
   std::atomic<bool> is_host_inflight{false};  // kHost: submitted to HostWorkerPool

@@ -167,30 +167,6 @@ InputTransformationResult ProcessInputTransformations(const std::string& op_name
   result.final_inputs.reserve(inputs.size());
   result.kernel_transforms.resize(inputs.size());
 
-  // Native-int64 prologue boundary guard: for an op that packs its int64 inputs
-  // (DOWNCAST / packed mode → the op module represents them as int32[...,2]),
-  // any int64 operand appears *unpacked* (tensor<...xi64>) in a fused prologue's
-  // pass-through signature. Merging that prologue with the op then hits an
-  // i64-vs-i32x2 boundary that cannot be linked (validateDepCompatibility skips
-  // it → empty merged MLIR → "Failed to merge prologue"). This bites ops with a
-  // non-contiguous *non-int64* input plus an int64 operand (e.g.
-  // cross_entropy_loss: non-contiguous float32 input + int64 target). Disable
-  // fusion for such ops so their non-contiguous inputs are materialized instead
-  // (correct, and matches the packed path). Native ops keep S64 in both the
-  // prologue and the op (no boundary), so they are unaffected.
-  if (fuse_transforms && torch_neuronx::dispatch::UsePackedInt64ViewForOp(op_name)) {
-    for (const auto& in : inputs) {
-      if (in.defined() && in.scalar_type() == c10::ScalarType::Long) {
-        TORCH_NEURONX_DEBUG(
-            "Packed-int64 op with int64 operand: disabling prologue fusion to avoid the "
-            "i64/i32x2 merge boundary; non-contiguous inputs are materialized instead",
-            "op=", op_name);
-        fuse_transforms = false;
-        break;
-      }
-    }
-  }
-
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& input = inputs[i];
 

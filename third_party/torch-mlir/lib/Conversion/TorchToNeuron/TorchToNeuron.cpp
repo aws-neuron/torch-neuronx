@@ -22,6 +22,7 @@
 #include "torch-mlir/Dialect/TorchConversion/IR/TorchConversionDialect.h"
 #include "torch-mlir/Dialect/TorchConversion/IR/TorchConversionOps.h"
 #include "torch-mlir/Dialect/TorchConversion/Transforms/BackendTypeConversion.h"
+#include <limits>
 #include <regex>
 
 using namespace mlir;
@@ -2191,6 +2192,9 @@ public:
       return rewriter.notifyMatchFailure(
           op, "dynamic spatial dimensions not supported in im2col decomposition");
 
+    if (!inputTy.hasDtype())
+      return rewriter.notifyMatchFailure(op, "input tensor has no dtype.");
+
     SmallVector<int64_t> kernelSize, stride, padding, dilation;
     bool ceilMode;
 
@@ -2211,8 +2215,29 @@ public:
       return rewriter.notifyMatchFailure(op, "non-const padding");
     if (!matchPattern(op.getDilation(), m_TorchListOfConstantInts(dilation)))
       return rewriter.notifyMatchFailure(op, "non-const dilation");
+    // TODO: ceil_mode is extracted but unused.
     if (!matchPattern(op.getCeilMode(), m_TorchConstantBool(&ceilMode)))
       return rewriter.notifyMatchFailure(op, "non-const ceil_mode");
+
+    // Reject integer types with >= 32 bits when padding is needed.
+    Type origDtype = inputTy.getDtype();
+    bool isIntType = isa<mlir::IntegerType>(origDtype);
+    unsigned origBitCount = isIntType
+        ? cast<mlir::IntegerType>(origDtype).getWidth() : 0;
+    // Safety net: rejectUnsupportedOperations should catch this first with
+    // a clear emitError. This check is kept as a fallback.
+    if (isIntType && origBitCount >= 64)
+      return rewriter.notifyMatchFailure(
+          op, "integer input with >= 64 bits is not currently supported. "
+              "The Neuron compiler's ISA validator rejects int64 in Pool "
+              "instructions (dtype_int64_illegal_check).");
+    bool needsPadding = padding[0] > 0 || padding[1] > 0 || ceilMode;
+    // TODO: Remove this check once the backend compiler fix is merged.
+    if (needsPadding && isIntType && origBitCount >= 32)
+      return rewriter.notifyMatchFailure(
+            op, "integer input with >= 32 bits and padding or ceil_mode is not "
+                "currently supported. Promotion to int64 triggers a Neuron "
+                "compiler bug with int64 scalar immediates.");
 
     // Extract dimensions
     int64_t N = inputShape[0], C = inputShape[1];
@@ -2243,12 +2268,14 @@ public:
                                   rewriter.getI64IntegerAttr(dilation[0])),
             ConstantIntOp::create(rewriter, loc,
                                   rewriter.getI64IntegerAttr(dilation[1]))});
-    Value paddingList = PrimListConstructOp::create(
+    // Padding is handled explicitly via AtenConstantPadNdOp below,
+    // so pass padding=0 to im2col.
+    Value im2colPaddingList = PrimListConstructOp::create(
         rewriter, loc, Torch::ListType::get(rewriter.getType<Torch::IntType>()),
         ValueRange{ConstantIntOp::create(
-                       rewriter, loc, rewriter.getI64IntegerAttr(padding[0])),
+                       rewriter, loc, rewriter.getI64IntegerAttr(0)),
                    ConstantIntOp::create(
-                       rewriter, loc, rewriter.getI64IntegerAttr(padding[1]))});
+                       rewriter, loc, rewriter.getI64IntegerAttr(0))});
     Value strideList = PrimListConstructOp::create(
         rewriter, loc, Torch::ListType::get(rewriter.getType<Torch::IntType>()),
         ValueRange{ConstantIntOp::create(rewriter, loc,
@@ -2256,14 +2283,86 @@ public:
                    ConstantIntOp::create(
                        rewriter, loc, rewriter.getI64IntegerAttr(stride[1]))});
 
+    // Pre-pad input with a fill value so padding cells never win the
+    // argmax for finite inputs. im2col's built-in padding fills with 0.0,
+    // which is wrong for maxpool to avoid tying (or having the padding
+    // value win).
+    const Value falseVal = ConstantBoolOp::create(rewriter, loc, false);
+    const Value none = ConstantNoneOp::create(rewriter, loc);
+    Value expandedInput = input;
+    auto expandedInputTy = inputTy;
+    if (needsPadding) {
+      Value fillVal;
+      Value promotedInput = input;
+      auto promotedTy = inputTy;
+
+      if (isa<mlir::FloatType>(origDtype)) {
+        // Float types: -inf, no dtype promotion needed.
+        // Known limitation: if the input data itself contains -inf, the
+        // padding cell can tie with a real value, producing an incorrect
+        // argmax index. This is consistent with upstream PyTorch
+        // (_max_pool_nd_with_indices in torch/_decomp/decompositions.py).
+        fillVal = ConstantFloatOp::create(
+            rewriter, loc,
+            rewriter.getF64FloatAttr(
+                -std::numeric_limits<double>::infinity()));
+      } else {
+        // Integer types (int8/int16/int32/uint8): promote to wider int
+        // to allow a fill value of (original_min - 1), guaranteed below all input data.
+        unsigned promotedBitCount = origBitCount < 32 ? 32 : 64;
+        Type promotedDtype =
+            rewriter.getIntegerType(promotedBitCount, IntegerType::Signed);
+        promotedTy = cast<BaseTensorType>(inputTy.getWithSizesAndDtype(
+            inputShape, promotedDtype));
+        promotedInput = AtenToDtypeOp::create(
+            rewriter, loc, promotedTy, input,
+            getDtypeIntValueForType(rewriter, loc, promotedDtype),
+            /*non_blocking=*/falseVal, /*copy=*/falseVal,
+            /*memory_format=*/none);
+
+        int64_t rawFillVal;
+        if (origDtype.isUnsignedInteger()) {
+          rawFillVal = -1;  // uint min is 0, minus 1
+        } else {
+          rawFillVal = -(1LL << (origBitCount - 1)) - 1;  // signed min - 1
+        }
+        fillVal = ConstantIntOp::create(
+            rewriter, loc, rewriter.getI64IntegerAttr(rawFillVal));
+      }
+
+      int64_t paddedH = H + 2 * padding[0];
+      int64_t paddedW = W + 2 * padding[1];
+      // AtenConstantPadNdOp pad order: [W_left, W_right, H_top, H_bottom]
+      SmallVector<Value> padAmounts{
+          ConstantIntOp::create(rewriter, loc,
+                                rewriter.getI64IntegerAttr(padding[1])),
+          ConstantIntOp::create(rewriter, loc,
+                                rewriter.getI64IntegerAttr(padding[1])),
+          ConstantIntOp::create(rewriter, loc,
+                                rewriter.getI64IntegerAttr(padding[0])),
+          ConstantIntOp::create(rewriter, loc,
+                                rewriter.getI64IntegerAttr(padding[0]))};
+      Value padList = PrimListConstructOp::create(
+          rewriter, loc,
+          Torch::ListType::get(rewriter.getType<Torch::IntType>()),
+          padAmounts);
+      expandedInputTy = cast<BaseTensorType>(promotedTy.getWithSizesAndDtype(
+          llvm::ArrayRef<int64_t>{N, C, paddedH, paddedW},
+          promotedTy.getDtype()));
+      expandedInput = AtenConstantPadNdOp::create(
+          rewriter, loc, expandedInputTy, promotedInput, padList, fillVal);
+    }
+
     // Use im2col to extract pooling windows: [N, C*kH*kW, outH*outW]
+    // im2col padding is set to 0 since we pre-padded above.
     int64_t colSize = C * kernelSize[0] * kernelSize[1];
-    auto im2colTy = inputTy.getWithSizesAndDtype(
+    auto im2colTy = expandedInputTy.getWithSizesAndDtype(
         llvm::ArrayRef<int64_t>{N, colSize, outH * outW},
-        inputTy.getOptionalDtype());
+        expandedInputTy.getDtype());
     Value columns =
-        AtenIm2colOp::create(rewriter, loc, im2colTy, input, kernelSizeList,
-                             dilationList, paddingList, strideList);
+        AtenIm2colOp::create(rewriter, loc, im2colTy, expandedInput,
+                             kernelSizeList, dilationList, im2colPaddingList,
+                             strideList);
 
     // Reshape to [N, C, kH*kW, outH*outW]
     SmallVector<Value> reshapeSize{
@@ -2277,10 +2376,10 @@ public:
     Value reshapeSizeList = PrimListConstructOp::create(
         rewriter, loc, Torch::ListType::get(rewriter.getType<Torch::IntType>()),
         reshapeSize);
-    auto reshapeTy = inputTy.getWithSizesAndDtype(
+    auto reshapeTy = expandedInputTy.getWithSizesAndDtype(
         llvm::ArrayRef<int64_t>{N, C, kernelSize[0] * kernelSize[1],
                                 outH * outW},
-        inputTy.getOptionalDtype());
+        expandedInputTy.getDtype());
     Value reshaped = AtenReshapeOp::create(rewriter, loc, reshapeTy, columns,
                                            reshapeSizeList);
 
@@ -2289,12 +2388,13 @@ public:
         ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(2));
     Value keepDim = ConstantBoolOp::create(rewriter, loc, false);
 
-    auto maxTy = inputTy.getWithSizesAndDtype(
-        llvm::ArrayRef<int64_t>{N, C, outH * outW}, inputTy.getOptionalDtype());
-    auto idxTy = inputTy.getWithSizesAndDtype(
+    auto maxTy = expandedInputTy.getWithSizesAndDtype(
+        llvm::ArrayRef<int64_t>{N, C, outH * outW}, expandedInputTy.getDtype());
+    auto idxTy = expandedInputTy.getWithSizesAndDtype(
         llvm::ArrayRef<int64_t>{N, C, outH * outW},
         rewriter.getIntegerType(64, IntegerType::Signed));
 
+    // TODO: AtenMaxDimOp is created twice. Create once and extract both results.
     Value maxResult = AtenMaxDimOp::create(rewriter, loc, maxTy, idxTy,
                                            reshaped, dim, keepDim)
                           .getValues();
@@ -2302,15 +2402,25 @@ public:
                                                reshaped, dim, keepDim)
                               .getIndices();
 
-    // Convert window indices to flattened image indices
-    // windowIdx = kh * kW + kw, need to compute: (oh * stride[0] + kh) * W +
-    // (ow * stride[1] + kw)
+    // Convert window indices to flattened image indices.
+    // windowIdx = kh * kW + kw; we compute:
+    // h = oh * stride[0] + kh * dilation[0] - padding[0]
+    // w = ow * stride[1] + kw * dilation[1] - padding[1]
+    // indices = h * W + w
     Value kW = ConstantIntOp::create(rewriter, loc,
                                      rewriter.getI64IntegerAttr(kernelSize[1]));
     Value strideH = ConstantIntOp::create(
         rewriter, loc, rewriter.getI64IntegerAttr(stride[0]));
     Value strideW = ConstantIntOp::create(
         rewriter, loc, rewriter.getI64IntegerAttr(stride[1]));
+    Value dilationH = ConstantIntOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(dilation[0]));
+    Value dilationW = ConstantIntOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(dilation[1]));
+    Value paddingH = ConstantIntOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(padding[0]));
+    Value paddingW = ConstantIntOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(padding[1]));
     Value width =
         ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(W));
 
@@ -2329,7 +2439,7 @@ public:
     Value outSizeList = PrimListConstructOp::create(
         rewriter, loc, Torch::ListType::get(rewriter.getType<Torch::IntType>()),
         outSize);
-    auto finalIdxTy = inputTy.getWithSizesAndDtype(
+    auto finalIdxTy = expandedInputTy.getWithSizesAndDtype(
         llvm::ArrayRef<int64_t>{N, C, outH, outW},
         rewriter.getIntegerType(64, IntegerType::Signed));
 
@@ -2339,7 +2449,7 @@ public:
     // Create iota for oh, ow
     Value ohIota = AtenArangeStartStepOp::create(
         rewriter, loc,
-        inputTy.getWithSizesAndDtype(
+        expandedInputTy.getWithSizesAndDtype(
             llvm::ArrayRef<int64_t>{outH},
             rewriter.getIntegerType(64, IntegerType::Signed)),
         ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(0)),
@@ -2351,7 +2461,7 @@ public:
         /*pin_memory=*/ConstantNoneOp::create(rewriter, loc));
     Value owIota = AtenArangeStartStepOp::create(
         rewriter, loc,
-        inputTy.getWithSizesAndDtype(
+        expandedInputTy.getWithSizesAndDtype(
             llvm::ArrayRef<int64_t>{outW},
             rewriter.getIntegerType(64, IntegerType::Signed)),
         ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(0)),
@@ -2373,7 +2483,7 @@ public:
         ohShape);
     ohIota = AtenReshapeOp::create(
         rewriter, loc,
-        inputTy.getWithSizesAndDtype(
+        expandedInputTy.getWithSizesAndDtype(
             llvm::ArrayRef<int64_t>{1, 1, outH, 1},
             rewriter.getIntegerType(64, IntegerType::Signed)),
         ohIota, ohShapeList);
@@ -2390,26 +2500,33 @@ public:
         owShape);
     owIota = AtenReshapeOp::create(
         rewriter, loc,
-        inputTy.getWithSizesAndDtype(
+        expandedInputTy.getWithSizesAndDtype(
             llvm::ArrayRef<int64_t>{1, 1, 1, outW},
             rewriter.getIntegerType(64, IntegerType::Signed)),
         owIota, owShapeList);
     owIota = AtenBroadcastToOp::create(rewriter, loc, finalIdxTy, owIota,
                                        outSizeList);
 
-    // h = oh * stride[0] + kh, w = ow * stride[1] + kw
+    // h = oh * stride[0] + kh * dilation[0] - padding[0]
+    // w = ow * stride[1] + kw * dilation[1] - padding[1]
+    const Value one =
+        ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(1));
+    Value khDilated =
+        AtenMulScalarOp::create(rewriter, loc, finalIdxTy, kh, dilationH);
+    Value kwDilated =
+        AtenMulScalarOp::create(rewriter, loc, finalIdxTy, kw, dilationW);
+
     Value h =
         AtenMulScalarOp::create(rewriter, loc, finalIdxTy, ohIota, strideH);
-    h = AtenAddTensorOp::create(
-        rewriter, loc, finalIdxTy, h, kh,
-        ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(1)));
+    h = AtenAddTensorOp::create(rewriter, loc, finalIdxTy, h, khDilated, one);
+    h = AtenSubScalarOp::create(rewriter, loc, finalIdxTy, h, paddingH, one);
+
     Value w =
         AtenMulScalarOp::create(rewriter, loc, finalIdxTy, owIota, strideW);
-    w = AtenAddTensorOp::create(
-        rewriter, loc, finalIdxTy, w, kw,
-        ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(1)));
+    w = AtenAddTensorOp::create(rewriter, loc, finalIdxTy, w, kwDilated, one);
+    w = AtenSubScalarOp::create(rewriter, loc, finalIdxTy, w, paddingW, one);
 
-    // flatIdx = h * W + w
+    // indices = h * W + w
     Value indices =
         AtenMulScalarOp::create(rewriter, loc, finalIdxTy, h, width);
     indices = AtenAddTensorOp::create(
@@ -2417,16 +2534,78 @@ public:
         ConstantIntOp::create(rewriter, loc, rewriter.getI64IntegerAttr(1)));
 
     // Reshape max output to [N, C, outH, outW]
-    auto finalMaxTy = inputTy.getWithSizesAndDtype(
-        llvm::ArrayRef<int64_t>{N, C, outH, outW}, inputTy.getOptionalDtype());
+    auto finalMaxTy = expandedInputTy.getWithSizesAndDtype(
+        llvm::ArrayRef<int64_t>{N, C, outH, outW}, expandedInputTy.getDtype());
     Value finalMax = AtenReshapeOp::create(rewriter, loc, finalMaxTy, maxResult,
                                            outSizeList);
+
+    // If we promoted the dtype for padding (e.g. int8 -> int32), cast back
+    // to the original dtype for the output.
+    if (needsPadding && isIntType) {
+      auto origMaxTy = inputTy.getWithSizesAndDtype(
+          llvm::ArrayRef<int64_t>{N, C, outH, outW}, origDtype);
+      finalMax = AtenToDtypeOp::create(
+          rewriter, loc, origMaxTy, finalMax,
+          getDtypeIntValueForType(rewriter, loc, origDtype),
+          /*non_blocking=*/falseVal, /*copy=*/falseVal,
+          /*memory_format=*/none);
+    }
 
     rewriter.replaceOp(op, {finalMax, indices});
     return success();
   }
 };
 } // namespace
+
+// Check a single maxpool op for unsupported configurations. Emits an
+// error and returns true if the op cannot be compiled on Neuron.
+static bool rejectUnsupportedMaxPool(Torch::AtenMaxPool2dWithIndicesOp op) {
+  auto inputTy = cast<BaseTensorType>(op.getSelf().getType());
+  // dtype may be unrefined (unk) before type refinement passes.
+  if (!inputTy.hasDtype()) {
+    op->emitError("max_pool2d: input tensor has no dtype.");
+    return true;
+  }
+  auto intTy = dyn_cast<mlir::IntegerType>(inputTy.getDtype());
+  if (!intTy)
+    return false;
+  unsigned width = intTy.getWidth();
+  if (width < 32)
+    return false;
+
+  if (width >= 64) {
+    op->emitError("max_pool2d: int64 (or wider) integer input is not "
+                  "supported on Neuron.");
+    return true;
+  }
+
+  SmallVector<int64_t> padding;
+  bool ceilMode = false;
+  if (!matchPattern(op.getPadding(), m_TorchListOfConstantInts(padding)))
+    return false;
+  matchPattern(op.getCeilMode(), m_TorchConstantBool(&ceilMode));
+  if (padding[0] > 0 || padding[1] > 0 || ceilMode) {
+    op->emitError("max_pool2d: int32 up to int64 integer input with "
+                  "padding > 0 or ceil_mode enabled is not currently "
+                  "supported on Neuron.");
+    return true;
+  }
+  return false;
+}
+
+// Walk all ops and reject unsupported configurations with clear errors
+// before legality gates or pattern matching runs. Returns true if any
+// unsupported op was found (caller should bail out).
+static bool rejectUnsupportedOperations(Operation *root) {
+  auto result = root->walk([&](Torch::AtenMaxPool2dWithIndicesOp op) {
+    if (rejectUnsupportedMaxPool(op))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  if (result.wasInterrupted())
+    return true;
+  return false;
+}
 
 namespace {
 class ConvertTorchToNeuron
@@ -2480,6 +2659,12 @@ public:
 
       target.addIllegalOp<Torch::AtenQuantizeMxOp>();
       patterns.add<ConvertNeuronQuantizeMxOp>(typeConverter, context);
+
+      // Reject unsupported op configurations early.
+      if (rejectUnsupportedOperations(getOperation())) {
+        signalPassFailure();
+        return;
+      }
 
       // Decomposition patterns:
       // - Static shapes are decomposed here via the im2col lowering

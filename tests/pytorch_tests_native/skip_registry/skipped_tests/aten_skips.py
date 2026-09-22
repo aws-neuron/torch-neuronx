@@ -224,6 +224,9 @@ ATEN_UPSTREAM_STRICT_XFAIL_PASSES_ON_NEURON = [
     "test_meta.py::TestMetaNEURON::test_meta_outplace__foreach_lerp_neuron_int64",
     "test_meta.py::TestMetaNEURON::test_meta_outplace__foreach_sub_neuron_float64",
     "test_meta.py::TestMetaNEURON::test_meta_outplace__foreach_sub_neuron_int64",
+    # matmul OpInfo xfails test_out ("Strides are not the same!"); Neuron now
+    # binds the strided, non-contiguous out= correctly, so the test passes.
+    "test_ops.py::TestCommonNEURON::test_out_matmul_neuron_float32",
 ]
 
 

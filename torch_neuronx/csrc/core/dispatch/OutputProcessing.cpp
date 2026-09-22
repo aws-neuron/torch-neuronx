@@ -71,12 +71,14 @@ std::vector<torch::Tensor> AllocateExecutionOutputs(
 
         const auto& ospec = entry.output_specs[ret_idx];  // physical (what the NEFF writes)
 
-        if (out_tensor.scalar_type() == ospec.dtype) {
-          // Direct reuse: the out='s dtype matches the execution buffer, so it
-          // can serve as the NEFF output directly. Resize to the spec shape if
-          // needed (here physical == logical, so this is the ordinary out=
-          // resize contract).
-          if (out_tensor.sizes().vec() != ospec.shape) {
+        bool needs_resize = out_tensor.sizes().vec() != ospec.shape;
+        if (out_tensor.scalar_type() == ospec.dtype &&
+            (out_tensor.is_contiguous() || !needs_resize)) {
+          // A resize flattens a strided view and drops its stride. Do not bind a
+          // non-contiguous out= that needs a resize; let it fall through to a
+          // fresh buffer (Step 3), so CopyBackToOriginal scatters it back. A
+          // non-contiguous out= that keeps its shape stays bound for the epilogue.
+          if (needs_resize) {
             TORCH_NEURONX_DISPATCH_DEBUG("[AllocateExecutionOutputs] resizing out tensor",
                                          " arg_idx=", arg_idx);
             ResizeOutputWithWarning(out_tensor, ospec.shape);
@@ -139,10 +141,12 @@ std::vector<torch::Tensor> AllocateExecutionOutputs(
           if (!out_tensor.defined()) continue;
 
           const auto& ospec = entry.output_specs[i];
-          if (out_tensor.sizes().vec() != ospec.shape) {
-            ResizeOutputWithWarning(out_tensor, ospec.shape);
-          }
           if (out_tensor.scalar_type() == ospec.dtype && out_tensor.is_contiguous()) {
+            // Resize inside the guard. Same reason as 2a: a resize flattens a
+            // strided view, so a non-contiguous out= must fall through.
+            if (out_tensor.sizes().vec() != ospec.shape) {
+              ResizeOutputWithWarning(out_tensor, ospec.shape);
+            }
             outputs[i] = out_tensor;
             TORCH_NEURONX_DISPATCH_DEBUG("[AllocateExecutionOutputs] using TensorList out[", i,
                                          "] from arg[", arg_idx, "]");
@@ -195,8 +199,15 @@ std::vector<torch::Tensor> AllocateExecutionOutputs(
                     required_storage, " but physical buffer has ", phys_tensor.numel(),
                     " elements");
 
-        // Create as_strided view: logical shape + target strides over physical buffer
-        outputs[i] = phys_tensor.as_strided(spec.shape, target);
+        // Create as_strided view: logical shape + target strides over physical buffer.
+        // Exclude ADInplaceOrView so the output has no view metadata. A prim
+        // reaches this code below Autograd only, and the ADInplaceOrView kernel
+        // would then mark the output as a view. The upstream python_ref tests
+        // compare _is_view() between the prim path and the direct path.
+        {
+          at::AutoDispatchBelowADInplaceOrView guard;
+          outputs[i] = phys_tensor.as_strided(spec.shape, target);
+        }
 
         TORCH_NEURONX_DISPATCH_DEBUG("[AllocateExecutionOutputs] target_strides allocation",
                                      " output_idx=", i, " logical_shape=", spec.shape,

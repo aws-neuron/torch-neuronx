@@ -110,6 +110,32 @@ class TestRemainder:
             assert result.device.type == "neuron"
             assert_op_runs_on_neuron("aten::remainder")
 
+    @pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32, torch.int64])
+    def test_remainder_integer_signed(self, device, dtype):
+        """Signed integer remainder must match CPU (Python floor semantics) exactly.
+
+        remainder = x - floor_divide(x, y) * y. The old lowering floored the truncated
+        integer quotient, so it computed C-style trunc remainder (sign of the dividend,
+        e.g. -7 % 3 -> -1 instead of 2), and for |x| >= 2**24 the f64 (=f32 on device)
+        quotient was also imprecise. Now it rides on the corrected integer floor. Sweep
+        every (num, den) pair; small values cover the mixed-sign semantics and (for
+        >= 32-bit dtypes) large values cover the precision path.
+        """
+        info = torch.iinfo(dtype)
+        vals = list(range(-9, 10))
+        if info.bits >= 32:
+            vals += [2**24 + 1, -(2**24 + 1), 100000001, -100000001, 2**30, -(2**30)]
+        vals = torch.tensor([v for v in vals if info.min <= v <= info.max], dtype=dtype)
+        num, den = torch.cartesian_prod(vals, vals).unbind(1)
+        keep = den != 0
+        num, den = num[keep], den[keep]
+        with track_neuron_ops():
+            expected = torch.remainder(num, den)
+            result = torch.remainder(num.to(device), den.to(device))
+            assert torch.equal(result.cpu(), expected)
+            assert result.device.type == "neuron"
+            assert_op_runs_on_neuron("aten::remainder")
+
     def test_remainder_single_element(self, device):
         """Test remainder with single element tensor."""
         with track_neuron_ops():

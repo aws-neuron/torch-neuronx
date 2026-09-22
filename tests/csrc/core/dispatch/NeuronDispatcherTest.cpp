@@ -449,6 +449,46 @@ TEST_F(FlattenFilterTest, EmptyArgsEmpty) {
   EXPECT_TRUE(TA::FlattenAndFilterInputs({}, schema(), {}, "t").empty());
 }
 
+// A zero-input factory NEFF (arange with out=) keeps no inputs. The write-aliased
+// out= must not become a phantom input, which would trip an NRT arity check.
+TEST_F(FlattenFilterTest, FactoryOutIsDroppedFromEmptyKept) {
+  auto sch = c10::Dispatcher::singleton().findSchemaOrThrow("aten::arange", "start_out").schema();
+  std::vector<c10::IValue> args = {c10::IValue(0), c10::IValue(4), c10::IValue(1),
+                                   torch::empty({4})};
+  EXPECT_TRUE(TA::FlattenAndFilterInputs(args, sch, {}, "aten::arange.start_out").empty());
+}
+
+// A write-only in-place self (zero_) is an output binding, not an input.
+TEST_F(FlattenFilterTest, WriteOnlyInplaceSelfDroppedFromEmptyKept) {
+  auto sch = c10::Dispatcher::singleton().findSchemaOrThrow("aten::zero_", "").schema();
+  std::vector<c10::IValue> args = {torch::ones({4})};
+  EXPECT_TRUE(TA::FlattenAndFilterInputs(args, sch, {}, "aten::zero_").empty());
+}
+
+// A write-aliased self stays an input when the NEFF references it (non-empty
+// kept). The drop happens only in the empty-kept factory branch.
+TEST_F(FlattenFilterTest, ReadModifyWriteInplaceSelfKeptWhenReferenced) {
+  auto sch = c10::Dispatcher::singleton().findSchemaOrThrow("aten::add_", "Tensor").schema();
+  auto self = torch::ones({4});
+  std::vector<c10::IValue> args = {self, torch::ones({4}), 1};
+  auto r = TA::FlattenAndFilterInputs(args, sch, {0}, "aten::add_.Tensor");
+  EXPECT_EQ(r.size(), 1u);
+  EXPECT_TRUE(r[0].equal(self));
+}
+
+// A mix of read-only args and a write-aliased out= keeps only the read-only
+// inputs under empty kept.
+TEST_F(FlattenFilterTest, MixedReadOnlyAndWriteAliasedKeepsOnlyReadOnly) {
+  auto sch = c10::Dispatcher::singleton().findSchemaOrThrow("aten::add", "out").schema();
+  auto self = torch::zeros({4});
+  auto other = torch::ones({4});
+  std::vector<c10::IValue> args = {self, other, 1, torch::empty({4})};
+  auto r = TA::FlattenAndFilterInputs(args, sch, {}, "aten::add.out");
+  EXPECT_EQ(r.size(), 2u);
+  EXPECT_TRUE(r[0].equal(self));
+  EXPECT_TRUE(r[1].equal(other));
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  ForEachTensor (DispatchUtils.h)
 // ═══════════════════════════════════════════════════════════════

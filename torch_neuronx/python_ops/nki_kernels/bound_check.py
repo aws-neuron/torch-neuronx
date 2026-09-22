@@ -175,8 +175,10 @@ def _mask_bounds_check(index: torch.Tensor, hi: int, lo: int) -> torch.Tensor:
     dependency keeps the gather alive through neuronx-cc DCE (which recurses into
     the kernel). On a fault the runtime invokes the op's registered
     ``error_handler`` (with inputs reconstructed from the OperationContext) to
-    raise the exact op-specific exception (see op_error_handlers.py)."""
-    return wrap_nki(_mask_bounds_check_kernel)[(1,)](index=index, hi=hi, lo=lo)
+    raise the exact op-specific exception (see op_error_handlers.py).
+    Launch without a grid: the kernel tiles the whole tensor in one program, so
+    it needs no SPMD axis and must not declare an LNC that the compile contradicts."""
+    return wrap_nki(_mask_bounds_check_kernel)(index=index, hi=hi, lo=lo)
 
 
 def assert_index_in_bounds(index: torch.Tensor, hi: int, lo: int = 0) -> torch.Tensor:

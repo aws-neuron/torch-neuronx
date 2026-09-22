@@ -6,7 +6,7 @@ common --enable_workspace
 common --registry=https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main/
 
 # Python version - set via --@rules_python//python/config_settings:python_version=X.Y
-# Supported: 3.10, 3.11, 3.12, 3.13 (setup.py and tools/run-cpp-test pass this automatically)
+# Supported: 3.10, 3.11, 3.12, 3.13, 3.14 (setup.py and tools/run-cpp-test pass this automatically)
 
 # Make Bazel print out all options from rc files
 build --announce_rc

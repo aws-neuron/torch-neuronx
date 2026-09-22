@@ -32,7 +32,6 @@ from torch_neuronx.packed_storage import (
     packed_logical_view,
     packed_physical_dtype,
     packed_physical_layout,
-    packed_physical_view,
 )
 from torch_neuronx.python_ops import io_tensor
 from torch_neuronx.python_ops.compilation.hlo_cache import CACHE_DIR, CachedHLO
@@ -85,11 +84,30 @@ def _wrap_torch_fn_for_packed_int64(fn, original_inputs, output_positions):
             # nothing to gather, and gathering would reintroduce a zero-size
             # packed value. Pass it through clean.
             return arg
-        if is_packed_physical_view(arg, orig):
-            # arg is the packed physical view of the int64 `orig`; gather the low
-            # words in-graph and reshape to orig's logical shape (handles the
-            # scalar (1,2) -> () case, where packed_gather_nki alone yields (1,)).
-            return packed_gather_nki(arg).reshape(tuple(orig.shape))
+        if (
+            isinstance(orig, torch.Tensor)
+            and orig.dtype == torch.int64
+            and isinstance(arg, torch.Tensor)
+            and arg.dtype == torch.int64
+        ):
+            # int64 inputs are kept as i64 graph parameters; reinterpret them to
+            # the packed int32[..., 2] view IN-GRAPH (zero-copy bitcast via
+            # view(int32)), matching the fake input's packed_physical_layout
+            # shape, then gather the low words. Avoids the out-of-graph
+            # physical_view set_ (no meta-cross-ref leak) and keeps the input
+            # boundary i64 (prologue and op agree — no i64/i32x2 merge boundary).
+            phys_shape, _, _ = packed_physical_layout(
+                torch.int64, shape=tuple(orig.shape), stride=tuple(orig.stride())
+            )
+            # Add-dim bitcast: unsqueeze a trailing 1, then view(int32) scales that
+            # last dim 1->2, giving int32[..., 2] directly (i64[*s,1]->i32[*s,2]).
+            # This matches the compilable add-dim bitcast_convert form; the flat
+            # form (view(int32) -> i32[2N] then reshape) trips a neuronx-cc
+            # TensorOpSimplifier memcpy element-count assertion (NCC_ITOS901).
+            packed = arg.unsqueeze(-1).view(torch.int32)
+            if tuple(packed.shape) != tuple(phys_shape):
+                packed = packed.reshape(phys_shape)
+            return packed_gather_nki(packed).reshape(tuple(orig.shape))
         if (
             isinstance(orig, list | tuple)
             and isinstance(arg, list | tuple)
@@ -232,20 +250,13 @@ class TorchMlirKernel(BaseNeuronKernel):
         return compilation_kwargs
 
     def _generate_fake_inputs(
-        self, inputs: tuple, compilation_kwargs: dict | None = None, physical_int64: bool = False
+        self, inputs: tuple, compilation_kwargs: dict | None = None
     ) -> tuple[list, dict]:
         """Generate fake inputs and mapping for flattened indices.
 
         Args:
             inputs: Input tensors
             compilation_kwargs: Compilation kwargs (optional)
-            physical_int64: When True, int64 tensors are faked as their packed
-                int32[..., 2] physical view (so the traced graph parameter is
-                int32 — the Neuron compiler has no int64 HLO type). Used only for
-                the tracing path; the in-graph wrap gathers the low words and the
-                int64 arg's physical view is bound to the NEFF at execution. The
-                dtype-inference path leaves this False so it sees the true int64
-                shapes.
 
         Returns:
             Tuple of (fake_inputs, fake_to_flattened_idx)
@@ -258,23 +269,10 @@ class TorchMlirKernel(BaseNeuronKernel):
         def create_fake_recursive(obj, original_idx):
             nonlocal flattened_idx
             if isinstance(obj, torch.Tensor):
-                if physical_int64 and obj.dtype == torch.int64 and obj.numel() > 0:
-                    # Packed int64: the NEFF parameter is the int32 physical view.
-                    # Use packed_physical_layout (single source of truth for the
-                    # physical shape) so this matches the execution binding exactly
-                    # — including the scalar/0-dim case ((1, 2), not (2,)).
-                    phys_shape, _, _ = packed_physical_layout(
-                        torch.int64, shape=tuple(obj.shape), stride=tuple(obj.stride())
-                    )
-                    fake_tensor = torch.empty(phys_shape, dtype=torch.int32, device="meta")
-                else:
-                    # Empty int64 stays *unpacked* (nothing to pack for 0 elements):
-                    # a packed (…, 2) view of an empty tensor is a zero-size 2-D
-                    # tensor the compiler elides, shifting the 1:1 inplace output
-                    # binding. Keeping it a clean empty makes it a trivial
-                    # pass-through (the execution binding + _gather_arg skip
-                    # packing/gathering it too).
-                    fake_tensor = torch.empty_like(obj, device="meta")
+                # int64 inputs stay i64 at the graph boundary; the in-graph
+                # reinterpret (view(int32).reshape(..., 2)) packs them inside the
+                # traced fn, so the fake input is a plain meta tensor of obj's dtype.
+                fake_tensor = torch.empty_like(obj, device="meta")
                 fake_to_flattened_idx[id(fake_tensor)] = flattened_idx
                 flattened_idx += 1
                 return fake_tensor
@@ -440,8 +438,17 @@ class TorchMlirKernel(BaseNeuronKernel):
 
                 # Unwrap all outputs and mutated inputs
                 unwrapped = tuple(from_fun(r) if isinstance(r, torch.Tensor) else r for r in result)
-                unwrapped_mutated = tuple(from_fun(a) for a in mutated_inputs)
-                return unwrapped + unwrapped_mutated if unwrapped_mutated else unwrapped
+                unwrapped_mutated = [from_fun(a) for a in mutated_inputs]
+
+                # Opt-in in-place aliasing: a must-alias kernel that returns the
+                # tensors it mutates emits each such tensor twice (once as a
+                # return, once as an appended mutated input). Drop the duplicate
+                # so the NEFF writes in place instead of to a fresh buffer.
+                if getattr(self, "alias_outputs_in_place", False):
+                    returned = {id(u) for u in unwrapped if isinstance(u, torch.Tensor)}
+                    unwrapped_mutated = [m for m in unwrapped_mutated if id(m) not in returned]
+
+                return unwrapped + tuple(unwrapped_mutated) if unwrapped_mutated else unwrapped
 
             disable_functionalize = torch._C._ExcludeDispatchKeyGuard(
                 torch._C.DispatchKeySet(torch._C.DispatchKey.Functionalize)
@@ -493,14 +500,10 @@ class TorchMlirKernel(BaseNeuronKernel):
         """
         compilation_kwargs = self._get_compilation_kwargs(kwargs)
 
-        # Create fake tensors and track flattened indices. In packed int64 mode
-        # the int64 inputs are faked as their int32[..., 2] physical view so the
-        # traced graph parameter is int32 (the compiler has no int64 HLO type);
-        # the wrap gathers the low words and the physical view is bound at exec.
-        physical_int64 = use_packed_int64_view_for_op(self.op_name, inputs)
-        fake_inputs, fake_to_flattened_idx = self._generate_fake_inputs(
-            inputs, compilation_kwargs, physical_int64=physical_int64
-        )
+        # Create fake tensors and track flattened indices. int64 inputs are kept
+        # as i64 graph parameters; the in-graph reinterpret packs them to the
+        # int32[..., 2] view inside the traced fn (see _wrap_torch_fn_for_packed_int64).
+        fake_inputs, fake_to_flattened_idx = self._generate_fake_inputs(inputs, compilation_kwargs)
 
         # Generate original_outputs by running meta eval
         original_outputs = self.infer_outputs_from_meta(
@@ -518,7 +521,7 @@ class TorchMlirKernel(BaseNeuronKernel):
         # + interleave and bound to the output's physical storage.
         packed_output_positions = []
         trace_fn = None
-        if use_packed_int64_view_for_op(self.op_name, inputs):
+        if use_packed_int64_view_for_op(self.op_name):
             # The wrap keys off `inputs` (the post-preprocess args the fakes were
             # generated from) — NOT context.original_inputs. `inputs` is aligned
             # 1:1 with fake_inputs, so operands promoted after the original
@@ -1861,24 +1864,6 @@ class TorchMlirKernel(BaseNeuronKernel):
                 flattened_processed_inputs.append(value)
         # Create filtered inputs using kept_input_indices on flattened inputs
         filtered_inputs = tuple(flattened_processed_inputs[i] for i in kept_input_indices)
-
-        # Packed int64: dispatch args are kept logical int64; bind their
-        # int32[..., 2] physical view to the NEFF here (matches the int32 graph
-        # parameter — the fake input was generated as int32[..., 2] — and the
-        # in-graph gather extracts the low words). Zero-copy reinterpret.
-        if use_packed_int64_view_for_op(self.op_name, flattened_processed_inputs):
-            filtered_inputs = tuple(
-                packed_physical_view(t)
-                if (
-                    isinstance(t, torch.Tensor)
-                    and t.dtype == torch.int64
-                    and t.device.type == "neuron"
-                    and t.is_contiguous()
-                    and t.numel() > 0
-                )
-                else t
-                for t in filtered_inputs
-            )
 
         # Normalize execution_tensors to sequence for execution
         exec_tensors = (

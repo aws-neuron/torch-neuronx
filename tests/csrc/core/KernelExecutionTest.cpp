@@ -795,15 +795,14 @@ TEST_F(KernelExecutionTest, WriteKernelBufferConstruction) {
   EXPECT_TRUE(kernel.IsValid());
 }
 
-TEST_F(KernelExecutionTest, CollectiveKernelRequiresPrepare) {
+TEST_F(KernelExecutionTest, CollectiveKernelDoesNotRequirePrepare) {
   std::vector<std::vector<int>> replica_groups = {{0, 1}};
   CollectiveDirectKernelExecution kernel(
       "allreduce_op", CollectiveDirectKernelExecution::CollectiveType::kAllReduce,
       create_fake_tensor_refs(input_ptrs_), create_fake_tensor_refs(output_ptrs_), {}, {},
       c10::ScalarType::Float, c10d::ReduceOp::SUM, replica_groups, 0);
 
-  // Collectives require preparation before scheduling
-  EXPECT_TRUE(kernel.RequiresPrepare());
+  EXPECT_FALSE(kernel.RequiresPrepare());
 }
 
 TEST_F(KernelExecutionTest, NonCollectiveKernelsDoNotRequirePrepare) {
@@ -842,7 +841,6 @@ TEST_F(KernelExecutionTest, IsDeviceKernelTypeReturnsTrue) {
 TEST_F(KernelExecutionTest, IsDeviceKernelTypeReturnsFalse) {
   // Host-side kernel types should return false
   EXPECT_FALSE(IsDeviceKernelType(KernelTypeEnum::kEvent));
-  EXPECT_FALSE(IsDeviceKernelType(KernelTypeEnum::kHint));
 }
 
 TEST_F(KernelExecutionTest, GetXUIndexMapping) {
@@ -858,7 +856,6 @@ TEST_F(KernelExecutionTest, GetXUIndexMapping) {
 TEST_F(KernelExecutionTest, GetXUIndexThrowsForNonDevice) {
   // Non-device kernel types should throw
   EXPECT_THROW(GetXUIndex(KernelTypeEnum::kEvent), torch_neuronx::ExecutionRuntimeException);
-  EXPECT_THROW(GetXUIndex(KernelTypeEnum::kHint), torch_neuronx::ExecutionRuntimeException);
 }
 
 TEST_F(KernelExecutionTest, BaseKernelPrepareDoesNotThrow) {

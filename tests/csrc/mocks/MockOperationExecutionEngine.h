@@ -32,6 +32,7 @@ class MockOperationExecutionEngine : public OperationExecutionEngine {
   using OperationExecutionEngine::pending_async_ops_count_;
   using OperationExecutionEngine::ProcessCompletions;
   using OperationExecutionEngine::ScheduleOperation;
+  using OperationExecutionEngine::SnapshotConcatenationQueueDepth;
   using OperationExecutionEngine::xu_inflight_counts_;
 
   // Test-only: push directly onto stream->runtime_queue_, bypassing the worker.

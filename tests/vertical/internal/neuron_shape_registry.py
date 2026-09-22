@@ -422,7 +422,7 @@ if _shape_registry_path and os.path.exists(_shape_registry_path):
 # plain run tests the model shapes too. To turn them off, set
 # NEURON_CACHE_KEY_SHAPES=0 (the --no-cache-key-shapes pytest option). The shapes
 # live in neuron_shape_defaults_generated.py. Regenerate them with
-# tests/vertical/tools/refresh_cache_key_shapes.py.
+# tests/vertical/internal/refresh_cache_key_shapes.py.
 if os.environ.get("NEURON_CACHE_KEY_SHAPES", "1") != "0":
     from .neuron_shape_defaults_generated import register_cache_key_shapes
 

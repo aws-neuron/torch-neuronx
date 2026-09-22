@@ -8,6 +8,7 @@
 #include <limits>
 
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
+#include "torch_neuronx/csrc/core/NeuronOpsApi.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"
 #include "torch_neuronx/csrc/core/dispatch/Int64Policy.h"
@@ -728,7 +729,7 @@ std::vector<MetaOutputSpec> ExtractMetaOutputSpecs(torch::jit::Stack& stack) {
     if (out.isTensor()) {
       auto t = out.toTensor();
       if (t.defined()) {
-        specs.push_back({t.sizes().vec(), t.scalar_type(), false});
+        specs.push_back({t.sizes().vec(), t.scalar_type(), false, t.strides().vec()});
       } else {
         specs.push_back({{}, c10::ScalarType::Undefined, true});
       }
@@ -738,7 +739,7 @@ std::vector<MetaOutputSpec> ExtractMetaOutputSpecs(torch::jit::Stack& stack) {
       for (const auto& t_ref : out.toTensorList()) {
         at::Tensor t = t_ref;
         if (t.defined()) {
-          specs.push_back({t.sizes().vec(), t.scalar_type(), false});
+          specs.push_back({t.sizes().vec(), t.scalar_type(), false, t.strides().vec()});
         } else {
           specs.push_back({{}, c10::ScalarType::Undefined, true});
         }
@@ -755,6 +756,86 @@ std::vector<MetaOutputSpec> InferOutputsViaMeta(const c10::OperatorHandle& op,
                                                 const std::vector<c10::IValue>& args) {
   auto stack = RunMetaDispatch(op, args);
   return ExtractMetaOutputSpecs(stack);
+}
+
+// True for strides that are a plain permutation of a dense buffer, and that
+// are not the contiguous layout.
+//
+// AnalyzeEpilogueLayout (Transformations.cpp) accepts exactly this class of
+// layout for a buffer that starts at element 0. It ignores each dim of size 1,
+// it needs the innermost active stride to be 1, and it refuses a gap between
+// two active dims. The walk below proves all three: it visits the active dims
+// from the innermost outward and it needs each stride to equal the product of
+// the sizes inside it.
+//
+// A layout outside this class must keep the contiguous output. The epilogue
+// reports such a layout as unsupported and then copies through the host, which
+// costs more than the stride difference.
+static bool IsFusableDensePermutation(const std::vector<int64_t>& shape,
+                                      const std::vector<int64_t>& strides) {
+  if (shape.size() != strides.size()) return false;
+
+  std::vector<size_t> active;
+  for (size_t d = 0; d < shape.size(); ++d) {
+    // An empty output has no layout to keep.
+    if (shape[d] == 0) return false;
+    if (shape[d] > 1) active.push_back(d);
+  }
+  if (active.empty()) return false;
+
+  std::vector<size_t> physical = active;
+  std::stable_sort(physical.begin(), physical.end(),
+                   [&](size_t a, size_t b) { return strides[a] > strides[b]; });
+
+  int64_t expected = 1;
+  for (size_t pi = physical.size(); pi-- > 0;) {
+    const size_t d = physical[pi];
+    if (strides[d] != expected) return false;
+    expected *= shape[d];
+  }
+
+  // Equal orders mean the layout is already contiguous, so there is no work.
+  return physical != active;
+}
+
+std::vector<MetaOutputSpec> AtenOutputLayouts(const c10::OperatorHandle& op,
+                                              const c10::FunctionSchema& schema,
+                                              const std::vector<c10::IValue>& original_args) {
+  // The epilogue is the only mechanism that writes a permuted output, so there
+  // is nothing to propagate when it is off.
+  if (!torch_neuronx::IsEpilogueEnabled()) return {};
+
+  // An out or inplace op takes the layout of the caller buffer instead.
+  if (schema.is_mutable()) return {};
+
+  // ATen derives the output layout from the inputs. Contiguous inputs give a
+  // contiguous output, which is what the default allocation already does.
+  bool has_permuted_input = false;
+  ForEachTensor(original_args, [&](const at::Tensor& t) {
+    if (t.defined() && t.numel() > 0 && !t.is_contiguous()) has_permuted_input = true;
+  });
+  if (!has_permuted_input) return {};
+
+  std::vector<MetaOutputSpec> specs;
+  try {
+    specs = InferOutputsViaMeta(op, original_args);
+  } catch (const std::exception& e) {
+    // No Meta kernel, or the Meta kernel rejects the arguments. The op still
+    // runs and returns correct values with the contiguous layout.
+    TORCH_NEURONX_DISPATCH_DEBUG("[AtenOutputLayouts] meta dispatch failed",
+                                 " op=", schema.operator_name().name, " error=", e.what());
+    return {};
+  }
+
+  for (auto& spec : specs) {
+    // Clear the layout of every output that must stay contiguous. This keeps
+    // the index alignment with the Meta returns.
+    if (spec.is_undefined || !IsFusableDensePermutation(spec.shape, spec.strides)) {
+      spec.strides.clear();
+    }
+  }
+
+  return specs;
 }
 
 bool NormalizeWrappedIntegerScalarViaMeta(const c10::OperatorHandle& op,

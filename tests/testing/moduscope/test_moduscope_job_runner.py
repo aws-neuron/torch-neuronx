@@ -48,7 +48,7 @@ GRID_DIR = str(Path(grid.__file__).resolve().parent)
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 #: The reusable workflow owns the suite; the wrapper owns the dispatch screen.
-REUSABLE_WORKFLOW = REPO_ROOT / ".github/workflows/_moduscope-tests.yml"
+REUSABLE_WORKFLOW = REPO_ROOT / ".github/workflows/_reusable-moduscope-tests.yml"
 WRAPPER_WORKFLOW = REPO_ROOT / ".github/workflows/manual-moduscope-tests.yml"
 
 GRID_FILE_NAME = "grid_metrics.json"

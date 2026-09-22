@@ -5,6 +5,7 @@ PythonVersion = struct(
     PY311 = "3.11",
     PY312 = "3.12",
     PY313 = "3.13",
+    PY314 = "3.14",
 )
 
 DEFAULT_PYTHON_VERSION = PythonVersion.PY310
@@ -15,6 +16,7 @@ TORCH_SHA256 = {
     PythonVersion.PY311: "673dbf5c9bbadfffab7a386b6dd7a0c219f1408a328b7b4e86d0ae551cdafa42",
     PythonVersion.PY312: "a09987c95ec4cffdb6df798d3d641558110a334cfccce22f2f046d83142bc260",
     PythonVersion.PY313: "160e1bc46aeded3111d2801f8ae10dc9a1b946843a7e126b4dbf5e19c5706e95",
+    PythonVersion.PY314: "b2cd92bce63d40bf6fc2e5d840fc2f0063bd180a242daa761cb6088cc2f46e27",
 }
 
 def format_python_wheel_tag(python_version):

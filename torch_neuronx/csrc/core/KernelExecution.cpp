@@ -407,25 +407,13 @@ void CollectiveDirectKernelExecution::PrepareImpl() const {
                       "device_id=", GetDeviceId(), "rank=", my_rank_, "cc_ctx=", cc_ctx_);
 }
 
-void CollectiveDirectKernelExecution::Prepare() const {
-  if (c10_neuron::NeuronCachingAllocator::IsLazyAllocEnabled()) {
-    return;
-  }
-  PrepareImpl();
-}
-
 bool CollectiveDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
                                                c10::StreamId stream_id) const {
   TORCH_NEURONX_DEBUG("CollectiveDirectKernelExecution::Schedule()",
                       "collective_type=", static_cast<int>(collective_type_));
 
-  if (c10_neuron::NeuronCachingAllocator::IsLazyAllocEnabled()) {
-    PrepareImpl();
-  } else {
-    // Check that Prepare() was called (cc_ctx_ should be set)
-    EXECUTION_RUNTIME_CHECK(cc_ctx_ != nullptr,
-                            "CollectiveDirectKernelExecution::Schedule() called before Prepare()");
-  }
+  // Tensors are only guaranteed bound once the worker has run kAlloc.
+  PrepareImpl();
 
   int queue = nrt::GetHardwareQueue(NRTA_XU_COLLECTIVES, stream_id);
   NRT_STATUS status = nrt::CollectivesSchedule(&cc_ctx_, queue, nrt_status, sequence_id);
@@ -436,14 +424,6 @@ bool CollectiveDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::Sequ
                       "seq=", *sequence_id);
   return true;
 }
-
-HintDirectKernelExecution::HintDirectKernelExecution(const std::string& op_name, void* ptr,
-                                                     size_t size_bytes, int device_id,
-                                                     HintType hint_type)
-    : NeuronKernelExecution(op_name, device_id),
-      ptr_(ptr),
-      size_bytes_(size_bytes),
-      hint_type_(hint_type) {}
 
 AllocDirectKernelExecution::AllocDirectKernelExecution(const std::string& op_name,
                                                        TensorDataRef dst_ref, size_t size_bytes,
@@ -641,7 +621,7 @@ EventDirectKernelExecution::EventDirectKernelExecution(const std::string& op_nam
     : NeuronKernelExecution(op_name, device_id),
       event_(event),
       action_(action),
-      signal_stream_id_(event.recorded_stream_id()) {}
+      signal_stream_impl_(event.recorded_stream_impl()) {}
 
 bool EventDirectKernelExecution::ValidateImpl() const {
   // Event primitives don't require inputs/outputs

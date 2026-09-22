@@ -30,6 +30,7 @@ PART = 128  # SBUF partitions; K2 blocks its schedule by this
 def grouped_mm_ragged_2d_3d(a, b, offs):
     R, D = a.shape
     E, _d1b, F = b.shape
+
     # One program per logical NeuronCore, each owning a disjoint F slice.
     # Overlapping writes between programs race.
     num_progs = nl.num_programs(0)
@@ -49,7 +50,8 @@ def grouped_mm_ragged_2d_3d(a, b, offs):
     # partition must start at a multiple of 32, so values cannot sit on partition g.
     starts = nl.ndarray((1, E), nl.int32, nl.sbuf)
     nisa.memset(starts, 0)
-    nisa.dma_copy(starts.ap([[E, 1], [1, E - 1]], 1), offs.ap([[E, 1], [1, E - 1]], 0))
+    if E > 1:
+        nisa.dma_copy(starts.ap([[E, 1], [1, E - 1]], 1), offs.ap([[E, 1], [1, E - 1]], 0))
     ends = nl.ndarray((1, E), nl.int32, nl.sbuf)
     nisa.dma_copy(ends, offs.ap([[E, 1], [1, E]]))
     ntiles = nl.ndarray((1, E), nl.int32, nl.sbuf)
@@ -214,8 +216,11 @@ def grouped_mm_ragged_2d_3d(a, b, offs):
                     narrow.ap([[FT, M_TILE], [1, fw]]),
                 )
 
-        nl.fori_loop(0, lo_reg, safe_body)
-        nl.fori_loop(lo_reg, hi_reg, tail_body)
+        if R >= M_TILE:
+            nl.fori_loop(0, lo_reg, safe_body)
+            nl.fori_loop(lo_reg, hi_reg, tail_body)
+        else:
+            nl.fori_loop(0, hi_reg, tail_body)
     return out
 
 
@@ -224,6 +229,8 @@ def grouped_mm_ragged_2d_2d(a, b, offs):
     D1, T = a.shape
     _tb, D2 = b.shape
     (E,) = offs.shape
+
+    LOAD_T = min(TOK, T)
     C_MAX = (T + TOK - 1) // TOK
     W = 4
     # D1 tiles. The last is short when D1 % D1T != 0; its extent stays a constant.
@@ -246,7 +253,8 @@ def grouped_mm_ragged_2d_2d(a, b, offs):
     nisa.dma_copy(ends_r, offs.ap([[E, 1], [1, E]]))
     starts_r = nl.ndarray((1, E), nl.int32, nl.sbuf)
     nisa.memset(starts_r, 0)
-    nisa.dma_copy(starts_r.ap([[E, 1], [1, E - 1]], 1), offs.ap([[E, 1], [1, E - 1]], 0))
+    if E > 1:
+        nisa.dma_copy(starts_r.ap([[E, 1], [1, E - 1]], 1), offs.ap([[E, 1], [1, E - 1]], 0))
     counts_sb = nl.ndarray((1, E), nl.int32, nl.sbuf)
     nisa.tensor_tensor(counts_sb, ends_r, starts_r, nl.subtract)
     nisa.tensor_scalar(counts_sb, counts_sb, nl.add, TOK - 1)
@@ -279,7 +287,7 @@ def grouped_mm_ragged_2d_2d(a, b, offs):
         nisa.tensor_tensor(base, base, starts.ap([[1, EB], [0, C_MAX]]), nl.add)
 
         base_c = nl.ndarray((EB, C_MAX), nl.int32, nl.sbuf)
-        nisa.tensor_scalar(base_c, base, nl.minimum, T - TOK)
+        nisa.tensor_scalar(base_c, base, nl.minimum, max(0, T - TOK))
 
         r_lo = nl.ndarray((EB, C_MAX), nl.int32, nl.sbuf)
         nisa.tensor_tensor(r_lo, base, base_c, nl.subtract)
@@ -342,12 +350,13 @@ def grouped_mm_ragged_2d_2d(a, b, offs):
             nisa.tensor_tensor(lt, iot, hi_bc, nl.less)
             nisa.tensor_tensor(mask, ge, lt, nl.multiply)
 
-            # b rows at the clamped base, masked so tokens outside this chunk
-            # contribute nothing.
+            if T < TOK:
+                nisa.memset(b_tile, 0)
+                nisa.memset(a_all, 0)
             nisa.dma_copy(
-                b_tile,
+                b_tile.ap([[PD2, LOAD_T], [1, PD2]]),
                 b.ap(
-                    [[D2, TOK], [1, PD2]],
+                    [[D2, LOAD_T], [1, PD2]],
                     prog_id * PD2,
                     scalar_offset=base_sb,
                     indirect_dim=0,
@@ -358,9 +367,9 @@ def grouped_mm_ragged_2d_2d(a, b, offs):
 
             if NFULL_D1:
                 nisa.dma_copy(
-                    a_all.ap([[NDT * TOK, D1T], [TOK, NFULL_D1], [1, TOK]]),
+                    a_all.ap([[NDT * TOK, D1T], [TOK, NFULL_D1], [1, LOAD_T]]),
                     a.ap(
-                        [[T, D1T], [D1T * T, NFULL_D1], [1, TOK]],
+                        [[T, D1T], [D1T * T, NFULL_D1], [1, LOAD_T]],
                         0,
                         scalar_offset=base_sb,
                         indirect_dim=1,
@@ -369,9 +378,9 @@ def grouped_mm_ragged_2d_2d(a, b, offs):
                 )
             if NFULL_D1 < NDT:
                 nisa.dma_copy(
-                    a_all.ap([[NDT * TOK, D1 - NFULL_D1 * D1T], [1, TOK]], NFULL_D1 * TOK),
+                    a_all.ap([[NDT * TOK, D1 - NFULL_D1 * D1T], [1, LOAD_T]], NFULL_D1 * TOK),
                     a.ap(
-                        [[T, D1 - NFULL_D1 * D1T], [1, TOK]],
+                        [[T, D1 - NFULL_D1 * D1T], [1, LOAD_T]],
                         NFULL_D1 * D1T * T,
                         scalar_offset=base_sb,
                         indirect_dim=1,

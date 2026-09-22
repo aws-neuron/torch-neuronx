@@ -260,29 +260,6 @@ c10_neuron::NeuronSegmentPool& NeuronResourceManager::GetSegmentPool(int device)
   return *pool;
 }
 
-c10_neuron::NrtTensorPool& NeuronResourceManager::GetTensorPool(int device) {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  if (tensor_pools_.empty()) {
-    int count = c10_neuron::device_count();
-    if (count <= 0) {
-      throw std::runtime_error("No Neuron devices available");
-    }
-    tensor_pools_.resize(count);
-  }
-
-  if (device < 0 || device >= static_cast<int>(tensor_pools_.size())) {
-    throw std::runtime_error("Invalid device: " + std::to_string(device));
-  }
-
-  auto& pool = tensor_pools_[device];
-  if (!pool) {
-    pool = std::make_unique<c10_neuron::NrtTensorPool>(device);
-  }
-
-  return *pool;
-}
-
 bool ResourceSemaphore::TryAcquireImmediate() {
   // Precondition: mutex_ is held by calling thread
   if (count_ > 0) {

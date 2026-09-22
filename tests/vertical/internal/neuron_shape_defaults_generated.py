@@ -7203,7 +7203,7 @@ SMOKE_SUBSET_OP_MODE = {
 
 
 # BEGIN GENERATED CACHE-KEY SHAPES
-# Do not edit by hand. Regenerate with tests/vertical/tools/refresh_cache_key_shapes.py.
+# Do not edit. Regenerate with tests/vertical/internal/refresh_cache_key_shapes.py.
 CACHE_KEY_SOURCE = "cache_keys"
 
 

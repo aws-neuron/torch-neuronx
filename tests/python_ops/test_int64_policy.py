@@ -337,11 +337,11 @@ class TestOpTables:
         for op in ["aten::add", "aten::sub", "aten::mul", "aten::div"]:
             assert op in _NATIVE_INT64_OPS
 
-    def test_comparison_ops_not_native(self):
-        # Disabled: native S64 comparison hangs on non-contiguous int64 (output
-        # transpose epilogue), which the input-based guard can't gate.
+    def test_comparison_ops_are_native(self):
+        # Native S64 (full-width). The compare+transpose device hang is fixed in
+        # the compiler (neuronx-cc 2.0.283011).
         for op in ["aten::eq", "aten::ne", "aten::gt", "aten::ge", "aten::lt", "aten::le"]:
-            assert op not in _NATIVE_INT64_OPS
+            assert op in _NATIVE_INT64_OPS
 
     def test_matmul_is_unsupported(self):
         assert "aten::mm" in _UNSUPPORTED_INT64_OPS

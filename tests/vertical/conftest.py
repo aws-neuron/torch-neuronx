@@ -33,7 +33,20 @@ logger = logging.getLogger(__name__)
 _WORKER_ID = os.environ.get("PYTEST_XDIST_WORKER", "main")
 _COVERAGE_CACHE_DIR = Path(tempfile.gettempdir()) / f"neuron_coverage_cache_{_WORKER_ID}"
 os.environ["TORCH_NEURONX_HLO_CACHE_DIR"] = str(_COVERAGE_CACHE_DIR / "hlo")
-os.environ["TORCH_NEURONX_NEFF_CACHE_DIR"] = str(_COVERAGE_CACHE_DIR / "neff")
+
+# NEFF cache dir. When the persistent NEFF cache is active, every worker shares
+# the one dir that neff_cache_ctl hydrates and uploads, the same way the upstream
+# suite does. The storage label injects PERSISTENT_STORAGE_BUCKET, so its presence
+# is the signal. The shared dir is the torch-neuronx default (/tmp/neff_cache),
+# which sits outside _COVERAGE_CACHE_DIR, so pytest_sessionfinish never deletes it
+# and the seeding run can upload it. HLO-derived keying makes a NEFF reusable
+# across runs and suites. Otherwise use a per-worker dir to avoid xdist write
+# races and /tmp bloat on a local run.
+if os.environ.get("PERSISTENT_STORAGE_BUCKET"):
+    os.environ.setdefault("TORCH_NEURONX_NEFF_CACHE_DIR", "/tmp/neff_cache")
+    os.environ.setdefault("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "1")
+else:
+    os.environ["TORCH_NEURONX_NEFF_CACHE_DIR"] = str(_COVERAGE_CACHE_DIR / "neff")
 
 # Disable torch.compile fallback for accurate lowering results
 os.environ["TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION"] = "1"
@@ -132,7 +145,8 @@ def pytest_addoption(parser):
         help=(
             "Skip the committed cache-key model shapes (register_cache_key_shapes in "
             "tests/vertical/internal/neuron_shape_defaults_generated.py). The shapes "
-            "load by default. Regenerate them with tools/refresh_cache_key_shapes.py."
+            "load by default. Regenerate them with "
+            "tests/vertical/internal/refresh_cache_key_shapes.py."
         ),
     )
     parser.addoption(
@@ -262,7 +276,9 @@ def pytest_sessionstart(session):
 
 def pytest_sessionfinish(session, exitstatus):
     # Per-worker: remove this worker's cache dir to avoid /tmp bloat across runs.
-    # Ignore errors — the main process (no workerinput) also runs this.
+    # Ignore errors — the main process (no workerinput) also runs this. The shared
+    # persistent NEFF cache lives at /tmp/neff_cache, outside this dir, so it
+    # survives for the seeding run to upload.
     import shutil
 
     shutil.rmtree(_COVERAGE_CACHE_DIR, ignore_errors=True)
@@ -275,6 +291,22 @@ def pytest_sessionfinish(session, exitstatus):
     _aggregate_dispatch_metrics(_DISPATCH_METRICS_DIR, "dispatch_latency")
     _aggregate_dynamic_metrics(_DYNAMIC_METRICS_DIR, "dynamic_aten_ops")
     _aggregate_dynamic_metrics(_COLLECTIVES_METRICS_DIR, "dynamic_collectives")
+    _render_coverage_summary(session)
+
+
+def _render_coverage_summary(session):
+    """Render the op-status panel from the coverage CSVs into step_summary.md.
+
+    Informational: a render failure must not fail the run.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "testing" / "vertical"))
+        import render_coverage_summary
+
+        kind = "perf" if session.config.getoption("--perf-timing", default=False) else "coverage"
+        render_coverage_summary.render(_CSV_OUTPUT_DIR, _CSV_OUTPUT_DIR, kind)
+    except Exception as e:
+        logger.warning(f"could not render coverage step summary: {e}")
 
 
 def _aggregate_metrics(metrics_dir: Path, prefix: str):

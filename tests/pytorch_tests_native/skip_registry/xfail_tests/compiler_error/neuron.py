@@ -98,6 +98,7 @@ COMPILER_ERROR_NEURON = [
     "test_modules.py::TestModuleNEURON::test_non_contiguous_tensors_nn_LazyConv1d_neuron_float32",
     "test_modules.py::TestModuleNEURON::test_non_contiguous_tensors_nn_LazyConv1d_neuron_float64",
     "test_ops.py::TestCommonNEURON::test_dtypes_nn_functional_conv_transpose2d_neuron",
+    "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_linalg_qr_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_nn_functional_conv_transpose1d_neuron_int64",
     "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_nn_functional_conv_transpose2d_neuron_int64",
     "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_nn_functional_conv_transpose3d_neuron_int64",

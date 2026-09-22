@@ -303,23 +303,6 @@ ConcatenationResult ConcatenationCore::ProcessBufferedOperationsImpl(
       ir_nodes_owned.push_back(std::move(hint_node));
       continue;
     }
-    if (kt == at::neuron::KernelTypeEnum::kHint) {
-      auto* hint = dynamic_cast<at::neuron::HintDirectKernelExecution*>(op->kernel_execution.get());
-      if (hint &&
-          hint->GetHintType() == at::neuron::HintDirectKernelExecution::HintType::kDeallocation) {
-        // Create DeallocHintNode
-        auto hint_node = std::make_unique<DeallocHintNode>(hint->GetPtr());
-        mixed_ir_nodes.push_back(hint_node.get());
-        ir_nodes_owned.push_back(std::move(hint_node));
-      } else if (hint && hint->GetHintType() ==
-                             at::neuron::HintDirectKernelExecution::HintType::kAllocation) {
-        // Create AllocHintNode - signals address (re)allocation to clear from pruned set
-        auto hint_node = std::make_unique<AllocHintNode>(hint->GetPtr());
-        mixed_ir_nodes.push_back(hint_node.get());
-        ir_nodes_owned.push_back(std::move(hint_node));
-      }
-      continue;
-    }
     // Create IR node from HLO operation
     // TODO(mengchiy): Handle hint nodes also in CreateNodeFromOperationContext
     auto ir_node = ir_node_manager->CreateNodeFromOperationContext(op);

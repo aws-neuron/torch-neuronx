@@ -79,25 +79,6 @@ class MixedModel(nn.Module):
         return x
 
 
-def _mock_functional_api(x):
-    """Stand-in for a vLLM functional API implemented outside nn.Module."""
-    return torch.relu(x * 2)
-
-
-class FunctionalBlock(nn.Module):
-    def forward(self, x):
-        return _mock_functional_api(x)
-
-
-class FunctionalModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.block = FunctionalBlock()
-
-    def forward(self, x):
-        return self.block(x)
-
-
 def get_fx_graph(model, input_shape=(2, 4)):
     """Get AOT FX graph from model."""
     x = torch.randn(*input_shape)
@@ -203,108 +184,18 @@ class TestGetHierarchyString:
                 for part in parts:
                     assert "[" in part and "]" in part
 
-    def test_captured_functional_api_includes_stack_trace_function_frame(self):
-        """Mirror vLLM's module-to-free-function call structure end to end."""
-        gm = get_fx_graph(FunctionalModel())
-
-        function_nodes = [
-            node
-            for node in gm.graph.nodes
-            if "in _mock_functional_api" in node.meta.get("stack_trace", "")
-        ]
-        assert function_nodes, "functional API frame was not preserved through AOT capture"
-
-        hierarchies = {_get_hierarchy_string(node) for node in function_nodes}
-        assert any(
-            "FunctionalBlock[block][0]/test_hierarchy_location[_mock_functional_api]" in hierarchy
-            for hierarchy in hierarchies
-        )
-
-    def test_stack_trace_interleaves_module_and_function_frames(self):
-        gm = get_fx_graph(SimpleLinear())
-        node = get_nodes_with_hierarchy(gm)[0]
-        node.meta["nn_module_stack"] = {
-            "model@0": ("L['self'].model", FunctionalModel),
-            "block@0": ("L['self'].model.block", FunctionalBlock),
-        }
-        node.meta["stack_trace"] = """\
-  File "/models/model.py", line 10, in forward
-    return self.block(x)
-  File "/models/block.py", line 20, in forward
-    return functional_attention(x)
-  File "/models/attention.py", line 30, in functional_attention
-    return torch.relu(x)
-"""
-
-        assert _get_hierarchy_string(node) == (
-            "FunctionalModel[model][0]/FunctionalBlock[block][0]/attention[functional_attention]"
-        )
-
-    def test_call_hierarchy_is_not_used(self):
-        gm = get_fx_graph(SimpleLinear())
-        node = get_nodes_with_hierarchy(gm)[0]
-        node.meta["call_hierarchy"] = [{"type": "function", "name": "experimental_api", "count": 0}]
-        node.meta.pop("stack_trace", None)
-
-        assert _get_hierarchy_string(node) == "Linear[linear][0]"
-
-    def test_function_only_stack_trace_without_module_stack(self):
-        gm = get_fx_graph(MixedModel())
-        node = get_nodes_without_hierarchy(gm)[0]
-        node.meta["stack_trace"] = """\
-  File "/models/functional.py", line 10, in functional_attention
-    return torch.relu(x)
-"""
-
-        assert _get_hierarchy_string(node) == "functional[functional_attention]"
-
-    def test_forward_module_stack_used_with_stack_trace_function(self):
-        gm = get_fx_graph(MixedModel())
-        node = get_nodes_without_hierarchy(gm)[0]
-        node.meta["fwd_nn_module_stack"] = {
-            "model@0": ("L['self'].model", FunctionalModel),
-        }
-        node.meta["stack_trace"] = """\
-  File "/models/model.py", line 10, in forward
-    return functional_attention(x)
-  File "/models/attention.py", line 20, in functional_attention
-    return torch.relu(x)
-"""
-
-        assert _get_hierarchy_string(node) == (
-            "FunctionalModel[model][0]/attention[functional_attention]"
-        )
-
-    def test_misaligned_trace_falls_back_to_modules_then_functions(self):
-        gm = get_fx_graph(SimpleLinear())
-        node = get_nodes_with_hierarchy(gm)[0]
-        node.meta["stack_trace"] = """\
-  File "/models/helper.py", line 10, in helper
-    return torch.relu(x)
-"""
-
-        assert _get_hierarchy_string(node) == "Linear[linear][0]/helper[helper]"
-
-    def test_stack_trace_ignores_wrappers_and_synthetic_frames(self):
-        gm = get_fx_graph(MixedModel())
-        node = get_nodes_without_hierarchy(gm)[0]
-        node.meta["stack_trace"] = """\
-  File "/torch/nn/modules/module.py", line 1, in _call_impl
-    return forward_call(*args)
-  File "/models/model.py", line 2, in <listcomp>
-    return [functional_attention(x)]
-  File "/models/attention.py", line 3, in functional_attention
-    return torch.relu(x)
-"""
-
-        assert _get_hierarchy_string(node) == "attention[functional_attention]"
-
-    def test_fallback_without_stack_trace(self):
-        gm = get_fx_graph(SimpleLinear())
-        node = get_nodes_with_hierarchy(gm)[0]
-        node.meta.pop("stack_trace", None)
-
-        assert _get_hierarchy_string(node) == "Linear[linear][0]"
+    # TODO: call_hierarchy format is not finalized yet. These tests are
+    # placeholders for upstream PyTorch PR populates this field.
+    # The current code has a pass-through that falls
+    # back to nn_module_stack when call_hierarchy is present.
+    #
+    # def test_call_hierarchy_preferred_over_nn_module_stack(self):
+    #     """When call_hierarchy metadata is present, use it instead of nn_module_stack."""
+    #     ...
+    #
+    # def test_fallback_without_call_hierarchy(self):
+    #     """Without call_hierarchy, falls back to nn_module_stack."""
+    #     ...
 
 
 class TestAtenHierarchyLeaf:

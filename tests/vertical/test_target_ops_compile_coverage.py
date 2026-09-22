@@ -26,13 +26,14 @@ import torch_neuronx
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from internal import NeuronOpInfo
 from internal.common import (
-    STATUS_RANK as _STATUS_RANK,
-)
-from internal.common import (
+    COMPILE_TIMEOUT_S,
     CompileTimeoutError,
     compile_time_limit,
     get_neuron_op_db,
     kill_compile_subprocesses,
+)
+from internal.common import (
+    STATUS_RANK as _STATUS_RANK,
 )
 from internal.common import (
     allocate_to_device as _allocate_to_device,
@@ -44,7 +45,13 @@ from internal.common import (
     classify_op as _classify_op,
 )
 from internal.common import (
+    compile_supported_ops as _compile_supported_ops,
+)
+from internal.common import (
     count_input_elems as _count_input_elems,
+)
+from internal.common import (
+    gate_enabled as _gate_enabled,
 )
 from internal.common import (
     probe_output_meta as _probe_output_meta,
@@ -57,6 +64,7 @@ from internal.common import (
 )
 from internal.neuron_op_info import _resolve_op
 from internal.roofline import compute_roofline
+from known_coverage_gaps import COMPILE_GAPS
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +331,30 @@ def _save_compile_result(result: dict):
         json.dump(result, f)
 
 
+# Compile statuses that mean an expected-supported op did not lower. A compile
+# timeout is watchdog/load dependent, so it does not gate.
+_COMPILE_BLOCKING = frozenset({"failed_lowering", "graph_break"})
+
+
+def _gate_check_compile(op_name: str, status: str, error: str) -> None:
+    """Merge-queue gate: fail on a compile-supported op that regressed.
+
+    "Supported" is static: a registered or composite op, or an op the backend
+    lowers through a decomposition. A known gap is on the allowlist, so it
+    reports xfail, not a failure.
+    """
+    if status not in _COMPILE_BLOCKING:
+        return
+    expected = _classify_op(op_name) in ("registered", "composite") or (
+        op_name in _compile_supported_ops()
+    )
+    if not expected:
+        return
+    if op_name in COMPILE_GAPS:
+        pytest.xfail(f"known compile gap: {COMPILE_GAPS[op_name]}")
+    pytest.fail(f"{op_name}: compile regression ({status}). {error}", pytrace=False)
+
+
 def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> dict:
     """Run a single sample through torch.compile(backend='neuron')."""
     out = {
@@ -414,13 +446,21 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
     # from accumulating across the ~1360 target ops in a worker.
     try:
         try:
-            # Ensure a cold compile for time_to_first_ms — clear the worker's
-            # HLO+NEFF cache so no previously-compiled primitive from a sibling
-            # op in this worker leaks into this op's first compile.
-            _reset_cache_dirs(
-                os.environ.get("TORCH_NEURONX_HLO_CACHE_DIR", "/tmp/hlo_cache"),
-                os.environ.get("TORCH_NEURONX_NEFF_CACHE_DIR", "/tmp/neff_cache"),
-            )
+            # Ensure a cold compile for time_to_first_ms. Clear the worker's
+            # HLO cache so no previously-compiled primitive from a sibling op
+            # in this worker leaks into this op's first compile. When the
+            # persistent NEFF cache is active (PERSISTENT_STORAGE_BUCKET set),
+            # keep the shared NEFF dir: a seeding coverage run accumulates
+            # NEFFs and a gate run reads them warm. The NEFF key comes from the
+            # HLO content, so wiping the HLO dir does not stop the reuse. Perf
+            # never sets the bucket, so it still wipes the NEFF dir and keeps
+            # time_to_first_ms cold.
+            _reset_dirs = [os.environ.get("TORCH_NEURONX_HLO_CACHE_DIR", "/tmp/hlo_cache")]
+            if not os.environ.get("PERSISTENT_STORAGE_BUCKET"):
+                _reset_dirs.append(
+                    os.environ.get("TORCH_NEURONX_NEFF_CACHE_DIR", "/tmp/neff_cache")
+                )
+            _reset_cache_dirs(*_reset_dirs)
             start = time.perf_counter()
             with torch.no_grad(), compile_time_limit():
                 _ = compiled_fn(*neuron_args, **neuron_kwargs)
@@ -464,14 +504,28 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
 
         # NUM_EXEC_ITERATIONS + 1 calls; first is an untimed warmup.
         # compiled_fn is reused so dynamo's cache stays warm (no recompile).
-        for i in range(NUM_EXEC_ITERATIONS + 1):
-            torch_neuronx.synchronize()
-            start = time.perf_counter()
-            with torch.no_grad():
-                _ = compiled_fn(*neuron_args, **neuron_kwargs)
-            torch_neuronx.synchronize()
-            if i > 0:  # skip warmup
-                out["exec_times"].append((time.perf_counter() - start) * 1000)
+        #
+        # Guard the loop with compile_time_limit. backend="neuron" runs the
+        # neuronx-cc compile on a background thread, and synchronize() waits on
+        # the device kernels, not on that compile. So the cold compile can land
+        # here in the warmup call, not in the ttf block above. Without the guard
+        # a runaway compile hangs the worker for the rest of the run. The
+        # watchdog kills the neuronx-cc subprocess, so the wrapped call raises.
+        try:
+            for i in range(NUM_EXEC_ITERATIONS + 1):
+                torch_neuronx.synchronize()
+                start = time.perf_counter()
+                with torch.no_grad(), compile_time_limit():
+                    _ = compiled_fn(*neuron_args, **neuron_kwargs)
+                    torch_neuronx.synchronize()
+                if i > 0:  # skip warmup
+                    out["exec_times"].append((time.perf_counter() - start) * 1000)
+        except CompileTimeoutError as e:
+            kill_compile_subprocesses()
+            out["error"] = str(e)
+            out["status"] = "compile_timeout"
+            out["exec_times"] = []
+            return out
 
         # Correctness check — allocate FRESH neuron args so in-place ops
         # (aten::add_, aten::sub_, aten::_foreach_add_, etc.) compare against an
@@ -700,6 +754,16 @@ class TestTargetOpsCompileCoverage:
         result["input_count"] = str(len(samples))
         op = _resolve_op(op_name)
 
+        # Persist a provisional compile_timeout row before the compile. A hard
+        # abort (see compile_time_limit) ends the process without running Python
+        # again, so this row records the timeout. The success path overwrites it.
+        result["status"] = "compile_timeout"
+        result["error"] = f"compile exceeded {COMPILE_TIMEOUT_S}s (hard abort)"
+        _save_compile_result(result)
+
         per_shape = [_run_one_sample_compile(op, op_name, classification, s) for s in samples]
         _aggregate_compile_results(result, per_shape, classification)
         _save_compile_result(result)
+
+        if _gate_enabled():
+            _gate_check_compile(op_name, result["status"], result["error"])

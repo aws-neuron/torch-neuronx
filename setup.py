@@ -1,6 +1,7 @@
 import os
 import posixpath
 import re
+import runpy
 import subprocess
 import sys
 import time
@@ -10,6 +11,34 @@ from setuptools import Extension, find_namespace_packages, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
 PACKAGE_NAME = "torch_neuronx"
+
+# Prevent an installed backend from loading during the build.
+os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+
+
+def _get_pytorch_version():
+    """Get the PyTorch version that this wheel uses."""
+    selected_version = os.environ.get("TORCH_NEURONX_BUILD_PYTORCH_VERSION")
+    try:
+        import torch
+
+        installed_version = torch.__version__.split("+", 1)[0]
+    except ImportError:
+        installed_version = None
+
+    version = selected_version or installed_version
+    if not version:
+        raise RuntimeError("PyTorch is not installed. Install PyTorch before the build.")
+
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:[a-z0-9.]*)?", version):
+        raise ValueError(f"PyTorch version {version!r} is invalid. Use a PEP 440 version.")
+
+    if selected_version and installed_version and selected_version != installed_version:
+        raise RuntimeError(
+            f"Selected PyTorch {selected_version} does not match installed PyTorch "
+            f"{installed_version}. Install the selected version."
+        )
+    return version
 
 
 def _get_git_sha():
@@ -64,42 +93,33 @@ def _is_release_branch():
     return branch.startswith("release")
 
 
-def _get_version():
+def _get_version(pytorch_version):
     """Build version string per versioning scheme.
 
     Format: {TORCH_MAJOR}.{TORCH_MINOR}.{NEURON_MAJOR}.{NEURON_MINOR}.{BUILD}+{suffix}
 
-    Mainline: 2.13.3.0.4527+8e870898.dev
-    Release:  2.13.3.0.4527+8e870898
+    Mainline: 2.14.3.0.4527+8e870898.dev
+    Release:  2.14.3.0.4527+8e870898
     """
-    version_info = {}
-    with open(Path(__file__).parent / "torch_neuronx" / "_version.py") as f:
-        exec(f.read(), version_info)
-
-    parts = version_info["__version__"].split(".")
-    torch_ver = f"{parts[0]}.{parts[1]}"
-
-    # Validate _version.py matches pyproject.toml torch dependency
-    pyproject = (Path(__file__).parent / "pyproject.toml").read_text()
-    m = re.search(r'"torch==(\d+\.\d+)', pyproject)
-    if m and m.group(1) != torch_ver:
-        sys.exit(
-            f"error: _version.py has torch {torch_ver} but "
-            f"pyproject.toml has torch=={m.group(1)}. Update both."
+    version_info = runpy.run_path(Path(__file__).parent / "torch_neuronx" / "_version.py")
+    neuron_version = version_info["NEURON_VERSION"]
+    if not re.fullmatch(r"\d+\.\d+", neuron_version):
+        raise ValueError(
+            f"Neuron version {neuron_version!r} is invalid. Use a major.minor version."
         )
 
-    parts[4] = _get_build_counter()
+    torch_parts = pytorch_version.split(".")
+    neuron_parts = neuron_version.split(".")
+    version_prefix = ".".join([*torch_parts[:2], *neuron_parts])
 
     sha = _get_git_sha() or "unknown"
     suffix = sha if _is_release_branch() else f"{sha}.dev"
 
-    return f"{'.'.join(parts)}+{suffix}"
+    return f"{version_prefix}.{_get_build_counter()}+{suffix}"
 
 
-version = _get_version()
-
-# Disable autoload for builds
-os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+pytorch_version = _get_pytorch_version()
+version = _get_version(pytorch_version)
 
 ROOT_DIR = Path(__file__).absolute().parent
 CSRC_DIR = ROOT_DIR / "torch_neuronx/csrc"
@@ -560,6 +580,14 @@ else:
     ext_modules = []
     cmdclass = {}
 
+install_requires = [
+    f"torch=={pytorch_version}",
+    "numpy<2; python_version < '3.12'",
+    "numpy>=2; python_version >= '3.12'",
+    "grpcio-tools",
+    "wheel",
+]
+
 setup(
     name=PACKAGE_NAME,
     version=version,
@@ -578,4 +606,5 @@ setup(
     python_requires=">=3.10",
     cmdclass=cmdclass,
     license_files=["LICENSE", "third_party/torch-mlir/LICENSE"],
+    install_requires=install_requires,
 )

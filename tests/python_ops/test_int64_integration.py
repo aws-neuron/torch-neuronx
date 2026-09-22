@@ -127,6 +127,69 @@ class TestUnsupportedOpsInt64:
         torch.testing.assert_close(result.cpu(), expected)
 
 
+@requires_neuron
+@pytest.mark.int64_mode("native")
+class TestMixedDtypePromotionInt64:
+    """A mixed int32/int64 op widens its int32 operand on device.
+
+    This is a regression test for a fixed bug. NeuronSafeCast once gated the
+    on-device widening (materialize_from_i32) on the packed mode alone. Native
+    mode then took the generic 64-bit CPU round-trip, and the operand went to
+    the host and back only to be promoted. The results stayed correct, so these
+    tests check where the promotion runs, not only the values.
+    """
+
+    @staticmethod
+    def _track(fn):
+        """Run fn and report the ops it executed. Drains lazy work on both sides."""
+        torch.neuron.synchronize()
+        torch_neuronx.clear_op_tracking()
+        result = fn()
+        torch.neuron.synchronize()
+        return (
+            result,
+            set(torch_neuronx.get_executed_ops()),
+            set(torch_neuronx.get_fallback_ops()),
+        )
+
+    def test_promotion_does_not_round_trip_through_host(self, dispatch_mode):
+        a = torch.tensor([10, 20, 30, 40], dtype=torch.int64, device="neuron")
+        b = torch.tensor([10, 21, 30, 41], dtype=torch.int32, device="neuron")
+
+        result, executed, fallback = self._track(lambda: torch.eq(a, b))
+
+        # A host round-trip shows up in two ways. The widening records an
+        # aten::_to_copy fallback, and it reads the operand back to the host.
+        # The on-device path only uploads the 8-byte shift constant, so a
+        # device-to-host copy is the exact marker of the round-trip.
+        assert "aten::_to_copy" not in fallback, f"promotion fell back to CPU; fallback={fallback}"
+        assert (
+            "neuron::copy::neuron_to_cpu" not in executed
+        ), f"promotion copied the operand to the host; executed={executed}"
+        expected = torch.tensor([True, False, True, False])
+        torch.testing.assert_close(result.cpu(), expected)
+
+    def test_promotion_keeps_the_int64_high_word(self, dispatch_mode):
+        # 2**40 + 7 and 7 share their low 32 bits, so a low-word-only promotion
+        # reports the pair as equal. Only a full 64-bit widening says False.
+        a = torch.tensor([2**40 + 7, -(2**40) - 7, 7], dtype=torch.int64, device="neuron")
+        b = torch.tensor([7, -7, 7], dtype=torch.int32, device="neuron")
+
+        result, _, _ = self._track(lambda: torch.eq(a, b))
+
+        torch.testing.assert_close(result.cpu(), torch.tensor([False, False, True]))
+
+    def test_promotion_is_exact_in_arithmetic(self, dispatch_mode):
+        a = torch.tensor([2**40, -(2**40)], dtype=torch.int64, device="neuron")
+        b = torch.tensor([7, -7], dtype=torch.int32, device="neuron")
+
+        result, _, _ = self._track(lambda: a + b)
+
+        expected = torch.tensor([2**40 + 7, -(2**40) - 7], dtype=torch.int64)
+        assert result.dtype == torch.int64
+        torch.testing.assert_close(result.cpu(), expected)
+
+
 # ═══════════════════════════════════════════════════════════════
 #  packed mode — every int64 op via the packed view
 # ═══════════════════════════════════════════════════════════════

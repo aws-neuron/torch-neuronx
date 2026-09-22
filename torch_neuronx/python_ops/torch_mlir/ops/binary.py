@@ -60,33 +60,30 @@ def _div_compute(x, y, rounding_mode=None):
         result = xx / yy
         return result.to(x.dtype) if up else result
 
-    # Integer floor/trunc division must be exact. A plain float divide rounds an
-    # exact integer quotient down to k-eps in fp32 (e.g. 122/122 -> 0.99999994), so
-    # ``xx // yy`` / ``trunc(xx / yy)`` yield k-1 for those inputs. For integer
-    # operands recover the exact quotient from the integer remainder (exact in fp32
-    # for the int32-widened, small-magnitude values); keep the float path for floats.
+    # Integer floor/trunc division must be exact, so compute it in the integer
+    # domain. A float divide cannot represent an int64 operand: the value loses
+    # its high word on the way to fp32 and the 24-bit mantissa cannot hold it,
+    # so div(2**63-2, 1) came back as -2. ``//`` lowers to an exact integer
+    # floor division (TorchToStablehlo emits divide + remainder), and trunc is
+    # derived from it. Floats keep the float path.
     _x_int = isinstance(x, torch.Tensor) and not x.dtype.is_floating_point and x.dtype != torch.bool
     _y_int = (not isinstance(y, torch.Tensor)) or (
         not y.dtype.is_floating_point and y.dtype != torch.bool
     )
     if _x_int and _y_int:
-        xf = xx.float()
-        yf = (
-            yy.float()
+        yt = (
+            yy
             if isinstance(yy, torch.Tensor)
-            else torch.tensor(float(yy), device=xf.device, dtype=torch.float32)
+            else torch.tensor(yy, device=xx.device, dtype=xx.dtype)
         )
-        ax, ay = xf.abs(), yf.abs()
-        qa = torch.trunc(ax / ay)
-        ra = ax - qa * ay
-        # Correct the fp32 rounding so qa == floor(|x| / |y|) exactly (ra in [0, ay)).
-        qa = qa + (ra >= ay).to(qa.dtype) - (ra < 0).to(qa.dtype)
-        ra = ax - qa * ay
-        sgn = torch.sign(xf) * torch.sign(yf)
-        result = sgn * qa
+        quot = xx // yt
         if rounding_mode == "floor":
-            # floor rounds toward -inf: a negative non-exact quotient steps down one.
-            result = result - ((sgn < 0) & (ra != 0)).to(result.dtype)
+            return quot
+        # floor rounds toward -inf and trunc toward zero, so step the quotient
+        # back up by one when it is negative and the division is not exact.
+        rem = xx - quot * yt
+        negative_quot = (xx < 0) != (yt < 0)
+        return quot + ((rem != 0) & negative_quot).to(quot.dtype)
     else:
         result = xx // yy if rounding_mode == "floor" else torch.trunc(xx / yy)
 

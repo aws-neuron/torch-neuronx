@@ -6,11 +6,9 @@ selection (suite -> table variant) and the partition layout.
 
 from __future__ import annotations
 
-import sys
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aggregate_vertical_results as agg
 
 _CSV = "op_name,op_group,status\naten::add,elementwise,runs_on_neuron\n"

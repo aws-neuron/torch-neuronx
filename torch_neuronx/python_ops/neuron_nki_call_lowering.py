@@ -65,6 +65,11 @@ def _lower_custom_nki(
     }
 
     _global_nki_op.kernel.operand_output_aliases = aliases
+    # Always set the flag (default False) so it never leaks across kernels that
+    # reuse the shared op impl.
+    _global_nki_op.kernel.alias_outputs_in_place = kernel_registry.get_alias_outputs_in_place(
+        kernel_idx
+    )
     result = _global_nki_op.kernel.lower(*tensor_args, **nki_params)
 
     # Preserve the collective flag from the config: the NKI frontend sets

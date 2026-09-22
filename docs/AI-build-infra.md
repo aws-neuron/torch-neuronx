@@ -66,7 +66,7 @@ proto stubs (`BuildPyCommand`) → `generate_build_config(is_release)` sets
 `BUILD_TYPE` in `_build_config.py` → compile `_C.so` → (Bazel only)
 `_fix_rpath` → `$ORIGIN/../torch/lib:/opt/aws/neuron/lib`. Version
 `0.1.0+{git_sha}`; `TORCH_DEVICE_BACKEND_AUTOLOAD=0` during build to prevent
-self-import. `pyproject.toml`: Python `>=3.10,<3.14`, `torch~=2.11.0`.
+self-import. `pyproject.toml`: Python `>=3.10,<3.15`, `torch~=2.11.0`.
 
 **CMake limitation:** does **not** build the torch-mlir libs — the MLIR /
 StableHLO lowering paths require the Bazel build. CMake is only for IDE work
@@ -91,10 +91,14 @@ though `from torch_mlir import fx` works.
 
 ## CI internals (gap content; job list in CONTRIBUTING.md)
 
-- `nightly-dispatcher.yml` runs 2 AM UTC daily; `nightly.yml` builds base image
-  → torch layer → wheel → promote to stable.
-- `_block-perf.yml`: reusable block + collective perf; **MFU golden thresholds
-  enforced on PRs (baseline × 0.9), not nightly.**
+- `dependency-guard.yml` builds and promotes one stable base for each supported
+  Python version.
+- `nightly.yml` runs every six hours. It builds the wheel matrix from the
+  stable base images. It promotes all wheels after all required tests pass.
+- `_reusable-full-wheel-tests.yml` defines the complete suite for Nightly and
+  Dependency Guard.
+- `_reusable-block-perf.yml`: reusable block and collective performance tests. Each
+  caller selects the platform and the MFU threshold policy.
 - Adding a CI job: add to `pull.yml`, use the
   `./.github/actions/run-test-suite` composite action; runner labels include
   `neuron.internal_compute:trn2.48xlarge`.

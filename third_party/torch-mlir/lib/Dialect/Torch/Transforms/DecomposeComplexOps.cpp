@@ -10007,11 +10007,12 @@ class DecomposeAtenFmodTensorOp : public OpRewritePattern<AtenFmodTensorOp> {
 
 namespace {
 // decompose `remainder(x, y)` to `x - floor(x/y) * y` (Python floor-division semantics).
-// The floor is dtype-scoped: fp32 uses the boundary-corrected div(floor) (a naive floor of an
-// fp32-rounded quotient lands one integer off at a boundary); fp16/bf16 do the whole thing in
-// fp32 and downcast once (a reduced-precision mul/sub rounds inconsistently across strides);
-// fp64 and integers keep the plain true-divide + floor (fp64 is already precise; integers must
-// keep their overflow semantics, e.g. remainder(INT_MIN, -1)). Tensor and Scalar variants.
+// The floor is dtype-scoped: fp32 and integers use div(floor) (fp32: a naive floor of an
+// fp32-rounded quotient lands one integer off at a boundary; integers: a plain DivOp+floor
+// collapses to C-style trunc remainder -- wrong-signed for mixed-sign operands -- so div(floor)
+// supplies the exact Python floor); fp16/bf16 do the whole thing in fp32 and downcast once
+// (a reduced-precision mul/sub rounds inconsistently across strides); fp64 keeps the plain
+// true-divide + floor (already precise). Tensor and Scalar variants.
 template <typename RemainderOp, typename DivOp, typename MulOp, typename DivModeOp>
 class DecomposeAtenRemainderOp : public OpRewritePattern<RemainderOp> {
 public:
@@ -10051,12 +10052,15 @@ public:
     }
 
     Value floor;
-    if (isa<mlir::FloatType>(dtype) && dtype.getIntOrFloatBitWidth() == 32) {
-      // fp32: boundary-corrected div(floor).
+    if ((isa<mlir::FloatType>(dtype) && dtype.getIntOrFloatBitWidth() == 32) ||
+        isa<mlir::IntegerType>(dtype)) {
+      // fp32 and integers: div(floor). For integers a plain DivOp+floor collapses to
+      // C-style trunc remainder (wrong sign for mixed-sign operands); div(floor) gives
+      // the exact Python floor-division semantics.
       Value cstFloor = Torch::ConstantStrOp::create(rewriter, loc, "floor");
       floor = DivModeOp::create(rewriter, loc, resultTy, self, other, cstFloor);
     } else {
-      // fp64 and integers: plain true-divide + floor.
+      // fp64: plain true-divide + floor (already precise).
       Value div = DivOp::create(rewriter, loc, resultTy, self, other);
       floor = AtenFloorOp::create(rewriter, loc, resultTy, div);
     }

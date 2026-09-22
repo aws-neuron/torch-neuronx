@@ -107,15 +107,6 @@ class ConcatenationEngineTest : public ::testing::Test {
     return op;
   }
 
-  // Helper to create a Hint operation (allocation/deallocation hints - not boundaries)
-  OperationContext* CreateMockHintOperation() {
-    auto mock_kernel = std::make_unique<::testing::NiceMock<MockNeuronKernelExecution>>("hint_op");
-    ON_CALL(*mock_kernel, GetKernelType()).WillByDefault(::testing::Return(KernelTypeEnum::kHint));
-    auto* op = new OperationContext(std::move(mock_kernel));
-    op->stream = test_stream_;
-    return op;
-  }
-
   // sentinel_tensors_ keeps the data_ptr() backing alive for the TensorDataRef.
   OperationContext* CreateMockAllocOperation(const std::string& name = "alloc") {
     sentinel_tensors_.push_back(torch::zeros({1}));
@@ -242,32 +233,6 @@ TEST_F(ConcatenationEngineTest, BoundaryOperationEnablesAccumulation) {
 
   delete boundary_op;
   delete hlo_op;
-}
-
-TEST_F(ConcatenationEngineTest, HintOperationIsNotBoundary) {
-  ConcatenationEngine engine;
-
-  // Enable accumulation first with a matmul
-  OperationContext* matmul_op = CreateMockMatmulOperation();
-  engine.ProcessConcatenationTask(matmul_op);
-
-  // Buffer some HLO operations
-  OperationContext* op1 = CreateMockHLOOperation("aten::add");
-  engine.ProcessConcatenationTask(op1);
-
-  size_t buffered_before = engine.GetBufferedOperationsCount();
-  EXPECT_GT(buffered_before, 0);
-
-  // Hint operation should NOT trigger flush (not a boundary)
-  OperationContext* hint_op = CreateMockHintOperation();
-  auto result = engine.ProcessConcatenationTask(hint_op);
-
-  // Hint should be processed but not trigger flush
-  // Buffer count may or may not change depending on implementation
-
-  delete matmul_op;
-  delete op1;
-  delete hint_op;
 }
 
 TEST_F(ConcatenationEngineTest, HLOWithCollectivesIsBoundary) {

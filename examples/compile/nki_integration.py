@@ -6,8 +6,10 @@ Demonstrates how to write NKI kernels and integrate them with torch.compile.
 Run: python nki_integration.py
 """
 
-import neuronxcc.nki as nki
-import neuronxcc.nki.language as nl
+import math
+
+import nki
+import nki.language as nl
 import torch
 
 from torch_neuronx import nki_op, wrap_nki
@@ -16,13 +18,22 @@ from torch_neuronx import nki_op, wrap_nki
 @wrap_nki
 @nki.jit
 def add_kernel(a_input, b_input):
-    """NKI kernel for tensor addition."""
+    """NKI kernel for element-wise tensor addition of any 2D shape.
+
+    Tiles over the partition dimension in chunks of tile_size.pmax (128).
+    """
+    sz_p, sz_f = a_input.shape
     c_output = nl.ndarray(a_input.shape, dtype=a_input.dtype, buffer=nl.shared_hbm)
-    ix = nl.arange(128)[:, None]
-    iy = nl.arange(512)[None, :]
-    a_tile = nl.load(a_input[ix, iy])
-    b_tile = nl.load(b_input[ix, iy])
-    nl.store(c_output[ix, iy], value=a_tile + b_tile)
+
+    for p in range(math.ceil(sz_p / nl.tile_size.pmax)):
+        p_start = p * nl.tile_size.pmax
+        p_end = min(p_start + nl.tile_size.pmax, sz_p)
+        i_p = slice(p_start, p_end)
+
+        a_tile = nl.load(a_input[i_p, 0:sz_f])
+        b_tile = nl.load(b_input[i_p, 0:sz_f])
+        nl.store(c_output[i_p, 0:sz_f], value=nl.add(a_tile, b_tile))
+
     return c_output
 
 
