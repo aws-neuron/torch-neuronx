@@ -59,6 +59,8 @@ std::vector<uint8_t> CompileRequest::Serialize() const {
   std::memcpy(buf.data(), &req_id, sizeof(uint64_t));
   AppendString(buf, hlo_file_path);
   AppendString(buf, ir_type);
+  AppendString(buf, op_name);
+  AppendString(buf, cache_key);
   AppendString(buf, optimization_level);
   AppendString(buf, additional_args);
   return buf;
@@ -73,6 +75,8 @@ CompileRequest CompileRequest::Deserialize(const uint8_t* data, size_t len) {
   p += sizeof(uint64_t);
   req.hlo_file_path = ReadString(p, end);
   req.ir_type = ReadString(p, end);
+  req.op_name = ReadString(p, end);
+  req.cache_key = ReadString(p, end);
   req.optimization_level = ReadString(p, end);
   req.additional_args = ReadString(p, end);
   return req;

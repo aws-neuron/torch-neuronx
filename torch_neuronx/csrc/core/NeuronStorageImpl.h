@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "torch_neuronx/csrc/core/OperationContext.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
@@ -28,6 +29,12 @@ struct NeuronStorageImpl : public c10::StorageImpl {
   ~NeuronStorageImpl() override = default;
 
   void release_resources() override;
+
+#if __has_include(<c10/core/StorageMaterializer.h>)
+  at::DataPtr replace_data_ptr_without_materializing(at::DataPtr&& data_ptr) {
+    return set_data_ptr_no_materialize(std::move(data_ptr));
+  }
+#endif
 
   // Initially we don't support resizing
   // We'll add this functionality later when we have an allocator

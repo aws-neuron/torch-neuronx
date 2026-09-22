@@ -1,9 +1,8 @@
-import os
-
 import pytest
 import torch
 
 import torch_neuronx
+from tests.utils.neuron_test_utils import requires_nrt_streams_with_host_cc
 
 
 def test_copy_neuron_to_neuron_same_device():
@@ -207,79 +206,340 @@ def test_copy_neuron_to_neuron_fp64_empty():
     assert dst.dtype == torch.float64
 
 
+@pytest.mark.needs_process_isolation(
+    reason="requires_nrt_streams_with_host_cc sets the stream flags, which the C++ "
+    "stream configuration keeps after first use."
+)
+@requires_nrt_streams_with_host_cc
 def test_copy_non_default_stream_uses_direct_primitive():
-    """Test that copy on non-default stream with host_cc routes to direct
-    primitive (CopyNeuronImpl)."""
-    from tests.utils.neuron_test_utils import requires_nrt_streams
+    """Test that a HostCC copy on a non-default stream uses the direct primitive."""
     from torch_neuronx.python_ops.torch_mlir.ops.copy import CopyMLIRImpl
 
-    @requires_nrt_streams
-    def _run():
-        src = torch.randn(4, 4, device="neuron")
-        dst = torch.empty(4, 4, device="neuron")
+    src = torch.randn(4, 4, device="neuron")
+    dst = torch.empty(4, 4, device="neuron")
 
-        impl = CopyMLIRImpl()
+    impl = CopyMLIRImpl()
 
-        # Default
-        assert impl.can_handle(dst, src)
+    # Default
+    assert impl.can_handle(dst, src)
 
-        # Non-default
-        stream = torch.neuron.Stream()
-        with torch.neuron.stream(stream):
-            assert not impl.can_handle(dst, src)
-            dst.copy_(src)
+    # Non-default
+    stream = torch.neuron.Stream()
+    with torch.neuron.stream(stream):
+        assert not impl.can_handle(dst, src)
+        dst.copy_(src)
 
-        stream.synchronize()
-        torch.testing.assert_close(src.cpu(), dst.cpu())
+    stream.synchronize()
+    torch.testing.assert_close(src.cpu(), dst.cpu())
 
-    _run()
+
+@pytest.mark.parametrize(
+    ("src_dtype", "dst_dtype"),
+    [
+        (torch.float32, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float16),
+        (torch.float16, torch.float32),
+    ],
+)
+@pytest.mark.needs_process_isolation(reason="HostCC stream flags remain fixed after first use.")
+@requires_nrt_streams_with_host_cc
+def test_copy_non_default_stream_cross_dtype_uses_nrt_cast(src_dtype, dst_dtype):
+    """Supported cross-dtype copy_ uses the NRT cast on a HostCC stream."""
+    src_storage = torch.randn(67, dtype=src_dtype, device="neuron")
+    dst_storage = torch.full((71,), 11, dtype=dst_dtype, device="neuron")
+    src = src_storage.narrow(0, 3, 64)
+    dst = dst_storage.narrow(0, 5, 64)
+
+    stream = torch.neuron.Stream()
+    stream.wait_stream(torch.neuron.current_stream())
+    with torch.neuron.stream(stream):
+        dst.copy_(src)
+    stream.synchronize()
+
+    result = dst_storage.cpu()
+    torch.testing.assert_close(result[5:69], src.cpu().to(dst_dtype))
+    torch.testing.assert_close(result[:5], torch.full((5,), 11, dtype=dst_dtype))
+    torch.testing.assert_close(result[69:], torch.full((2,), 11, dtype=dst_dtype))
 
 
 def test_copy_non_default_stream_without_host_cc_uses_mlir():
-    """Test that copy on non-default stream WITHOUT host_cc still uses MLIR."""
-
+    """Test that a copy uses MLIR when HostCC is disabled."""
     from torch_neuronx.python_ops.torch_mlir.ops.copy import CopyMLIRImpl
-    from torch_neuronx.utils import is_host_cc_enabled
 
-    old_value = os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC")
-    os.environ.pop("TORCH_NEURONX_ENABLE_HOST_CC", None)
-    is_host_cc_enabled.cache_clear()
-    try:
-        src = torch.randn(4, 4, device="neuron")
-        dst = torch.empty(4, 4, device="neuron")
+    src = torch.randn(4, 4, device="neuron")
+    dst = torch.empty(4, 4, device="neuron")
 
-        impl = CopyMLIRImpl()
+    stream = torch.neuron.Stream()
+    with torch.neuron.stream(stream):
+        assert CopyMLIRImpl().can_handle(dst, src)
+        dst.copy_(src)
 
-        stream = torch.neuron.Stream()
-        with torch.neuron.stream(stream):
-            assert impl.can_handle(dst, src)
-    finally:
-        if old_value is not None:
-            os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = old_value
-        is_host_cc_enabled.cache_clear()
+    stream.synchronize()
+    torch.testing.assert_close(dst.cpu(), src.cpu())
 
 
+@pytest.mark.needs_process_isolation(
+    reason="requires_nrt_streams_with_host_cc sets the stream flags, which the C++ "
+    "stream configuration keeps after first use."
+)
+@requires_nrt_streams_with_host_cc
 def test_to_copy_non_default_stream_uses_direct_primitive():
-    """Test that _to_copy on non-default stream with host_cc routes to direct primitive."""
-    from tests.utils.neuron_test_utils import requires_nrt_streams
+    """Test that HostCC _to_copy on a non-default stream uses the direct primitive."""
     from torch_neuronx.python_ops.torch_mlir.ops.to_copy import ToCopyMLIRImpl
 
-    @requires_nrt_streams
-    def _run():
-        src = torch.randn(4, 4, device="neuron")
+    src = torch.randn(4, 4, device="neuron")
 
-        impl = ToCopyMLIRImpl()
+    impl = ToCopyMLIRImpl()
 
-        # Default
-        assert impl.can_handle(src, device=torch.device("neuron"))
+    # Default
+    assert impl.can_handle(src, device=torch.device("neuron"))
 
-        # Non-default
+    # Non-default
+    stream = torch.neuron.Stream()
+    with torch.neuron.stream(stream):
+        assert not impl.can_handle(src, device=torch.device("neuron"))
+        result = src.to(device="neuron", dtype=torch.float16)
+
+    stream.synchronize()
+    torch.testing.assert_close(src.cpu().to(torch.float16), result.cpu())
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Conjugate / negation bit materialization during copy
+#
+#  The conj/neg bits are lazy metadata flags (set by .conj() and ._neg_view()).
+#  copy_ must materialize them into actual data. The CPU-bounce path in
+#  DispatchCopyImpl previously did a raw byte copy without applying these
+#  transformations, causing silent correctness bugs in complex autograd
+#  (e.g. view_as_complex backward producing swapped gradient rows).
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestConjBitCopyNeuronToNeuron:
+    """copy_ with conjugated complex source must negate imaginary parts."""
+
+    def test_copy_conj_basic(self):
+        t = torch.tensor([1.0 + 2.0j, 3.0 - 4.0j], dtype=torch.complex64, device="neuron")
+        dst = torch.empty(2, dtype=torch.complex64, device="neuron")
+        dst.copy_(t.conj())
+        expected = torch.tensor([1.0 - 2.0j, 3.0 + 4.0j], dtype=torch.complex64)
+        torch.testing.assert_close(dst.cpu(), expected)
+
+    def test_copy_conj_2d(self):
+        t = torch.randn(8, 8, dtype=torch.complex64)
+        t_neuron = t.to("neuron")
+        dst = torch.empty(8, 8, dtype=torch.complex64, device="neuron")
+        dst.copy_(t_neuron.conj())
+        torch.testing.assert_close(dst.cpu(), t.conj().resolve_conj())
+
+    def test_copy_conj_no_conj_unchanged(self):
+        """Non-conjugated source copies data as-is."""
+        t = torch.randn(4, 4, dtype=torch.complex64)
+        t_neuron = t.to("neuron")
+        dst = torch.empty(4, 4, dtype=torch.complex64, device="neuron")
+        dst.copy_(t_neuron)
+        torch.testing.assert_close(dst.cpu(), t)
+
+    def test_copy_double_conj_cancels(self):
+        t = torch.randn(4, 4, dtype=torch.complex64)
+        t_neuron = t.to("neuron")
+        dst = torch.empty(4, 4, dtype=torch.complex64, device="neuron")
+        dst.copy_(t_neuron.conj().conj())
+        torch.testing.assert_close(dst.cpu(), t)
+
+    def test_clone_conj(self):
+        """clone() goes through copy_ — must also materialize conj."""
+        t = torch.tensor([1.0 + 2.0j, 3.0 - 4.0j], dtype=torch.complex64, device="neuron")
+        cloned = t.conj().clone()
+        expected = torch.tensor([1.0 - 2.0j, 3.0 + 4.0j], dtype=torch.complex64)
+        torch.testing.assert_close(cloned.cpu(), expected)
+
+
+class TestNegBitCopyNeuronToNeuron:
+    """copy_ with negated source must negate all values."""
+
+    def test_copy_neg_basic(self):
+        t = torch.tensor([1.0 + 2.0j, 3.0 - 4.0j], dtype=torch.complex64, device="neuron")
+        dst = torch.empty(2, dtype=torch.complex64, device="neuron")
+        dst.copy_(t._neg_view())
+        expected = torch.tensor([-1.0 - 2.0j, -3.0 + 4.0j], dtype=torch.complex64)
+        torch.testing.assert_close(dst.cpu(), expected)
+
+    def test_clone_neg(self):
+        t = torch.randn(4, 4, dtype=torch.complex64)
+        t_neuron = t.to("neuron")
+        cloned = t_neuron._neg_view().clone()
+        torch.testing.assert_close(cloned.cpu(), -t)
+
+
+class TestConjNegEdgeCases:
+    """Edge cases: broadcast, combined bits, non-contiguous dst."""
+
+    def test_copy_conj_with_broadcast(self):
+        """copy_ with conj'd source that needs broadcasting."""
+        src = torch.randn(1, 4, dtype=torch.complex64)
+        src_neuron = src.to("neuron").conj()
+        dst = torch.empty(3, 4, dtype=torch.complex64, device="neuron")
+        dst.copy_(src_neuron)
+        expected = src.conj().resolve_conj().expand(3, 4)
+        torch.testing.assert_close(dst.cpu(), expected)
+
+    def test_copy_conj_and_neg_combined(self):
+        """Tensor with both conj and neg bits set."""
+        t = torch.randn(4, 4, dtype=torch.complex64)
+        t_neuron = t.to("neuron").conj()._neg_view()
+        dst = torch.empty(4, 4, dtype=torch.complex64, device="neuron")
+        dst.copy_(t_neuron)
+        expected = -(t.conj().resolve_conj())
+        torch.testing.assert_close(dst.cpu(), expected)
+
+    def test_copy_neg_with_broadcast(self):
+        """copy_ with neg'd source that needs broadcasting."""
+        src = torch.randn(1, 4, dtype=torch.complex64)
+        src_neuron = src.to("neuron")._neg_view()
+        dst = torch.empty(3, 4, dtype=torch.complex64, device="neuron")
+        dst.copy_(src_neuron)
+        expected = (-src).expand(3, 4)
+        torch.testing.assert_close(dst.cpu(), expected)
+
+    def test_to_copy_conj_neuron_to_neuron(self):
+        """_to_copy (via .clone()) on a conj'd Neuron tensor stays on device."""
+        t = torch.randn(4, 4, dtype=torch.complex64)
+        t_neuron = t.to("neuron").conj()
+        result = t_neuron.clone()
+        assert result.device.type == "neuron"
+        torch.testing.assert_close(result.cpu(), t.conj().resolve_conj())
+
+    def test_to_copy_neg_neuron_to_neuron(self):
+        """_to_copy (via .clone()) on a neg'd Neuron tensor stays on device."""
+        t = torch.randn(4, 4, dtype=torch.complex64)
+        t_neuron = t.to("neuron")._neg_view()
+        result = t_neuron.clone()
+        assert result.device.type == "neuron"
+        torch.testing.assert_close(result.cpu(), -t)
+
+    def test_copy_conj_with_dtype_cast_neuron_to_neuron(self):
+        """copy_ conj'd complex64 src into complex128 dst on Neuron."""
+        t = torch.randn(4, 4, dtype=torch.complex64)
+        src_neuron = t.to("neuron").conj()
+        dst = torch.empty(4, 4, dtype=torch.complex128, device="neuron")
+        dst.copy_(src_neuron)
+        expected = t.conj().resolve_conj().to(torch.complex128)
+        torch.testing.assert_close(dst.cpu(), expected)
+
+
+@pytest.mark.needs_process_isolation(
+    reason="requires_nrt_streams_with_host_cc sets the stream flags, which the C++ "
+    "stream configuration keeps after first use."
+)
+class TestNonDefaultStreamGuards:
+    @requires_nrt_streams_with_host_cc
+    def test_copy_same_dtype_contiguous_accepted(self):
+        """Same-dtype contiguous: raw NRT on-device copy."""
+        cpu_src = torch.randn(8, 8, dtype=torch.bfloat16)
+        src = cpu_src.to("neuron")
+        dst = torch.empty(8, 8, dtype=torch.bfloat16, device="neuron")
         stream = torch.neuron.Stream()
+        stream.wait_stream(torch.neuron.current_stream())
         with torch.neuron.stream(stream):
-            assert not impl.can_handle(src, device=torch.device("neuron"))
-            result = src.to(device="neuron", dtype=torch.float16)
-
+            dst.copy_(src)
         stream.synchronize()
-        torch.testing.assert_close(src.cpu().to(torch.float16), result.cpu())
+        torch.testing.assert_close(dst.cpu(), cpu_src)
 
-    _run()
+    @requires_nrt_streams_with_host_cc
+    def test_copy_partial_overlap_rejected(self):
+        """Partial-overlap aliased copy_: falls back to CPU bounce."""
+        cpu_base = torch.arange(100, dtype=torch.float32)
+        base = cpu_base.to("neuron")
+        stream = torch.neuron.Stream()
+        stream.wait_stream(torch.neuron.current_stream())
+        with torch.neuron.stream(stream):
+            # base[10:60].copy_(base[30:80]) - overlap on byte range [30, 60)
+            base[10:60].copy_(base[30:80])
+        stream.synchronize()
+        # Reference: snapshot of source range BEFORE write
+        cpu_ref = cpu_base.clone()
+        cpu_ref[10:60] = cpu_base[30:80]
+        torch.testing.assert_close(base.cpu(), cpu_ref)
+
+    @requires_nrt_streams_with_host_cc
+    def test_copy_non_contiguous_src_rejected(self):
+        """Non-contiguous src: falls back to CPU bounce."""
+        cpu_src = torch.randn(8, 8, dtype=torch.bfloat16)
+        src_strided = cpu_src.to("neuron").t()  # non-contig view
+        dst = torch.empty(8, 8, dtype=torch.bfloat16, device="neuron")
+        stream = torch.neuron.Stream()
+        stream.wait_stream(torch.neuron.current_stream())
+        with torch.neuron.stream(stream):
+            dst.copy_(src_strided)
+        stream.synchronize()
+        torch.testing.assert_close(dst.cpu(), cpu_src.t().contiguous())
+
+    @requires_nrt_streams_with_host_cc
+    def test_copy_neg_src_rejected(self):
+        """src.is_neg(): falls back to CPU bounce, which materializes the sign."""
+        cpu_src = torch.randn(4, 4, dtype=torch.bfloat16)
+        src_neuron = cpu_src.to("neuron")._neg_view()
+        dst = torch.empty(4, 4, dtype=torch.bfloat16, device="neuron")
+        stream = torch.neuron.Stream()
+        stream.wait_stream(torch.neuron.current_stream())
+        with torch.neuron.stream(stream):
+            dst.copy_(src_neuron)
+        stream.synchronize()
+        torch.testing.assert_close(dst.cpu(), -cpu_src)
+
+    @requires_nrt_streams_with_host_cc
+    def test_copy_neg_dst_rejected(self):
+        """dst.is_neg(): falls back to CPU bounce so dst's flag stays meaningful.
+        Post-copy, read(dst) must equal read(src), so the storage gets the
+        sign-flipped bytes.
+        """
+        cpu_src = torch.randn(4, 4, dtype=torch.bfloat16)
+        src = cpu_src.to("neuron")
+        dst_base = torch.empty(4, 4, dtype=torch.bfloat16, device="neuron")
+        dst_neg = dst_base._neg_view()
+        stream = torch.neuron.Stream()
+        stream.wait_stream(torch.neuron.current_stream())
+        with torch.neuron.stream(stream):
+            dst_neg.copy_(src)
+        stream.synchronize()
+        torch.testing.assert_close(dst_neg.cpu(), cpu_src)
+
+    @requires_nrt_streams_with_host_cc
+    def test_to_copy_same_dtype_accepted(self):
+        """_to_copy same-dtype: raw NRT on-device copy."""
+        cpu_src = torch.randn(8, 8, dtype=torch.bfloat16)
+        src = cpu_src.to("neuron")
+        stream = torch.neuron.Stream()
+        stream.wait_stream(torch.neuron.current_stream())
+        with torch.neuron.stream(stream):
+            # .clone() routes through aten::_to_copy with same dtype/device
+            result = src.clone()
+        stream.synchronize()
+        torch.testing.assert_close(result.cpu(), cpu_src)
+
+    @requires_nrt_streams_with_host_cc
+    def test_to_copy_cross_dtype_uses_nrt_cast(self):
+        """Cross-dtype _to_copy uses the NRT cast on a HostCC stream."""
+        cpu_src = torch.randn(4, 4, dtype=torch.float32)
+        src = cpu_src.to("neuron")
+        stream = torch.neuron.Stream()
+        stream.wait_stream(torch.neuron.current_stream())
+        with torch.neuron.stream(stream):
+            result = src.to(torch.bfloat16)
+        stream.synchronize()
+        torch.testing.assert_close(result.cpu(), cpu_src.to(torch.bfloat16))
+
+    @requires_nrt_streams_with_host_cc
+    def test_copy_broadcast_falls_back(self):
+        """copy_ with broadcast: falls back to CPU bounce which broadcasts on host."""
+        cpu_src = torch.randn(1, 8, dtype=torch.bfloat16)
+        src = cpu_src.to("neuron")
+        dst = torch.empty(4, 8, dtype=torch.bfloat16, device="neuron")
+        stream = torch.neuron.Stream()
+        stream.wait_stream(torch.neuron.current_stream())
+        with torch.neuron.stream(stream):
+            dst.copy_(src)
+        stream.synchronize()
+        torch.testing.assert_close(dst.cpu(), cpu_src.expand(4, 8))

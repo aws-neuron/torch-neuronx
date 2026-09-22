@@ -551,6 +551,54 @@ class TestNormalizationCorrectness:
         assert scalar_nodes[0].args[0] == 0  # zero for comparison
         assert scalar_nodes[1].args[0] == 7  # dim_size for offset
 
+    def test_scalar_tensor_dtype_matches_index(self, pass_instance):
+        """Regression: scalar_tensor must be built with dtype=idx_meta.dtype.
+
+        Without an explicit dtype, scalar_tensor defaults to float32, which
+        promotes the subsequent add/where to float32 and produces a float
+        index tensor — causing aten.index to fail at runtime with
+        "tensors used as indices must be long, int, byte or bool tensors".
+        """
+        for idx_dtype in (torch.int32, torch.int64):
+            gm = _build_index_put_graph(
+                input_shape=(7, 4),
+                index_shapes=[(3,)],
+                values_shape=(3, 4),
+                index_dtype=idx_dtype,
+            )
+            pass_instance.call(gm)
+
+            scalar_nodes = [
+                n
+                for n in gm.graph.nodes
+                if n.op == "call_function" and n.target == torch.ops.aten.scalar_tensor.default
+            ]
+            assert len(scalar_nodes) == 2
+            for s in scalar_nodes:
+                assert s.kwargs.get("dtype") == idx_dtype, (
+                    f"scalar_tensor must carry dtype={idx_dtype} kwarg so the "
+                    f"downstream where-normalized index stays integer; got kwargs={s.kwargs}"
+                )
+
+    def test_scalar_tensor_dtype_matches_index_on_index_op(self, pass_instance):
+        """Same regression as above, verified via aten.index.Tensor path."""
+        gm = _build_index_graph(
+            input_shape=(7, 4),
+            index_shapes=[(3,)],
+            output_shape=(3, 4),
+            index_dtype=torch.int64,
+        )
+        pass_instance.call(gm)
+
+        scalar_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target == torch.ops.aten.scalar_tensor.default
+        ]
+        assert len(scalar_nodes) == 2
+        for s in scalar_nodes:
+            assert s.kwargs.get("dtype") == torch.int64
+
     def test_where_connects_to_index_put(self, pass_instance):
         """The where node should be used as the new index in the index_put args."""
         gm = _build_index_put_graph(

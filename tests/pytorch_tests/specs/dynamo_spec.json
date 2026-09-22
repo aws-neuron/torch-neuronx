@@ -180,6 +180,7 @@
             "test_cross_entropy_loss_fancy_ctor2_dynamic_shapes",
             "test_cross_entropy_loss_simple_ctor",
             "test_cross_entropy_loss_simple_ctor_dynamic_shapes",
+            "test_inplace_ops_propagate_requires_grad_metadata_copysign_neuron_float64",
             "test_dunder_call_explicitly",
             "test_dunder_call_explicitly_dynamic_shapes",
             "test_eager_sequence_nr",
@@ -235,6 +236,186 @@
       ],
       "xfail": [
         {
+          "reason": "PT 2.11 test_inplace_ops: Numerical tolerance mismatch on Neuron hardware",
+          "tests": [
+            "test_inplace_ops_propagate_requires_grad_metadata_atan2_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_atan2_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_atan2_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_div_no_rounding_mode_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_div_no_rounding_mode_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_div_no_rounding_mode_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_lerp_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_lerp_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_mul_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_mul_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_pow_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_pow_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_remainder_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_mean_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_mean_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_mean_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_mean_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_prod_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_hypot_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_hypot_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_hypot_neuron_float64"
+          ]
+        },
+        {
+          "reason": "PT 2.11 test_inplace_ops: Backward pass requires dynamic shapes or unregistered ops in torch-mlir",
+          "tests": [
+            "test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_masked_scatter_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_put_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_put_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_put_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_put_neuron_float64"
+          ]
+        },
+        {
+          "reason": "PT 2.11 test_inplace_ops: Torch-MLIR legalization scatter_add illegal",
+          "tests": [
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_add_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_add_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_add_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_add_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_prod_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_prod_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_prod_neuron_float32"
+          ]
+        },
+        {
+          "reason": "PT 2.11 test_inplace_ops: IndexError tuple out of range in masked_fill",
+          "tests": [
+            "test_inplace_ops_propagate_requires_grad_metadata_masked_fill_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_masked_fill_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_masked_fill_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_masked_fill_neuron_float64"
+          ]
+        },
+        {
+          "reason": "PT 2.11 test_inplace_ops: Torch-MLIR legalization gather illegal",
+          "tests": [
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amax_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amax_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amax_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amax_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amin_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amin_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amin_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_amin_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_sum_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_sum_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_sum_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_reduce_sum_neuron_float64"
+          ]
+        },
+        {
+          "reason": "PT 2.11 test_inplace_ops: Torch-MLIR legalization xlogy illegal",
+          "tests": [
+            "test_inplace_ops_propagate_requires_grad_metadata_xlogy_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_xlogy_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_xlogy_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_xlogy_neuron_float64"
+          ]
+        },
+        {
+          "reason": "PT 2.11 test_inplace_ops: No contiguous implementation for complex dtypes on Neuron",
+          "tests": [
+            "test_inplace_ops_propagate_requires_grad_metadata_addmm_decomposed_neuron_complex128",
+            "test_inplace_ops_propagate_requires_grad_metadata_addmm_decomposed_neuron_complex64",
+            "test_inplace_ops_propagate_requires_grad_metadata_addmm_neuron_complex128",
+            "test_inplace_ops_propagate_requires_grad_metadata_addmm_neuron_complex64",
+            "test_inplace_ops_propagate_requires_grad_metadata_baddbmm_neuron_complex128",
+            "test_inplace_ops_propagate_requires_grad_metadata_baddbmm_neuron_complex64"
+          ]
+        },
+        {
+          "reason": "PT 2.11 test_inplace_ops: neuronx-cc compilation failure",
+          "tests": [
+            "test_inplace_ops_propagate_requires_grad_metadata_addmm_decomposed_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_addmm_decomposed_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_addmm_decomposed_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_addmm_decomposed_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_addmm_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_addmm_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_addmm_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_addmm_neuron_float64"
+          ]
+        },
+        {
+          "reason": "PT 2.11 test_inplace_ops: IndexError 0-dim tensor in index_select",
+          "tests": [
+            "test_inplace_ops_propagate_requires_grad_metadata_index_add_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_add_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_add_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_add_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_fill_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amax_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amax_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amax_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amax_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amin_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amin_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amin_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_amin_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_mean_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_mean_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_mean_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_mean_neuron_float64",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_prod_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_prod_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_prod_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_reduce_prod_neuron_float64"
+          ]
+        },
+        {
+          "reason": "PT 2.11 test_inplace_ops: IndexError tuple out of range in scatter",
+          "tests": [
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_scatter_neuron_float64"
+          ]
+        },
+        {
+          "reason": "PT 2.11 test_inplace_ops: Meta tensor inference failure in index_copy",
+          "tests": [
+            "test_inplace_ops_propagate_requires_grad_metadata_index_copy_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_copy_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_copy_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_copy_neuron_float64"
+          ]
+        },
+        {
+          "reason": "PT 2.11 test_inplace_ops: Device mismatch index tensor on CPU",
+          "tests": [
+            "test_inplace_ops_propagate_requires_grad_metadata_index_put_neuron_bfloat16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_put_neuron_float16",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_put_neuron_float32",
+            "test_inplace_ops_propagate_requires_grad_metadata_index_put_neuron_float64"
+          ]
+        },
+        {
+          "reason": "PT 2.11 test_inplace_ops: Unimplemented op for complex dtypes on Neuron",
+          "tests": [
+            "test_inplace_ops_propagate_requires_grad_metadata_cumprod_neuron_complex128",
+            "test_inplace_ops_propagate_requires_grad_metadata_cumprod_neuron_complex64",
+            "test_inplace_ops_propagate_requires_grad_metadata_div_no_rounding_mode_neuron_complex128",
+            "test_inplace_ops_propagate_requires_grad_metadata_div_no_rounding_mode_neuron_complex64",
+            "test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_complex128",
+            "test_inplace_ops_propagate_requires_grad_metadata_true_divide_neuron_complex64"
+          ]
+        },
+        {
           "reason": "AttributeError: 'MiscTests' object has no attribute",
           "tests": [
             "test_isdisjoint_with_generator"
@@ -252,7 +433,8 @@
             "test_no_raise_guard_partial_constraint_dynamic_shapes",
             "test_sourceless_namedtuple",
             "test_torch_dynamo_codegen_pow",
-            "test_torch_dynamo_codegen_pow_dynamic_shapes"
+            "test_torch_dynamo_codegen_pow_dynamic_shapes",
+            "test_foreach_norm_inf_dynamic"
           ]
         },
         {
@@ -1514,6 +1696,12 @@
           ]
         },
         {
+          "reason": "Compiled graph allocates on device index 1, but the NEFF execution context exposes a single logical core (Number of LNCs 1), so NRT fails with Invalid Logical Core 1",
+          "tests": [
+            "test_gpu_current_device"
+          ]
+        },
+        {
           "reason": "E RuntimeError: CPU fallback disabled because TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1. Operation eq failed to execute on Neuron (last implementation: ImplementationWrapper). Details: ImplementationWrapper: E Traceback (most recent call last): E File \"/workspace/torch_neuron_eager/torch_neuronx/python_ops/torch_mlir/op_impl.py\", line 99, in execute",
           "tests": [
             "test_items_type"
@@ -1768,7 +1956,7 @@
         {
           "reason": "E RuntimeError: Neuron backend NEFF execution setup failed with unexpected error: E Failed Torch-MLIR Lowering Torch Backend IR -> StableHLO IR: loc(\"/workspace/torch_neuron_eager/.venv/lib/python3.10/site-packages/einops/layers/torch.py\":63:0): error: matmul: input datatypes mismatched E loc(\"/workspace/torch_neuron_eager/.venv/lib/python3.10/site-packages/einops/layers/torch.py\":63:0): error: failed to perform matmul operation",
           "tests": [
-            "test_layers_version_0_8_1"
+            "test_layers_version_0_8_2"
           ]
         },
         {
@@ -2220,12 +2408,6 @@
           ]
         },
         {
-          "reason": "E RuntimeError: _copy_from_and_resize now only support copy with same size, or dst.numel() == 0!",
-          "tests": [
-            "test_sort_out"
-          ]
-        },
-        {
           "reason": "E RuntimeError: can't assign Variable as its own grad",
           "tests": [
             "test_post_acc_grad_hook"
@@ -2476,6 +2658,315 @@
           "reason": "torch._dynamo.exc.ObservedTypeError: raised exception ExceptionVariable(<class 'TypeError'>)",
           "tests": [
             "test_dict_construct_from_mapping_like"
+          ]
+        },
+        {
+          "reason": "Missing HOP import _import_hop_with_effects",
+          "tests": [
+            "test_leaf_function_escaped_gradient_actually_lost_backend_aot_eager",
+            "test_leaf_function_escaped_gradient_actually_lost_backend_eager",
+            "test_leaf_function_escaped_gradient_error_message_contains_tensor_info_backend_aot_eager",
+            "test_leaf_function_escaped_gradient_error_message_contains_tensor_info_backend_eager",
+            "test_leaf_function_escaped_gradient_input_no_grad_backend_aot_eager_check_escaped_gradients_False",
+            "test_leaf_function_escaped_gradient_input_no_grad_backend_aot_eager_check_escaped_gradients_True",
+            "test_leaf_function_escaped_gradient_input_no_grad_backend_eager_check_escaped_gradients_False",
+            "test_leaf_function_escaped_gradient_input_no_grad_backend_eager_check_escaped_gradients_True",
+            "test_leaf_function_escaped_gradient_mixed_inputs_backend_aot_eager_check_escaped_gradients_False",
+            "test_leaf_function_escaped_gradient_mixed_inputs_backend_aot_eager_check_escaped_gradients_True",
+            "test_leaf_function_escaped_gradient_mixed_inputs_backend_eager_check_escaped_gradients_False",
+            "test_leaf_function_escaped_gradient_mixed_inputs_backend_eager_check_escaped_gradients_True",
+            "test_leaf_function_escaped_gradient_multiple_tensors_backend_aot_eager_check_escaped_gradients_False",
+            "test_leaf_function_escaped_gradient_multiple_tensors_backend_aot_eager_check_escaped_gradients_True",
+            "test_leaf_function_escaped_gradient_multiple_tensors_backend_eager_check_escaped_gradients_False",
+            "test_leaf_function_escaped_gradient_multiple_tensors_backend_eager_check_escaped_gradients_True",
+            "test_leaf_function_input_mutation_error_backend_aot_eager",
+            "test_leaf_function_input_mutation_error_backend_eager",
+            "test_leaf_function_multiple_compiled_submodules_backend_aot_eager",
+            "test_leaf_function_multiple_compiled_submodules_backend_eager",
+            "test_leaf_function_validation_dtype_mismatch_backend_aot_eager",
+            "test_leaf_function_validation_dtype_mismatch_backend_eager",
+            "test_leaf_function_validation_shape_mismatch_backend_aot_eager_validate_outputs_False",
+            "test_leaf_function_validation_shape_mismatch_backend_eager_validate_outputs_False",
+            "test_leaf_function_with_graph_breaks_backend_aot_eager_do_compile_True",
+            "test_leaf_function_with_graph_breaks_backend_eager_do_compile_True"
+          ]
+        },
+        {
+          "reason": "RuntimeError: nested_compile_region config is an experimental feature for testing only",
+          "tests": [
+            "test_custom_decomposition",
+            "test_two_graphs_serialize_False",
+            "test_unbacked_expr_input_serialize_False"
+          ]
+        },
+        {
+          "reason": "Torch-mlir doesn't support ops from mylib",
+          "tests": [
+            "test_debugmode",
+            "test_debugmode_warns_outside_ci"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Neuron backend NEFF execution setup failed with unexpected error",
+          "tests": [
+            "test_builtin_bool_on_tensor",
+            "test_builtin_bool_on_tensor_dynamic_shapes",
+            "test_diagonal_scatter_single_elem_cpu_with_cuda_tensor",
+            "test_diagonal_scatter_single_elem_cpu_with_cuda_tensor_dynamic_shapes",
+            "test_foreach_tensor_scalar",
+            "test_foreach_tensor_scalar_dynamic_shapes",
+            "test_output_views_input_dynamic",
+            "test_select_scatter_mixed_dtype",
+            "test_select_scatter_mixed_dtype_dynamic_shapes"
+          ]
+        },
+        {
+          "reason": "AssertionError: Scalars are not equal",
+          "tests": [
+            "test_autograd_grad_missing_detach_errors_like_eager",
+            "test_changing_cache_hash_invalidates_cache",
+            "test_custom_runtime_estimator_cache_hit",
+            "test_different_custom_estimator_uuids_cause_cache_miss",
+            "test_different_sac_policies_cause_cache_miss",
+            "test_layer_norm_double_backward_dynamic_shapes",
+            "test_layer_norm_double_backward_dynamic_shapes_dynamic_shapes",
+            "test_same_sac_policy_causes_cache_hit"
+          ]
+        },
+        {
+          "reason": "Logging output format mismatch",
+          "tests": [
+            "test_dynamo_debug",
+            "test_side_effects",
+            "test_side_effects_attribute_mutations",
+            "test_side_effects_dict_mutations",
+            "test_side_effects_local_object_with_log",
+            "test_side_effects_multiple_mutations_same_object",
+            "test_side_effects_nested_calls",
+            "test_side_effects_nn_module_buffer"
+          ]
+        },
+        {
+          "reason": "TypeError: Multiple dispatch failed for torch._ops.aten._to_copy.default",
+          "tests": [
+            "test_base_torch_function_tracing",
+            "test_no_call_to_new",
+            "test_subclass_method_override",
+            "test_subclass_with_disabled_torch_function",
+            "test_tensor_subclass_unpack",
+            "test_tensor_subclass_with_non_classmethod_torch_function",
+            "test_user_overridden_property_unsupported"
+          ]
+        },
+        {
+          "reason": "NameError: name 'einops' is not defined",
+          "tests": [
+            "test_einops_method_einsum",
+            "test_einops_method_pack",
+            "test_einops_method_rearrange",
+            "test_einops_method_reduce",
+            "test_einops_method_repeat",
+            "test_einops_method_unpack"
+          ]
+        },
+        {
+          "reason": "Error message format mismatch",
+          "tests": [
+            "test_generic_ctx_mgr_graph_break_fullgraph_false",
+            "test_graph_break_in_loop",
+            "test_hop_side_effect_error_includes_hop_context_fullgraph_false",
+            "test_nested_generic_ctx_mgr",
+            "test_skip_frame_in_loop_message",
+            "test_unsupported_error"
+          ]
+        },
+        {
+          "reason": "torch._inductor.exc.InductorError: Device neuron not supported",
+          "tests": [
+            "test_combined_backend_and_config_override_neuron",
+            "test_complex_config_neuron",
+            "test_inductor_with_mode_neuron",
+            "test_multiple_config_overrides_with_backend_neuron",
+            "test_multiple_rules_neuron"
+          ]
+        },
+        {
+          "reason": "AssertionError: expected OutputCode, got <class 'function'>",
+          "tests": [
+            "test_aot_compile_portable_guards_unsafe",
+            "test_aot_compile_with_captured_module",
+            "test_aot_compile_with_captured_module_2",
+            "test_cross_aot_compile",
+            "test_eager_backend"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.TorchRuntimeError when making fake tensor call",
+          "tests": [
+            "test_submodule_forward_hooks_with_kwargs_complex",
+            "test_tensor_share_memory",
+            "test_tensor_share_memory_dynamic_shapes",
+            "test_triton_op_local_variable_cache_invalidation"
+          ]
+        },
+        {
+          "reason": "Triton op kernel detection not working on Neuron",
+          "tests": [
+            "test_triton_op_kernel_factory_function",
+            "test_triton_op_local_variable_kernel_detection",
+            "test_triton_op_lru_cache_factory_function",
+            "test_triton_op_recursive_function_kernel_detection"
+          ]
+        },
+        {
+          "reason": "Double backward not supported with compile",
+          "tests": [
+            "test_double_backward_with_compile",
+            "test_double_backward_with_compile_dynamic_shapes"
+          ]
+        },
+        {
+          "reason": "AssertionError: 0 not greater than 0",
+          "tests": [
+            "test_custom_estimator_bypasses_cache",
+            "test_sac_without_cache_hash_bypasses_cache"
+          ]
+        },
+        {
+          "reason": "RuntimeError: CompiledFunctionBackward returned incorrect number of gradients",
+          "tests": [
+            "test_compile_with_userland_fake_tensor_mode",
+            "test_compile_with_userland_fake_tensor_mode_dynamic_shapes"
+          ]
+        },
+        {
+          "reason": "Segfault in test_structseq_repr",
+          "tests": [
+            "test_structseq_repr",
+            "test_structseq_repr_dynamic_shapes"
+          ]
+        },
+        {
+          "reason": "ModuleNotFoundError: No module named 'einops'",
+          "tests": [
+            "test_layers_version_none",
+            "test_no_recompile_on_lazy_state_version_none"
+          ]
+        },
+        {
+          "reason": "Neuron device name mismatch in codegen (cuda vs neuron)",
+          "tests": [
+            "test_default_partitioner_offload",
+            "test_default_partitioner_offload_sep_stream"
+          ]
+        },
+        {
+          "reason": "Unimplemented call_function: sym_sum",
+          "tests": [
+            "test_validate_outputs_unbacked",
+            "test_validate_outputs_unbacked_dynamic_shapes"
+          ]
+        },
+        {
+          "reason": "PyTorch is not linked with support for cuda devices",
+          "tests": [
+            "test_epilogue_copy_streams_external",
+            "test_epilogue_copy_streams_inference"
+          ]
+        },
+        {
+          "reason": "HOP 'run_and_save_rng_state' not implemented in FxImporter",
+          "tests": [
+            "test_checkpoint_with_dropout_caches_correctly"
+          ]
+        },
+        {
+          "reason": "AssertionError: RuntimeError not raised",
+          "tests": [
+            "test_fake_tensor_mode_raises_error"
+          ]
+        },
+        {
+          "reason": "AssertionError: BackendCompilerFailed not raised",
+          "tests": [
+            "test_unsafe_mark_cacheable"
+          ]
+        },
+        {
+          "reason": "torch._dynamo.exc.Unsupported: failed to find name in frame builtins",
+          "tests": [
+            "test_no_warning"
+          ]
+        },
+        {
+          "reason": "AttributeError: module 'torch_neuronx.neuron' has no attribute '_DeviceGuard'",
+          "tests": [
+            "test_constant_tensor_device_guards"
+          ]
+        },
+        {
+          "reason": "HOP 'cond' not implemented in FxImporter",
+          "tests": [
+            "test_hook_on_intermediate_with_higher_order_op"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Ninja is required to load C++ extensions",
+          "tests": [
+            "test_cpp_extension_recommends_custom_ops"
+          ]
+        },
+        {
+          "reason": "RuntimeError: autograd.Function must override setup_context staticmethod",
+          "tests": [
+            "test_old_style_autograd_function_with_grad_compiled"
+          ]
+        },
+        {
+          "reason": "ConstraintViolationError",
+          "tests": [
+            "test_storage_nbytes_symint_mismatch"
+          ]
+        },
+        {
+          "reason": "Missing inductor event in nested compilation",
+          "tests": [
+            "test_nested_compilation_events_in_profiler"
+          ]
+        },
+        {
+          "reason": "FlexAttention not supported on neuron device",
+          "tests": [
+            "test_cross_compile_realistic_transformer_model"
+          ]
+        },
+        {
+          "reason": "version.parse within graph is not supported",
+          "tests": [
+            "test_packaging_version_parse",
+            "test_packaging_version_parse_dynamic_shapes"
+          ]
+        },
+        {
+          "reason": "python version change error",
+          "tests": [
+            "test_latest_bytecode_to_graph_break_python_versioning"
+          ]
+        },
+        {
+          "reason": "Peak memory counter on Neuron tracks physical on-device slices, not Python-side outstanding DataPtrs. With the async lazy allocator, Python can queue alloc ops faster than the worker materializes them, so the peak physical count during the hot loop legitimately exceeds the warmup peak. The upstream CUDA-authored assertion peak_mem1 == peak_mem2 assumes synchronous Python-side accounting and does not hold for Neuron's asynchronous allocations.",
+          "tests": [
+            "test_mem_leak_guards",
+            "test_mem_leak_guards_dynamic_shapes"
+          ]
+        },
+        {
+          "reason": "Turned execution CPU fallback off",
+          "tests": [
+            "test_swin_base_tensor_attr_dynamic_shapes",
+            "test_subclass_dont_invoke_torch_function_on_overridden_method",
+            "test_subclass_override_shape_and_to",
+            "test_zero_dim_param_mixed_device_grad_neuron"
           ]
         }
       ]

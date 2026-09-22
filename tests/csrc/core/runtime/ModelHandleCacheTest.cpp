@@ -19,7 +19,7 @@ class ModelHandleCacheTest : public ::testing::Test {
     mock_session_ = std::make_unique<MockNRTSession>();
     cache_ = std::make_unique<ModelHandleCache>();
 
-    neff_bytes_ = {0x4E, 0x45, 0x46, 0x46, 0x01, 0x02, 0x03, 0x04};
+    compile_key_ = "001dc83d58c20cf82b82ad89a0006641";
   }
 
   void TearDown() override {
@@ -29,7 +29,7 @@ class ModelHandleCacheTest : public ::testing::Test {
 
   std::unique_ptr<MockNRTSession> mock_session_;
   std::unique_ptr<ModelHandleCache> cache_;
-  std::vector<uint8_t> neff_bytes_;
+  std::string compile_key_;
 };
 
 TEST_F(ModelHandleCacheTest, InitialState) {
@@ -38,7 +38,7 @@ TEST_F(ModelHandleCacheTest, InitialState) {
 }
 
 TEST_F(ModelHandleCacheTest, GetModelMiss) {
-  std::string key = cache_->GenerateCacheKey(neff_bytes_, 0);
+  std::string key = cache_->MakeCacheKey(compile_key_, 0);
   auto model = cache_->GetModel(key);
   EXPECT_EQ(model, nullptr);
 }
@@ -47,7 +47,7 @@ TEST_F(ModelHandleCacheTest, StoreAndGetModel) {
   nrt::ModelHandle* fake_model = reinterpret_cast<nrt::ModelHandle*>(0xABCD);
   EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(fake_model)).Times(1);
 
-  std::string key = cache_->GenerateCacheKey(neff_bytes_, 0);
+  std::string key = cache_->MakeCacheKey(compile_key_, 0);
   std::shared_ptr<nrt::ModelHandle> model(fake_model, nrt::ModelDeleter{});
 
   auto stored = cache_->StoreModel(key, model, 0, false);
@@ -65,7 +65,7 @@ TEST_F(ModelHandleCacheTest, StoreModelRaceReturnsExisting) {
   nrt::ModelHandle* fake_model2 = reinterpret_cast<nrt::ModelHandle*>(0xDCBA);
   EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(_)).Times(2);
 
-  std::string key = cache_->GenerateCacheKey(neff_bytes_, 0);
+  std::string key = cache_->MakeCacheKey(compile_key_, 0);
   std::shared_ptr<nrt::ModelHandle> model1(fake_model1, nrt::ModelDeleter{});
   std::shared_ptr<nrt::ModelHandle> model2(fake_model2, nrt::ModelDeleter{});
 
@@ -85,8 +85,8 @@ TEST_F(ModelHandleCacheTest, DifferentDevicesAreDifferentKeys) {
   nrt::ModelHandle* fake_model2 = reinterpret_cast<nrt::ModelHandle*>(0xDCBA);
   EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(_)).Times(2);
 
-  std::string key0 = cache_->GenerateCacheKey(neff_bytes_, 0);
-  std::string key1 = cache_->GenerateCacheKey(neff_bytes_, 1);
+  std::string key0 = cache_->MakeCacheKey(compile_key_, 0);
+  std::string key1 = cache_->MakeCacheKey(compile_key_, 1);
   EXPECT_NE(key0, key1);
 
   cache_->StoreModel(key0, std::shared_ptr<nrt::ModelHandle>(fake_model1, nrt::ModelDeleter{}), 0,
@@ -105,7 +105,7 @@ TEST_F(ModelHandleCacheTest, ClearCache) {
   nrt::ModelHandle* fake_model = reinterpret_cast<nrt::ModelHandle*>(0xABCD);
   EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(fake_model)).Times(1);
 
-  std::string key = cache_->GenerateCacheKey(neff_bytes_, 0);
+  std::string key = cache_->MakeCacheKey(compile_key_, 0);
   cache_->StoreModel(key, std::shared_ptr<nrt::ModelHandle>(fake_model, nrt::ModelDeleter{}), 0,
                      false);
 
@@ -121,8 +121,8 @@ TEST_F(ModelHandleCacheTest, GetCacheEntries) {
   nrt::ModelHandle* fake_model2 = reinterpret_cast<nrt::ModelHandle*>(0xDCBA);
   EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(_)).Times(2);
 
-  std::string key0 = cache_->GenerateCacheKey(neff_bytes_, 0);
-  std::string key1 = cache_->GenerateCacheKey(neff_bytes_, 1);
+  std::string key0 = cache_->MakeCacheKey(compile_key_, 0);
+  std::string key1 = cache_->MakeCacheKey(compile_key_, 1);
 
   cache_->StoreModel(key0, std::shared_ptr<nrt::ModelHandle>(fake_model1, nrt::ModelDeleter{}), 0,
                      false);
@@ -138,16 +138,16 @@ TEST_F(ModelHandleCacheTest, GetCacheEntries) {
   }
 }
 
-TEST_F(ModelHandleCacheTest, MultipleNeffBytes) {
+TEST_F(ModelHandleCacheTest, DifferentCompileKeysAreDifferentCacheKeys) {
   nrt::ModelHandle* fake_model1 = reinterpret_cast<nrt::ModelHandle*>(0xABCD);
   nrt::ModelHandle* fake_model2 = reinterpret_cast<nrt::ModelHandle*>(0xDCBA);
   EXPECT_CALL(*MockNRT::GetInstance(), nrt_unload(_)).Times(2);
 
-  std::vector<uint8_t> neff_bytes1 = {0x4E, 0x45, 0x46, 0x46, 0x01};
-  std::vector<uint8_t> neff_bytes2 = {0x4E, 0x45, 0x46, 0x46, 0x02, 0x03};
+  const std::string compile_key_1 = "001dc83d58c20cf82b82ad89a0006641";
+  const std::string compile_key_2 = "002552290cea6c67f274dbd9762f1953";
 
-  std::string key1 = cache_->GenerateCacheKey(neff_bytes1, 0);
-  std::string key2 = cache_->GenerateCacheKey(neff_bytes2, 0);
+  std::string key1 = cache_->MakeCacheKey(compile_key_1, 0);
+  std::string key2 = cache_->MakeCacheKey(compile_key_2, 0);
   EXPECT_NE(key1, key2);
 
   cache_->StoreModel(key1, std::shared_ptr<nrt::ModelHandle>(fake_model1, nrt::ModelDeleter{}), 0,

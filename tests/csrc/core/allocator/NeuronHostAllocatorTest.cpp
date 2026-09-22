@@ -95,3 +95,63 @@ TEST_F(NeuronHostAllocatorTest, RecordEventReturnsFalseForUnknownPtr) {
   bool recorded = host_alloc->record_event(random_ptr, nullptr, stream);
   EXPECT_FALSE(recorded);
 }
+
+// ==================== isPinnedPtr / IsNeuronPinnedPtr tests ====================
+
+TEST_F(NeuronHostAllocatorTest, IsPinnedPtrReturnsTrueForAllocatedPointer) {
+  torch_neuronx::NeuronHostAllocatorImpl impl;
+  void* ptr = nullptr;
+  impl.allocate_host_memory(1024, &ptr);
+  ASSERT_NE(ptr, nullptr);
+  EXPECT_TRUE(impl.is_pinned_ptr(ptr));
+  free(ptr);
+}
+
+TEST_F(NeuronHostAllocatorTest, IsPinnedPtrReturnsFalseForUnknownPointer) {
+  torch_neuronx::NeuronHostAllocatorImpl impl;
+  void* random_ptr = reinterpret_cast<void*>(0xDEADBEEF);
+  EXPECT_FALSE(impl.is_pinned_ptr(random_ptr));
+}
+
+TEST_F(NeuronHostAllocatorTest, IsPinnedPtrZeroSizeAllocationDoesNotTrackNullptr) {
+  torch_neuronx::NeuronHostAllocatorImpl impl;
+  void* ptr = nullptr;
+  impl.allocate_host_memory(0, &ptr);
+  EXPECT_EQ(ptr, nullptr);
+  EXPECT_FALSE(impl.is_pinned_ptr(nullptr));
+}
+
+TEST_F(NeuronHostAllocatorTest, IsPinnedPtrTracksMultipleAllocations) {
+  torch_neuronx::NeuronHostAllocatorImpl impl;
+  void* ptr1 = nullptr;
+  void* ptr2 = nullptr;
+  void* ptr3 = nullptr;
+  impl.allocate_host_memory(64, &ptr1);
+  impl.allocate_host_memory(128, &ptr2);
+  impl.allocate_host_memory(256, &ptr3);
+
+  EXPECT_TRUE(impl.is_pinned_ptr(ptr1));
+  EXPECT_TRUE(impl.is_pinned_ptr(ptr2));
+  EXPECT_TRUE(impl.is_pinned_ptr(ptr3));
+
+  free(ptr1);
+  free(ptr2);
+  free(ptr3);
+}
+
+TEST_F(NeuronHostAllocatorTest, IsNeuronPinnedPtrWorksViaGlobalAllocator) {
+  auto* alloc = torch_neuronx::GetNeuronHostAllocator();
+  auto data_ptr = alloc->allocate(2048);
+  void* ptr = data_ptr.get();
+  ASSERT_NE(ptr, nullptr);
+  EXPECT_TRUE(torch_neuronx::IsNeuronPinnedPtr(ptr));
+}
+
+TEST_F(NeuronHostAllocatorTest, IsNeuronPinnedPtrReturnsFalseForArbitraryPointer) {
+  void* random_ptr = reinterpret_cast<void*>(0xCAFEBABE);
+  EXPECT_FALSE(torch_neuronx::IsNeuronPinnedPtr(random_ptr));
+}
+
+TEST_F(NeuronHostAllocatorTest, IsNeuronPinnedPtrReturnsFalseForNullptr) {
+  EXPECT_FALSE(torch_neuronx::IsNeuronPinnedPtr(nullptr));
+}

@@ -92,7 +92,7 @@ class NeuronWork : public c10d::Work {
    */
   NeuronWork(const std::string& pg_uid, const std::string& pg_desc, at::Device device, int rank,
              const std::string& op_type, uint64_t seq_num, std::vector<at::Tensor> outputs = {},
-             bool enable_timing = false, float timeout_ms = 300000.0f,
+             bool enable_timing = false, int64_t timeout_ms = 300000,
              at::neuron::NeuronStream* stream = nullptr, bool blocking_wait = false);
 
   ~NeuronWork() override = default;
@@ -305,7 +305,7 @@ class NeuronWork : public c10d::Work {
 
   // Timing and timeout
   bool timing_enabled_;
-  float timeout_ms_;
+  int64_t timeout_ms_;
   std::chrono::steady_clock::time_point work_start_time_;
 
   // Events for tracking completion

@@ -268,6 +268,11 @@ class ErrorHandler {
   std::string debug_dump_directory_;
 
   /**
+   * Get async error disclaimer suffix, empty when NEURON_LAUNCH_BLOCKING=1
+   */
+  static std::string GetAsyncErrorSuffix();
+
+  /**
    * Record error for monitoring only (does NOT set promise)
    * Consolidates all stage-specific error recording into a single method
    * @param op The operation context

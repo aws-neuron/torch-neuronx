@@ -224,6 +224,41 @@ void RegisterTransformations() {
     TORCH_NEURONX_DEBUG("RegisterTransformations: Registered COMPOUND");
   }
 
+  // Register COMPOUND_FOLDED (folded decomposition for narrow→view→permute patterns)
+  // Runs after COMPOUND — handles patterns where GCD check fails due to coprime strides.
+  // The creator emits SLICE, RESHAPE, and TRANSPOSE TensorTransformations which are
+  // processed by the existing handlers in CollectTransformationTasks.
+  {
+    TransformationDescriptor folded_desc;
+    folded_desc.creator = [](const at::Tensor& input, const std::string& op_name,
+                             size_t input_index) {
+      return Creators::TryCreateFoldedDecomposition(input, op_name, input_index);
+    };
+    folded_desc.handler = std::make_unique<CompoundHandler>();
+    folded_desc.priority = 45;  // After COMPOUND at 50
+    folded_desc.name = "COMPOUND_FOLDED";
+
+    registry.Register(TransformationType::COMPOUND_FOLDED, std::move(folded_desc));
+    TORCH_NEURONX_DEBUG("RegisterTransformations: Registered COMPOUND_FOLDED");
+  }
+
+  // Register SCATTER_IOTA (epilogue only — scatter with iota-computed flat indices)
+  // The creator always returns nullopt (detection is done by TryCreateEpilogue).
+  // The handler converts TensorTransformation → TransformationTask for MLIR generation.
+  {
+    TransformationDescriptor scatter_iota_desc;
+    scatter_iota_desc.creator = [](const at::Tensor&, const std::string&,
+                                   size_t) -> std::optional<TransformationCreationResult> {
+      return std::nullopt;
+    };
+    scatter_iota_desc.handler = std::make_unique<Handlers::ScatterIotaHandler>();
+    scatter_iota_desc.priority = 0;  // Never used for detection — epilogue only
+    scatter_iota_desc.name = "SCATTER_IOTA";
+
+    registry.Register(TransformationType::SCATTER_IOTA, std::move(scatter_iota_desc));
+    TORCH_NEURONX_DEBUG("RegisterTransformations: Registered SCATTER_IOTA");
+  }
+
   TORCH_NEURONX_DEBUG("RegisterTransformations: Complete",
                       "total_registered=", registry.GetRegistrationCount());
 }

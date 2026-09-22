@@ -9,6 +9,7 @@ produces correct numerical results and properly integrates with PassManager.
 
 import logging
 import operator
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -29,6 +30,12 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Fixtures
 # ============================================================================
+
+
+@pytest.fixture(autouse=True)
+def disable_flex_attention_device_check():
+    with patch("torch.nn.attention.flex_attention._validate_device", lambda *args, **kwargs: None):
+        yield
 
 
 @pytest.fixture
@@ -364,9 +371,7 @@ class TestComputeSoftmax:
             }
         )
 
-        attn_weights, _, _ = flex_pass._compute_softmax(
-            graph, nodes["scores"], shapes, torch.float32
-        )
+        attn_weights, _ = flex_pass._compute_softmax(graph, nodes["scores"], shapes, torch.float32)
         graph.output(attn_weights)
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -387,7 +392,7 @@ class TestComputeSoftmax:
         scores_node = graph.placeholder("scores")
         scores_node.meta = {"val": torch.empty(B, H, L, S)}
 
-        attn_weights, _, _ = flex_pass._compute_softmax(graph, scores_node, shapes, torch.float32)
+        attn_weights, _ = flex_pass._compute_softmax(graph, scores_node, shapes, torch.float32)
         graph.output(attn_weights)
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -399,45 +404,36 @@ class TestComputeSoftmax:
         assert not torch.isinf(result).any()
         torch.testing.assert_close(result.sum(dim=-1), torch.ones(B, H, L), rtol=1e-5, atol=1e-6)
 
+    @pytest.mark.parametrize(
+        "B,H,L,S",
+        [
+            (2, 4, 16, 32),
+            (1, 2, 8, 8),
+            (1, 1, 1, 4),
+        ],
+    )
+    def test_softmax_logsumexp_matches_pytorch(self, create_graph, B, H, L, S):
+        """Test that _compute_softmax returns correct logsumexp values."""
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=64)
 
-class TestReplaceSortStable:
-    """Tests for sort.stable replacement via FlexAttentionLegalization."""
-
-    def test_sort_values_become_identity(self):
-        """Test that sorted values output becomes identity (input passthrough)."""
         flex_pass = FlexAttentionLegalization()
 
-        graph = fx.Graph()
-        x = graph.placeholder("x")
-        x.meta = {"val": torch.randn(2, 4, 8)}
+        graph, nodes = create_graph(
+            {
+                "scores": (B, H, L, S),
+            }
+        )
 
-        sort_result = graph.call_function(torch.ops.aten.sort.stable, args=(x,), kwargs={"dim": -1})
-        sort_result.meta = {"val": (torch.randn(2, 4, 8), torch.randint(0, 8, (2, 4, 8)))}
-
-        sorted_vals = graph.call_function(operator.getitem, args=(sort_result, 0))
-        graph.output(sorted_vals)
-
-        flex_pass._replace_sort_stable_with_identity(graph)
+        _, logsumexp = flex_pass._compute_softmax(graph, nodes["scores"], shapes, torch.float32)
+        graph.output(logsumexp)
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
-        test_input = torch.randn(2, 4, 8)
-        result = gm(test_input)
+        scores = torch.randn(B, H, L, S)
+        result = gm(scores)
+        expected = torch.logsumexp(scores, dim=-1)
 
-        # After replacement, sorted_vals should be identity (same as input)
-        torch.testing.assert_close(result, test_input)
-
-    def test_returns_false_when_no_sort_nodes(self):
-        """Test that function returns False when no sort.stable nodes exist."""
-        flex_pass = FlexAttentionLegalization()
-
-        graph = fx.Graph()
-        x = graph.placeholder("x")
-        y = graph.call_function(torch.ops.aten.add.Tensor, args=(x, x))
-        graph.output(y)
-
-        modified = flex_pass._replace_sort_stable_with_identity(graph)
-
-        assert modified is False
+        assert result.shape == (B, H, L), f"LSE shape mismatch: {result.shape} vs {(B, H, L)}"
+        torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-6)
 
 
 class TestFullAttentionPipeline:
@@ -462,7 +458,7 @@ class TestFullAttentionPipeline:
         scores = flex_pass._compute_attention_scores(
             graph, query_node, key_node, scale, shapes, torch.float32
         )
-        attn_weights, _, _ = flex_pass._compute_softmax(graph, scores, shapes, torch.float32)
+        attn_weights, _ = flex_pass._compute_softmax(graph, scores, shapes, torch.float32)
         output = graph.call_function(torch.ops.aten.matmul.default, args=(attn_weights, value_node))
         graph.output(output)
 
@@ -506,7 +502,7 @@ class TestFullAttentionPipeline:
         scores = flex_pass._compute_attention_scores(
             graph, query_node, key_expanded, scale, shapes, torch.float32
         )
-        attn_weights, _, _ = flex_pass._compute_softmax(graph, scores, shapes, torch.float32)
+        attn_weights, _ = flex_pass._compute_softmax(graph, scores, shapes, torch.float32)
         output = graph.call_function(
             torch.ops.aten.matmul.default, args=(attn_weights, value_expanded)
         )
@@ -533,25 +529,6 @@ class TestFullAttentionPipeline:
 
 class TestLegalizeFlexAttentionPass:
     """Tests for the legalize_flex_attention_pass convenience function."""
-
-    def test_pass_handles_graph_with_sort_stable(self):
-        """Test that pass removes sort.stable nodes even without flex_attention."""
-        graph = fx.Graph()
-        x = graph.placeholder("x")
-        x.meta = {"val": torch.randn(2, 4, 8)}
-
-        sort_result = graph.call_function(torch.ops.aten.sort.stable, args=(x,), kwargs={"dim": -1})
-        sort_result.meta = {"val": (torch.randn(2, 4, 8), torch.randint(0, 8, (2, 4, 8)))}
-
-        sorted_vals = graph.call_function(operator.getitem, args=(sort_result, 0))
-        graph.output(sorted_vals)
-
-        gm = fx.GraphModule(torch.nn.Module(), graph)
-        result = legalize_flex_attention_pass(gm)
-
-        # Should remove sort.stable
-        sort_nodes = [n for n in result.graph.nodes if n.target == torch.ops.aten.sort.stable]
-        assert len(sort_nodes) == 0
 
     def test_pass_returns_same_module_when_no_changes_needed(self):
         """Test that pass returns unchanged module for simple graphs."""
@@ -793,9 +770,6 @@ class TestCombinedScoreMaskMod:
 
         torch.testing.assert_close(legalized_output, reference_output, rtol=1e-4, atol=1e-5)
 
-    @pytest.mark.xfail(
-        reason="External buffer support in mask_mod/score_mod currently not implemented"
-    )
     @pytest.mark.parametrize(
         "B,H,L,S,E",
         [
@@ -844,6 +818,120 @@ class TestCombinedScoreMaskMod:
         captured_gm = captured_gm_holder[0]
 
         # Apply legalization
+        flex_pass = FlexAttentionLegalization()
+        pm = PassManager(passes=[flex_pass])
+        pm(captured_gm)
+
+        with torch.no_grad():
+            legalized_output = captured_gm(query, key, value)
+
+        if isinstance(legalized_output, tuple):
+            legalized_output = legalized_output[0]
+
+        torch.testing.assert_close(legalized_output, reference_output, rtol=1e-4, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (2, 2, 8, 8, 16),
+        ],
+    )
+    def test_score_mod_with_external_buffer(self, B, H, L, S, E):
+        """Test score_mod that uses an external buffer (captured tensor)."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.nn.attention.flex_attention import flex_attention
+
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        value = torch.randn(B, H, S, E)
+
+        # External buffer: per-head bias
+        head_bias = torch.randn(H)
+
+        def biased_score_mod(score, b, h, q_idx, kv_idx):
+            return score + head_bias[h]
+
+        with torch.no_grad():
+            reference_output = flex_attention(query, key, value, score_mod=biased_score_mod)
+
+        captured_gm_holder = []
+        capture_compiler = create_capture_compiler(captured_gm_holder)
+
+        class BiasedScoreFlexAttnModule(torch.nn.Module):
+            def forward(self, q, k, v):
+                return flex_attention(q, k, v, score_mod=biased_score_mod)
+
+        model = BiasedScoreFlexAttnModule()
+
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            aot_model = aot_module(model, fw_compiler=capture_compiler)
+            with torch.no_grad():
+                _ = aot_model(query, key, value)
+
+        assert len(captured_gm_holder) > 0
+        captured_gm = captured_gm_holder[0]
+
+        flex_pass = FlexAttentionLegalization()
+        pm = PassManager(passes=[flex_pass])
+        pm(captured_gm)
+
+        with torch.no_grad():
+            legalized_output = captured_gm(query, key, value)
+
+        if isinstance(legalized_output, tuple):
+            legalized_output = legalized_output[0]
+
+        torch.testing.assert_close(legalized_output, reference_output, rtol=1e-4, atol=1e-5)
+
+    @pytest.mark.parametrize(
+        "B,H,L,S,E",
+        [
+            (2, 2, 8, 8, 16),
+        ],
+    )
+    def test_score_mod_and_mask_mod_both_with_external_buffers(self, B, H, L, S, E):
+        """Test score_mod and mask_mod both using external buffers."""
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+        query = torch.randn(B, H, L, E)
+        key = torch.randn(B, H, S, E)
+        value = torch.randn(B, H, S, E)
+
+        # External buffers
+        head_bias = torch.randn(H)
+        prefix_length = torch.tensor([4, 6], dtype=torch.int32)
+
+        def biased_score_mod(score, b, h, q_idx, kv_idx):
+            return score + head_bias[h]
+
+        def prefix_mask(b, h, q_idx, kv_idx):
+            return kv_idx <= prefix_length[b]
+
+        block_mask = create_block_mask(prefix_mask, B, H, L, S, device="cpu")
+
+        with torch.no_grad():
+            reference_output = flex_attention(
+                query, key, value, score_mod=biased_score_mod, block_mask=block_mask
+            )
+
+        captured_gm_holder = []
+        capture_compiler = create_capture_compiler(captured_gm_holder)
+
+        class BothBuffersFlexAttnModule(torch.nn.Module):
+            def forward(self, q, k, v):
+                return flex_attention(q, k, v, score_mod=biased_score_mod, block_mask=block_mask)
+
+        model = BothBuffersFlexAttnModule()
+
+        with FakeTensorMode(allow_non_fake_inputs=True):
+            aot_model = aot_module(model, fw_compiler=capture_compiler)
+            with torch.no_grad():
+                _ = aot_model(query, key, value)
+
+        assert len(captured_gm_holder) > 0
+        captured_gm = captured_gm_holder[0]
+
         flex_pass = FlexAttentionLegalization()
         pm = PassManager(passes=[flex_pass])
         pm(captured_gm)
@@ -1054,7 +1142,7 @@ class TestDtypeSizeCombinations:
         scores_node = graph.placeholder("scores")
         scores_node.meta = {"val": torch.empty(B, H, L, S, dtype=dtype)}
 
-        attn_weights, _, _ = flex_pass._compute_softmax(graph, scores_node, shapes, dtype)
+        attn_weights, _ = flex_pass._compute_softmax(graph, scores_node, shapes, dtype)
         graph.output(attn_weights)
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -1346,9 +1434,13 @@ class TestComputeAttentionBackward:
             (2, 4, 8, 8, 16),
         ],
     )
-    def test_backward_with_mask_mod(self, B, H, L, S, E):
+    def test_backward_with_mask_mod(self, B, H, L, S, E, monkeypatch):
         """Test that legalization handles mask_mod in both forward and backward passes."""
+        import torch.nn.attention.flex_attention as flex_mod
         from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+        # Monkey-patch out the device validation that blocks CPU backward
+        monkeypatch.setattr(flex_mod, "_validate_device", lambda *args, **kwargs: None)
 
         # Define causal mask
         def mask_mod(b, h, q_idx, kv_idx):
@@ -1619,7 +1711,6 @@ class TestTypePromotionInScoreMod:
     def test_binary_op_type_promotion(self, dtype1, dtype2, op, expected_dtype):
         """Test that binary ops correctly handle type promotion via meta tensors."""
         B, H, L, S = 1, 1, 4, 4
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=8)
         flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
@@ -1630,7 +1721,7 @@ class TestTypePromotionInScoreMod:
         arg2.meta = {"val": torch.empty(1, 1, L, 1, dtype=dtype2)}
 
         op_node = graph.call_function(op, args=(arg1, arg2))
-        flex_pass._fix_score_mod_metadata(op_node, op_node, arg1, shapes)
+        flex_pass._fix_score_mod_metadata(op_node, op_node)
 
         assert op_node.meta["val"].dtype == expected_dtype
         assert list(op_node.meta["val"].shape) == [B, H, L, S]
@@ -1746,3 +1837,50 @@ class TestScoreModBroadcasting:
             legalized_output = legalized_output[0]
 
         torch.testing.assert_close(legalized_output, reference_output, rtol=1e-4, atol=1e-5)
+
+
+class TestFinalizeDetachRemoval:
+    """Tests for aten.detach node removal in _finalize_legalization."""
+
+    def test_detach_removal_preserves_data_flow(self):
+        """Test that aten.detach nodes are removed and computation is preserved.
+
+        When mask_mod/score_mod submodules with captured buffers are inlined,
+        aten.detach nodes from autograd tracing are carried over.
+        torch-mlir cannot lower aten.detach to StableHLO, so the legalization
+        pass must remove them without changing outputs.
+        """
+
+        class ModuleWithDetach(torch.nn.Module):
+            def forward(self, x, y):
+                a = torch.ops.aten.detach.default(x)
+                b = torch.ops.aten.detach.default(y)
+                return a + b
+
+        gm = fx.symbolic_trace(ModuleWithDetach())
+
+        # Verify detach nodes exist before finalization
+        detach_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target == torch.ops.aten.detach.default
+        ]
+        assert len(detach_nodes) == 2
+
+        # Run finalization
+        flex_pass = FlexAttentionLegalization()
+        flex_pass._finalize_legalization(gm)
+
+        # Verify all detach nodes removed
+        detach_nodes_after = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function" and n.target == torch.ops.aten.detach.default
+        ]
+        assert len(detach_nodes_after) == 0
+
+        # Verify output is still correct
+        x = torch.randn(4, 4)
+        y = torch.randn(4, 4)
+        result = gm(x, y)
+        torch.testing.assert_close(result, x + y)

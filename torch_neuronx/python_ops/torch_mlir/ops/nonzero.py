@@ -11,9 +11,6 @@ from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
 logger = logging.getLogger(__name__)
 
 
-# TODO uncomment the following once fully migrate to MLIR
-# @neuron_op("aten::nonzero")
-# @neuron_op("aten::nonzero.out")
 class NonzeroMLIRImpl(OperationImplementation):
     """nonzero implementation using MLIR"""
 
@@ -27,6 +24,35 @@ class NonzeroMLIRImpl(OperationImplementation):
 
     def can_handle(self, tensor, out=None):
         return tensor.device.type == "neuron"
+
+    def get_lower_func(self):
+        """Return a lower function for C++ dispatch of nonzero.
+
+        The kernel traces nonzero_with_count which returns (indices, count)
+        as 2 tensors. The C++ DispatchNonzeroImpl handles post-processing
+        (slicing and int64 cast).
+
+        Injects size=tensor.numel() and with_count=True since the ATen
+        schema only provides (Tensor self) but the kernel needs these.
+        """
+        kernel = self.kernel
+
+        def lower_func(*args, **kwargs):
+            kwargs.pop("original_args", None)
+            kwargs.pop("original_kwargs", None)
+            kwargs.pop("out", None)  # out= handled by C++ post-processing
+            tensor = args[0]
+            # Pass size/with_count as kwargs. The kernel has these as
+            # static_argnames so they get baked into the HLO.
+            # Don't pass original_args — the C++ dispatcher's original args
+            # don't include size/with_count, which confuses dtype inference.
+            return kernel.lower(
+                tensor,
+                size=tensor.numel(),
+                with_count=True,
+            )
+
+        return lower_func
 
     def _handle_empty_tensor(self, tensor, *, out=None) -> ExecutionResult:
         """Handle empty tensor - return empty (0, ndim) tensor."""

@@ -301,7 +301,11 @@ class TestGather(BaseCollectiveOpTest):
         """Test gather with specific process groups."""
         self.distributed_tester.run_test(run_group_argument_test)
 
-    @assert_raises(RuntimeError, match=r".*Expected neuron device, got cpu.*")
+    @assert_raises(
+        RuntimeError,
+        match=r".*(Expected neuron device, got cpu"
+        r"|No backend type associated with device type cpu).*",
+    )
     def test_different_devices(self):
         """Test gather with tensors on different devices."""
         self.distributed_tester.run_test(run_different_device_test)
@@ -403,6 +407,12 @@ def run_gather_partial_group_test(rank, world_size, kwargs):
     # Verify results (only on root rank)
     if rank in partial_group and rank == root_rank:
         verify_gather_list(gather_list, expected_values)
+
+    # Barrier on the default group: participating ranks can finish at
+    # different times; the compilation service is single-owner by design,
+    # and the first rank to exit tears down its shared socket, starving
+    # any in-flight compiles on peers.
+    dist.barrier()
 
 
 class TestGatherWorldSize4(BaseCollectiveOpTest):

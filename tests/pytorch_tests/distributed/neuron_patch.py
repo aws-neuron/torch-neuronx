@@ -94,7 +94,7 @@ def patch_skip_decorator_early():
     """
     import torch.testing._internal.common_distributed
 
-    def neuron_skip_if_lt_x_gpu(x):
+    def neuron_skip_if_lt_x_gpu(x, **kwargs):
         return _create_noop_decorator()
 
     def patch_requires_nccl():
@@ -256,6 +256,10 @@ def patch_common_fsdp():
     common_fsdp.DISTRIBUTED_BACKEND = "neuron"
     common_fsdp.DEVICE_COUNT = 2
 
+    if hasattr(common_fsdp, "FSDPTestContinuous"):
+        common_fsdp.FSDPTestContinuous.device_type = "neuron"
+        common_fsdp.FSDPTestContinuous.world_size = common_fsdp.DEVICE_COUNT
+
 
 def patch_amp_not_available():
     from torch.cuda.amp.common import amp_definitely_not_available
@@ -301,7 +305,7 @@ def patch_get_cycles_per_ms():
     try:
         import torch.testing._internal.common_utils as common_utils
 
-        common_utils.get_cycles_per_ms = lambda: 1
+        common_utils.get_cycles_per_ms = lambda *args, **kwargs: 1
     except (ImportError, AttributeError):
         pass
 

@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from torch_neuronx.python_ops import io_tensor
+from torch_neuronx.python_ops.schema_utils import is_inplace_op
 from torch_neuronx.utils import move_pytree_to_cpu
 
 from .handlers import BaseEmptyTensorHandler
@@ -15,17 +16,18 @@ from .handlers import BaseEmptyTensorHandler
 _debug_messages_printed = set()
 
 
-def _should_use_sync_execution(impl, *args):
+def _needs_python_side_logging(impl, *args):
     """
-    Helper function to determine if op should be logged
-    or if current CPU fallback should be used for sync
-    execution (not async pipeline)
+    Helper function to determine if op should be logged from Python.
+
+    Ops that go through the C++ async pipeline have their execution logged
+    from C++. Ops without a kernel or with empty tensors are handled in
+    Python and need Python-side logging.
     """
     return (
         not hasattr(impl, "kernel")
         or impl.kernel is None
         or BaseEmptyTensorHandler().check_for_empty(*args)
-        or os.environ.get("NEURON_LAUNCH_BLOCKING", "0") == "1"
     )
 
 
@@ -46,6 +48,19 @@ class OperationImplementation(ABC):
     DISABLE_DTYPE_AUTOCAST: bool = False
     DISABLE_EMPTY_SHORTCIRCUIT: bool = False
 
+    def translate_args(self, *args, **kwargs):
+        """Translate raw ATen dispatcher arguments to what this implementation expects.
+
+        Override this when the PyTorch ATen schema passes more arguments than
+        the implementation consumes (e.g. _grouped_mm passes bias and
+        use_fast_accum that the NKI kernel ignores).
+
+        Returns:
+            Tuple of (args, kwargs) in the format expected by can_handle,
+            execute, and _execute_impl.
+        """
+        return args, kwargs
+
     def can_handle(self, *args, **kwargs) -> bool:
         """Check if this implementation can handle the given arguments
 
@@ -53,42 +68,41 @@ class OperationImplementation(ABC):
         for the operation. Override this method when multiple implementations
         exist and need to filter based on input arguments.
 
-        Returns False for complex dtypes (not supported yet by neuron backend).
+        Complex dtypes are allowed through here; the allowlist in
+        composite_lower (auto_registration.py) controls which complex
+        ops actually run on Neuron vs fall back to CPU.
 
         Raises:
             RuntimeError: If non-scalar tensors are on wrong device
         """
         for i, arg in enumerate(args):
             if isinstance(arg, torch.Tensor):
-                # Complex dtype not supported yet
-                if arg.dtype.is_complex:
-                    return False
                 if arg.ndim != 0 and arg.device.type != "neuron":
                     raise RuntimeError(
                         f"Non-scalar tensor arg{i} is on {arg.device.type} device, expected neuron"
                     )
             elif isinstance(arg, list | tuple):
                 for j, value in enumerate(arg):
-                    if isinstance(value, torch.Tensor):
-                        # Complex dtype not supported yet
-                        if value.dtype.is_complex:
-                            return False
-                        if value.ndim != 0 and value.device.type != "neuron":
-                            raise RuntimeError(
-                                f"Non-scalar tensor arg{i}[{j}] is on {value.device.type} "
-                                "device, expected neuron"
-                            )
+                    if (
+                        isinstance(value, torch.Tensor)
+                        and value.ndim != 0
+                        and value.device.type != "neuron"
+                    ):
+                        raise RuntimeError(
+                            f"Non-scalar tensor arg{i}[{j}] is on {value.device.type} "
+                            "device, expected neuron"
+                        )
 
         for key, kwarg in kwargs.items():
-            if isinstance(kwarg, torch.Tensor):
-                # Complex dtype not supported yet
-                if kwarg.dtype.is_complex:
-                    return False
-                if kwarg.ndim != 0 and kwarg.device.type != "neuron":
-                    raise RuntimeError(
-                        f"Non-scalar tensor kwarg '{key}' is on {kwarg.device.type}"
-                        "device, expected neuron"
-                    )
+            if (
+                isinstance(kwarg, torch.Tensor)
+                and kwarg.ndim != 0
+                and kwarg.device.type != "neuron"
+            ):
+                raise RuntimeError(
+                    f"Non-scalar tensor kwarg '{key}' is on {kwarg.device.type}"
+                    "device, expected neuron"
+                )
 
         return True
 
@@ -561,9 +575,8 @@ class Operation(ABC):
 
     @property
     def is_inplace(self) -> bool:
-        """Check if this is an in-place operation based on the operation name."""
-        op_name = self.op_name
-        return "_." in op_name or (op_name.endswith("_") and "." not in op_name)
+        """Check if this is an in-place operation, per the op's ATen schema."""
+        return is_inplace_op(getattr(self, "_actual_aten_name", self.op_name))
 
     @property
     @abstractmethod
@@ -723,8 +736,22 @@ class Operation(ABC):
         )
         neuron_impl_failed = False
         last_failed_impl = "unknown"
+        # IMPORTANT: When C++ dispatch is enabled, the dispatch cache key depends
+        # only on op name, tensor shapes, dtypes, strides, storage offsets, and
+        # static scalar args.  The key does NOT encode which implementation was
+        # selected by can_handle().  This means the FIRST impl whose can_handle()
+        # returns True will be lowered and cached — all subsequent calls with the
+        # same cache key will reuse that lowering, even if a different impl's
+        # can_handle() would also return True.
+        #
+        # Correctness requirement: for a given cache key (same shapes/dtypes/strides),
+        # all implementations that return can_handle()=True MUST produce equivalent
+        # HLO.  If two impls have different can_handle() criteria that go beyond
+        # shapes/dtypes/strides (e.g., checking tensor values or runtime state),
+        # they risk cache collisions and incorrect lowering reuse.
         for impl in self._implementations:
-            can_handle_result = impl.can_handle(*args, **kwargs)
+            impl_args, impl_kwargs = impl.translate_args(*args, **kwargs)
+            can_handle_result = impl.can_handle(*impl_args, **impl_kwargs)
             if isinstance(can_handle_result, tuple):
                 can_handle_impl, can_handle_error_msg = can_handle_result
             else:
@@ -735,7 +762,7 @@ class Operation(ABC):
                 if hasattr(impl, "kernel") and impl.kernel is not None:
                     impl.kernel._cpu_fallback_context = cpu_fallback_context
                 try:
-                    result = impl.execute(*args, **kwargs)
+                    result = impl.execute(*impl_args, **impl_kwargs)
                 finally:
                     # Clear fallback context to avoid holding tensor references
                     # in long-lived cached kernel objects
@@ -745,10 +772,10 @@ class Operation(ABC):
                     # Log that this operation was executed on Neuron
                     import torch_neuronx
 
-                    # Log the op for all impl other than JAX/XLA/c10d kernels
+                    # Log the op for all impl other than XLA/c10d kernels
                     # or NEURON_LAUNCH_BLOCKING=1
                     # TODO - remove this condition once all ops are onboarded to async pipeline
-                    if _should_use_sync_execution(impl, *args):
+                    if _needs_python_side_logging(impl, *args):
                         torch_neuronx._C._log_executed_op(self.op_name)
                     return result.output
                 # Log failure and continue to next implementation - debug print once only

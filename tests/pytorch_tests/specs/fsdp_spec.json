@@ -83,6 +83,14 @@
         "test_fsdp_ddp_parity_with_grad_scaler_offload_false_none_none_none",
         "test_fsdp_ddp_parity_with_grad_scaler_offload_false_shard_grad_op_none_none",
         "test_fsdp_ddp_parity_with_grad_scaler_offload_false_none_mixed_precision_use_orig_params"
+      ],
+      "xfail": [
+        {
+          "reason": "PyTorch _MultiDeviceReplicator reads non_blocking=True device-to-host copy without synchronizing. On CUDA this works by timing (tiny DMA completes before CPU reads), on Neuron the higher DMA latency exposes the race.",
+          "tests": [
+            "test_sharded_grad_scaler_found_inf"
+          ]
+        }
       ]
     },
     {
@@ -162,6 +170,14 @@
       "sanity_methods": [
         "test_named_parameters_in_forward",
         "test_no_sync_correctness"
+      ],
+      "xfail": [
+        {
+          "reason": "SIGSEGV during backward with SHARD_GRAD_OP",
+          "tests": [
+            "test_diff_hyperparams_sharding_strategy_str_shard_grad_op"
+          ]
+        }
       ]
     },
     {

@@ -1,7 +1,7 @@
 import torch
-from neuronxcc.nki._pre_prod_kernels.experimental.gmm import grouped_mm_2d_2d
 
 from torch_neuronx import nki_op, wrap_nki
+from torch_neuronx.python_ops.nki_kernels._grouped_mm_2d_2d import grouped_mm_2d_2d
 from torch_neuronx.utils import get_logical_neuron_cores
 
 

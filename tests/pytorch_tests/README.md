@@ -13,7 +13,7 @@ Test configurations are defined in JSON spec files (`specs/`).
 Clone PyTorch tests before running any tests:
 
 ```sh
-python tests/pytorch_tests/clone_tests.py --torch-version v2.10.0
+python tests/pytorch_tests/clone_tests.py --torch-version v2.11.0
 ```
 
 ### Device-Agnostic Tests (FSDP, etc.)

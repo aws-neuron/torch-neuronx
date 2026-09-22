@@ -108,3 +108,16 @@ class TestEyeRegistration:
             cpu_tensor = tensor.cpu()
             expected = torch.eye(3)
             assert torch.allclose(cpu_tensor, expected)
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.int32])
+    def test_eye_out_dtype_inherited(self, dtype):
+        """Verify eye inherits dtype from out tensor when dtype is not specified."""
+        out_cpu = torch.empty(3, 3, dtype=dtype)
+        out_neuron = torch.empty(3, 3, dtype=dtype, device="neuron")
+
+        result_cpu = torch.eye(3, out=out_cpu)
+        result_neuron = torch.eye(3, out=out_neuron)
+
+        assert (
+            result_neuron.dtype == result_cpu.dtype
+        ), f"dtype mismatch: neuron={result_neuron.dtype}, cpu={result_cpu.dtype}"

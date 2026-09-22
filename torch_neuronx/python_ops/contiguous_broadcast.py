@@ -195,6 +195,30 @@ class ContiguousBroadcastMLIRImpl(ContiguousBroadcastImpl):
     def _get_kernel(self):
         return ContiguousBroadcastMLIRImpl._kernel
 
+    def get_lower_func(self):
+        """Return a lower function that transforms aten args to kernel args."""
+        kernel = self._get_kernel()
+
+        def contiguous_broadcast_lower(*args, **kwargs):
+            self_tensor = args[0]
+            expand_dims, base_view = _prepare_broadcast_inputs(self_tensor)
+            target_shape = tuple(self_tensor.shape)
+            return kernel.lower(base_view, target_shape)
+
+        return contiguous_broadcast_lower
+
+    def get_infer_func(self):
+        """Return an infer function that transforms aten args to kernel args."""
+        kernel = self._get_kernel()
+
+        def contiguous_broadcast_infer(*args, **kwargs):
+            self_tensor = args[0]
+            expand_dims, base_view = _prepare_broadcast_inputs(self_tensor)
+            target_shape = tuple(self_tensor.shape)
+            return kernel.infer_output_dtypes(base_view, target_shape)
+
+        return contiguous_broadcast_infer
+
 
 class ContiguousBroadcastFunction(torch.autograd.Function):
     """Autograd function for broadcast-based contiguous implementation."""
@@ -202,6 +226,10 @@ class ContiguousBroadcastFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, self_tensor: torch.Tensor, memory_format, impl: ContiguousBroadcastImpl):
         return impl._execute_impl_internal(self_tensor, memory_format)
+
+    @staticmethod
+    def jvp(ctx, grad_self, grad_memory_format, grad_impl):
+        return grad_self
 
     @staticmethod
     def backward(ctx, grad_output):

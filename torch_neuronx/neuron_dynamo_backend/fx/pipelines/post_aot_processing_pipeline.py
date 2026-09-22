@@ -11,6 +11,8 @@ from typing import NamedTuple
 import torch
 from torch.fx.passes.infra.pass_manager import PassManager
 
+from torch_neuronx.kernels.cache_utils import CompilationJob
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import PassMutations
 from torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization import (
     CollectiveLegalization,
 )
@@ -32,10 +34,18 @@ from torch_neuronx.neuron_dynamo_backend.fx.passes.legalize_bool_scalars import 
 from torch_neuronx.neuron_dynamo_backend.fx.passes.legalize_index_indices import (
     LegalizeIndexIndices,
 )
-from torch_neuronx.neuron_dynamo_backend.fx.passes.random_op_legalization import (
-    RandomOpLegalization,
-)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import NeuronFXPassState
 from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import RemoveNoneOutputs
+from torch_neuronx.neuron_dynamo_backend.fx.passes.replace_device_mesh_placeholders import (
+    ReplaceDeviceMeshPlaceholders,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.rewrite_row_scatter_add import (
+    RewriteRowScatterAdd,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.vocab_sharding_spmd import (
+    ShardIndexInjection,
+    VocabShardingSPMD,
+)
 
 
 class PostAOTProcessingResults(NamedTuple):
@@ -45,25 +55,47 @@ class PostAOTProcessingResults(NamedTuple):
     analysis: dict
 
 
-def post_aot_processing(gm: torch.fx.GraphModule) -> PostAOTProcessingResults:
+def post_aot_processing(
+    gm: torch.fx.GraphModule,
+    job: CompilationJob,
+    model_name: str,
+    pre_aot_pass_mutations: PassMutations | None = None,
+) -> PostAOTProcessingResults:
     """
     Apply FX graph analysis and transformations after AOTAutograd.
 
     Args:
         gm: Input GraphModule
+        job: CompilationJob for dumping FX graph after each pass.
+        model_name: model name for artifact filenames.
 
     Returns:
         PostAOTProcessingResults containing the graph and analysis results
     """
-    flex_lowering_pass = FlexAttentionNKILowering()
-    flex_attention_pass = FlexAttentionLegalization()
-    functionalize_pass = FunctionalizeCopyInplacePass()
-    legalize_bool_scalars_pass = LegalizeBoolScalars()
-    legalize_index_indices_pass = LegalizeIndexIndices()
-    random_op_pass = RandomOpLegalization()
-    remove_none_outputs = RemoveNoneOutputs()
-    collective_legalization = CollectiveLegalization()
-    dtensor_redistribute = DTensorRedistributeOptimization()
+    config = NeuronFXPassState(
+        job=job,
+        model_name=model_name,
+        dumping_enabled=job.preserve,
+        pre_aot_pass_mutations=pre_aot_pass_mutations,
+    )
+
+    flex_lowering_pass = FlexAttentionNKILowering(config)
+    flex_attention_pass = FlexAttentionLegalization(config)
+    functionalize_pass = FunctionalizeCopyInplacePass(config)
+    legalize_bool_scalars_pass = LegalizeBoolScalars(config)
+    # Runs before LegalizeIndexIndices so the negative-index normalization
+    # in that pass covers the rewritten aten.index_put nodes.
+    rewrite_row_scatter_add_pass = RewriteRowScatterAdd(config)
+    legalize_index_indices_pass = LegalizeIndexIndices(config)
+    remove_none_outputs = RemoveNoneOutputs(config)
+    replace_device_mesh = ReplaceDeviceMeshPlaceholders(config)
+    collective_legalization = CollectiveLegalization(config)
+    dtensor_redistribute = DTensorRedistributeOptimization(config)
+
+    # Vocab sharding SPMD passes
+    shard_injection = ShardIndexInjection(config)
+    vocab_sharding = VocabShardingSPMD(config)
+    spmd_vocab_passes = [shard_injection, vocab_sharding]
 
     pm = PassManager(
         passes=[
@@ -71,10 +103,12 @@ def post_aot_processing(gm: torch.fx.GraphModule) -> PostAOTProcessingResults:
             flex_attention_pass,
             functionalize_pass,
             legalize_bool_scalars_pass,
+            rewrite_row_scatter_add_pass,
             legalize_index_indices_pass,
-            random_op_pass,
             remove_none_outputs,
+            replace_device_mesh,
             dtensor_redistribute,  # Before collective legalization
+            *spmd_vocab_passes,
             collective_legalization,
         ],
         run_checks_after_each_pass=True,
@@ -83,9 +117,7 @@ def post_aot_processing(gm: torch.fx.GraphModule) -> PostAOTProcessingResults:
     pass_result = pm(gm)
 
     analysis_results = {
-        "mutation_info": functionalize_pass.get_mutation_info(),
-        "none_output_info": remove_none_outputs.result,
-        "random_input_info": random_op_pass.result,
+        "pass_mutations": config.pass_mutations,
     }
 
     return PostAOTProcessingResults(pass_result.graph_module, analysis_results)

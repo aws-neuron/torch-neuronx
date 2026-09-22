@@ -2,7 +2,7 @@
 
 Implements:
   * aten::nll_loss_forward / aten::nll_loss_backward
-  * aten::cross_entropy_loss / aten::cross_entropy_loss_backward_
+  * aten::cross_entropy_loss / aten::cross_entropy_loss_backward
 
 Cross-entropy uses a chunked online-logsumexp algorithm that avoids
 materializing the full (N, V) softmax/log-softmax matrix, keeping peak
@@ -16,19 +16,33 @@ from torch._refs.nn.functional import TensorLikeType
 
 from torch_neuronx.python_ops.auto_registration import neuron_op
 from torch_neuronx.python_ops.base import ExecutionResult, OperationImplementation
+from torch_neuronx.python_ops.torch_mlir.op_impl import TorchMlirOpImpl
 
-from ..operation_registry import register_aten
+from ..operation_registry import Preprocessing, register_aten
+
+try:
+    from torch.distributed._tensor import DTensor
+    from torch.distributed._tensor.placement_types import Replicate
+except ImportError:
+    DTensor = None
+    Replicate = None
 
 # ── NLL Loss (forward & backward) ───────────────────────────────────────
 
 
-@register_aten(["aten::nll_loss_forward"], static_argnums=(3, 4))
+@register_aten(
+    ["aten::nll_loss_forward", "aten::nll_loss_forward.output"],
+    static_argnums=(3, 4),
+    output_params=("output", "total_weight"),
+)
 def nll_loss(
     input: TensorLikeType,
     target: TensorLikeType,
     weight: TensorLikeType | None,
     reduction: int,
     ignore_index: int,
+    output: TensorLikeType | None = None,
+    total_weight: TensorLikeType | None = None,
 ):
     """NLL loss forward using PyTorch decomposition."""
     if input.dim() == 1 and target.dim() == 1 and target.size(0) != 1:
@@ -36,7 +50,11 @@ def nll_loss(
     return torch.ops.aten.nll_loss_forward(input, target, weight, reduction, ignore_index)
 
 
-@register_aten(["aten::nll_loss_backward"], static_argnums=(4, 5))
+@register_aten(
+    ["aten::nll_loss_backward", "aten::nll_loss_backward.grad_input"],
+    static_argnums=(4, 5),
+    output_params=("grad_input",),
+)
 def nll_loss_backward(
     grad_output: TensorLikeType,
     input: TensorLikeType,
@@ -45,6 +63,7 @@ def nll_loss_backward(
     reduction: int,
     ignore_index: int,
     total_weight: TensorLikeType,
+    grad_input: TensorLikeType | None = None,
 ):
     """NLL loss backward using PyTorch decomposition."""
     return torch.ops.aten.nll_loss_backward(
@@ -99,15 +118,22 @@ def _validate_ce_inputs(input, target, weight, ignore_index, label_smoothing):
             f"tensor of shape: {list(weight.shape)}"
         )
 
-    if not is_prob_target:
-        valid = target[target != ignore_index]
-        if valid.numel() > 0:
-            max_t = valid.max().item()
-            if max_t >= n_classes:
-                raise IndexError(f"Target {max_t} is out of bounds.")
-            min_t = valid.min().item()
-            if min_t < 0:
-                raise IndexError(f"Target {min_t} is out of bounds.")
+    if not is_prob_target and target.numel() > 0:
+        # Neutralize ignore_index entries by mapping them to 0 rather than
+        # masking them out. Boolean-mask indexing is nonzero-backed, so its
+        # output shape depends on tensor *values* — that forces a recompile
+        # whenever the number of ignored targets changes between steps. This
+        # form keeps the shape static, so it compiles once and hits the NEFF
+        # cache thereafter. The numel() guard preserves the old code's
+        # `valid.numel() > 0` check: max()/min() raise on 0 elements.
+        safe = torch.where(target == ignore_index, torch.zeros_like(target), target)
+        # Stack before transferring: one host sync instead of two, and both
+        # reductions schedule into a single graph rather than serializing.
+        max_t, min_t = torch.stack([safe.max(), safe.min()]).tolist()
+        if max_t >= n_classes:
+            raise IndexError(f"Target {max_t} is out of bounds.")
+        if min_t < 0:
+            raise IndexError(f"Target {min_t} is out of bounds.")
 
 
 def _flatten_spatial(input, target, n_classes, is_prob_target):
@@ -141,7 +167,8 @@ def _flatten_spatial(input, target, n_classes, is_prob_target):
         "orig_shape",
         "is_prob_target",
     ),
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.VALUE_DEPENDENT,
+    skip_dispatch_registration=True,
 )
 def cross_entropy_loss(
     input: TensorLikeType,
@@ -398,7 +425,7 @@ def _ce_chunked_fwd_inner(
 
 
 @register_aten(
-    ["aten::cross_entropy_loss_backward_"],
+    ["aten::cross_entropy_loss_backward"],
     static_argnames=(
         "n_classes",
         "reduction",
@@ -407,7 +434,7 @@ def _ce_chunked_fwd_inner(
         "no_batch",
         "is_prob_target",
     ),
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.SHAPE_ONLY,
 )
 def cross_entropy_loss_backward(
     input: TensorLikeType,
@@ -420,10 +447,9 @@ def cross_entropy_loss_backward(
 ):
     """Preprocessing (eager): detect shapes, return ``_ce_bwd``.
 
-    ``input`` is the first positional arg so that the trailing-underscore
-    in-place convention causes kernel.py to reuse it as the output buffer,
-    avoiding a separate allocation for the gradient.  All reshaping is
-    deferred to the traced function so the output shape matches input.
+    ``input`` is the first positional arg to match the autograd formula's
+    calling convention. All reshaping is deferred to the traced function so
+    the output shape matches input without aliasing its storage.
     """
     no_batch = input.dim() == 1
     n_classes = (
@@ -461,8 +487,8 @@ def _ce_bwd(
     """Unified backward entry point.
 
     All reshaping (unsqueeze, flatten, unflatten) happens here inside the
-    traced function so the HLO output shape matches the input shape,
-    enabling in-place output buffer reuse by kernel.py.
+    traced function so the HLO output shape matches the input shape while
+    preserving the input tensor.
     """
     if no_batch:
         input = input.unsqueeze(0)
@@ -495,7 +521,8 @@ def _ce_bwd(
     if no_batch:
         grad_input = grad_input.squeeze(0)
     if grad_output.dim() > 0 and grad_input.dim() > grad_output.dim():
-        grad_output = grad_output.unsqueeze(-1)
+        # Unreduced cross entropy omits the class dimension from grad_output.
+        grad_output = grad_output.unsqueeze(1)
     return grad_input * grad_output
 
 
@@ -647,6 +674,132 @@ def _unflatten_spatial(grad_input, orig_shape):
     return grad_input.permute(*inv_perm)
 
 
+# ── Register autograd formula for C++ dispatch path ──────────────────────
+# The setup_context and backward are op-specific: they know the cross_entropy
+# schema (which args to save, how to call the backward lowering).
+
+_ce_bwd_impl = TorchMlirOpImpl(
+    "aten::cross_entropy_loss_backward",
+    cross_entropy_loss_backward,
+    static_argnames=(
+        "n_classes",
+        "reduction",
+        "ignore_index",
+        "label_smoothing",
+        "no_batch",
+        "is_prob_target",
+    ),
+)
+
+_NONE_WEIGHT_SENTINEL = torch.tensor([])
+
+
+def _ce_setup_context(ctx, inputs, output):
+    # inputs: (input, target, weight, reduction, ignore_index, label_smoothing)
+    weight = inputs[2]
+    ctx.save_for_backward(
+        inputs[0],
+        inputs[1],
+        weight if weight is not None else _NONE_WEIGHT_SENTINEL,
+    )
+    ctx.reduction = inputs[3]
+    ctx.ignore_index = inputs[4]
+    ctx.label_smoothing = inputs[5]
+    ctx.has_weight = weight is not None and weight.numel() > 0
+
+
+def _ce_backward(ctx, grad_output):
+    saved = ctx.saved_tensors
+    weight = saved[2] if ctx.has_weight else None
+
+    # During AOT autograd tracing (torch.compile), the kernel's make_fx would
+    # nest inside AOT autograd's make_fx, causing FunctionalTensor mode conflicts.
+    # The forward is decomposed via get_compile_decomposition_table(), but the
+    # AutogradPrivateUse1 formula still captures this backward. Call the backward
+    # function directly so the outer tracer captures individual ops.
+    proxy_mode = torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.PROXY)
+    if proxy_mode is not None:
+        fn, args, kwargs = cross_entropy_loss_backward(
+            saved[0],
+            grad_output,
+            saved[1],
+            weight,
+            ctx.reduction,
+            ctx.ignore_index,
+            ctx.label_smoothing,
+        )
+        grad_input = fn(*args, **kwargs)
+        return grad_input, None, None, None, None, None
+
+    result = _ce_bwd_impl.execute(
+        saved[0],
+        grad_output,
+        saved[1],
+        weight,
+        ctx.reduction,
+        ctx.ignore_index,
+        ctx.label_smoothing,
+    )
+    if not result.success:
+        raise RuntimeError(f"Cross entropy backward failed: {result.error_msg}")
+    return result.output, None, None, None, None, None
+
+
+def _wrap_ce_for_dtensor(autograd_kernel):
+    """Wrap the cross-entropy autograd kernel to handle DTensor inputs.
+
+    When ``loss_parallel()`` is active the logits are a DTensor (Shard on
+    the vocab dim) while targets/weight may be plain Tensors.  The standard
+    ``make_autograd_impl`` kernel calls ``op.redispatch`` which hits the
+    DTensor dispatch key *before* PrivateUse1 and raises
+    "got mixed torch.Tensor and DTensor".
+
+    This wrapper intercepts DTensor inputs, converts plain Tensor args to
+    Replicate DTensors, and decomposes into log_softmax + nll_loss (which
+    DTensor/loss_parallel know how to shard).  Plain-tensor inputs fall
+    through to the standard autograd kernel unchanged.
+    """
+
+    def wrapper(keyset, *args, **kwargs):
+        x = args[0]
+        if DTensor is not None and isinstance(x, DTensor):
+            target = args[1]
+            weight = args[2] if len(args) > 2 else None
+            reduction_int = args[3] if len(args) > 3 else 1
+            ignore_index = args[4] if len(args) > 4 else -100
+
+            mesh = x.device_mesh
+            replicate = (Replicate(),) * mesh.ndim
+
+            if isinstance(target, torch.Tensor) and not isinstance(target, DTensor):
+                target = DTensor.from_local(
+                    target, device_mesh=mesh, placements=replicate, run_check=False
+                )
+            if isinstance(weight, torch.Tensor) and not isinstance(weight, DTensor):
+                weight = DTensor.from_local(
+                    weight, device_mesh=mesh, placements=replicate, run_check=False
+                )
+
+            reduction_str = {0: "none", 1: "mean", 2: "sum"}.get(reduction_int, "mean")
+            log_softmax = torch.nn.functional.log_softmax(x, dim=1)
+            return torch.nn.functional.nll_loss(
+                log_softmax,
+                target,
+                weight=weight,
+                reduction=reduction_str,
+                ignore_index=ignore_index,
+            )
+
+        return autograd_kernel(keyset, *args, **kwargs)
+
+    return wrapper
+
+
+# TODO: (apoorvgu) - add register_autograd_formula once the reason behind
+# the OOM causing extra input reference is found.
+# Removed: register_autograd_formula causes OOM for large-vocab TP1 models.
+# The @neuron_op CrossEntropyLossOp handles autograd via _CrossEntropyAutograd.
+
 # ── Autograd glue ────────────────────────────────────────────────────────
 
 
@@ -744,7 +897,7 @@ class CrossEntropyLossOp(OperationImplementation):
 
         bwd_fn = cross_entropy_loss_backward
         self._bwd = TorchMlirOpImpl(
-            "aten::cross_entropy_loss_backward_",
+            "aten::cross_entropy_loss_backward",
             bwd_fn,
             static_argnames=(
                 "n_classes",
@@ -834,3 +987,44 @@ def cross_entropy_autograd_privateuse1(*args, **kwargs):
 
     # Plain tensors — dispatch to PrivateUse1 (neuron fused impl)
     return torch.ops.aten.cross_entropy_loss.default._op_dk(torch._C.DispatchKey.PrivateUse1, *args)
+
+
+# Register DTensor handler on AutogradPrivateUse1.
+# This does NOT use register_autograd_formula / make_autograd_impl (which causes OOM).
+# For plain tensors, it falls through to PrivateUse1 where @neuron_op handles autograd.
+# For DTensor inputs (TP training), it decomposes to log_softmax + nll_loss.
+_ce_dtensor_lib = torch.library.Library("aten", "IMPL")
+_ce_dtensor_lib.impl(
+    "cross_entropy_loss", cross_entropy_autograd_privateuse1, "AutogradPrivateUse1"
+)
+
+
+@register_aten(
+    ["aten::mse_loss", "aten::mse_loss.out"],
+    static_argnums=(2,),
+    output_params=("out",),
+)
+def mse_loss(
+    input: TensorLikeType,
+    target: TensorLikeType,
+    reduction: int = 1,
+    out: TensorLikeType | None = None,
+):
+    """MSE loss forward."""
+    return torch.ops.aten.mse_loss(input, target, reduction)
+
+
+@register_aten(
+    ["aten::mse_loss_backward", "aten::mse_loss_backward.grad_input"],
+    static_argnums=(3,),
+    output_params=("grad_input",),
+)
+def mse_loss_backward(
+    grad_output: TensorLikeType,
+    input: TensorLikeType,
+    target: TensorLikeType,
+    reduction: int,
+    grad_input: TensorLikeType | None = None,
+):
+    """MSE loss backward using PyTorch decomposition."""
+    return torch.ops.aten.mse_loss_backward(grad_output, input, target, reduction)

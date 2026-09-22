@@ -115,7 +115,7 @@ class TestLogicalOpsRegistration:
         expected = op_func(a, b)
         torch.testing.assert_close(expected, output.cpu())
 
-    def test_logical_op_inplace_runs_on_neuron(self, op_name, op_func, input1, input2):
+    def test_logical_op_inplace_runs_on_neuron(self, request, op_name, op_func, input1, input2):
         """Test that inplace logical op runs on Neuron without CPU fallback"""
         a, a_device = input1, input1.to("neuron")
         b, b_device = input2, input2.to("neuron")
@@ -137,18 +137,24 @@ class TestLogicalOpsRegistration:
                 assert_op_runs_on_neuron(op_name)
             torch.testing.assert_close(a, a_device.cpu())
         else:
+            # Marker-based (not pytest.xfail()) so the assertion still runs and
+            # surfaces as XPASS once neuron raises like CPU.
+            request.applymarker(
+                pytest.mark.xfail(
+                    reason=(
+                        "cpu raises runtime error but neuron prints warning, cpu runtime error"
+                        " hits https://github.com/pytorch/pytorch/blob/"
+                        "5d819f3fafe68ad6fdc133c58b5f5591a34c2d9f/aten/src/ATen/"
+                        "TensorIterator.cpp#L1213"
+                    )
+                )
+            )
             self._test_inplace_runtime_error(inplace_op_device, b_device)
 
     @assert_raises(RuntimeError)
     def _test_inplace_runtime_error(self, inplace_op_device, b_device):
         """Helper method to test inplace operation runtime error"""
         inplace_op_device(b_device)
-        pytest.xfail(
-            reason=(
-                "cpu raises runtime error but neuron prints warning, cpu runtime error hits"
-                " https://github.com/pytorch/pytorch/blob/5d819f3fafe68ad6fdc133c58b5f5591a34c2d9f/aten/src/ATen/TensorIterator.cpp#L1213"
-            )
-        )
 
     def test_logical_op_with_output(self, op_name, op_func, input1, input2):
         """Test logical op with pre-allocated output tensor"""

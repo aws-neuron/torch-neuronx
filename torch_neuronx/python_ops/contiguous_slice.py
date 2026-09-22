@@ -147,12 +147,9 @@ class ContiguousSliceImpl(OperationImplementation):
 
         slice_axis, original_size, start_offset = slice_info
 
-        # Create base view with original shape and contiguous strides
         implied_shape = list(shape)
         implied_shape[slice_axis] = original_size
         base_strides = _row_major_strides(implied_shape)
-
-        # Calculate the base storage offset (start of the original tensor)
         base_storage_offset = self_tensor.storage_offset() - start_offset * strides[slice_axis]
 
         base_view = self_tensor.as_strided(
@@ -233,6 +230,56 @@ class ContiguousSliceMLIRImpl(ContiguousSliceImpl):  # lower priority than Conti
     def _get_kernel(self):
         return ContiguousSliceMLIRImpl._kernel
 
+    def get_lower_func(self):
+        """Return a lower function that transforms aten args to kernel args."""
+        kernel = self._get_kernel()
+
+        def contiguous_slice_lower(*args, **kwargs):
+            self_tensor = args[0]
+            shape = list(self_tensor.shape)
+            strides = list(self_tensor.stride())
+            slice_axis, original_size, start_offset = detect_slice_pattern(
+                shape, strides, self_tensor.storage_offset()
+            )
+            implied_shape = list(shape)
+            implied_shape[slice_axis] = original_size
+            base_strides = _row_major_strides(implied_shape)
+            base_storage_offset = self_tensor.storage_offset() - start_offset * strides[slice_axis]
+            base_view = self_tensor.as_strided(
+                size=tuple(implied_shape),
+                stride=tuple(base_strides),
+                storage_offset=base_storage_offset,
+            )
+            end_offset = start_offset + shape[slice_axis]
+            return kernel.lower(base_view, slice_axis, start_offset, end_offset)
+
+        return contiguous_slice_lower
+
+    def get_infer_func(self):
+        """Return an infer function that transforms aten args to kernel args."""
+        kernel = self._get_kernel()
+
+        def contiguous_slice_infer(*args, **kwargs):
+            self_tensor = args[0]
+            shape = list(self_tensor.shape)
+            strides = list(self_tensor.stride())
+            slice_axis, original_size, start_offset = detect_slice_pattern(
+                shape, strides, self_tensor.storage_offset()
+            )
+            implied_shape = list(shape)
+            implied_shape[slice_axis] = original_size
+            base_strides = _row_major_strides(implied_shape)
+            base_storage_offset = self_tensor.storage_offset() - start_offset * strides[slice_axis]
+            base_view = self_tensor.as_strided(
+                size=tuple(implied_shape),
+                stride=tuple(base_strides),
+                storage_offset=base_storage_offset,
+            )
+            end_offset = start_offset + shape[slice_axis]
+            return kernel.infer_output_dtypes(base_view, slice_axis, start_offset, end_offset)
+
+        return contiguous_slice_infer
+
 
 class ContiguousSliceFunction(torch.autograd.Function):
     """Autograd function for slice-based contiguous implementation."""
@@ -240,6 +287,10 @@ class ContiguousSliceFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, self_tensor: torch.Tensor, memory_format, impl: ContiguousSliceImpl):
         return impl._execute_impl_internal(self_tensor, memory_format)
+
+    @staticmethod
+    def jvp(ctx, grad_self, grad_memory_format, grad_impl):
+        return grad_self
 
     @staticmethod
     def backward(ctx, grad_output):

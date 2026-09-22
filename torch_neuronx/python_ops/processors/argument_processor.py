@@ -5,9 +5,9 @@ import os
 
 import torch
 
+from torch_neuronx.dtype_utils import torch_dtype_to_scalar_type
 from torch_neuronx.utils import (
     convert_for_neuron,
-    is_stablehlo_enabled,
     is_sync_mode_enabled,
 )
 
@@ -80,12 +80,10 @@ class ArgumentProcessor:
         """
 
         # Prologues are enabled by default, but disabled if:
-        # 1. StableHLO is not enabled (required for prologue)
-        # 2. OR TORCH_NEURONX_ENABLE_PROLOGUE env var is "0" or "false"
-        # 3. OR sync mode is enabled
+        # 1. TORCH_NEURONX_ENABLE_PROLOGUE env var is "0" or "false"
+        # 2. OR sync mode is enabled
         prologue_disabled = (
-            not is_stablehlo_enabled()
-            or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false")
+            os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false")
             or is_sync_mode_enabled()
         )
 
@@ -95,6 +93,17 @@ class ArgumentProcessor:
             if isinstance(inp, torch.Tensor) and inp.ndim > 0:
                 target_device = inp.device
                 break
+
+        # Fallback device for scalar-to-tensor conversion when there are no
+        # tensor inputs (creation ops like scalar_tensor).  Uses the current
+        # process's assigned device so distributed ranks don't all target
+        # neuron:0.
+        if target_device is None and scalar_to_tensor:
+            import torch_neuronx
+
+            scalar_device = torch.device("neuron", torch_neuronx.current_device())
+        else:
+            scalar_device = None
 
         def preprocess_value(inp):
             """preprocess a single input"""
@@ -113,9 +122,9 @@ class ArgumentProcessor:
                 # c10/core/ScalarType.h for MLIR lowering
                 return ArgumentProcessor._get_scalar_type_value(inp)
             elif scalar_to_tensor and isinstance(inp, int):
-                return torch.tensor(inp, dtype=torch.int32, device="neuron")
+                return torch.tensor(inp, dtype=torch.int32, device=target_device or scalar_device)
             elif scalar_to_tensor and isinstance(inp, float):
-                return torch.tensor(inp, dtype=torch.float32, device="neuron")
+                return torch.tensor(inp, dtype=torch.float32, device=target_device or scalar_device)
             else:
                 # Keep scalars as-is
                 return inp
@@ -210,16 +219,34 @@ class ArgumentProcessor:
             kwargs: Keyword arguments (may contain 'device')
 
         Returns:
-            Device from kwargs['device'], first tensor, or "neuron"
+            Device from kwargs['device'], first tensor, or current neuron device
         """
-        # Check for explicit device argument first
-        if kwargs and kwargs.get("device") is not None:
-            return torch.device(kwargs["device"])
-
+        # Try to get device from an input tensor first — this is the most
+        # reliable source because the tensor is already on the correct device.
         for inp in inputs:
             if isinstance(inp, torch.Tensor):
                 return inp.device
-        return torch.device("neuron")
+
+        # No tensor inputs (creation ops like scalar_tensor, ones, empty, etc.)
+        # In distributed settings each rank is restricted to its own device
+        # slice via NEURON_RT_VISIBLE_CORES.  PyTorch's dispatch fills in the
+        # default device (neuron:0) for creation-op kwargs, which is wrong for
+        # ranks assigned to a different device.  Use current_device() to get
+        # the process's actual assigned device.
+        import torch_neuronx
+
+        current_dev = torch.device("neuron", torch_neuronx.current_device())
+
+        # If an explicit device kwarg is present, honour it — but remap the
+        # bare default "neuron:0" to the current device so that decomposition-
+        # generated ops (e.g. scalar_tensor from add_) land on the right core.
+        if kwargs and kwargs.get("device") is not None:
+            dev = torch.device(kwargs["device"])
+            if dev.type == "neuron" and (dev.index is None or dev.index == 0):
+                return current_dev
+            return dev
+
+        return current_dev
 
     def add_static_to_cache_key(self, base_key: str, kwargs: dict) -> str:
         """Add static keyword arguments to cache key.
@@ -259,23 +286,5 @@ class ArgumentProcessor:
         Returns:
             Integer value corresponding to the ScalarType enum
         """
-        dtype_to_scalar_type = {
-            torch.uint8: 0,  # Byte
-            torch.int8: 1,  # Char
-            torch.int16: 2,  # Short
-            torch.int32: 3,  # Int
-            torch.int64: 4,  # Long
-            torch.float16: 5,  # Half
-            torch.float32: 6,  # Float
-            torch.float64: 7,  # Double
-            # torch.complex32: 8,   # ComplexHalf (not commonly used)
-            torch.complex64: 9,  # ComplexFloat
-            torch.complex128: 10,  # ComplexDouble
-            torch.bool: 11,  # Bool
-            # Quantized types: 12-14, 16-17
-            torch.bfloat16: 15,  # BFloat16
-            # Float8 types: 23-26
-            # Additional types: 27-45
-        }
-
-        return dtype_to_scalar_type.get(dtype, 6)  # Default to Float (6)
+        val = torch_dtype_to_scalar_type(dtype)
+        return val if val is not None else 6  # Default to Float (6)

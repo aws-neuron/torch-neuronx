@@ -92,6 +92,16 @@ TEST_F(ResourceSemaphoreTest, PriorityAcquisition) {
 
   std::vector<int> completion_order;
   std::mutex order_mutex;
+  auto wait_for_waiters = [&](int expected_count) {
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (semaphore_->WaitingThreads() == expected_count) {
+        return true;
+      }
+      std::this_thread::sleep_for(1ms);
+    }
+    return semaphore_->WaitingThreads() == expected_count;
+  };
 
   // Start threads with different priorities
   std::thread low_priority([&]() {
@@ -101,7 +111,12 @@ TEST_F(ResourceSemaphoreTest, PriorityAcquisition) {
     semaphore_->Release();
   });
 
-  std::this_thread::sleep_for(10ms);
+  if (!wait_for_waiters(1)) {
+    ADD_FAILURE() << "Low-priority waiter did not reach the semaphore queue";
+    semaphore_->Release();
+    low_priority.join();
+    return;
+  }
 
   std::thread high_priority([&]() {
     semaphore_->AcquireWithPriority(10);  // High priority
@@ -110,7 +125,13 @@ TEST_F(ResourceSemaphoreTest, PriorityAcquisition) {
     semaphore_->Release();
   });
 
-  std::this_thread::sleep_for(10ms);
+  if (!wait_for_waiters(2)) {
+    ADD_FAILURE() << "High-priority waiter did not reach the semaphore queue";
+    semaphore_->Release();
+    high_priority.join();
+    low_priority.join();
+    return;
+  }
 
   // Release one slot - high priority should get it
   semaphore_->Release();

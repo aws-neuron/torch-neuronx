@@ -179,3 +179,42 @@ class TestStack:
             torch.testing.assert_close(result_neuron.cpu(), result_cpu)
 
             assert_op_runs_on_neuron("aten::stack")
+
+
+class TestInternalStack:
+    """Test cases for aten::_stack and aten::_stack.out."""
+
+    @pytest.mark.parametrize("dim", [0, 1])
+    @pytest.mark.parametrize(
+        "shape,num_tensors",
+        [((256, 4096), 15), ((4, 8), 3), ((32, 64), 5)],
+    )
+    def test_internal_stack_out_correctness(self, shape, num_tensors, dim):
+        """Test aten::_stack.out produces correct shape and values."""
+        tensors_cpu = [torch.randn(shape) for _ in range(num_tensors)]
+        expected = torch.stack(tensors_cpu, dim=dim)
+
+        tensors_neuron = [t.to("neuron") for t in tensors_cpu]
+        out = torch.empty(expected.shape, device="neuron")
+
+        with track_neuron_ops():
+            result = torch.ops.aten._stack.out(tensors_neuron, dim, out=out)
+            assert_op_runs_on_neuron("aten::_stack")
+
+        assert out.data_ptr() == result.data_ptr()
+        assert out.shape == expected.shape
+        torch.testing.assert_close(out.cpu(), expected)
+
+    def test_internal_stack_functional(self):
+        """Test aten::_stack (functional) produces correct results."""
+        tensors_cpu = [torch.randn(4, 8) for _ in range(3)]
+        expected = torch.stack(tensors_cpu, dim=0)
+
+        tensors_neuron = [t.to("neuron") for t in tensors_cpu]
+
+        with track_neuron_ops():
+            result = torch.ops.aten._stack(tensors_neuron, 0)
+            assert_op_runs_on_neuron("aten::_stack")
+
+        assert result.shape == expected.shape
+        torch.testing.assert_close(result.cpu(), expected)

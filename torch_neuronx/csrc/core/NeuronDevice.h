@@ -4,6 +4,7 @@
 #include <c10/core/Device.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 
+#include <cstdint>
 #include <vector>
 
 namespace c10_neuron {
@@ -11,6 +12,15 @@ namespace c10_neuron {
 // Check if Neuron runtime is initialized
 bool is_initialized();
 void set_initialized(bool value);
+
+// Compile-only mode flag. Process-global; from TORCH_NEURONX_COMPILE_ONLY.
+bool is_compile_only();
+void set_compile_only(bool value);
+
+// True if this process was forked after the runtime was initialized; device
+// ops check it to fail fast instead of using inherited (invalid) NRT state.
+bool is_in_bad_fork();
+void mark_in_bad_fork();
 
 // Helper to check if a device is a Neuron device
 bool IsNeuronDevice(const c10::Device& device);
@@ -36,6 +46,10 @@ int get_local_device_start_index();
 std::vector<c10::DeviceIndex> get_visible_device_indices();
 
 int get_vnc_id(int device_id);
+
+// Query device HBM stats (maps device_id -> vnc_id). Returns false on failure;
+// out params are optional.
+bool get_vnc_memory_stats(int device_id, uint64_t* bytes_limit, uint64_t* bytes_used);
 
 int vnc_count();
 

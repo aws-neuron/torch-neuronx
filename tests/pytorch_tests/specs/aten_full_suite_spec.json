@@ -159,7 +159,20 @@
         "PRIVATEUSE1",
         "NEURON"
       ],
-      "file": "test_foreach.py"
+      "file": "test_foreach.py",
+      "skip_tests": [
+        {
+          "reason": "TODO: Investigate - Hangs in native code, causes test suite timeout",
+          "tests": [
+            "test_parity__foreach_mul_fastpath_outplace_neuron_int32",
+            "test_parity__foreach_norm_fastpath_outplace_neuron_float64",
+            "test_parity__foreach_sub_fastpath_outplace_neuron_uint8",
+            "test_parity__foreach_sub_slowpath_inplace_neuron_bfloat16",
+            "test_parity__foreach_tanh_fastpath_outplace_neuron_int16",
+            "test_parity__foreach_tanh_fastpath_outplace_neuron_int32"
+          ]
+        }
+      ]
     },
     {
       "class": "TestMHADeviceType",

@@ -8,13 +8,77 @@ import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import get_cache_size
+from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, get_cache_size, track_neuron_ops
+
+_CPP_DISPATCH = os.environ.get("TORCH_NEURONX_CPP_DISPATCH", "1") == "1"
+
+_SKIP_MONKEYPATCH = pytest.mark.skipif(
+    _CPP_DISPATCH,
+    reason="Monkeypatching _get_kernel returns a plain "
+    "function that lacks lower/infer_output_dtypes needed by C++ dispatch",
+)
 
 
 @pytest.mark.usefixtures("enable_metrics_for_class")
 class TestContiguousBroadcast:
     """Test class for contiguous broadcast operations"""
 
+    # ── New tests: work with both Python and C++ dispatch paths ──
+
+    def test_contiguous_broadcast_runs_on_neuron(self):
+        """Broadcast contiguous should run on Neuron, not CPU fallback."""
+        with track_neuron_ops():
+            scalar = torch.tensor(42.0, device="neuron")
+            broadcasted_view = scalar.expand(128, 256)
+            assert not broadcasted_view.is_contiguous()
+
+            y = broadcasted_view.contiguous()
+
+            assert y.is_contiguous()
+            assert y.shape == (128, 256)
+            assert torch.allclose(y.cpu(), broadcasted_view.cpu())
+            assert torch.all(y == 42.0)
+            assert_op_runs_on_neuron("aten::contiguous")
+
+    def test_repeat_kv_runs_on_neuron(self):
+        """repeat_kv pattern should run on Neuron, not CPU fallback."""
+
+        def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+            bs, slen, n_kv_heads, head_dim = x.shape
+            if n_rep == 1:
+                return x
+            return (
+                torch.unsqueeze(x, dim=3)
+                .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+                .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+            )
+
+        with track_neuron_ops():
+            x = torch.zeros(1, 4096, 8, 128, dtype=torch.bfloat16, device="neuron")
+            y = _repeat_kv(x, 4)
+            y_cpu = _repeat_kv(x.cpu(), 4)
+
+            assert torch.allclose(y.cpu(), y_cpu)
+            assert_op_runs_on_neuron("aten::contiguous")
+
+    def test_broadcast_different_shapes_produce_correct_results(self):
+        """Different broadcast shapes should each produce correct results."""
+        with track_neuron_ops():
+            scalar = torch.tensor(123.0, dtype=torch.bfloat16, device="neuron")
+
+            result_1 = scalar.expand(4096, 2048).contiguous()
+            assert result_1.is_contiguous()
+            assert torch.all(result_1 == 123.0)
+
+            result_2 = scalar.expand(2048, 4096).contiguous()
+            assert result_2.is_contiguous()
+            assert torch.all(result_2 == 123.0)
+
+            assert_op_runs_on_neuron("aten::contiguous")
+
+    # ── Original tests: monkeypatch _get_kernel, only work without C++ dispatch ──
+
+    @_SKIP_MONKEYPATCH
     def test_contiguous_broadcast_uses_mlir_kernel(self, monkeypatch):
         """Broadcast case should use the broadcast kernel (MLIR), not the generic copy."""
         from torch_neuronx.python_ops import contiguous as contiguous_mod
@@ -26,12 +90,11 @@ class TestContiguousBroadcast:
         impl_class = ContiguousBroadcastMLIRImpl
         orig_get_kernel = impl_class._get_kernel
 
-        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel, impl_class=impl_class):
+        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
             k = orig_get_kernel(self)
 
             def wrapper(*args, **kwargs):
                 broadcast_called["count"] += 1
-                print(f"{impl_class.__name__}._get_kernel called")
                 return k(*args, **kwargs)
 
             return wrapper
@@ -143,6 +206,7 @@ class TestContiguousBroadcast:
         # Verify neuron tensor properties
         assert torch.allclose(contiguous_neuron.cpu(), contiguous_cpu)
 
+    @_SKIP_MONKEYPATCH
     def test_repeat_kv_uses_mlir_kernel(self, monkeypatch):
         """Test repeat_kv uses broadcast MLIR kernel"""
         from torch_neuronx.python_ops import contiguous as contiguous_mod
@@ -204,6 +268,7 @@ class TestContiguousBroadcast:
         assert mlir_called["count"] >= 1, "Expected broadcast kernel to be invoked"
         assert generic_called["count"] == 0, "Generic fallback should not be used for broadcast"
 
+    @_SKIP_MONKEYPATCH
     def test_incorrect_fallback_to_generic_kernel(self, monkeypatch):
         """Test incorrect fallback to generic kernel for different target shapes"""
 
@@ -218,9 +283,9 @@ class TestContiguousBroadcast:
             kernel = orig_get_kernel(self)
 
             def wrapper(*args, **kwargs):
-                orig_cache_size = get_cache_size(kernel)
+                orig_cache_size = get_cache_size()
                 result = kernel(*args, **kwargs)
-                updated_cache_size = get_cache_size(kernel)
+                updated_cache_size = get_cache_size()
                 if updated_cache_size > orig_cache_size:
                     compile_called["count"] += 1
                 return result
@@ -272,6 +337,7 @@ class TestContiguousBroadcast:
             assert result_2.stride() == (4096, 1)
             assert result_2.is_contiguous()
 
+    @_SKIP_MONKEYPATCH
     def test_mixed_broadcast_handled_by_compound(self):
         """Test that mixed broadcast/non-broadcast patterns are handled on-device.
 

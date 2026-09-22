@@ -7,15 +7,31 @@
 #include <vector>
 
 #include "tests/csrc/mocks/MockKernelExecution.h"
+#include "tests/csrc/mocks/MockNRT.h"
 #include "tests/csrc/mocks/MockStreamImpl.h"
 #include "torch_neuronx/csrc/core/utils/ErrorHandler.h"
+#include "torch_neuronx/csrc/core/utils/OpErrorHandler.h"
 
 using namespace at::neuron;
+using ::testing::_;
+using ::testing::DoAll;
+using ::testing::Return;
+using ::testing::SetArgPointee;
 namespace mock = at::neuron::testing;
 
 class ErrorHandlerTest : public ::testing::Test {
  protected:
+  torch_neuronx::testing::MockNRTSession mock_session_;
+  torch_neuronx::testing::MockNRT* mock_nrt_ = torch_neuronx::testing::MockNRT::GetInstance();
+
   void SetUp() override {
+    // Mock NRT instance info for MockCompilableKernelExecution construction
+    nrt_instance_info_t info{};
+    info.family = NRT_INSTANCE_TRN3;
+    EXPECT_CALL(*mock_nrt_, nrt_get_instance_info(_, _))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly(DoAll(SetArgPointee<0>(info), Return(NRT_SUCCESS)));
+
     // Clear environment variables for consistent testing
     unsetenv("NEURON_ENHANCED_ERROR_HANDLING");
     unsetenv("NEURON_DUMP_EXECUTION_ON_ERROR");
@@ -31,7 +47,7 @@ class ErrorHandlerTest : public ::testing::Test {
     unsetenv("NEURON_ERROR_DUMP_DIR");
   }
 
-  // Helper to create standard mock operation
+  // Helper to create standard mock operation (non-compilable)
   std::unique_ptr<OperationContext> create_mock_operation(
       const std::string& op_name = "test_op",
       const std::vector<torch::Tensor>& inputs = {torch::ones({2, 3})},
@@ -41,6 +57,16 @@ class ErrorHandlerTest : public ::testing::Test {
     EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
     EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
 
+    auto mock_op = std::make_unique<OperationContext>(std::move(mock_kernel), "test_stack_trace");
+    mock_op->submit_time = std::chrono::steady_clock::now();
+    mock_op->stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+    return mock_op;
+  }
+
+  // Helper to create compilable mock operation (for HandleCompilationError tests)
+  std::unique_ptr<OperationContext> create_mock_compilable_operation(
+      const std::string& op_name = "test_op") {
+    auto mock_kernel = std::make_unique<mock::MockCompilableKernelExecution>(op_name);
     auto mock_op = std::make_unique<OperationContext>(std::move(mock_kernel), "test_stack_trace");
     mock_op->submit_time = std::chrono::steady_clock::now();
     mock_op->stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
@@ -200,7 +226,7 @@ TEST_F(ErrorHandlerTest, CreateErrorContextWithMockOperation) {
 
 // Test handle_compilation_error method
 TEST_F(ErrorHandlerTest, HandleCompilationError) {
-  auto mock_op = create_mock_operation();
+  auto mock_op = create_mock_compilable_operation();
 
   ErrorContext context;
   context.operation_name = "test_op";
@@ -497,9 +523,9 @@ TEST_F(ErrorHandlerTest, DefaultDumpDirectory) {
 
 // Test Multiple error recording
 TEST_F(ErrorHandlerTest, MultipleErrorRecording) {
-  auto mock_op1 = create_mock_operation("op1");
+  auto mock_op1 = create_mock_compilable_operation("op1");
   auto mock_op2 = create_mock_operation("op2");
-  auto mock_op3 = create_mock_operation("op3");
+  auto mock_op3 = create_mock_compilable_operation("op3");
 
   ErrorContext context1;
   context1.operation_name = "op1";
@@ -530,7 +556,7 @@ TEST_F(ErrorHandlerTest, MultipleErrorRecording) {
 }
 
 TEST_F(ErrorHandlerTest, ErrorRecordingUpdatesRecentErrors) {
-  auto mock_op = create_mock_operation();
+  auto mock_op = create_mock_compilable_operation();
 
   ErrorContext context;
   context.operation_name = "test_op";
@@ -558,16 +584,18 @@ TEST_F(ErrorHandlerTest, ConcurrentErrorRecording) {
   for (int t = 0; t < num_threads; ++t) {
     threads.emplace_back([this, t, errors_per_thread]() {
       for (int i = 0; i < errors_per_thread; ++i) {
-        auto mock_op = create_mock_operation("op_" + std::to_string(t) + "_" + std::to_string(i));
+        std::string op_name = "op_" + std::to_string(t) + "_" + std::to_string(i);
         ErrorContext context;
-        context.operation_name = "op_" + std::to_string(t) + "_" + std::to_string(i);
+        context.operation_name = op_name;
         context.stream_id = t * 100 + i;
         context.current_stage =
             (i % 2 == 0) ? ErrorContext::Stage::COMPILATION : ErrorContext::Stage::EXECUTION;
 
         if (i % 2 == 0) {
+          auto mock_op = create_mock_compilable_operation(op_name);
           error_handler_->HandleCompilationError(mock_op.get(), "Error", context);
         } else {
+          auto mock_op = create_mock_operation(op_name);
           error_handler_->HandleExecutionError(mock_op.get(), "Error", context);
         }
       }
@@ -632,6 +660,29 @@ Third error: Timeout)";
   std::string cleaned = ErrorHandler::CleanErrorMessage(multiple_errors);
   // Should return the last meaningful line
   EXPECT_EQ(cleaned, "Third error: Timeout");
+}
+
+// A multi-line neuronx-cc compilation failure puts the actionable [NCC_*]
+// diagnostic first and the failing HLO instruction last. The diagnostic, with
+// its error code, must survive; keeping only the last line drops the reason.
+TEST_F(ErrorHandlerTest, CleanErrorMessagePreservesCompilerDiagnostic) {
+  std::string compiler_error =
+      R"(2026-01-01 00:00:00.000000: E hilo/hlo_passes/NeuronHloVerifier.cc:1154] module.mlir:8 [ERROR] [NCC_EVRF010] Operation convolution does not support both input dilation and kernel dilation simultaneously.
+%convolution.9 = bf16[2,4,22]{2,1,0} convolution(%Arg_0.1, %reshape.8), window={size=4 lhs_dilate=3 rhs_dilate=4}, dim_labels=bf0_0oi->bf0)";
+
+  std::string cleaned = ErrorHandler::CleanErrorMessage(compiler_error);
+  // The compiler error code and reason must be preserved.
+  EXPECT_THAT(cleaned, ::testing::HasSubstr("[NCC_EVRF010]"));
+  EXPECT_THAT(cleaned, ::testing::HasSubstr("does not support both input dilation"));
+  // The failing op line is still included for context.
+  EXPECT_THAT(cleaned, ::testing::HasSubstr("%convolution.9"));
+}
+
+// When the diagnostic is the only meaningful line, it is returned as-is.
+TEST_F(ErrorHandlerTest, CleanErrorMessageDiagnosticOnly) {
+  std::string compiler_error = "[ERROR] [NCC_EBIR110] internal compiler error";
+  std::string cleaned = ErrorHandler::CleanErrorMessage(compiler_error);
+  EXPECT_EQ(cleaned, compiler_error);
 }
 
 // Test CheckAndThrowPendingException with clear_exception parameter
@@ -781,6 +832,55 @@ TEST_F(ErrorHandlerTest, HandleOperationErrorWithSeqId) {
   // Error message should contain seq_id info
   EXPECT_THAT(result.GetError(), ::testing::HasSubstr("seq_id=42"));
   EXPECT_THAT(result.GetError(), ::testing::HasSubstr("Neuron core busy"));
+}
+
+// --- Out-of-bounds error-handler branch in HandleOperationError -------------
+
+// On an NRT_EXEC_OOB fault for an op with a registered handler, the handler's
+// exact exception is recorded and re-thrown at the surfacing sync; the op is
+// NOT re-run.
+TEST_F(ErrorHandlerTest, HandleOperationErrorOOBSurfacesViaHandler) {
+  OpErrorHandler::RegisterInvoker([](const std::string&, OpErrorContext&) {
+    throw std::runtime_error("index 10 is out of bounds for dimension 0 with size 5");
+  });
+
+  auto mock_op = create_mock_operation("aten::scatter");
+  // Non-empty reconstruction context so SurfaceException invokes the handler.
+  mock_op->cpu_fallback_context.input_metadata.emplace_back(TensorMarker{});
+
+  torch_neuronx::ExecutionRuntimeException oob("OOB", NRT_EXEC_OOB);
+  auto result = error_handler_->HandleOperationError(mock_op.get(), oob);
+
+  EXPECT_FALSE(result.IsSuccess());
+  EXPECT_TRUE(error_handler_->has_pending_exception_);
+
+  // The recorded exception is the handler's exact one. (stream_id is only used
+  // for logging by CheckAndThrowPendingException; the first pending exception
+  // is re-thrown regardless of the id.)
+  try {
+    error_handler_->CheckAndThrowPendingException(/*stream_id=*/0, /*clear_exception=*/true);
+    FAIL() << "expected the pending exception to be re-thrown";
+  } catch (const std::runtime_error& e) {
+    EXPECT_STREQ(e.what(), "index 10 is out of bounds for dimension 0 with size 5");
+  }
+
+  OpErrorHandler::RegisterInvoker({});
+}
+
+// With no handler registered, the OOB branch is a no-op and control falls
+// through to the generic recovery path (which fails for this mock op) — no
+// handler exception is recorded.
+TEST_F(ErrorHandlerTest, HandleOperationErrorOOBNoHandlerFallsThrough) {
+  OpErrorHandler::RegisterInvoker({});  // no handler
+
+  auto mock_op = create_mock_operation("aten::scatter");
+  mock_op->cpu_fallback_context.input_metadata.emplace_back(TensorMarker{});
+
+  torch_neuronx::ExecutionRuntimeException oob("OOB", NRT_EXEC_OOB);
+  auto result = error_handler_->HandleOperationError(mock_op.get(), oob);
+
+  // Fell through to generic recovery, which fails for this mock operation.
+  EXPECT_FALSE(result.IsSuccess());
 }
 
 int main(int argc, char** argv) {

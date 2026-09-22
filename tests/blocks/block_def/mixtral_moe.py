@@ -37,6 +37,19 @@ class MixtralConfig:
         """Get preset configurations for Mixtral model sizes."""
         presets = {
             "mixtral-8x7b": cls(),
+            # Small preset for the varying-shape sweep: hidden/intermediate 1024 keep
+            # the expert matmuls routing to the dynamic mm kernel (K, N must be
+            # 1024-multiples) while compiling cheaply. num_experts=4 with top_k=2
+            # (< num_experts) so per-expert token counts vary step-to-step.
+            "mixtral-tiny": cls(
+                hidden_size=1024,
+                num_attention_heads=8,
+                num_key_value_heads=2,
+                head_dim=128,
+                intermediate_size=1024,
+                num_experts=4,
+                num_experts_per_tok=2,
+            ),
         }
         if name not in presets:
             raise ValueError(f"Unknown preset: {name}. Available: {list(presets.keys())}")

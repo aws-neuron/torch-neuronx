@@ -9,7 +9,9 @@ does not support boolean scalars in arithmetic contexts.
 import logging
 
 import torch
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
+
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import NeuronFXPass
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +34,7 @@ _ARITHMETIC_OPS = {
 }
 
 
-class LegalizeBoolScalars(PassBase):
+class LegalizeBoolScalars(NeuronFXPass):
     """Replace True/False scalar args with 1/0 in arithmetic ops."""
 
     def call(self, gm: torch.fx.GraphModule) -> PassResult:

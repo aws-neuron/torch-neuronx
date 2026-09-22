@@ -1,10 +1,13 @@
 """Tests for contiguous operation on Neuron device"""
 
+import typing
+
 import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import assert_raises
+import torch_neuronx._C as _C
+from tests.utils.neuron_test_utils import track_neuron_ops
 
 from .view_test_utils import (
     assert_storage_shared,
@@ -391,21 +394,187 @@ class TestNrtStridedCopy:
             _C._nrt_copy_strided_neuron_to_neuron(src, dst)
 
 
+class TestStridedCopyStrideS:
+    """Uniform stride-S neuron->neuron copies run on-device (no host bounce).
+
+    A contiguous <-> stride-S lane view (any supported dtype — e.g. an
+    object-collective uint8 buffer, or a ``[:, k]`` column of an ``(N, S)``
+    tensor) is routed by ``nki_copy_strided_neuron_to_neuron`` to the NKI
+    gather/scatter kernel instead of a per-element span copy (PR #1458 /
+    MFU-415). These pin correctness (copied values + untouched lanes preserved)
+    and that no CPU-bounce fallback fires. ``_C._nki_copy_strided_neuron_to_neuron``
+    is the direct binding for that entry point; it's called directly because a
+    plain ``dst.copy_(src)`` of a supported dtype is served by the MLIR epilogue
+    and never reaches this path.
+
+    ``rows`` covers both tiling paths: < P_MAX (tail) and >= P_MAX (main tile).
+    """
+
+    _CPU_BOUNCE_FALLBACKS: typing.ClassVar = {
+        "aten::copy_[noncontiguous_scatter_cpu_bounce]",
+    }
+
+    # dtypes the kernel moves bit-exactly. Excludes bool (NKI rejects it) and
+    # int64 (packed-int64 special case, covered by the packed suites).
+    _DTYPES: typing.ClassVar = [
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int32,
+        torch.int16,
+        torch.int8,
+        torch.uint8,
+    ]
+
+    @staticmethod
+    def _values(n, dtype):
+        """Distinct test values in an explicit range that fits every tested dtype.
+
+        ``[0, 100)`` sits inside int8's [-128, 127] and uint8's [0, 255]. A local
+        seeded generator keeps the values deterministic (reproducible failures)
+        without touching the global RNG that other tests in the process share.
+        """
+        gen = torch.Generator().manual_seed(0)
+        return torch.randint(0, 100, (n,), generator=gen, dtype=torch.int64).to(dtype)
+
+    def _assert_no_bounce(self, fallbacks):
+        hit = set(fallbacks) & self._CPU_BOUNCE_FALLBACKS
+        assert not hit, f"strided copy took a host round-trip: {sorted(hit)}"
+
+    def _check_scatter(self, dtype, stride, rows, lane):
+        """Contiguous src -> lane ``lane`` of an (rows, stride) dst; other lanes kept."""
+        base = torch.zeros((rows, stride), dtype=dtype, device="neuron")
+        other_lanes = {}  # lanes the copy must leave untouched
+        for other in range(stride):
+            if other == lane:
+                continue
+            fill = int(((other + 3) * 7) % 100)
+            base[:, other] = fill
+            other_lanes[other] = fill
+
+        src = self._values(rows, dtype).to("neuron")
+        dst = base[:, lane]  # (rows,), stride (stride,) — rows single-element spans
+        assert not dst.is_contiguous()
+
+        with track_neuron_ops():
+            _C._nki_copy_strided_neuron_to_neuron(src, dst)
+            fallbacks = torch_neuronx.get_fallback_ops()
+
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+        for other, fill in other_lanes.items():
+            torch.testing.assert_close(base[:, other].cpu(), torch.full((rows,), fill, dtype=dtype))
+        self._assert_no_bounce(fallbacks)
+
+    def _check_gather(self, dtype, stride, rows, lane):
+        """Lane ``lane`` of an (rows, stride) src -> contiguous dst."""
+        base = torch.zeros((rows, stride), dtype=dtype, device="neuron")
+        base[:, lane] = self._values(rows, dtype).to("neuron")
+        src = base[:, lane]  # stride (stride,)
+        dst = torch.empty(rows, dtype=dtype, device="neuron")
+        assert not src.is_contiguous()
+
+        with track_neuron_ops():
+            _C._nki_copy_strided_neuron_to_neuron(src, dst)
+            fallbacks = torch_neuronx.get_fallback_ops()
+
+        torch.testing.assert_close(dst.cpu(), base[:, lane].cpu())
+        self._assert_no_bounce(fallbacks)
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_dtype_roundtrip(self, dtype):
+        """Every supported dtype scatters/gathers bit-exactly (main-tile + tail)."""
+        self._check_scatter(dtype, stride=3, rows=200, lane=1)
+        self._check_gather(dtype, stride=3, rows=200, lane=1)
+
+    @pytest.mark.parametrize("stride,lane", [(2, 0), (2, 1), (3, 0), (3, 2), (4, 3)])
+    @pytest.mark.parametrize("rows", [8, 256])
+    def test_shapes_and_lanes(self, stride, lane, rows):
+        """Strides, lane offsets, and both tiling paths (tail: 8, main: 256)."""
+        self._check_scatter(torch.float32, stride, rows, lane)
+        self._check_gather(torch.float32, stride, rows, lane)
+
+
+class TestStridedCopySpanDecomposition:
+    """Strided copies the NKI kernel does not handle, decomposed into spans.
+
+    ``nki_copy_strided_neuron_to_neuron`` — the default strided-copy entry point —
+    routes uniform stride-S gather/scatter to the NKI kernel
+    (``TestStridedCopyStrideS``) and delegates everything it declines — both sides
+    strided, non-uniform strides, unsupported dtypes — to
+    ``copy_strided_neuron_to_neuron``, which submits one stream-ordered device copy
+    op per contiguous span.
+
+    Every shape below is deliberately *not* kernel-eligible, so it exercises that
+    span decomposition. Each asserts the bytes outside the destination view are
+    left alone, which comparing only the view cannot detect.
+    """
+
+    def test_element_spans_preserve_dst_gaps(self):
+        """No unit stride on either side: 12 single-element spans."""
+        base_src = torch.arange(24, dtype=torch.float32).reshape(4, 6).to("neuron")
+        src = base_src[:, ::2]  # (4, 3), strides (6, 2)
+
+        base_dst = torch.zeros((4, 6), device="neuron")
+        sentinel = torch.full((4, 3), -7.0, device="neuron")
+        base_dst[:, 1::2] = sentinel  # lanes the copy must leave alone
+        dst = base_dst[:, ::2]  # (4, 3), strides (6, 2)
+
+        # Strided on both sides, so the kernel declines it (it needs one
+        # contiguous side).
+        assert not src.is_contiguous() and not dst.is_contiguous()
+
+        _C._nki_copy_strided_neuron_to_neuron(src, dst)
+
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+        torch.testing.assert_close(base_dst[:, 1::2].cpu(), sentinel.cpu())
+
+    def test_row_spans_preserve_dst_gaps(self):
+        """Unit innermost stride on both sides: 4 spans of 3 elements."""
+        rows = 4
+        base_dst = torch.zeros((2 * rows, 3), device="neuron")
+        sentinel = torch.full((rows, 3), -7.0, device="neuron")
+        base_dst[1::2] = sentinel  # rows the copy must leave alone
+
+        src = torch.arange(rows * 3, dtype=torch.float32).reshape(rows, 3).to("neuron")
+        # A row slice: strides (6, 1) are not a uniform stride-S layout, so the
+        # kernel declines it and the copy decomposes per row.
+        dst = base_dst[::2]
+        assert not dst.is_contiguous()
+
+        _C._nki_copy_strided_neuron_to_neuron(src, dst)
+
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+        torch.testing.assert_close(base_dst[1::2].cpu(), sentinel.cpu())
+
+    def test_contiguous_is_single_span(self):
+        """A fully contiguous copy is one bulk span."""
+        src = torch.arange(20, dtype=torch.float32).reshape(4, 5).to("neuron")
+        dst = torch.empty_like(src)
+
+        _C._nki_copy_strided_neuron_to_neuron(src, dst)
+
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+
+
 class TestChannelsLastCopyCount:
     """Tests to verify copy optimization reduces number of operations"""
 
+    @pytest.mark.xfail(
+        reason="C++ dispatch uses MLIR permute+clone instead of NRT strided copy "
+        "for contiguous inputs"
+    )
     def test_channels_last_single_nrt_call_for_contiguous_input(self, monkeypatch):
         """channels_last on contiguous input should use single strided copy, no intermediate"""
         import torch_neuronx._C as _C
 
         copy_calls = {"count": 0}
-        orig_copy = _C._nrt_copy_strided_neuron_to_neuron
+        orig_copy = _C._nki_copy_strided_neuron_to_neuron
 
         def counting_copy(src, dst):
             copy_calls["count"] += 1
             return orig_copy(src, dst)
 
-        monkeypatch.setattr(_C, "_nrt_copy_strided_neuron_to_neuron", counting_copy)
+        monkeypatch.setattr(_C, "_nki_copy_strided_neuron_to_neuron", counting_copy)
 
         x = make_test_tensor((2, 3, 4, 5), device="neuron")
         assert x.is_contiguous()
@@ -415,13 +584,28 @@ class TestChannelsLastCopyCount:
         assert y.is_contiguous(memory_format=torch.channels_last)
         assert copy_calls["count"] == 1, f"Expected 1 NRT copy call, got {copy_calls['count']}"
 
+    def test_channels_last_contiguous_input_runs_on_neuron(self):
+        """channels_last on contiguous input produces correct result on neuron"""
+        from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
+
+        x = make_test_tensor((2, 3, 4, 5), device="neuron")
+        assert x.is_contiguous()
+
+        with track_neuron_ops():
+            y = x.contiguous(memory_format=torch.channels_last)
+            assert_op_runs_on_neuron("aten::contiguous")
+
+        assert y.is_contiguous(memory_format=torch.channels_last)
+        torch.testing.assert_close(y.cpu(), x.cpu().contiguous(memory_format=torch.channels_last))
+
+    @pytest.mark.xfail(reason="C++ dispatch clone/copy calls bypass Python monkeypatch")
     def test_channels_last_broadcast_materializes_then_copies(self, monkeypatch):
         """Broadcast input should clone first, then single strided copy"""
         import torch_neuronx._C as _C
 
         copy_calls = {"count": 0}
         clone_calls = {"count": 0}
-        orig_copy = _C._nrt_copy_strided_neuron_to_neuron
+        orig_copy = _C._nki_copy_strided_neuron_to_neuron
 
         def counting_copy(src, dst):
             copy_calls["count"] += 1
@@ -429,7 +613,7 @@ class TestChannelsLastCopyCount:
             assert all(s != 0 for s in src.stride()), "Source should be materialized (no stride=0)"
             return orig_copy(src, dst)
 
-        monkeypatch.setattr(_C, "_nrt_copy_strided_neuron_to_neuron", counting_copy)
+        monkeypatch.setattr(_C, "_nki_copy_strided_neuron_to_neuron", counting_copy)
 
         # Patch clone to count materializations
         orig_clone = torch.Tensor.clone
@@ -449,3 +633,169 @@ class TestChannelsLastCopyCount:
         assert y.is_contiguous(memory_format=torch.channels_last)
         assert clone_calls["count"] >= 1, "Broadcast source should be cloned"
         assert copy_calls["count"] == 1, f"Expected 1 NRT copy call, got {copy_calls['count']}"
+
+    def test_channels_last_broadcast_runs_on_neuron(self):
+        """Broadcast input channels_last produces correct result on neuron"""
+        from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
+
+        base = make_test_tensor((1, 3, 1, 1), device="neuron")
+        x = base.expand(2, 3, 4, 5)
+        assert any(s == 0 for s in x.stride())
+
+        with track_neuron_ops():
+            y = x.contiguous(memory_format=torch.channels_last)
+            assert_op_runs_on_neuron("aten::contiguous")
+
+        assert y.is_contiguous(memory_format=torch.channels_last)
+        torch.testing.assert_close(y.cpu(), x.cpu().contiguous(memory_format=torch.channels_last))
+
+
+class TestSlicedViewContiguousPerformance:
+    """Regression test: slice + permute should not trigger slow O(numel) NRT copy."""
+
+    def test_sliced_permute_add_not_slow(self):
+        """slice → permute → add must use fast on-device kernel, not NRT strided copy."""
+        import time
+
+        t, h, w, c, b = 15, 15, 20, 32, 2
+        padded_seq = t * h * w + 50
+        x = torch.randn(b, padded_seq, c, dtype=torch.bfloat16, device="neuron")
+        x = x[:, : t * h * w, :]  # slice: storage > numel
+        out = x.reshape(b, t, h, w, c).permute(0, 4, 1, 2, 3)
+
+        # warmup
+        _ = out + 1.0
+        torch.neuron.synchronize()
+
+        # timed run
+        t0 = time.time()
+        result = out + 1.0
+        torch.neuron.synchronize()
+        elapsed_ms = (time.time() - t0) * 1000
+
+        # correctness
+        ref = x.cpu().reshape(b, t, h, w, c).permute(0, 4, 1, 2, 3).float() + 1.0
+        torch.testing.assert_close(result.cpu().float(), ref, atol=1e-2, rtol=1e-2)
+
+        # performance: fast path ~1ms, slow path ~2000ms
+        assert elapsed_ms < 50, (
+            f"Took {elapsed_ms:.0f}ms, expected <50ms. "
+            "Likely hit slow copy_strided_neuron_to_neuron fallback."
+        )
+
+
+class TestContiguousUnsupportedDtypes:
+    """Tests for contiguous() on float64/int64 non-contiguous tensors.
+
+    Regression tests for the bug where DowncastArgs/NeuronSafeCast makes the
+    tensor contiguous during lowering, causing composite_lower to return None.
+    The bug manifests when contiguous_internal is called from CopyToNonContiguous
+    during CPU fallback copy-back of unsupported-dtype tensors.
+    """
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.int64])
+    def test_copy_into_permuted_3d(self, dtype):
+        """Reproduce: CPU fallback result copied into non-contiguous Neuron tensor.
+
+        This is the exact pattern that triggers the bug:
+        1. A non-contiguous Neuron tensor (dst) with unsupported dtype exists
+        2. A contiguous tensor (src) is copied into it via copy_
+        3. CopyToNonContiguous calls contiguous_internal on src.permute(perm)
+        4. DispatchContiguousImpl fails because DowncastArgs makes it contiguous
+        """
+        # Create a non-contiguous destination (simulates channels_last output)
+        base = torch.arange(24, device="neuron", dtype=dtype).reshape(2, 3, 4)
+        dst = base.permute(0, 2, 1)  # non-contiguous, shape (2, 4, 3)
+        assert not dst.is_contiguous()
+
+        # Create contiguous source with same logical shape
+        src = torch.ones(2, 4, 3, device="neuron", dtype=dtype)
+
+        # This triggers CopyToNonContiguous → contiguous_internal
+        dst.copy_(src)
+
+        assert dst.dtype == dtype
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.int64])
+    def test_upsample_like_cpu_fallback_pattern(self, dtype):
+        """Simulate the upsample_bilinear2d CPU fallback copy-back pattern.
+
+        The original failure: upsample_bilinear2d falls back to CPU, produces
+        a channels_last float64 result, _copy_from_and_resize copies it back
+        to a channels_last Neuron tensor.
+        """
+        # Channels-last Neuron tensor (the "output" that CPU fallback writes into)
+        dst = torch.zeros(2, 3, 4, 4, device="neuron", dtype=dtype)
+        dst = dst.contiguous(memory_format=torch.channels_last)
+        assert dst.is_contiguous(memory_format=torch.channels_last)
+        assert not dst.is_contiguous()  # not contiguous in standard format
+
+        # Simulate CPU fallback result being copied back
+        if dtype == torch.float64:
+            cpu_result = torch.randn(2, 3, 4, 4, dtype=dtype)
+        else:
+            cpu_result = torch.randint(0, 100, (2, 3, 4, 4), dtype=dtype)
+        cpu_result = cpu_result.contiguous(memory_format=torch.channels_last)
+        src = cpu_result.to("neuron")
+
+        dst.copy_(src)
+
+        assert dst.dtype == dtype
+        torch.testing.assert_close(dst.cpu(), cpu_result)
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.int64])
+    def test_copy_into_transposed_2d(self, dtype):
+        """Copy into a transposed 2D destination."""
+        base = torch.arange(12, device="neuron", dtype=dtype).reshape(3, 4)
+        dst = base.t()  # shape (4, 3), non-contiguous
+        assert not dst.is_contiguous()
+
+        src = torch.ones(4, 3, device="neuron", dtype=dtype) * 7
+        dst.copy_(src)
+
+        assert dst.dtype == dtype
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.int64])
+    def test_copy_into_sliced(self, dtype):
+        """Copy into a strided-slice destination."""
+        base = torch.zeros(6, 4, device="neuron", dtype=dtype)
+        dst = base[::2, :]  # shape (3, 4), non-contiguous
+        assert not dst.is_contiguous()
+
+        src = torch.ones(3, 4, device="neuron", dtype=dtype) * 5
+        dst.copy_(src)
+
+        assert dst.dtype == dtype
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+        # Verify only sliced rows were written
+        expected = torch.zeros(6, 4, dtype=dtype)
+        expected[::2, :] = 5
+        torch.testing.assert_close(base.cpu(), expected)
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.int64])
+    def test_copy_into_permuted_4d(self, dtype):
+        """Copy into a 4D permuted destination."""
+        base = torch.zeros(2, 3, 4, 5, device="neuron", dtype=dtype)
+        dst = base.permute(0, 2, 3, 1)  # shape (2, 4, 5, 3), non-contiguous
+        assert not dst.is_contiguous()
+
+        src = torch.ones(2, 4, 5, 3, device="neuron", dtype=dtype) * 3
+        dst.copy_(src)
+
+        assert dst.dtype == dtype
+        torch.testing.assert_close(dst.cpu(), src.cpu())
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.int64])
+    def test_contiguous_direct(self, dtype):
+        """Calling .contiguous() directly on a non-contiguous unsupported-dtype tensor."""
+        x = torch.arange(12, device="neuron", dtype=dtype).reshape(3, 4)
+        x_t = x.t()
+        assert not x_t.is_contiguous()
+
+        result = x_t.contiguous()
+
+        assert result.is_contiguous()
+        assert result.dtype == dtype
+        torch.testing.assert_close(result.cpu(), x_t.cpu().contiguous())

@@ -7,6 +7,9 @@ from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron
 
 UNARY_OPS_LIST = [
     torch.log,
+    torch.log2,
+    torch.log10,
+    torch.log1p,
     torch.sigmoid,
     torch.sin,
     torch.cos,
@@ -14,6 +17,7 @@ UNARY_OPS_LIST = [
     torch.abs,
     f.silu,
     torch.ceil,
+    torch.floor,
     torch.trunc,
     torch.sqrt,
     torch.rsqrt,
@@ -23,12 +27,16 @@ UNARY_OPS_LIST = [
 ]
 UNARY_OPS_OUT_LIST = [
     torch.log,
+    torch.log2,
+    torch.log10,
+    torch.log1p,
     torch.sigmoid,
     torch.sin,
     torch.cos,
     torch.exp,
     torch.abs,
     torch.ceil,
+    torch.floor,
     torch.trunc,
     torch.sqrt,
     torch.rsqrt,
@@ -38,12 +46,16 @@ UNARY_OPS_OUT_LIST = [
 ]
 UNARY_INPLACE_OPS_LIST = [
     "log_",
+    "log2_",
+    "log10_",
+    "log1p_",
     "sigmoid_",
     "sin_",
     "cos_",
     "exp_",
     "abs_",
     "ceil_",
+    "floor_",
     "trunc_",
     "logical_not_",
 ]
@@ -60,6 +72,10 @@ UNARY_SPECIAL_VALUE_XFAIL_LIST = {
         torch.ceil,
         marks=pytest.mark.xfail(reason="-2.1475e+09 is returned when input is inf, -inf or nan"),
     ),
+    torch.floor: pytest.param(
+        torch.floor,
+        marks=pytest.mark.xfail(reason="-2.1475e+09 is returned when input is inf, -inf or nan"),
+    ),
     torch.trunc: pytest.param(
         torch.trunc,
         marks=pytest.mark.xfail(reason="-2.1475e+09 is returned when input is inf, -inf or nan"),
@@ -72,6 +88,29 @@ UNARY_DTYPE_LIST = {
     "default": [torch.float32, torch.float16],
     torch.logical_not: [torch.bool],  # logical_not returns bool unless specified otherwise
 }
+
+# Unary and activation pointwise ops enabled through the Torch-MLIR passthrough
+# registrations. These need op-specific inputs, so they do not fit UNARY_OPS_LIST:
+# logit needs a (0, 1) domain. The upstream OpInfo suite covers dtypes, out=, and
+# non-contiguity. This list only guards that each op routes through the trace/lower
+# path and does not fall back to CPU. The binary ops (rsub, ldexp) and the isposinf
+# predicate live in their family test files (test_sub, test_ldexp, test_isposinf).
+_unit = torch.rand(8) * 0.8 + 0.1  # (0, 1) domain for logit
+POINTWISE_OPS = [
+    ("aten::celu", lambda x: torch.ops.aten.celu(x), torch.randn(8)),
+    ("aten::leaky_relu", lambda x: torch.ops.aten.leaky_relu(x), torch.randn(8)),
+    ("aten::round", lambda x: torch.ops.aten.round(x), torch.randn(8)),
+    ("aten::frac", lambda x: torch.ops.aten.frac(x), torch.randn(8)),
+    ("aten::hardsigmoid", lambda x: torch.ops.aten.hardsigmoid(x), torch.randn(8)),
+    ("aten::logit", lambda x: torch.ops.aten.logit(x), _unit),
+    ("aten::exp2", lambda x: torch.ops.aten.exp2(x), torch.randn(8)),
+    ("aten::special_i1e", lambda x: torch.ops.aten.special_i1e(x), torch.randn(8)),
+    ("aten::elu", lambda x: torch.ops.aten.elu(x), torch.randn(8)),
+    ("aten::hardtanh", lambda x: torch.ops.aten.hardtanh(x), torch.randn(8)),
+    ("aten::hardshrink", lambda x: torch.ops.aten.hardshrink(x), torch.randn(8)),
+    ("aten::hardswish", lambda x: torch.ops.aten.hardswish(x), torch.randn(8)),
+    ("aten::mish", lambda x: torch.ops.aten.mish(x), torch.randn(8)),
+]
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
@@ -89,6 +128,14 @@ class TestUnaryElementwiseOp:
             result = op(input_tensor)
             assert result.device.type == "neuron"
             assert_op_runs_on_neuron(f"aten::{op.__name__}")
+
+    @pytest.mark.parametrize("op_name, fn, x", POINTWISE_OPS, ids=[o[0] for o in POINTWISE_OPS])
+    def test_pointwise_runs_on_neuron(self, op_name, fn, x, device):
+        """Test each passthrough pointwise op routes to Neuron, not CPU."""
+        with track_neuron_ops():
+            fn(x.to(device))
+            torch.neuron.synchronize()
+        assert_op_runs_on_neuron(op_name)
 
     @pytest.mark.parametrize("op_name", UNARY_INPLACE_OPS_LIST)
     def test_unary_inplace_runs_on_neuron(self, op_name, device):
@@ -318,6 +365,23 @@ class TestUnaryElementwiseOp:
         assert result.device.type == "neuron"
         torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-3, equal_nan=True)
 
+    def test_floor_large_float_values(self, device):
+        """Test floor with float32 values outside int32 range.
+
+        Regression test for neuronx-cc stablehlo.floor bug where values
+        outside int32 range get clamped to ±2.1475e+09. The workaround
+        bypasses floor for |x| >= 2^23 (where floats are already integers).
+        """
+        with track_neuron_ops():
+            input_cpu = torch.tensor([2.5e9, -2.5e9, 1e10, -1e10, 8388608.0, -8388608.0])
+            input_neuron = input_cpu.to(device)
+
+            result = torch.floor(input_neuron)
+            assert_op_runs_on_neuron("aten::floor")
+
+        expected = torch.floor(input_cpu)
+        torch.testing.assert_close(result.cpu(), expected)
+
     # Specific tests for torch.exp
     def test_exp_specific(self, device):
         """Test specific properties of exponential function."""
@@ -352,12 +416,13 @@ class TestUnaryElementwiseOp:
             result_neg = torch.abs(-input_tensor_device)
             torch.testing.assert_close(result_pos.cpu(), result_neg.cpu(), rtol=1e-4, atol=1e-3)
 
-            # Test abs preserves zeros
+            # Test abs clears the sign bit of zero: abs(-0.0) must be +0.0.
+            # A plain `== 0.0` check can't detect this (-0.0 == 0.0 is True),
+            # so assert on the sign bit directly.
             input_tensor = torch.tensor([0.0, -0.0])
             input_tensor_device = input_tensor.to(device)
-            result = torch.abs(input_tensor_device)
-            assert result.cpu()[0].item() == 0.0
-            assert result.cpu()[1].item() == 0.0
+            result = torch.abs(input_tensor_device).cpu()
+            assert not torch.signbit(result).any(), result
 
             # Test abs with mixed positive and negative values
             input_tensor = torch.tensor([-5.0, -3.0, 0.0, 3.0, 5.0])

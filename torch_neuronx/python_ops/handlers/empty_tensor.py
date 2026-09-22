@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 class BaseEmptyTensorHandler:
     """Handles operations on empty tensors.
-    Note: Not all the APIs are ported over from jax's empty tensor handler.
+    Note: Not all the APIs are ported over from the legacy empty tensor handler.
     """
 
     def check_for_empty(self, *args) -> bool:

@@ -30,7 +30,6 @@ Run with:
 
 NOTE: These tests require the prologue system to be enabled. They are skipped when:
     - NEURON_LAUNCH_BLOCKING=1 (sync mode disables prologue)
-    - TORCH_NEURONX_ENABLE_STABLEHLO=0 (StableHLO disabled)
     - TORCH_NEURONX_ENABLE_PROLOGUE=0 (prologue explicitly disabled)
 """
 
@@ -46,11 +45,9 @@ import torch
 
 # These tests require the prologue system to be enabled. The prologue is disabled in:
 # 1. Sync mode (NEURON_LAUNCH_BLOCKING=1)
-# 2. When StableHLO is disabled (TORCH_NEURONX_ENABLE_STABLEHLO=0)
-# 3. When prologue is explicitly disabled (TORCH_NEURONX_ENABLE_PROLOGUE=0)
+# 2. When prologue is explicitly disabled (TORCH_NEURONX_ENABLE_PROLOGUE=0)
 SKIP_PROLOGUE_DISABLED = pytest.mark.skipif(
     os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
-    or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
     or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
     reason=(
         "Compound sweep tests require prologue to be enabled (disabled in sync mode "
@@ -254,6 +251,39 @@ def make_broadcast_transpose_slice(B, H, S, D, dtype, device):
     )  # [B, S, H, D//2]
 
 
+# --- Folded patterns (narrow→view→permute) ---
+
+
+def make_folded_narrow_view_permute(B, H, S, D, dtype, device):
+    """Narrow a dim, then view-split it, then permute.
+    This creates coprime stride ratios that the GCD check rejects,
+    handled by TryFoldedDecomposition (SLICE→RESHAPE→TRANSPOSE).
+    [B, H, D] -> narrow(2, 0, D-1) -> view(B, H, D//2-1, 2) -> permute(2, 0, 3, 1)
+    Requires D >= 6 for the factorization to work."""
+    base_d = D + 1  # ensure narrow produces something factorable
+    t = torch.randn(B, H, base_d, dtype=dtype, device=device)
+    narrowed_size = D  # narrow to D elements
+    # Factor D into two parts
+    factor_a = 2
+    factor_b = D // 2
+    return t.narrow(2, 0, narrowed_size).view(B, H, factor_a, factor_b).permute(2, 0, 3, 1)
+
+
+def make_folded_padded_sequence(B, H, S, D, dtype, device):
+    """Padded sequence pattern: base[:, :seq, :].view(B, h1, h2, w, c).permute(0, 4, 1, 2, 3).
+    Simulates the common NLP/vision pattern where variable-length sequences are packed.
+    Uses smaller dimensions to keep test fast."""
+    # Create a base with a padding dim slightly larger than needed
+    seq_len = S * 2  # total sequence slots
+    padded_len = seq_len + S  # add padding
+    c_dim = min(D, 8)  # channel dim
+    t = torch.randn(B, padded_len, c_dim, dtype=dtype, device=device)
+    # narrow to seq_len, then reshape into multi-dim sequence
+    h1 = 2
+    h2 = seq_len // h1
+    return t[:, :seq_len, :].view(B, h1, h2, c_dim).permute(0, 3, 1, 2)
+
+
 # --- View-based patterns ---
 
 
@@ -332,6 +362,9 @@ PATTERNS = {
         # contiguous tensor -- no negative strides. This tests end-to-end correctness.
         torch.randn(B, S, H, D, dtype=dtype, device=device).transpose(1, 2).flip(-1)
     ),
+    # --- Folded patterns (narrow→view→permute, handled by TryFoldedDecomposition) ---
+    "folded_narrow_view_permute": make_folded_narrow_view_permute,
+    "folded_padded_sequence": make_folded_padded_sequence,
     # --- View-based patterns (view can preserve/create non-contiguous strides) ---
     "view_split_select": make_view_split_select,
     "view_split_transpose": make_view_split_transpose,
@@ -910,35 +943,17 @@ def _generate_and_apply_sequence(tensor, rng, num_ops):
 
                 if view_strategy == 0:
                     # Split a random dim into two factors.
-                    # IMPORTANT: Only on contiguous tensors. View-split on non-contiguous
-                    # tensors creates stride patterns that the prologue's GCD-based
-                    # factorization can't decompose back into base dimensions.
+                    # View-split on non-contiguous tensors creates stride patterns where
+                    # GCD-based factorization fails (coprime stride ratios). These are
+                    # handled by TryFoldedDecomposition which detects compact
+                    # sub-dimension groups and emits SLICE→RESHAPE→TRANSPOSE.
                     #
-                    # Example of the failure case:
+                    # Example:
                     #   x = torch.randn(2, 3, 5)
                     #   y = x.narrow(2, 0, 4).view(2, 3, 2, 2).permute(2, 0, 3, 1)
                     #   # shape=[2, 2, 2, 3], strides=(2, 15, 1, 5)
-                    #   # Sorted strides: [15, 5, 2, 1] → GCD(5, 2) = 1
-                    #
-                    # Why it happens: narrow creates a stride gap (stride 5 for size 4
-                    # in the last dim), then view splits the narrowed dim into two
-                    # sub-dims (strides 2, 1). After permute, these sub-dims interleave
-                    # with the gap dim, creating stride ratios that aren't integer
-                    # multiples of each other (GCD=1).
-                    #
-                    # Why it's hard to fix: the decomposition algorithm assumes each
-                    # output dimension maps to exactly one base dimension. View-split
-                    # creates output dimensions that are sub-divisions of a single base
-                    # dimension. Fixing this requires adding RESHAPE to the decomposition
-                    # chain (base → SLICE → RESHAPE → TRANSPOSE → BROADCAST).
-                    #
-                    # Note: this restriction only affects the fuzz test's random op
-                    # generation. The deterministic view-based test patterns
-                    # (make_view_split_select, make_view_split_transpose, etc.) work
-                    # because they start from contiguous tensors before the view-split.
-                    if not tensor.is_contiguous():
-                        op_log.append("view(split) SKIPPED (non-contiguous, known limitation)")
-                        continue
+                    #   # GCD(5, 2) = 1 → DecomposeStrides rejects
+                    #   # TryFoldedDecomposition: base [2, 3, 5] → SLICE → RESHAPE → TRANSPOSE
 
                     def _get_factors(n):
                         """Get all factor pairs (a, b) where a*b=n, a>1, b>1."""
@@ -1015,6 +1030,16 @@ def _generate_and_apply_sequence(tensor, rng, num_ops):
 
 
 @SKIP_PROLOGUE_DISABLED
+@pytest.mark.xfail(
+    os.environ.get("TORCH_NEURONX_CPP_DISPATCH", "1") != "0",
+    strict=True,
+    reason=(
+        "C++ dispatch routes contiguous through DispatchContiguousImpl which "
+        "falls back to ATen CPU fallback, never reaching the Python "
+        "contiguous_generic_kernel. The fallback detection mechanism only "
+        "works with the Python dispatch path (TORCH_NEURONX_CPP_DISPATCH=0)."
+    ),
+)
 def test_fallback_detection_self_test():
     """Meta-test: verify that our fallback detection infrastructure actually works.
 
@@ -1055,13 +1080,19 @@ _FUZZ_NUM_ITERATIONS = 200
 
 
 @SKIP_PROLOGUE_DISABLED
-@pytest.mark.xfail(reason="Flaky test - intermittent failures under investigation")
 @pytest.mark.parametrize("iteration", range(_FUZZ_NUM_ITERATIONS))
 def test_random_mixed_sequences(iteration):
-    """Fuzz test: single random transformation sequence, compare CPU vs Neuron.
+    """Fuzz test: random view-op sequences to find prologue system bugs.
 
-    Parametrized over 200 iterations so pytest-xdist can parallelize across workers.
-    Each iteration generates its own random seed and prints it on failure for reproduction.
+    Each iteration generates a random seed, applies random view ops (transpose,
+    slice, permute, select, expand, etc.) to create a non-contiguous tensor, then
+    runs neg() on Neuron and compares against CPU. Any failure is a real bug —
+    the prologue system should handle ALL standard view patterns on-device.
+
+    When this test fails:
+      1. Note the seed printed in the failure message
+      2. File a ticket for test_random_mixed_sequences with the seed
+      3. Fix the bug in the prologue system (Transformations.cpp)
 
     Run parallelized:  pytest -k test_random_mixed_sequences -n 8
     """
@@ -1113,7 +1144,11 @@ def test_random_mixed_sequences(iteration):
         # Fail immediately if the prologue fell through to the CPU roundtrip path.
         if _cg_module._fuzzer_fallback_triggered:
             pytest.fail(
-                f"\n=== FALLBACK DETECTED (seed={seed}, iter={iteration}) ===\n"
+                f"\n{'='*70}\n"
+                f"PROLOGUE BUG: CPU fallback triggered for non-contiguous pattern\n"
+                f"{'='*70}\n"
+                f"Seed: {seed}\n"
+                f"Please file a ticket with this seed to track the fix.\n"
                 f"Shape: {shape}, num_ops: {num_ops}\n"
                 f"Operations:\n"
                 + "\n".join([f"  {entry}" for entry in op_log])
@@ -1121,27 +1156,38 @@ def test_random_mixed_sequences(iteration):
                 f"Final strides: {list(cpu_transformed.stride())}\n"
                 f"Offset: {cpu_transformed.storage_offset()}\n"
                 f"contiguous_generic_kernel was called — the prologue system did NOT "
-                f"handle this non-contiguous tensor pattern on-device."
+                f"handle this non-contiguous tensor pattern on-device.\n"
+                f"{'='*70}\n"
             )
 
     except RuntimeError as e:
         pytest.fail(
-            f"\n=== FUZZ FAILURE (seed={seed}, iter={iteration}) ===\n"
+            f"\n{'='*70}\n"
+            f"PROLOGUE BUG: Runtime error on non-contiguous pattern\n"
+            f"{'='*70}\n"
+            f"Seed: {seed}\n"
+            f"Please file a ticket with this seed to track the fix.\n"
             f"Shape: {shape}, num_ops: {num_ops}\n"
             f"Operations:\n"
             + "\n".join([f"  {entry}" for entry in op_log])
             + f"\nFinal shape: {list(cpu_transformed.shape)}\n"
             f"Error: {e}\n"
+            f"{'='*70}\n"
         )
 
     try:
         torch.testing.assert_close(neuron_cpu, cpu_result, atol=0, rtol=0)
     except AssertionError as e:
         pytest.fail(
-            f"\n=== FUZZ FAILURE (seed={seed}, iter={iteration}) ===\n"
+            f"\n{'='*70}\n"
+            f"PROLOGUE BUG: Numerical mismatch on non-contiguous pattern\n"
+            f"{'='*70}\n"
+            f"Seed: {seed}\n"
+            f"Please file a ticket with this seed to track the fix.\n"
             f"Shape: {shape}, num_ops: {num_ops}\n"
             f"Operations:\n"
             + "\n".join([f"  {entry}" for entry in op_log])
             + f"\nFinal shape: {list(cpu_transformed.shape)}\n"
             f"Error: {e}\n"
+            f"{'='*70}\n"
         )

@@ -1,5 +1,7 @@
 """Torch-MLIR implementation for NKI kernels."""
 
+import hashlib
+
 import torch
 
 from torch_neuronx.nki_hop import nki_kernel_wrapper
@@ -18,18 +20,24 @@ class NkiKernel(TorchMlirKernel):
     """Specialized kernel for NKI that handles aliasing in execution tensor preparation."""
 
     def _generate_unified_cache_key(self, inputs: tuple, kwargs: dict, context=None) -> str:
-        """Use kernel_idx and constant_args hash_key for NKI caching."""
+        """Use kernel identity, backend_config, and constant_args for NKI caching."""
         from torch_neuronx.nki_hop import kernel_registry
 
         kernel_idx = kwargs.get("kernel_idx", 0)
         constant_args_key = kwargs.get("constant_args_key", 0)
+        grid = kwargs.get("grid", ())
+        backend_config = kwargs.get("backend_config", "")
         kernel = kernel_registry.get_kernel(kernel_idx)
         kernel_name = kernel.func.__qualname__
+
+        # Hash backend_config for cache invalidation
+        config_hash = hashlib.sha256(backend_config.encode()).hexdigest()[:16]
+
         # Include tensor shapes/dtypes for cache differentiation
         tensor_info = tuple((t.shape, t.dtype) for t in inputs if isinstance(t, torch.Tensor))
         return (
-            f"nki_{kernel_idx}_{kernel_name}"
-            f"_{constant_args_key}_{tensor_info}"
+            f"nki_{kernel_idx}_{kernel_name}_{config_hash}"
+            f"_{constant_args_key}_{grid}_{tensor_info}"
             f":{global_version_hash()}"
         )
 

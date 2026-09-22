@@ -267,9 +267,18 @@ at::Tensor empty_strided_neuron(at::IntArrayRef size, at::IntArrayRef stride,
   // Get dtype
   auto dtype = c10::scalarTypeToTypeMeta(dtype_or_default(dtype_opt));
 
-  // Calculate total size
-  int64_t nelements = c10::multiply_integers(size);
-  int64_t size_bytes = nelements * dtype.itemsize();
+  // Calculate storage size needed to cover all elements given the strides.
+  // For non-contiguous layouts the last reachable element is at offset
+  // sum_i((size[i]-1) * |stride[i]|), so storage = that offset + 1.
+  int64_t storage_size = 1;
+  for (size_t i = 0; i < size.size(); ++i) {
+    if (size[i] == 0) {
+      storage_size = 0;
+      break;
+    }
+    storage_size += (size[i] - 1) * std::abs(stride[i]);
+  }
+  int64_t size_bytes = storage_size * dtype.itemsize();
 
   // Handle zero-size tensors
   if (size_bytes == 0) {
@@ -301,7 +310,14 @@ const at::Tensor& resize_neuron(const at::Tensor& self, c10::IntArrayRef size,
               "resize_: expected neuron tensor, but got: ", self.device());
 
   auto format = memory_format.value_or(c10::MemoryFormat::Contiguous);
+  if (!memory_format.has_value() && self.sizes().equals(size)) {
+    // No format requested and size unchanged — preserve existing strides.
+    return self;
+  }
   if (format == c10::MemoryFormat::Preserve) {
+    if (self.sizes().equals(size)) {
+      return self;
+    }
     format = c10::MemoryFormat::Contiguous;
   }
 

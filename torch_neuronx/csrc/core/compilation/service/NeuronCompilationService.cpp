@@ -4,6 +4,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -124,16 +125,22 @@ void NeuronCompilationService::HandleClient(int client_fd) {
   auto job = std::make_shared<CompileJob>();
   job->hlo_file_path = req.hlo_file_path;
   job->ir_type = req.ir_type;
+  job->op_name = req.op_name;
+  job->cache_key = req.cache_key;
   job->optimization_level = req.optimization_level;
   job->additional_args = req.additional_args;
 
   std::future<CompileResult> result_future = job->result.get_future();
 
+  size_t queue_depth_after = 0;
   {
     std::lock_guard lock(queue_mutex_);
     job_queue_.push(job);
+    queue_depth_after = job_queue_.size();
   }
   queue_cv_.notify_one();
+  TORCH_NEURONX_DEBUG("HandleClient: enqueued req_id=", req.req_id, " op=", req.op_name,
+                      " cache_key=", req.cache_key, " queue_depth=", queue_depth_after);
 
   auto result = result_future.get();
 
@@ -143,7 +150,11 @@ void NeuronCompilationService::HandleClient(int client_fd) {
   resp.neff_cache_path = result.neff_path;
   resp.error_message = result.error_message;
   auto resp_payload = resp.Serialize();
-  SendMessage(client_fd, ServiceMsgType::kCompileResponse, resp_payload);
+  if (!SendMessage(client_fd, ServiceMsgType::kCompileResponse, resp_payload)) {
+    TORCH_NEURONX_ERROR(
+        "HandleClient: SendMessage(kCompileResponse) failed for req_id=", req.req_id,
+        " op=", req.op_name, " success=", resp.success, " errno=", errno);
+  }
 
   close(client_fd);
 }
@@ -171,9 +182,14 @@ void NeuronCompilationService::WorkerLoop() {
         // Build config from per-request values
         CompilationConfig request_config = compilation_config_;
         request_config.optimization_level = job->optimization_level;
-        request_config.additional_args = job->additional_args;
+        // Append per-request args to base config (preserves int64 flags from FromEnvironment)
+        if (!job->additional_args.empty()) {
+          if (!request_config.additional_args.empty()) request_config.additional_args += " ";
+          request_config.additional_args += job->additional_args;
+        }
 
-        auto neff_bytes = NeuronCompiler::CompileHloToNeff(hlo_bytes, request_config, job->ir_type);
+        auto neff_bytes = NeuronCompiler::CompileHloToNeff(hlo_bytes, request_config, job->ir_type,
+                                                           job->op_name, job->cache_key);
 
         if (!neff_bytes.empty()) {
           neff_path = job->hlo_file_path + ".neff";
@@ -185,6 +201,11 @@ void NeuronCompilationService::WorkerLoop() {
             neff_path.clear();
             error_msg = "Failed to write NEFF to temp file";
           }
+        } else {
+          error_msg =
+              "NeuronCompiler::CompileHloToNeff returned empty NEFF for op=" + job->op_name +
+              " cache_key=" + job->cache_key + " ir_type=" + job->ir_type;
+          TORCH_NEURONX_ERROR(error_msg);
         }
       } else {
         error_msg = "Failed to read HLO file: " + job->hlo_file_path;

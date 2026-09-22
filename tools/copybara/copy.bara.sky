@@ -1,0 +1,51 @@
+PUBLIC_REPOSITORY = "https://github.com/aws-neuron/torch-neuronx.git"
+PRIVATE_REPOSITORY = "https://github.com/aws-neuron/private-torch-neuronx.git"
+
+SYNC_FILES = glob(
+    include = ["**"],
+    exclude = [
+        ".agents/**",
+        ".claude/**",
+        ".code_sharing_ignore",
+        ".codex/**",
+        ".github/**",
+        ".internal_docs/**",
+        ".kiro/**",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "docs/work-in-progress/**",
+        "tools/copybara/**",
+    ],
+)
+
+core.workflow(
+    name = "import_public_pr",
+    origin = git.github_pr_origin(
+        url = PUBLIC_REPOSITORY,
+        required_labels = ["ready-for-private-import"],
+        state = "OPEN",
+        baseline_from_branch = True,
+        review_state = "HEAD_COMMIT_APPROVED",
+        review_approvers = ["MEMBER", "OWNER"],
+    ),
+    destination = git.github_pr_destination(
+        url = PRIVATE_REPOSITORY,
+        destination_ref = "main",
+        allow_empty_diff = False,
+        draft = True,
+        title = "Import public pull request ${GITHUB_PR_NUMBER}",
+        body = """Imported from ${GITHUB_PR_URL}.
+
+Public author: @${GITHUB_PR_USER}
+Public head: `${GITHUB_PR_HEAD_SHA}`
+""",
+        integrates = [],
+    ),
+    origin_files = SYNC_FILES,
+    destination_files = SYNC_FILES,
+    authoring = authoring.overwrite(
+        default = "Neuron Copybara Bot <neuron-training-foundation@amazon.com>",
+    ),
+    mode = "CHANGE_REQUEST",
+    set_rev_id = False,
+)

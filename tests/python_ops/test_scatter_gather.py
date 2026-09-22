@@ -1,5 +1,6 @@
 """Test that scatter operation is properly registered with PyTorch dispatcher."""
 
+import os
 from contextlib import nullcontext
 from unittest.mock import patch
 
@@ -307,12 +308,37 @@ class TestScatterGatherRegistration:
             res.backward(weight)
             torch.testing.assert_close(src.grad, grad, atol=0, rtol=0)
 
+    def test_scatter_value_rank0_input(self):
+        """Test torch_scatter_value with a 0-dim input tensor."""
+        x = torch.tensor(5.0, device="neuron")
+        index = torch.tensor(0, dtype=torch.int64, device="neuron")
+        result = torch.scatter(x, 0, index, 1.0)
+        expected = torch.scatter(torch.tensor(5.0), 0, torch.tensor(0, dtype=torch.int64), 1.0)
+        torch.testing.assert_close(result.cpu(), expected)
+
+    def test_scatter_src_rank0_input(self):
+        """Test torch_scatter_src with a 0-dim input tensor."""
+        x = torch.tensor(5.0, device="neuron")
+        index = torch.tensor(0, dtype=torch.int64, device="neuron")
+        src = torch.tensor(1.0, device="neuron")
+        result = torch.scatter(x, 0, index, src)
+        expected = torch.scatter(
+            torch.tensor(5.0), 0, torch.tensor(0, dtype=torch.int64), torch.tensor(1.0)
+        )
+        torch.testing.assert_close(result.cpu(), expected)
+
 
 class TestGatherPriorityImpl:
     """Test priority-based implementation for gather."""
 
+    _CPP_DISPATCH = os.environ.get("TORCH_NEURONX_CPP_DISPATCH", "1") == "1"
+
+    @pytest.mark.skipif(
+        _CPP_DISPATCH,
+        reason="C++ dispatch changes compiler call count due to contiguous path differences",
+    )
     @patch(
-        "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+        "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
         wraps=convert_fx_to_stablehlo,
     )
     def test_gather_nki_kernel_used(self, mock_compiler):
@@ -338,6 +364,19 @@ class TestGatherPriorityImpl:
                 mock_compiler.call_count == initial_count + 1
             ), "Compiler was not called as expected"
 
+    def test_gather_nki_kernel_runs_on_neuron(self):
+        """Verify gather runs on Neuron for 2D tensors with dim=0."""
+        input_neuron = torch.randn(3, 4, dtype=torch.float32, device="neuron")
+        index_tensor = torch.tensor([0, 2], device="neuron")
+        index_neuron = index_tensor.unsqueeze(1).expand(-1, 4)
+
+        with torch.no_grad(), track_neuron_ops():
+            result = torch.gather(input_neuron, 0, index_neuron)
+            assert_op_runs_on_neuron("aten::gather")
+
+        expected = torch.gather(input_neuron.cpu(), 0, index_neuron.cpu())
+        torch.testing.assert_close(result.cpu(), expected)
+
     @patch("torch_neuronx.python_ops.gather.GatherNKIImpl.can_handle", return_value=False)
     def test_gather_xla_fallback(self, mocked_handle):
         """Verify XLA fallback when NKI can't handle the input"""
@@ -354,3 +393,52 @@ class TestGatherPriorityImpl:
             assert_op_runs_on_neuron("aten::gather")
 
         torch.testing.assert_close(result_neuron.cpu(), result_cpu, rtol=1e-4, atol=1e-4)
+
+
+class TestScatterReduceDtypeMismatch:
+    """Regression tests for scatter(..., reduce='add'|'multiply') when src
+    does not match self.dtype.
+
+    Upstream scatter-with-reduce silently casts src to self.dtype, but the
+    Neuron fallback decomposes to scatter_add / scatter+multiply, which both
+    enforce self.dtype == src.dtype at the meta level. The fix in
+    torch_scatter_src_fn casts src to x.dtype before dispatching. These cases
+    reproduce the 7 previously-xfailing tests (integer/bool self with a
+    Python-float scalar src, and float16 self with reduce='multiply').
+    """
+
+    @pytest.mark.parametrize(
+        "reduce,self_dtype",
+        [
+            ("add", torch.int8),  # reproduces test_comprehensive_scatter_neuron_int8 and friends
+            ("add", torch.bool),  # reproduces test_non_standard_bool_values_scatter_neuron_bool
+            ("multiply", torch.float16),  # reproduces test_scatter__reductions_neuron_float16
+        ],
+    )
+    def test_scatter_reduce_scalar_src_mismatched_dtype(self, reduce, self_dtype):
+        """Python-float scalar src whose implicit dtype does not match self.dtype."""
+        base = torch.ones((3, 4), dtype=self_dtype, device="neuron")
+        idx = torch.tensor([[0, 1, 2, 0], [1, 2, 0, 1]], dtype=torch.int64, device="neuron")
+        scalar_src = 2.5  # Python float, deliberately not matching self_dtype
+
+        actual = base.clone().scatter_(0, idx, scalar_src, reduce=reduce)
+        expected = base.cpu().clone().scatter_(0, idx.cpu(), scalar_src, reduce=reduce)
+
+        torch.testing.assert_close(actual.cpu(), expected, rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.parametrize("reduce", ["add", "multiply"])
+    def test_scatter_reduce_tensor_src_matching_dtype(self, reduce):
+        """Tensor src whose dtype matches self.dtype.
+
+        This is the only tensor-src reduce path reachable from the Python API;
+        upstream PyTorch rejects mismatched-dtype tensor src at dispatch time.
+        Kept as a guardrail alongside the scalar-src cases above.
+        """
+        base = torch.ones((3, 4), dtype=torch.float16, device="neuron")
+        idx = torch.tensor([[0, 1, 2, 0], [1, 2, 0, 1]], dtype=torch.int64, device="neuron")
+        src = torch.full(idx.shape, 2.0, dtype=torch.float16, device="neuron")
+
+        actual = base.clone().scatter_(0, idx, src, reduce=reduce)
+        expected = base.cpu().clone().scatter_(0, idx.cpu(), src.cpu(), reduce=reduce)
+
+        torch.testing.assert_close(actual.cpu(), expected, rtol=1e-3, atol=1e-3)

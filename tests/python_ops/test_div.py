@@ -22,6 +22,50 @@ class TestDiv:
             assert result.device.type == "neuron"
             assert_op_runs_on_neuron("aten::div")
 
+    @pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
+    @pytest.mark.parametrize("dtype", [torch.uint8, torch.int8, torch.int16, torch.int32])
+    def test_div_integer_exact_quotient(self, dtype, rounding_mode):
+        """Integer floor/trunc division must be exact for every operand pair.
+
+        Regression: the fp32 divide rounds an exact integer quotient down to
+        k-eps (e.g. 122/122 -> 0.99999994), so floor/trunc previously returned
+        k-1. Sweep the full small-magnitude grid (incl. a == b and negatives)
+        and compare against CPU.
+        """
+        with track_neuron_ops():
+            lo = 0 if dtype == torch.uint8 else -30
+            vals = list(range(lo, 50))
+            a = torch.tensor([av for av in vals for bv in vals if bv != 0], dtype=dtype)
+            b = torch.tensor([bv for _ in vals for bv in vals if bv != 0], dtype=dtype)
+            expected = torch.div(a, b, rounding_mode=rounding_mode)
+            result = torch.div(a.to("neuron"), b.to("neuron"), rounding_mode=rounding_mode)
+            torch.testing.assert_close(result.cpu(), expected)
+            assert_op_runs_on_neuron("aten::div")
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    def test_floor_divide_float_boundary(self, dtype):
+        """floor_divide on floats must match CPU at integer boundaries.
+
+        The correction runs in fp32 (fp16/bf16 upcast, single downcast of the integer
+        floor), so it applies to every float dtype.
+
+        Regression: floor_divide floored an fp32-rounded quotient, so a quotient sitting
+        just under an integer boundary (k - eps) floored to k-1 -- off by exactly 1. Sweep
+        every (num, den) pair over a grid of fractional values so boundary-adjacent
+        quotients are covered, and compare to CPU. (remainder has its own file,
+        test_remainder.py.)
+        """
+        vals = torch.arange(-16, 16, 0.5)
+        num, den = torch.cartesian_prod(vals, vals).unbind(1)
+        keep = den != 0
+        num, den = num[keep].to(dtype), den[keep].to(dtype)
+        with track_neuron_ops():
+            expected = torch.floor_divide(num, den)
+            result = torch.floor_divide(num.to("neuron"), den.to("neuron"))
+            torch.testing.assert_close(result.cpu(), expected, equal_nan=True)
+            assert result.device.type == "neuron"
+            assert_op_runs_on_neuron("aten::floor_divide")
+
     @pytest.mark.parametrize("rounding_mode", [None, "floor", "trunc"])
     def test_div_basic(self, rounding_mode):
         """Test basic element-wise division"""
@@ -88,6 +132,18 @@ class TestDiv:
             assert a_neuron.device.type == "neuron"
             # The in-place operation div_ is being handled by the div/div.out variant
             assert_op_runs_on_neuron("aten::div")
+
+    def test_div_bool_by_zero(self):
+        """Bool true division follows CPU NaN/Inf semantics."""
+        a_cpu = torch.tensor([[False, True], [True, False]], dtype=torch.bool)
+        b_cpu = torch.tensor([False], dtype=torch.bool).expand_as(a_cpu)
+        a_neuron = a_cpu.to("neuron")
+        b_neuron = torch.tensor([False], dtype=torch.bool, device="neuron").expand_as(a_neuron)
+
+        actual = torch.div(a_neuron, b_neuron).cpu()
+        expected = torch.div(a_cpu, b_cpu)
+
+        torch.testing.assert_close(actual, expected, equal_nan=True)
 
     def test_div_broadcast(self):
         """Test division with broadcasting"""

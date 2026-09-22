@@ -91,6 +91,7 @@ class CompilationJob:
         self.preserve = is_preserve_artifacts_enabled()
         self._base_dir = get_artifacts_directory()
         self._job_dir = self._base_dir / self.job_id
+        self._pass_counter = 0
         working_dir_hash = hashlib.sha256(self.job_id.encode(errors="ignore")).hexdigest()
         self._neuronx_cc_directory = self._base_dir / "neuronx-cc" / working_dir_hash
 
@@ -142,6 +143,26 @@ class CompilationJob:
         with open(path, "w") as f:
             f.write(gm.print_readable(print_output=False))
         logger.debug(f"Saved FX graph to {path}")
+        return path
+
+    def save_pass_fx(self, model_name: str, gm, pass_name: str) -> Path:
+        """Save FX graph after an individual pass under transformed_fx/.
+
+        Args:
+            model_name: Model name for the artifact filename.
+            gm: FX GraphModule to save.
+            pass_name: Name of the pass (typically the class name).
+
+        Returns:
+            Path: {job_dir}/transformed_fx/{model}_{ts}.pass_{idx}_{name}.fx.txt
+        """
+        pass_index = self._pass_counter
+        self._pass_counter += 1
+        suffix = f".pass_{pass_index}_{pass_name}.fx.txt"
+        path = self._make_path("transformed_fx", model_name, suffix)
+        with open(path, "w") as f:
+            f.write(gm.print_readable(print_output=False))
+        logger.debug(f"Saved FX graph after pass {pass_index} ({pass_name}) to {path}")
         return path
 
     def save_transformed_fx(self, model_name: str, gm) -> Path:

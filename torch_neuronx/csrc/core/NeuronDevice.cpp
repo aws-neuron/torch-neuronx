@@ -5,7 +5,7 @@
 #include <c10/core/impl/InlineStreamGuard.h>
 
 #include <atomic>
-#include <mutex>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,18 +34,40 @@ int world_size = -1;
 int rank = -1;
 int rank_vnc_count = -1;
 
-bool g_initialized = false;
-std::mutex g_init_mutex;
+// Atomic, not mutex-guarded: mark_in_bad_fork() runs from a pthread_atfork
+// child handler, where a lock the parent held at fork() would never unlock.
+std::atomic<bool> g_initialized{false};
+std::atomic<bool> g_in_bad_fork{false};
+
+// Lazily initialized from TORCH_NEURONX_COMPILE_ONLY on first read.
+std::atomic<int> g_compile_only{-1};  // -1 = not yet resolved, 0/1 = value
 }  // namespace
 
-bool is_initialized() {
-  std::lock_guard<std::mutex> lock(g_init_mutex);
-  return g_initialized;
+bool is_initialized() { return g_initialized.load(std::memory_order_acquire); }
+
+void set_initialized(bool value) { g_initialized.store(value, std::memory_order_release); }
+
+bool is_in_bad_fork() { return g_in_bad_fork.load(std::memory_order_relaxed); }
+
+void mark_in_bad_fork() {
+  g_in_bad_fork.store(true, std::memory_order_relaxed);
+  g_initialized.store(false, std::memory_order_release);
 }
 
-void set_initialized(bool value) {
-  std::lock_guard<std::mutex> lock(g_init_mutex);
-  g_initialized = value;
+bool is_compile_only() {
+  int v = g_compile_only.load(std::memory_order_acquire);
+  if (v < 0) {
+    const char* env = std::getenv("TORCH_NEURONX_COMPILE_ONLY");
+    v = (env && (env[0] == '1' || env[0] == 't' || env[0] == 'T')) ? 1 : 0;
+    int expected = -1;
+    g_compile_only.compare_exchange_strong(expected, v, std::memory_order_acq_rel);
+    v = g_compile_only.load(std::memory_order_acquire);
+  }
+  return v != 0;
+}
+
+void set_compile_only(bool value) {
+  g_compile_only.store(value ? 1 : 0, std::memory_order_release);
 }
 
 // Helper to check if a device is a Neuron device
@@ -63,7 +85,7 @@ int GetTargetDeviceId(const std::vector<at::Tensor>& inputs,
   // Check all input tensors
   for (const auto& input : inputs) {
     c10::Device device = input.storage().device();
-    TORCH_CHECK(IsNeuronDevice(device), "Input storage is not on Neuron device");
+    TORCH_CHECK(IsNeuronDevice(device), "input tensor is on cpu device, expected neuron");
     int current_device = device.index();
     if (!device_found) {
       device_id = current_device;
@@ -78,7 +100,9 @@ int GetTargetDeviceId(const std::vector<at::Tensor>& inputs,
   // Check all output tensors
   for (const auto& output : outputs) {
     c10::Device device = output.storage().device();
-    TORCH_CHECK(IsNeuronDevice(device), "Output storage is not on Neuron device");
+    TORCH_CHECK(IsNeuronDevice(device),
+                "Expected all tensors to be on the same device, but the output tensor is on ",
+                device.str(), " and the operation was dispatched to the Neuron device");
     int current_device = device.index();
     if (!device_found) {
       device_id = current_device;
@@ -208,6 +232,21 @@ int get_vnc_id(int device_id) {
   }
 
   return device_id - local_device_start_index;
+}
+
+bool get_vnc_memory_stats(int device_id, uint64_t* bytes_limit, uint64_t* bytes_used) {
+  if (device_id < 0) {
+    return false;
+  }
+  nrt_vnc_memory_stats_t stats;
+  size_t out_size = 0;
+  if (nrt_get_vnc_memory_stats(static_cast<uint32_t>(get_vnc_id(device_id)), &stats, sizeof(stats),
+                               &out_size) != NRT_SUCCESS) {
+    return false;
+  }
+  if (bytes_limit) *bytes_limit = stats.bytes_limit;
+  if (bytes_used) *bytes_used = stats.bytes_used;
+  return true;
 }
 
 int vnc_count() {

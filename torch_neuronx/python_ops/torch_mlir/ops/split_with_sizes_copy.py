@@ -43,6 +43,18 @@ class SplitWithSizesCopyMLIR(TorchMlirOpImpl):
             static_argnames=("split_sizes", "dim"),
         )
 
+    def translate_args(self, *args, **kwargs):
+        """Translate ATen split_with_sizes_copy.out args to kernel format.
+
+        ATen schema: (input, split_sizes, dim, *, out)
+        Kernel expects: (input_tensor, split_sizes=..., dim=..., out=...)
+        """
+        input_tensor = args[0]
+        split_sizes = tuple(int(s) for s in args[1]) if len(args) > 1 else ()
+        dim = int(args[2]) if len(args) > 2 else int(kwargs.get("dim", 0))
+        out = kwargs.get("out")
+        return (input_tensor,), {"split_sizes": split_sizes, "dim": dim, "out": out}
+
     def can_handle(self, *args, **kwargs) -> bool:
         """Handle when input is on Neuron device."""
         input_tensor = args[0]
@@ -59,15 +71,11 @@ class SplitWithSizesCopyMLIR(TorchMlirOpImpl):
     def execute(self, *args, **kwargs):
         """Execute split_with_sizes_copy using MLIR backend.
 
-        Args:
-            args[0]: input tensor
-            args[1]: split_sizes (list/tuple of ints)
-            args[2]: dim (default 0)
-            kwargs['out']: output tensors
+        Receives translated args: (input_tensor,), {split_sizes, dim, out}
         """
         input_tensor = args[0]
-        split_sizes = tuple(args[1]) if len(args) > 1 else ()
-        dim = args[2] if len(args) > 2 else kwargs.get("dim", 0)
+        split_sizes = kwargs.get("split_sizes", ())
+        dim = kwargs.get("dim", 0)
         out = kwargs.get("out")
 
         n_outputs = len(split_sizes)

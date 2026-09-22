@@ -2,21 +2,18 @@
 
 import torch
 
+from torch_neuronx.python_ops.nki_kernels.rng_state import _has_nki_rng
+
 from ..operation_registry import register_aten
 
 
 @register_aten(
-    ["aten::native_dropout"],
+    ["aten::native_dropout", "aten::native_dropout.out"],
     static_argnums=(1, 2),
-    uses_preprocessing=True,
+    output_params=("out0", "out1"),
 )
-def torch_native_dropout(input, p: float, train: bool = True, **kwargs):
-    """Native dropout implementation with CPU preprocessing for random mask generation."""
-
-    def torch_dropout_fn(x, p, train, mask, scale):
-        y = x * mask.to(x.dtype) * scale
-        return y, mask
-
+def torch_native_dropout(input, p: float, train: bool = True, out0=None, out1=None, **kwargs):
+    """Decompose native_dropout using on-device RNG."""
     if train and not (0.0 <= float(p) <= 1.0):
         raise RuntimeError(f"dropout probability has to be between 0 and 1, but got {p}")
 
@@ -27,13 +24,17 @@ def torch_native_dropout(input, p: float, train: bool = True, **kwargs):
         mask = torch.zeros(input.shape, dtype=torch.bool, device=input.device)
         scale = 0.0
     else:
-        # Generate mask on CPU then move to device
-        mask = torch.empty(input.shape, dtype=torch.bool)
         keep_prob = 1.0 - p
-        mask = torch.bernoulli(mask, keep_prob).to(input.device)
+        if _has_nki_rng:
+            mask = torch.ops.nki_kernels.rand(input, list(input.shape)) < keep_prob
+        else:
+            mask = (
+                torch.rand(list(input.shape), dtype=torch.float32, device=input.device) < keep_prob
+            )
         scale = 1.0 / keep_prob
 
-    return torch_dropout_fn, (input, p, train, mask, scale), {}
+    y = input * mask.to(input.dtype) * scale
+    return y, mask
 
 
 @register_aten(["aten::native_dropout_backward"], static_argnums=(2,))

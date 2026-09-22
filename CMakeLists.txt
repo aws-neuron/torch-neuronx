@@ -132,7 +132,8 @@ set(INTERNAL_OPS_SOURCES
 
 set(INTERNAL_OPS_HEADERS
     torch_neuronx/csrc/ops/InternalOps.h
-    torch_neuronx/csrc/utils/CopyUtils.h
+    torch_neuronx/csrc/core/utils/CopyUtils.h
+    torch_neuronx/csrc/core/utils/PackedInt64Utils.h
 )
 
 add_library(internal_ops STATIC ${INTERNAL_OPS_SOURCES})
@@ -202,7 +203,8 @@ set(ATEN_NEURON_SOURCES
     torch_neuronx/csrc/core/NeuronHooksInterface.cpp
     torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.cpp
     torch_neuronx/csrc/core/allocator/NeuronHostAllocator.cpp
-    torch_neuronx/csrc/utils/CopyUtils.cpp
+    torch_neuronx/csrc/core/utils/CopyUtils.cpp
+    torch_neuronx/csrc/core/utils/PackedInt64Utils.cpp
 )
 
 set(ATEN_NEURON_HEADERS
@@ -214,7 +216,8 @@ set(ATEN_NEURON_HEADERS
     torch_neuronx/csrc/core/NeuronHooksInterface.h
     torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h
     torch_neuronx/csrc/core/allocator/NeuronHostAllocator.h
-    torch_neuronx/csrc/utils/CopyUtils.h
+    torch_neuronx/csrc/core/utils/CopyUtils.h
+    torch_neuronx/csrc/core/utils/PackedInt64Utils.h
     torch_neuronx/csrc/utils/SymIntUtils.h
 )
 
@@ -237,6 +240,7 @@ set(EXTENSION_SOURCES
     torch_neuronx/csrc/amp/autocast_mode.cpp
     # Profiler sources (compiled directly to ensure proper linking)
     torch_neuronx/csrc/profiler/Profiler.cpp
+    torch_neuronx/csrc/profiler/ContinuousExporter.cpp
     torch_neuronx/csrc/profiler/Session.cpp
     torch_neuronx/csrc/profiler/Registration.cpp
     torch_neuronx/csrc/profiler/TorchStubs.cpp

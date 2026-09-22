@@ -44,6 +44,8 @@ class NeuronCompilationService {
   struct CompileJob {
     std::string hlo_file_path;
     std::string ir_type;
+    std::string op_name;
+    std::string cache_key;
     std::string optimization_level;
     std::string additional_args;
     std::promise<CompileResult> result;

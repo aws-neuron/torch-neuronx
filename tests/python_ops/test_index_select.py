@@ -58,16 +58,50 @@ class TestIndexSelect:
 
         assert result.shape == torch.Size([1, 4])
 
-    @pytest.mark.xfail(reason="produces nan instead of OOB error")
     @assert_raises(IndexError, match="index out of range in self")
     def test_index_select_with_indices_out_of_range(self):
-        """Test index select with input empty"""
+        """Test index select with an out-of-range index raises IndexError."""
 
         device = "neuron"
         input = torch.ones((3, 4))
         indices = torch.tensor([10])
 
         torch.index_select(input.to(device), dim=0, index=indices.to(device))
+
+    def test_index_select_0d_input(self):
+        """Test index_select with 0-d (scalar) input — returns the scalar unchanged."""
+        x = torch.tensor(3.14, dtype=torch.float32)
+        indices = torch.tensor([0], dtype=torch.long)
+
+        cpu_result = torch.index_select(x, dim=0, index=indices)
+        with track_neuron_ops():
+            neuron_result = torch.index_select(x.to("neuron"), dim=0, index=indices.to("neuron"))
+        torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+        assert_op_runs_on_neuron("aten::index_select")
+
+    @assert_raises(IndexError, match="index out of range in self")
+    def test_index_select_0d_input_oob(self):
+        """Test index_select with 0-d input and out-of-range index (matches CPU).
+
+        Exercises the precondition path — the op never dispatches to Neuron,
+        so no `assert_op_runs_on_neuron` here by design.
+        """
+        device = "neuron"
+        x = torch.tensor(1.0)
+        indices = torch.tensor([1])
+        torch.index_select(x.to(device), dim=0, index=indices.to(device))
+
+    @assert_raises(RuntimeError, match=r"Index to scalar can have only 1 value, got 2 value\(s\)")
+    def test_index_select_0d_input_multiple_indices(self):
+        """Test index_select with 0-d input and multiple indices (matches CPU).
+
+        Exercises the precondition path — the op never dispatches to Neuron,
+        so no `assert_op_runs_on_neuron` here by design.
+        """
+        device = "neuron"
+        x = torch.tensor(1.0)
+        indices = torch.tensor([0, 0])
+        torch.index_select(x.to(device), dim=0, index=indices.to(device))
 
     @assert_raises(
         TypeError if use_mlir_aten_ops() else ValueError,
@@ -107,7 +141,29 @@ class TestIndexSelect:
         # This triggers CPU fallback which fails with IndexError about vector requirement
         torch.index_select(input_neuron, dim=0, index=indices.to(device))
 
-    @assert_raises(TypeError, match=r"received an invalid combination of arguments")
+    @pytest.mark.xfail(
+        condition=os.environ.get("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS", "0") == "0",
+        reason="CPU fallback modifies out= tensor, removing overlap",
+    )
+    @assert_raises(RuntimeError, match="unsupported operation")
+    def test_index_select_out_internal_overlap(self):
+        """Test index_select raises RuntimeError when out= has internal memory overlap.
+
+        CPU raises: 'unsupported operation: more than one element of the
+        written-to tensor refers to a single memory location.'
+        Neuron must match.
+        """
+        device = "neuron"
+        x = torch.randn(3, 6).to(device)
+        index = torch.tensor([0, 1], dtype=torch.int64).to(device)
+        # Create an out tensor with internal overlap (stride 0 in dim 0)
+        out = torch.randn(6, device=device).unsqueeze(0).expand(2, 6)
+        assert not out.is_contiguous()
+        torch.index_select(x, 1, index, out=out)
+
+    @assert_raises(
+        TypeError, match=r"received an invalid combination of arguments|argument 'dim' must be int"
+    )
     def test_index_select_with_incorrect_value(self):
         """Test index select with index dtype float"""
 

@@ -1,16 +1,36 @@
 try:
+    from importlib.metadata import PackageNotFoundError
     from importlib.metadata import version as _pkg_version
 
     __version__ = _pkg_version("torch-neuronx")
-except Exception:
-    __version__ = "0.1.0"
+except PackageNotFoundError:
+    __version__ = "0.0.0"
 
 
 import os
+import sys
+import warnings
+
+# Ensure the embedded torch_mlir is used instead of any standalone
+# neuron-torch-mlir wheel. For source builds, prepend the embedded path.
+# For wheel installs, torch_mlir is already bundled in the wheel.
+_embedded_torch_mlir = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "third_party",
+    "torch-mlir",
+    "python",
+)
+if os.path.isdir(_embedded_torch_mlir):
+    sys.path.insert(0, _embedded_torch_mlir)
+
 import threading
 
 # Global variable to track if module has been loaded
 _is_loaded = False
+
+# Thread-local context for transmitting the C++ dispatch cache key to Python
+# lowering code without injecting it into kwargs (which breaks composite ops).
+_dispatch_context = threading.local()
 
 
 def _autoload():
@@ -50,6 +70,8 @@ os.environ.setdefault(
     "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS", DEFAULT_FALLBACK_ONLY_FOR_UNIMPLEMENTED
 )
 
+os.environ.setdefault("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", "1")
+
 # Set default for aten ops lowering
 os.environ.setdefault("TORCH_NEURONX_MLIR_ATEN_OPS", DEFAULT_MLIR_ATEN_OPS)
 
@@ -65,9 +87,60 @@ os.environ.setdefault("NEURON_RT_DBG_ZEROCOPY", "1")
 # Set default for HBM mapping
 os.environ.setdefault("NEURON_RT_MAP_HBM", "1")
 
-# Set default for host-cc
-os.environ.setdefault("TORCH_NEURONX_ENABLE_HOST_CC", "0")
-os.environ.setdefault("NEURON_RT_DISABLE_EXECUTION_BARRIER", "0")
+
+def _read_boolean_environment(name, default):
+    value = os.environ.get(name) or default
+    if value not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1; got {value!r}")
+    return value == "1"
+
+
+_streams_enabled = _read_boolean_environment("TORCH_NEURONX_ENABLE_STREAMS", "0")
+_host_cc_enabled = _read_boolean_environment("TORCH_NEURONX_ENABLE_HOST_CC", "0")
+if _host_cc_enabled and not _streams_enabled:
+    raise RuntimeError("TORCH_NEURONX_ENABLE_HOST_CC=1 requires TORCH_NEURONX_ENABLE_STREAMS=1")
+
+os.environ["TORCH_NEURONX_ENABLE_STREAMS"] = "1" if _streams_enabled else "0"
+os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = "1" if _host_cc_enabled else "0"
+
+if _streams_enabled and not _host_cc_enabled:
+    warnings.warn(
+        "Neuron streams are enabled, but HostCC is disabled. Non-default streams support "
+        "ordinary operations, but compiled collectives submitted to them will fail. "
+        "Distributed training workloads that use non-default-stream collectives, such as "
+        "FSDPv2, should set TORCH_NEURONX_ENABLE_HOST_CC=1.",
+        stacklevel=2,
+    )
+
+_dma_transpose_env = "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE"
+if _host_cc_enabled:
+    from torch_neuronx.utils import get_platform_target
+
+    platform_target = get_platform_target()
+    if platform_target in ("trn2", "trn3"):
+        if os.environ.get(_dma_transpose_env, "").lower() == "false":
+            raise RuntimeError(
+                "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=false is incompatible with "
+                f"host collectives on {platform_target}. This "
+                "combination can lead to a hang. Remove the "
+                "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=false setting or select a "
+                "configuration with TORCH_NEURONX_ENABLE_HOST_CC=0."
+            )
+        # HostCC hangs on these platforms without this NKI setting. The setting
+        # restricts every kernel to psum_banks=7, which costs kernel performance,
+        # so only HostCC turns it on.
+        os.environ.setdefault(_dma_transpose_env, "true")
+    os.environ.setdefault("NEURON_RT_EXEC_TIMEOUT", "300")
+else:
+    if os.environ.get(_dma_transpose_env, "").lower() == "true":
+        raise RuntimeError(
+            "TORCH_NEURONX_ENABLE_HOST_CC=0 does not support "
+            "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=true. Remove "
+            "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE or set TORCH_NEURONX_ENABLE_HOST_CC=1."
+        )
+
+# Default to C++ NeuronBackend process group
+os.environ.setdefault("TORCH_NEURONX_CPP_PROCESS_GROUP", "1")
 
 # Disable stack trace by default
 os.environ.setdefault("TORCH_NEURONX_ENABLE_STACK_TRACE", "0")
@@ -75,8 +148,25 @@ os.environ.setdefault("TORCH_NEURONX_ENABLE_STACK_TRACE", "0")
 # Set default debug directory
 os.environ.setdefault("TORCH_NEURONX_DEBUG_DIR", "/tmp/neuron_backend")
 
+# Surface the neuronx-cc compiler version to C++ via env var so the persistent
+# NEFF cache key includes it (a compiler upgrade should bust cached NEFFs).
+# Read by utils::GetCompilerVersion() in PlatformUtils.cpp.
+if "NEURONXCC_VERSION" not in os.environ:
+    try:
+        import neuronxcc
+
+        os.environ["NEURONXCC_VERSION"] = getattr(neuronxcc, "__version__", "")
+    except Exception:
+        os.environ["NEURONXCC_VERSION"] = ""
+
 # Disable artifact preservation by default
 os.environ.setdefault("TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS", "0")
+
+# Enable NKI colz for intermediate NKI artifacts
+os.environ.setdefault("NKI_USE_COLZ", "1")
+
+# Enable NKI persistent cache
+os.environ.setdefault("NKI_ENABLE_TRACE_CACHE", "1")
 
 # Import and register neuron device
 try:
@@ -84,6 +174,11 @@ try:
 
     _C._register_device()
     _C._register_profiler()
+
+    # Initialize per-op int64 policy tables in C++ (lock-free after this).
+    from torch_neuronx.int64_policy import init_cpp_policy
+
+    init_cpp_policy()
 
     # Wrap neuron C extensions with torch._dynamo.disable since they can't be traced.
     import inspect
@@ -117,9 +212,13 @@ from .memory import (
     memory_allocated,
     memory_reserved,
     memory_stats,
+    memory_stats_as_nested_dict,
     memory_summary,
+    peak_memory_stats,
     reset_accumulated_memory_stats,
     reset_peak_memory_stats,
+    segment_pool_analysis,
+    segment_pool_analysis_summary,
 )
 
 # Import torch.compile metrics APIs
@@ -127,23 +226,34 @@ from .neuron_dynamo_backend.metrics import get_dynamo_metrics, reset_dynamo_metr
 
 # Import NKI kernel support
 from .nki_hop import nki_op, wrap_nki
-from .profiling import NeuronProfiler
+from .profiling import (
+    ContinuousExportConfig,
+    ExportStatus,
+    InspectExportMask,
+    NeuronConfig,
+    NeuronProfiler,
+    ProfileMode,
+    export_now,
+    request_export,
+)
 
 # Import stream and event classes
 from .streams import Event, Stream
 
-# Register neuron as a custom backend
-# This replaces PrivateUse1 with 'neuron'
-torch.utils.rename_privateuse1_backend("neuron")
+# Register neuron as a custom backend (Python side of the PrivateUse1 surface).
+# Skip if another backend already owns PrivateUse1 (imported first) — re-registering
+# would raise or shadow its device module/ops. Uses the frozen C++ snapshot shared
+# by both guards. See Coexistence.h.
+_should_register_device = not _C._privateuse1_owned_by_other()
 
-# Register the device module - this makes torch.neuron available
-torch._register_device_module("neuron", neuron)
+if _should_register_device:
+    torch.utils.rename_privateuse1_backend("neuron")
 
-# Generate standard methods for the neuron backend
-# This creates methods like tensor.neuron(), module.neuron(), etc.
-torch.utils.generate_methods_for_privateuse1_backend(
-    for_tensor=True, for_module=True, for_storage=True
-)
+    torch._register_device_module("neuron", neuron)
+
+    torch.utils.generate_methods_for_privateuse1_backend(
+        for_tensor=True, for_module=True, for_storage=True
+    )
 
 # Global state for lazy initialization
 _initialized = False
@@ -177,8 +287,15 @@ def _lazy_init():
         _original_pid = os.getpid()
         _initialized = True
 
+        # Set any seed set via manual_seed before runtime was ready
+        from torch_neuronx import neuron as _neuron_module
 
-def _after_fork(arg):
+        idx = _neuron_module.current_device()
+        gen = _C._get_default_generator(idx)
+        _neuron_module._set_device_rng_seed(gen.initial_seed())
+
+
+def _after_fork():
     """Mark that we're in a forked process where reinit is not allowed."""
     global _initialized, _is_in_bad_fork
     current_pid = os.getpid()
@@ -193,11 +310,16 @@ os.register_at_fork(after_in_child=_after_fork)
 # HLO persistent cache configuration (enabled by default, disable with TORCH_NEURONX_HLO_CACHE=0)
 os.environ.setdefault("TORCH_NEURONX_HLO_CACHE", "1")
 
-# Register Python operations first
-python_ops.register_python_operations()
+# Register Python operations (aten PrivateUse1 op impls). Skip if another backend
+# owns the device — ours would shadow its kernels and route to our uninitialized
+# runtime. Same guard as the device-module registration above.
+if _should_register_device:
+    python_ops.register_python_operations()
 
-# Tell C++ that Python ops are now registered
-_C._set_python_ops_registered(True)
+    _C._set_python_ops_registered(True)
+
+# Register neuron::nki_strided_copy_ custom op for packed int64 support
+import torch_neuronx.nki_strided_copy_op
 
 # Apply mesh registry patch for SPMD collective legalization
 # TODO: Remove this patch once PyTorch's compile_on_one_rank lands upstream
@@ -205,6 +327,11 @@ _C._set_python_ops_registered(True)
 from .distributed.mesh_registry import _apply_mesh_registry_patch
 
 _apply_mesh_registry_patch()
+
+# Make torch.random.fork_rng infer device_type from devices (no-op on torch >=2.13)
+from .random import _apply_fork_rng_patch
+
+_apply_fork_rng_patch()
 
 
 def is_neuron_runtime_initialized():
@@ -252,7 +379,7 @@ def get_device_properties(device):
         device_obj = torch.device(device)
         if device_obj.type != "neuron":
             raise ValueError(f"Expected neuron device, got {device_obj.type}")
-        device_id = device_obj.index if device_obj.index is not None else 0
+        device_id = device_obj.index if device_obj.index is not None else current_device()
     else:
         device_id = int(device)
 

@@ -4,7 +4,7 @@
 # Import memory module to enable torch.neuron.memory.* access
 import sys
 
-from torch_neuronx import memory  # noqa: F401
+import torch_neuronx.memory as memory  # noqa: F401
 
 
 def is_initialized() -> bool:
@@ -94,13 +94,20 @@ def _is_in_bad_fork() -> bool:
 
 
 def manual_seed_all(seed: int) -> None:
-    """Set seed for all neuron devices."""
+    """Set seed for all neuron devices.
+
+    Note: In distributed settings, device_count() may report more devices than
+    this process has generators for (e.g. after init_process_group restricts
+    visible cores), so iterate over the generator count instead.
+    """
     import torch_neuronx
 
     seed = int(seed)
-    for i in range(device_count()):
+    for i in range(torch_neuronx._C._get_default_generator_count()):
         default_generator = torch_neuronx._C._get_default_generator(i)
         default_generator.manual_seed(seed)
+    if is_initialized():
+        _set_device_rng_seed(seed)
 
 
 def manual_seed(seed: int) -> None:
@@ -111,6 +118,37 @@ def manual_seed(seed: int) -> None:
     idx = current_device()
     default_generator = torch_neuronx._C._get_default_generator(idx)
     default_generator.manual_seed(seed)
+    if is_initialized():
+        _set_device_rng_seed(seed)
+
+
+def _set_device_rng_seed(seed: int) -> None:
+    """Set the on-device GPSIMD RNG state from a scalar seed."""
+    import torch
+    from torch.utils._python_dispatch import _disable_current_modes
+
+    from torch_neuronx.python_ops.nki_kernels.rng_state import _has_nki_rng
+
+    if _has_nki_rng:
+        from torch_neuronx.python_ops.nki_kernels.rng_state import NUM_RNG_SEEDS, set_rng_state
+
+        # Seeding the device is host-side state management, not part of the
+        # computation, so it must stay invisible to an active dispatch or
+        # __torch_function__ mode. CUDA gets this for free because it seeds in
+        # C++; Neuron builds a seed tensor in Python, so a tracing or
+        # cross-reference mode captures it and .to("neuron") then raises
+        # "Cannot copy out of meta tensor; no data!". torch.manual_seed() reaches
+        # here through the PrivateUse1 hook, so every test that seeds before a
+        # random op hit that error.
+        # Both stacks must be off: _disable_current_modes() pops TorchDispatchMode
+        # only, and Tensor.to is intercepted through __torch_function__.
+        with _disable_current_modes(), torch._C.DisableTorchFunction():
+            # Cast to int32 until torch-mlir uint32 is there
+            state = torch.zeros(1, NUM_RNG_SEEDS, dtype=torch.uint32, device="cpu")
+            state[0][0] = seed & 0xFFFFFFFF
+            state = state.view(torch.int32).to("neuron")
+            set_rng_state(state)
+    # If nki rng is not available, no-op
 
 
 def seed() -> None:
@@ -127,7 +165,7 @@ def seed_all() -> None:
     import torch_neuronx
 
     random_seed = 0
-    for i in range(device_count()):
+    for i in range(torch_neuronx._C._get_default_generator_count()):
         default_generator = torch_neuronx._C._get_default_generator(i)
         if i == 0:
             default_generator.seed()
@@ -169,6 +207,9 @@ def get_rng_state(device=None):
     return default_generator.get_state()
 
 
+_last_seed_state = None
+
+
 def set_rng_state(state, device=None):
     """Set the RNG state for a Neuron device.
 
@@ -189,6 +230,17 @@ def set_rng_state(state, device=None):
         idx = current_device()
     default_generator = torch_neuronx._C._get_default_generator(idx)
     default_generator.set_state(state)
+
+    # Sync Philox state to CPU so fallback RNG ops respect DTensor's offset.
+    # Guard: skip when inside FakeTensorMode (e.g., DTensor sharding propagation
+    # with LocalTensorMode), as torch.manual_seed triggers clone() on the CPU
+    # RNG state tensor which FakeTensorMode rejects.
+    if torch._C._get_dispatch_mode(torch._C._TorchDispatchModeKey.FAKE) is None:
+        current_state = (default_generator.initial_seed(), default_generator.get_offset())
+        global _last_seed_state
+        if current_state != _last_seed_state:
+            _last_seed_state = current_state
+            torch._C.default_generator.manual_seed(current_state[0] ^ current_state[1])
 
 
 # Import device class from main module to avoid duplication
@@ -416,6 +468,50 @@ def empty_cache():
     import torch_neuronx
 
     torch_neuronx.empty_cache()
+
+
+def peak_memory_stats(device=None):
+    """Return peak memory stats snapshot captured at the all-time allocation peak.
+
+    Args:
+        device: Device index (optional)
+
+    Returns:
+        dict: Peak stats snapshot with allocated/reserved/active bytes at peak,
+              internal fragmentation, and OOM counters.
+    """
+    import torch_neuronx
+
+    return torch_neuronx.peak_memory_stats(device)
+
+
+def segment_pool_analysis(device=None):
+    """Compute segment pool fragmentation and efficiency metrics.
+
+    Args:
+        device: Device index (optional)
+
+    Returns:
+        dict: Analysis with fragmentation_index, memory_density,
+              largest_free, free_chunks, address_span, etc.
+    """
+    import torch_neuronx
+
+    return torch_neuronx.segment_pool_analysis(device)
+
+
+def segment_pool_analysis_summary(device=None):
+    """Return a formatted string of segment pool analysis.
+
+    Args:
+        device: Device index (optional)
+
+    Returns:
+        str: Formatted analysis summary
+    """
+    import torch_neuronx
+
+    return torch_neuronx.segment_pool_analysis_summary(device)
 
 
 def _sleep(cycles: int) -> None:

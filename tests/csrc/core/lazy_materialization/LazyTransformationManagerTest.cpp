@@ -15,7 +15,7 @@
 #include "torch_neuronx/csrc/core/NeuronTensorImpl.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.h"
-#include "torch_neuronx/csrc/core/lazy_materialization/OperationPrologue.h"
+#include "torch_neuronx/csrc/core/lazy_materialization/OperationTransformations.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/TransformationTypes.h"
 
 using namespace torch_neuronx::testing;
@@ -132,6 +132,14 @@ class LazyTransformationManagerTest : public ::testing::Test {
     mock_session_ = std::make_unique<torch_neuronx::testing::MockNRTSession>();
     mock_nrt_ = torch_neuronx::testing::MockNRT::GetInstance();
     ::testing::Mock::VerifyAndClearExpectations(mock_nrt_);
+
+    // Mock NRT instance info for CompilationCacheKey construction
+    nrt_instance_info_t info{};
+    info.family = NRT_INSTANCE_TRN3;
+    EXPECT_CALL(*mock_nrt_, nrt_get_instance_info(::testing::_, ::testing::_))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly(
+            ::testing::DoAll(::testing::SetArgPointee<0>(info), ::testing::Return(NRT_SUCCESS)));
 
     // Clear caches before each test
     LazyTransformationManager::ClearMergedOperationCache();

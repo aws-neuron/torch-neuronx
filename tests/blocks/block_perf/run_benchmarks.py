@@ -459,8 +459,8 @@ def collect_memory_stats(device_name):
 
     stats = torch_neuronx.memory_stats()
     memory_stats = {
-        "allocated_bytes_current": stats["allocated_bytes"]["current"],
-        "allocated_bytes_peak": stats["allocated_bytes"]["peak"],
+        "allocated_bytes_current": stats["allocated_bytes.all.current"],
+        "allocated_bytes_peak": stats["allocated_bytes.all.peak"],
         "num_alloc_retries": stats["num_alloc_retries"],
         "num_ooms": stats["num_ooms"],
     }
@@ -488,18 +488,22 @@ def print_performance_metrics(timings, total_flops, device_name, forward_only=Tr
 
     # Calculate statistics
     avg_time = np.mean(timings)
+    median_time = np.median(timings)
     std_time = np.std(timings)
     min_time = np.min(timings)
     max_time = np.max(timings)
 
     printf("\nExecution Time Statistics:")
+    printf(f"  Median: {median_time:.2f} ms")
     printf(f"  Average: {avg_time:.2f} ms")
     printf(f"  Std Dev: {std_time:.2f} ms")
     printf(f"  Min: {min_time:.2f} ms")
     printf(f"  Max: {max_time:.2f} ms")
 
-    # Calculate throughput
-    flops_per_sec = total_flops / (avg_time / 1000)
+    # Use the median iteration time: robust to rare host-side scheduling stalls
+    # that spike a single iteration, unlike the mean. Iterations are host-timed
+    # around a device sync, so a descheduled host thread inflates that sample.
+    flops_per_sec = total_flops / (median_time / 1000)
     tflops = flops_per_sec / 1e12
 
     operation_type = "forward pass" if forward_only else "forward+loss+backward"
@@ -523,6 +527,7 @@ def print_performance_metrics(timings, total_flops, device_name, forward_only=Tr
 
     return {
         "avg_time_ms": avg_time,
+        "median_time_ms": median_time,
         "std_time_ms": std_time,
         "min_time_ms": min_time,
         "max_time_ms": max_time,
@@ -551,6 +556,7 @@ def benchmark_block(
     with_optimizer=False,
     neuron_profile=False,
     with_stack=False,
+    exec_mode="eager",
 ):
     """
     Generic benchmark function for transformer blocks.
@@ -596,6 +602,7 @@ def benchmark_block(
         if with_optimizer:
             mode_str += " + Optimizer"
     printf(f"  Mode: {mode_str}")
+    printf(f"  Execution: {exec_mode}")
     printf(f"  Warmup runs: {warmup_runs}")
     printf(f"  Benchmark runs: {benchmark_runs}")
 
@@ -619,6 +626,9 @@ def benchmark_block(
         block = StackedBlocks(
             block_module.create_block, n_layers, config, device, dtype, tp_mesh, dp_mesh
         )
+
+    if exec_mode == "compile":
+        block = torch.compile(block, backend="neuron")
 
     # Create input tensor
     if block_type == "qwen3":
@@ -765,6 +775,7 @@ def main():
             "rms_norm",
             "rope",
             "mixtral_moe",
+            "moe_dynamic",
         ],
     )
     args_temp, _ = parser_temp.parse_known_args()
@@ -792,6 +803,7 @@ def main():
             "gpt_oss_transformer",
             "rope",
             "mixtral_moe",
+            "moe_dynamic",
         ],
         help="Block type to benchmark (default: llama)",
     )
@@ -917,6 +929,14 @@ def main():
         help="Enable NeuronMetrics collection and print full metrics/op-tracking report",
     )
 
+    parser.add_argument(
+        "--exec_mode",
+        type=str,
+        default="eager",
+        choices=["eager", "compile"],
+        help="Execution mode: eager (default) or compile",
+    )
+
     # Parse all arguments
     args = parser.parse_args()
     setup_distributed(args.device)
@@ -973,6 +993,7 @@ def main():
         with_optimizer=args.with_optimizer,
         neuron_profile=args.neuron_profile,
         with_stack=args.with_stack,
+        exec_mode=args.exec_mode,
     )
 
     # Save results if requested
@@ -982,6 +1003,7 @@ def main():
         output_data = {
             "block_type": args.block,
             "device": args.device,
+            "exec_mode": args.exec_mode,
             "results": {
                 "config": results["config"],
                 "mode": results.get("mode"),

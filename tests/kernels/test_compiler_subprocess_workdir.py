@@ -193,8 +193,8 @@ class TestCompileHloProtobufToNeffWorkdir:
                     sample_hlo, mock_config, "lnc1"
                 )
 
-            # Verify HLO file was created with correct content
-            hlo_file = glob.glob(str(workdir) + "/neuronx-cc/*/module.hlo.pb")
+            # Verify MLIR file was created with correct content
+            hlo_file = glob.glob(str(workdir) + "/neuronx-cc/*/module.mlir")
 
             assert hlo_file
             assert Path(hlo_file[0]).read_bytes() == sample_hlo
@@ -228,9 +228,7 @@ class TestCompileHloProtobufToNeffWorkdir:
 
             # Verify MLIR file was created (not HLO)
             mlir_file = glob.glob(str(workdir) + "/neuronx-cc/*/module.mlir")
-            hlo_file = glob.glob(str(workdir) + "/neuronx-cc/*/module.hlo.pb")
             assert mlir_file
-            assert not hlo_file
             assert Path(mlir_file[0]).read_bytes() == sample_hlo
             assert result == expected_neff
 
@@ -259,7 +257,7 @@ class TestCompileHloProtobufToNeffWorkdir:
             # Verify run_neuronx_cc was called with correct arguments
             args, _ = mock_run_neuronx_cc.call_args
             assert args[0] == mock_config
-            assert args[1] == "module.hlo.pb"  # Input file name (relative)
+            assert args[1] == "module.mlir"  # Input file name (relative)
             assert args[2] == "module.neff"  # Output file name (relative)
             assert args[3] == "lnc_override"
             assert re.match(str(workdir) + "/neuronx-cc/[a-f0-9]+", args[4])
@@ -345,8 +343,8 @@ class TestCompileHloProtobufToNeffWorkdir:
             # Verify symlink is followed
             assert symlink_path.exists()
             assert symlink_path.is_symlink()
-            # HLO file should be created in actual directory via symlink
-            hlo_file = glob.glob(str(symlink_path) + "/neuronx-cc/*/module.hlo.pb")
+            # MLIR file should be created in actual directory via symlink
+            hlo_file = glob.glob(str(symlink_path) + "/neuronx-cc/*/module.mlir")
             assert hlo_file
             assert result == expected_neff
 
@@ -375,7 +373,7 @@ class TestCompileHloProtobufToNeffWorkdir:
                     )
 
                 # Verify files created in current directory
-                hlo_file = glob.glob(str(workdir) + "/neuronx-cc/*/module.hlo.pb")
+                hlo_file = glob.glob(str(workdir) + "/neuronx-cc/*/module.mlir")
                 assert hlo_file
                 assert result == expected_neff
             finally:

@@ -1,0 +1,153 @@
+{
+  "description": "Test distribution config. Each entry is a logical unit assigned to one or more nodes. Paths are relative to tests/pytorch_tests_native/test/.",
+  "nodes": [
+    {
+      "ignore": [
+        "distributed/fsdp",
+        "distributed/tensor",
+        "distributed/_composable",
+        "distributed/pipelining"
+      ],
+      "items": [
+        "distributed"
+      ],
+      "num_workers": 8
+    },
+    {
+      "items": [
+        "distributed/fsdp"
+      ],
+      "num_workers": 8
+    },
+    {
+      "items": [
+        "distributed/tensor"
+      ],
+      "num_shards": 2,
+      "num_workers": 8
+    },
+    {
+      "items": [
+        "distributed/_composable"
+      ],
+      "num_workers": 8
+    },
+    {
+      "items": [
+        "distributed/pipelining"
+      ],
+      "num_workers": 8
+    },
+    {
+      "items": [
+        "dynamo"
+      ]
+    },
+    {
+      "items": [
+        "profiler"
+      ]
+    },
+    {
+      "items": [
+        "test_ops.py"
+      ],
+      "num_shards": 2
+    },
+    {
+      "items": [
+        "test_meta.py"
+      ]
+    },
+    {
+      "items": [
+        "test_decomp.py"
+      ],
+      "num_shards": 2
+    },
+    {
+      "items": [
+        "test_ops_gradients.py",
+        "test_ops_fwd_gradients.py"
+      ]
+    },
+    {
+      "items": [
+        "test_foreach.py"
+      ]
+    },
+    {
+      "items": [
+        "test_unary_ufuncs.py",
+        "test_binary_ufuncs.py"
+      ]
+    },
+    {
+      "items": [
+        "test_linalg.py",
+        "nn",
+        "test_reductions.py",
+        "test_torch.py"
+      ]
+    },
+    {
+      "items": [
+        "test_nn.py",
+        "test_optim.py",
+        "test_modules.py"
+      ]
+    },
+    {
+      "items": [
+        "test_autograd.py",
+        "test_content_store.py",
+        "test_indexing.py",
+        "test_native_mha.py",
+        "test_numpy_interop.py",
+        "test_prims.py",
+        "test_python_dispatch.py",
+        "test_scatter_gather_ops.py",
+        "test_serialization.py",
+        "test_shape_ops.py",
+        "test_sort_and_select.py",
+        "test_tensor_creation_ops.py",
+        "test_testing.py",
+        "test_type_promotion.py",
+        "test_utils.py",
+        "test_view_ops.py",
+        "test_transformers.py",
+        "test_accelerator.py",
+        "test_dataloader.py"
+      ]
+    },
+    {
+      "items": [
+        "test_as_strided.py",
+        "test_autograd_fallback.py",
+        "test_autoload.py",
+        "test_bmm_outer_product.py",
+        "test_flop_counter.py",
+        "test_functional_optim.py",
+        "test_module_tracker.py",
+        "test_stateless.py",
+        "test_subclass.py",
+        "test_tensor_iterator.py",
+        "test_torchfuzz_repros.py",
+        "test_type_info.py"
+      ]
+    },
+    {
+      "comment": "Auto-discovery node. Runs every file not covered by dedicated nodes above and not in the blocklist. Automatically excludes all items listed in other nodes -- no manual sync needed. New upstream test files are picked up here on the next clone without any config change. soft_fail=true so failures in newly discovered tests do not block CI.",
+      "items": [
+        "torch_test_root_files"
+      ],
+      "soft_fail": true
+    },
+    {
+      "items": [
+        "tests/pytorch_tests_native/neuron_compile_ops/test_neuron_compile_ops.py"
+      ],
+      "num_shards": 2
+    }
+  ]
+}

@@ -7,13 +7,75 @@ import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import get_cache_size
+from tests.utils.neuron_test_utils import (
+    assert_op_runs_on_neuron,
+    get_cache_size,
+    track_neuron_ops,
+)
+
+_CPP_DISPATCH = os.environ.get("TORCH_NEURONX_CPP_DISPATCH", "1") == "1"
 
 
 @pytest.mark.usefixtures("enable_metrics_for_class")
 class TestContiguousTranspose:
     """Test class for contiguous transpose operations"""
 
+    # ── New tests: work with both Python and C++ dispatch paths ──
+
+    def test_contiguous_transpose_runs_on_neuron(self):
+        """Transpose contiguous should run on Neuron, not CPU fallback."""
+        with track_neuron_ops():
+            x = torch.randn(128, 256, device="neuron")
+            y_view = x.transpose(0, 1)
+            y = y_view.contiguous()
+
+            assert y.is_contiguous()
+            assert y.shape == (256, 128)
+            assert torch.allclose(y, y_view)
+            assert_op_runs_on_neuron("aten::contiguous")
+
+    @pytest.mark.xfail(
+        reason="stride-2 slices use contiguous_generic_kernel (CPU fallback) — not a Neuron op",
+    )
+    def test_contiguous_non_permutation_runs_on_neuron(self):
+        """Non-permutation contiguous should run on Neuron, not CPU fallback."""
+        with track_neuron_ops():
+            x_cpu = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+            x = x_cpu.to("neuron")
+            y = x[:, ::2]
+            assert not y.is_contiguous()
+
+            z = y.contiguous()
+            assert z.is_contiguous()
+            assert torch.allclose(z, y)
+            assert_op_runs_on_neuron("aten::contiguous")
+
+    def test_different_permutations_produce_correct_results(self):
+        """Different permutations should each produce correct results."""
+        with track_neuron_ops():
+            base_tensor = torch.arange(
+                1 * 64 * 32 * 128, dtype=torch.bfloat16, device="neuron"
+            ).reshape(1, 64, 32, 128)
+
+            view_1 = base_tensor.permute(0, 2, 3, 1)
+            result_1 = view_1.contiguous()
+            expected_1 = base_tensor.cpu().permute(0, 2, 3, 1).contiguous()
+            assert torch.allclose(result_1.cpu(), expected_1)
+
+            view_2 = base_tensor.permute(0, 2, 1, 3)
+            result_2 = view_2.contiguous()
+            expected_2 = base_tensor.cpu().permute(0, 2, 1, 3).contiguous()
+            assert torch.allclose(result_2.cpu(), expected_2)
+
+            assert_op_runs_on_neuron("aten::contiguous")
+
+    # ── Original tests: monkeypatch _get_kernel, only work without C++ dispatch ──
+
+    @pytest.mark.skipif(
+        _CPP_DISPATCH,
+        reason="Monkepatching _get_kernel returns a plain "
+        "function that lacks lower/infer_output_dtypes needed by C++ dispatch",
+    )
     def test_contiguous_transpose_uses_mlir_kernel(self, monkeypatch):
         """Transpose case should use the transpose kernel (MLIR), not the generic copy."""
         from torch_neuronx.python_ops import contiguous as contiguous_mod
@@ -59,6 +121,11 @@ class TestContiguousTranspose:
         assert transpose_called["count"] >= 1, "Expected MLIR transpose kernel to be invoked"
         assert generic_called["count"] == 0, "Generic fallback should not be used for transpose"
 
+    @pytest.mark.skipif(
+        _CPP_DISPATCH,
+        reason="Monkepatching _get_kernel returns a plain "
+        "function that lacks lower/infer_output_dtypes needed by C++ dispatch",
+    )
     def test_contiguous_non_permutation_uses_generic(self, monkeypatch):
         """Non-permutation view should use generic path, NOT MLIR transpose kernel"""
         from torch_neuronx.python_ops import contiguous as contiguous_mod
@@ -107,6 +174,8 @@ class TestContiguousTranspose:
         ), "MLIR transpose kernel should not be used for non-permutation"
         assert generic_called["count"] >= 1, "Generic fallback should handle non-permutation views"
 
+    # ── Remaining tests: no monkeypatching, work with both paths ──
+
     def test_contiguous_transpose_2d_and_autograd(self):
         """2D transpose path should preserve values and gradients."""
         x = torch.randn(128, 256, device="neuron")
@@ -118,7 +187,9 @@ class TestContiguousTranspose:
         assert torch.allclose(y, y_view)
 
         xg = torch.randn(128, 256, device="neuron", requires_grad=True)
-        yg = xg.transpose(0, 1).contiguous()
+        t_view = xg.transpose(0, 1)
+        yg = t_view.contiguous()
+
         yg.retain_grad()
         yg.sum().backward()
 
@@ -172,6 +243,11 @@ class TestContiguousTranspose:
         yg.sum().backward()
         assert xg.grad is not None and torch.allclose(xg.grad.cpu(), torch.ones_like(xg).cpu())
 
+    @pytest.mark.skipif(
+        _CPP_DISPATCH,
+        reason="Monkepatching _get_kernel returns a plain "
+        "function that lacks lower/infer_output_dtypes needed by C++ dispatch",
+    )
     def test_incorrect_fallback_to_generic_kernel(self, monkeypatch):
         """Test incorrect fallback to generic kernel"""
         from torch_neuronx.python_ops.contiguous_transpose import ContiguousTransposeMLIRImpl
@@ -185,9 +261,9 @@ class TestContiguousTranspose:
             kernel = orig_get_kernel(self)
 
             def wrapper(*args, **kwargs):
-                orig_cache_size = get_cache_size(kernel)
+                orig_cache_size = get_cache_size()
                 result = kernel(*args, **kwargs)
-                updated_cache_size = get_cache_size(kernel)
+                updated_cache_size = get_cache_size()
                 if updated_cache_size > orig_cache_size:
                     compile_called["count"] += 1
                 return result

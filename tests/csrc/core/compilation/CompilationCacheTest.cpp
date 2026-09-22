@@ -6,6 +6,7 @@
 #include <thread>
 #include <vector>
 
+#include "tests/csrc/mocks/MockNRT.h"
 #include "tests/csrc/mocks/MockNeuronDevice.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
@@ -14,7 +15,9 @@
 
 using namespace at::neuron;
 using ::testing::_;
+using ::testing::DoAll;
 using ::testing::Return;
+using ::testing::SetArgPointee;
 
 class MockNeuronKernelExecution : public CompilableKernelExecution {
  public:
@@ -26,8 +29,12 @@ class MockNeuronKernelExecution : public CompilableKernelExecution {
 
   static void ResetCompileCounter() { GetCompileCounter().store(0); }
 
-  MockNeuronKernelExecution(const std::string& cache_key)
-      : CompilableKernelExecution(cache_key, "", "", false), hlo_bytes_({'H', 'L', 'O', '_'}) {
+  MockNeuronKernelExecution(const std::string& cache_key, bool wlo_enabled = false)
+      // WLO identity rides on the "|wlo" suffix of the base key, which CompilationCacheKey infers.
+      : CompilableKernelExecution(CompilationCacheKey(wlo_enabled ? cache_key + "|wlo" : cache_key,
+                                                      "", "", nullptr, CacheKeySource::UNKNOWN),
+                                  "", "", false),
+        hlo_bytes_({'H', 'L', 'O', '_'}) {
     hlo_bytes_.insert(hlo_bytes_.end(), cache_key.begin(), cache_key.end());
     GetCompilationCacheKey().SetHloBytesPtr(&hlo_bytes_);
   }
@@ -46,7 +53,7 @@ class MockNeuronKernelExecution : public CompilableKernelExecution {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     // Return dummy NEFF data based on cache key for uniqueness
     std::vector<uint8_t> neff_data;
-    std::string neff_content = "NEFF_" + GetCacheKey() + "_" + GetAdditionalArgs();
+    std::string neff_content = "NEFF_" + GetCompileKey() + "_" + GetAdditionalArgs();
     neff_data.assign(neff_content.begin(), neff_content.end());
     return neff_data;
   }
@@ -62,7 +69,17 @@ class MockNeuronKernelExecution : public CompilableKernelExecution {
 
 class CompilationCacheTest : public ::testing::Test {
  protected:
+  torch_neuronx::testing::MockNRTSession mock_session_;
+  torch_neuronx::testing::MockNRT* mock_nrt_ = torch_neuronx::testing::MockNRT::GetInstance();
+
   void SetUp() override {
+    // Mock NRT instance info for CompilationCacheKey construction
+    nrt_instance_info_t info{};
+    info.family = NRT_INSTANCE_TRN3;
+    EXPECT_CALL(*mock_nrt_, nrt_get_instance_info(_, _))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly(DoAll(SetArgPointee<0>(info), Return(NRT_SUCCESS)));
+
     // Enable metrics for testing
     at::neuron::metrics::SetMetricsEnabled(true);
 
@@ -71,9 +88,15 @@ class CompilationCacheTest : public ::testing::Test {
     SaveEnvVar("TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR");
     SaveEnvVar("TORCH_NEURONX_NEFF_DISABLE_CACHE");
     SaveEnvVar("NEURON_COMPILE_SERVICE");
+    SaveEnvVar("TORCH_NEURONX_NEFF_KEY_FROM_HLO");
 
     // Force local backend for unit tests (service backend calls real neuronx-cc)
     setenv("NEURON_COMPILE_SERVICE", "0", 1);
+
+    // Pin the HLO-content keying flag on for these tests. The graceful-skip
+    // and cross-commit-reuse cases below assert the new contract; the legacy
+    // (flag-off) path is exercised in CompilationCacheKeyLegacyKeyTest.
+    setenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "1", 1);
 
     // Create temp directories for persistent and local cache
     temp_dir_ = std::make_unique<TempDirectory>("compilation_cache_test_");
@@ -107,9 +130,11 @@ class CompilationCacheTest : public ::testing::Test {
     for (const auto& [name, value] : saved_env_vars_) {
       setenv(name.c_str(), value.c_str(), 1);
     }
-    // Unset any vars that weren't originally set
+    // Unset any vars that weren't originally set. Every name that SetUp() saves must
+    // appear here, or SetUp()'s value leaks into a later suite in the same binary.
     for (const char* name : {"TORCH_NEURONX_NEFF_CACHE_DIR", "TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR",
-                             "TORCH_NEURONX_NEFF_DISABLE_CACHE"}) {
+                             "TORCH_NEURONX_NEFF_DISABLE_CACHE", "NEURON_COMPILE_SERVICE",
+                             "TORCH_NEURONX_NEFF_KEY_FROM_HLO"}) {
       if (saved_env_vars_.find(name) == saved_env_vars_.end()) {
         unsetenv(name);
       }
@@ -249,14 +274,29 @@ TEST_F(CompilationCacheTest, ConcurrentAccess) {
 
 class LimitedCompilationCacheTest : public ::testing::Test {
  protected:
+  torch_neuronx::testing::MockNRTSession mock_session_;
+  torch_neuronx::testing::MockNRT* mock_nrt_ = torch_neuronx::testing::MockNRT::GetInstance();
+
   void SetUpWithLimits(size_t max_entries, size_t max_size_mb) {
+    // Mock NRT instance info for CompilationCacheKey construction
+    nrt_instance_info_t info{};
+    info.family = NRT_INSTANCE_TRN3;
+    EXPECT_CALL(*mock_nrt_, nrt_get_instance_info(_, _))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly(DoAll(SetArgPointee<0>(info), Return(NRT_SUCCESS)));
+
     // Save original environment variables
     SaveEnvVar("NEURON_COMPILATION_CACHE_MAX_SIZE_MB");
     SaveEnvVar("NEURON_COMPILATION_CACHE_MAX_ENTRIES");
     SaveEnvVar("TORCH_NEURONX_NEFF_DISABLE_CACHE");
+    SaveEnvVar("NEURON_COMPILE_SERVICE");
 
     // Disable persistent caching for in-memory cache tests
     setenv("TORCH_NEURONX_NEFF_DISABLE_CACHE", "true", 1);
+
+    // Force the local backend. The mock kernels return dummy NEFF bytes, so the
+    // service backend would send the dummy IR to the real neuronx-cc and fail.
+    setenv("NEURON_COMPILE_SERVICE", "0", 1);
 
     // Set test-specific limits
     setenv("NEURON_COMPILATION_CACHE_MAX_ENTRIES", std::to_string(max_entries).c_str(), 1);
@@ -283,10 +323,11 @@ class LimitedCompilationCacheTest : public ::testing::Test {
     for (const auto& [name, value] : saved_env_vars_) {
       setenv(name.c_str(), value.c_str(), 1);
     }
-    // Unset any vars that weren't originally set
+    // Unset any vars that weren't originally set. Every name that SetUpWithLimits()
+    // saves must appear here, or its value leaks into a later suite in the same binary.
     for (const char* name :
          {"NEURON_COMPILATION_CACHE_MAX_SIZE_MB", "NEURON_COMPILATION_CACHE_MAX_ENTRIES",
-          "TORCH_NEURONX_NEFF_DISABLE_CACHE"}) {
+          "TORCH_NEURONX_NEFF_DISABLE_CACHE", "NEURON_COMPILE_SERVICE"}) {
       if (saved_env_vars_.find(name) == saved_env_vars_.end()) {
         unsetenv(name);
       }
@@ -1676,7 +1717,7 @@ TEST_F(CompilationCacheTest, FileLockWithSlowCompilation) {
       // Simulate long compilation (200ms)
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       std::vector<uint8_t> neff_data;
-      std::string content = "SLOW_NEFF_" + GetCacheKey();
+      std::string content = "SLOW_NEFF_" + GetCompileKey();
       neff_data.assign(content.begin(), content.end());
       return neff_data;
     }
@@ -1783,7 +1824,7 @@ TEST_F(CompilationCacheTest, FileLocksReadFromCacheAfterFirstCompile) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
       done_flag_ = true;
       std::vector<uint8_t> neff_data;
-      std::string content = "FIRST_COMPILE_" + GetCacheKey();
+      std::string content = "FIRST_COMPILE_" + GetCompileKey();
       neff_data.assign(content.begin(), content.end());
       return neff_data;
     }
@@ -2279,6 +2320,274 @@ TEST_F(CompilationCacheTest, AsyncErrorStashedOnKernel) {
   EXPECT_TRUE(kernel.IsFailedCompilation());
   EXPECT_THAT(kernel.GetCompilationError(), ::testing::HasSubstr("neuronx-cc: unsupported op xyz"));
 }
+
+// ============================================================================
+// Tests for graceful-skip behavior when HLO bytes are not available.
+// Simulates NeffDirectKernelExecution-style paths where persistent caching
+// is intentionally disabled.
+// ============================================================================
+
+class NoHloKernelExecution : public CompilableKernelExecution {
+ public:
+  static std::atomic<int>& GetCompileCounter() {
+    static std::atomic<int> compile_counter{0};
+    return compile_counter;
+  }
+
+  static void ResetCompileCounter() { GetCompileCounter().store(0); }
+
+  explicit NoHloKernelExecution(const std::string& cache_key)
+      : CompilableKernelExecution(cache_key, "", "", false) {
+    // Intentionally do NOT call SetHloBytesPtr — persistent key is unavailable.
+  }
+
+  std::vector<uint8_t> CompileToNeff() const override {
+    GetCompileCounter()++;
+    std::string neff_content = "NEFF_NO_HLO_" + GetCompileKey();
+    return std::vector<uint8_t>(neff_content.begin(), neff_content.end());
+  }
+
+  // Returning empty matches the contract for paths without HLO.
+  const std::vector<uint8_t>& GetHloBytes() const override {
+    static const std::vector<uint8_t> empty;
+    return empty;
+  }
+};
+
+TEST_F(CompilationCacheTest, GracefulSkip_NoHloBytesCompilesWithoutCrash) {
+  // Without HLO bytes, GetPersistentKey() returns nullptr. Cache must
+  // fall through to in-memory-only mode, compile the kernel, and cache
+  // it without dereferencing the null persistent key.
+  NoHloKernelExecution::ResetCompileCounter();
+  NoHloKernelExecution kernel("no_hlo_key_1");
+
+  // Sanity: persistent key really is unavailable.
+  EXPECT_EQ(kernel.GetCompilationCacheKey().GetPersistentKey(), nullptr);
+
+  cache_->GetOrCompileNeff(kernel, /*stream_id=*/1);
+
+  EXPECT_TRUE(kernel.HasCachedNeff());
+  EXPECT_FALSE(kernel.GetCachedNeff().empty());
+  EXPECT_EQ(NoHloKernelExecution::GetCompileCounter().load(), 1);
+}
+
+TEST_F(CompilationCacheTest, GracefulSkip_NoHloBytesHitsInMemoryCache) {
+  // Even without persistent cache backing, in-memory cache should still
+  // dedupe on base_key — second lookup should not trigger a recompile.
+  NoHloKernelExecution::ResetCompileCounter();
+
+  NoHloKernelExecution k1("no_hlo_key_2");
+  cache_->GetOrCompileNeff(k1, /*stream_id=*/1);
+  EXPECT_EQ(NoHloKernelExecution::GetCompileCounter().load(), 1);
+
+  NoHloKernelExecution k2("no_hlo_key_2");
+  cache_->GetOrCompileNeff(k2, /*stream_id=*/1);
+  EXPECT_EQ(NoHloKernelExecution::GetCompileCounter().load(), 1);  // no recompile
+  EXPECT_EQ(k1.GetCachedNeff(), k2.GetCachedNeff());
+}
+
+TEST_F(CompilationCacheTest, GracefulSkip_NoHloBytesNotPersistedAcrossCacheInstances) {
+  // Without HLO bytes, the persistent cache layer is bypassed, so a fresh
+  // CompilationCache instance does NOT see the previously-compiled NEFF.
+  // This documents the cost of the graceful-skip path: in-memory only.
+  NoHloKernelExecution::ResetCompileCounter();
+
+  NoHloKernelExecution k1("no_hlo_key_3");
+  cache_->GetOrCompileNeff(k1, /*stream_id=*/1);
+  EXPECT_EQ(NoHloKernelExecution::GetCompileCounter().load(), 1);
+
+  // New cache instance — sharing the same persistent dir, but persistent
+  // cache wasn't populated for this kernel.
+  auto fresh_cache = std::make_unique<CompilationCache>();
+  NoHloKernelExecution k2("no_hlo_key_3");
+  fresh_cache->GetOrCompileNeff(k2, /*stream_id=*/1);
+  EXPECT_EQ(NoHloKernelExecution::GetCompileCounter().load(), 2);  // recompiled
+}
+
+TEST_F(CompilationCacheTest, KeyHint_NoHloKernelResolvesPersistentKeyFromCompileStep) {
+  // NeffDirectKernelExecution carries no IR, so it cannot compute the content key.
+  // The compile step records base_key -> persistent_key. A later IR-less execution
+  // with the same base_key must resolve that key and read the NEFF from disk.
+  MockNeuronKernelExecution::ResetCompileCounter();
+  NoHloKernelExecution::ResetCompileCounter();
+  const std::string base_key = "shared_base_key_for_hint";
+
+  // Compile with IR. This writes the NEFF to disk and records the hint.
+  // Scope the kernel: it holds the NEFF pointer, which keeps the entry active and
+  // therefore not evictable.
+  std::vector<uint8_t> compiled_neff;
+  {
+    MockNeuronKernelExecution with_hlo(base_key);
+    cache_->GetOrCompileNeff(with_hlo, /*stream_id=*/1);
+    EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+    compiled_neff = with_hlo.GetCachedNeff();
+  }
+
+  // Drop the NEFF but keep the hint, which is what LRU eviction does.
+  EXPECT_EQ(cache_->EvictLruEntries(/*target_entries=*/0), 1u);
+
+  // The IR-less kernel must not reach CompileToNeff().
+  NoHloKernelExecution no_hlo(base_key);
+  EXPECT_EQ(no_hlo.GetCompilationCacheKey().GetPersistentKey(), nullptr);
+  cache_->GetOrCompileNeff(no_hlo, /*stream_id=*/1);
+
+  EXPECT_TRUE(no_hlo.HasCachedNeff());
+  EXPECT_EQ(NoHloKernelExecution::GetCompileCounter().load(), 0);
+  EXPECT_EQ(no_hlo.GetCachedNeff(), compiled_neff);
+}
+
+TEST_F(CompilationCacheTest, CrossCommitReuse_SameHloDifferentBaseKeyHitsPersistentCache) {
+  // The cross-commit reuse scenario: two kernels with different base_keys
+  // (simulating a Python source edit that bumped global_version_hash) but
+  // identical HLO bytes. After the first compile populates the persistent
+  // cache, a fresh CompilationCache instance should see the entry via the
+  // HLO-content-derived persistent key.
+  MockNeuronKernelExecution::ResetCompileCounter();
+  std::vector<uint8_t> shared_hlo = {0x42, 0x42, 0x42, 0x42};
+
+  // First "commit": base_key v1, populates persistent cache.
+  MockNeuronKernelExecution k1("base_key_v1_pre_edit", shared_hlo);
+  cache_->GetOrCompileNeff(k1, /*stream_id=*/1);
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+
+  // Second "commit" simulated via fresh cache (clears in-memory state).
+  // Different base_key but same HLO → persistent key matches → cache hit.
+  auto fresh_cache = std::make_unique<CompilationCache>();
+  MockNeuronKernelExecution k2("base_key_v2_post_edit", shared_hlo);
+  fresh_cache->GetOrCompileNeff(k2, /*stream_id=*/1);
+
+  // No new compile — persistent cache served the previous NEFF.
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+  EXPECT_TRUE(k2.HasCachedNeff());
+}
+
+// WLO mock kernel: advertises RequiresWrappedNeffHlo and emits a wrapped_neff.hlo
+// sidecar of a configurable size alongside the (base-class) NEFF, so we can assert
+// the sidecar is stored on the cache entry and counted in memory accounting.
+class WloMockKernelExecution : public MockNeuronKernelExecution {
+ public:
+  WloMockKernelExecution(const std::string& cache_key, size_t sidecar_size)
+      : MockNeuronKernelExecution(cache_key, /*wlo_enabled=*/true), sidecar_size_(sidecar_size) {}
+
+  bool RequiresWrappedNeffHlo() const override { return true; }
+  CompileResult CompileToNeffResult() const override {
+    return CompileResult{CompileToNeff(), std::vector<uint8_t>(sidecar_size_, 0xAB)};
+  }
+
+ private:
+  size_t sidecar_size_;
+};
+
+TEST_F(CompilationCacheTest, WrappedNeffHloIsStoredAndCounted) {
+  // A WLO compile stores the wrapped_neff.hlo sidecar on the cache entry...
+  WloMockKernelExecution wlo_kernel("wlo_key", /*sidecar_size=*/4096);
+  cache_->GetOrCompileNeff(wlo_kernel, /*stream_id=*/1);
+
+  auto entry = cache_->GetEntry(wlo_kernel.GetCompileKey());
+  ASSERT_NE(entry, nullptr);
+  EXPECT_EQ(entry->wrapped_neff_hlo.size(), 4096u);
+
+  // ...and that sidecar counts toward the cache's memory footprint. Compare against
+  // a fresh cache holding a non-WLO entry with the SAME NEFF (identical cache key ->
+  // identical MockNeuronKernelExecution NEFF bytes), whose sidecar is empty. The only
+  // difference is the 4096-byte sidecar, so the WLO cache must report more memory.
+  auto plain_cache = std::make_unique<CompilationCache>();
+  MockNeuronKernelExecution plain_kernel("wlo_key");
+  plain_cache->GetOrCompileNeff(plain_kernel, /*stream_id=*/1);
+
+  EXPECT_GT(cache_->GetMemoryUsageBytes(), plain_cache->GetMemoryUsageBytes());
+}
+
+TEST_F(CompilationCacheTest, ZeroTransformWloHitsPersistentCacheAcrossInstances) {
+  // A WLO compile that yields NO transforms (empty wrapped_neff.hlo) must still be a
+  // cacheable positive — a fresh process must hit the persistent cache, not recompile every
+  // run. The version-tagged sidecar marker is what makes the empty case distinguishable from
+  // "sidecar missing".
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  WloMockKernelExecution k1("zero_xform_wlo", /*sidecar_size=*/0);
+  cache_->GetOrCompileNeff(k1, /*stream_id=*/1);
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+  auto e1 = cache_->GetEntry(k1.GetCompileKey());
+  ASSERT_NE(e1, nullptr);
+  EXPECT_TRUE(e1->wrapped_neff_hlo.empty());  // zero transforms
+
+  // Fresh instance on the same persistent dir simulates a new process.
+  auto fresh_cache = std::make_unique<CompilationCache>();
+  WloMockKernelExecution k2("zero_xform_wlo", /*sidecar_size=*/0);
+  fresh_cache->GetOrCompileNeff(k2, /*stream_id=*/1);
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);  // hit, no recompile
+  EXPECT_TRUE(k2.HasCachedNeff());
+}
+
+TEST_F(CompilationCacheTest, WloSidecarRecoveredAcrossInstances) {
+  // A WLO compile with N transforms persists the sidecar; a fresh process recovers the
+  // exact payload (version marker stripped) without recompiling.
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  WloMockKernelExecution k1("nonzero_xform_wlo", /*sidecar_size=*/128);
+  cache_->GetOrCompileNeff(k1, /*stream_id=*/1);
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
+
+  auto fresh_cache = std::make_unique<CompilationCache>();
+  WloMockKernelExecution k2("nonzero_xform_wlo", /*sidecar_size=*/128);
+  fresh_cache->GetOrCompileNeff(k2, /*stream_id=*/1);
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);  // hit, no recompile
+
+  auto e2 = fresh_cache->GetEntry(k2.GetCompileKey());
+  ASSERT_NE(e2, nullptr);
+  EXPECT_EQ(e2->wrapped_neff_hlo, std::vector<uint8_t>(128, 0xAB));  // payload recovered, no marker
+}
+
+TEST_F(CompilationCacheTest, WloAndNonWloSameCacheKeyDoNotCollide) {
+  // Same base cache_key, one non-WLO and one WLO. Because WLO-ness is part of the key, they
+  // occupy distinct entries — a WLO request is never served the non-WLO NEFF.
+  MockNeuronKernelExecution::ResetCompileCounter();
+
+  MockNeuronKernelExecution plain("shared_key");
+  cache_->GetOrCompileNeff(plain, /*stream_id=*/1);
+
+  WloMockKernelExecution wlo("shared_key", /*sidecar_size=*/64);
+  cache_->GetOrCompileNeff(wlo, /*stream_id=*/1);
+
+  // Two distinct entries, two compiles — no collision.
+  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 2);
+  EXPECT_NE(plain.GetCompileKey(), wlo.GetCompileKey());
+  auto wlo_entry = cache_->GetEntry(wlo.GetCompileKey());
+  ASSERT_NE(wlo_entry, nullptr);
+  EXPECT_EQ(wlo_entry->wrapped_neff_hlo.size(), 64u);
+}
+
+TEST_F(CompilationCacheTest, GetWrappedNeffHloReturnsSidecar) {
+  // After a WLO compile completes, GetWrappedNeffHlo returns the entry's wrapped_neff.hlo sidecar.
+  WloMockKernelExecution wlo("wlo_fetch", /*sidecar_size=*/64);
+  cache_->GetOrCompileNeff(wlo, /*stream_id=*/1);
+  EXPECT_EQ(cache_->GetWrappedNeffHlo(wlo.GetCompileKey()), std::vector<uint8_t>(64, 0xAB));
+}
+
+TEST_F(CompilationCacheTest, GetWrappedNeffHloFailsClosedWhenAbsent) {
+  // No pending compile and no cached entry -> after the bounded wait for an async submit to
+  // register, fail closed rather than return an empty (wrong) sidecar that would run a relaid NEFF
+  // against untransformed weights. A short timeout keeps the test fast.
+  EXPECT_THROW(cache_->GetWrappedNeffHlo("no_such_key", std::chrono::milliseconds(50)),
+               std::runtime_error);
+}
+
+TEST_F(CompilationCacheTest, GetWrappedNeffHloWaitsForAsyncRegistration) {
+  // A' fix: the WLO fetch can run before the async submit has registered the pending compile.
+  // GetWrappedNeffHlo must WAIT for the key to appear (rather than fail immediately). Here a
+  // producer thread compiles shortly after we begin waiting; the fetch should block, then return
+  // the sidecar once the compile is registered/completed.
+  WloMockKernelExecution wlo("wlo_async_fetch", /*sidecar_size=*/32);
+  std::thread producer([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    cache_->GetOrCompileNeff(wlo, /*stream_id=*/2);
+  });
+  auto sidecar = cache_->GetWrappedNeffHlo(wlo.GetCompileKey(), std::chrono::seconds(10));
+  producer.join();
+  EXPECT_EQ(sidecar, std::vector<uint8_t>(32, 0xAB));
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

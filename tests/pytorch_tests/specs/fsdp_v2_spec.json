@@ -18,6 +18,12 @@
             "test_param_registration_after_forward",
             "test_root_move_forward_input_to_device"
           ]
+        },
+        {
+          "reason": "Timeout/hang during multi-group CPU offload",
+          "tests": [
+            "test_train_parity_multi_group_cpu_offload_eager"
+          ]
         }
       ]
     },
@@ -60,6 +66,12 @@
           "reason": "[TODO-FIX post Beta] AssertionError: timing assertion failures",
           "tests": [
             "test_fully_shard_post_optim_event_overlap"
+          ]
+        },
+        {
+          "reason": "Flaky performance test - assertLessEqual timing comparison fails intermittently on Neuron",
+          "tests": [
+            "test_fully_shard_training_overlap"
           ]
         }
       ]

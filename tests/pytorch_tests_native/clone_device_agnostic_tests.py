@@ -93,11 +93,12 @@ def _clone_from_remote(dest_dir: Path, repo: str, branch: str):
         logger.info(f"Cloned torch/testing/_internal/ to {dest}")
 
 
-def clone(source_repo: str | None = None):
+def clone(source_repo: str | None = None, pytorch_fork_branch: str = PYTORCH_FORK_BRANCH):
     """Clone PyTorch tests with device-agnostic changes.
 
     Args:
         source_repo: Local path to pytorch fork. If None, clones from remote fork.
+        pytorch_fork_branch: Branch of the PyTorch fork to clone. Defaults to PYTORCH_FORK_BRANCH.
     """
     dest_dir = Path(__file__).resolve().parent
 
@@ -107,7 +108,7 @@ def clone(source_repo: str | None = None):
             raise RuntimeError(f"Source repo not found: {source_path}")
         _clone_from_local(dest_dir, source_path)
     else:
-        _clone_from_remote(dest_dir, PYTORCH_FORK_REPO, PYTORCH_FORK_BRANCH)
+        _clone_from_remote(dest_dir, PYTORCH_FORK_REPO, pytorch_fork_branch)
 
     logger.info("Done")
 
@@ -115,5 +116,11 @@ def clone(source_repo: str | None = None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Clone PyTorch tests with device-agnostic changes")
     parser.add_argument("--source-repo", type=str, help="Local path to pytorch fork")
+    parser.add_argument(
+        "--pytorch-fork-branch",
+        type=str,
+        default=PYTORCH_FORK_BRANCH,
+        help=f"Branch of the PyTorch fork (default: {PYTORCH_FORK_BRANCH})",
+    )
     args = parser.parse_args()
-    clone(source_repo=args.source_repo)
+    clone(source_repo=args.source_repo, pytorch_fork_branch=args.pytorch_fork_branch)

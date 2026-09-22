@@ -60,6 +60,20 @@ python run_benchmarks.py --forward-only
 python run_benchmarks.py
 ```
 
+### Compile mode
+
+Run any block under `torch.compile` with the neuron backend by passing `--exec_mode compile`:
+
+```bash
+python run_benchmarks.py --block llama --preset llama-7b --exec_mode compile
+```
+
+To run the Qwen3 group without enforcing a hardware golden:
+
+```bash
+python run_group.py --config group_configs/qwen3.json --platform trn2 --skip-mfu-threshold
+```
+
 ### Run with TP
 
 ```bash
@@ -79,6 +93,7 @@ torchrun --nproc-per-node=8 run_benchmarks.py --tp_size=8
 - `--save_results`: Save results to JSON file (flag)
 - `--output_file`: Output file for results (default: benchmark_results.json)
 - `--tp_size`: Tensor parallel degree to use for the block test
+- `--exec_mode`: Execution mode `eager` (default) or `compile` (uses `torch.compile(backend="neuron")`)
 
 ## Preset Configurations
 

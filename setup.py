@@ -1,16 +1,44 @@
 import os
 import posixpath
 import re
+import runpy
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from setuptools import Extension, find_packages, setup
+from setuptools import Extension, find_namespace_packages, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
 PACKAGE_NAME = "torch_neuronx"
-_base_version = "0.1.0"
+
+# Prevent an installed backend from loading during the build.
+os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+
+
+def _get_pytorch_version():
+    """Get the PyTorch version that this wheel uses."""
+    selected_version = os.environ.get("TORCH_NEURONX_BUILD_PYTORCH_VERSION")
+    try:
+        import torch
+
+        installed_version = torch.__version__.split("+", 1)[0]
+    except ImportError:
+        installed_version = None
+
+    version = selected_version or installed_version
+    if not version:
+        raise RuntimeError("PyTorch is not installed. Install PyTorch before the build.")
+
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:[a-z0-9.]*)?", version):
+        raise ValueError(f"PyTorch version {version!r} is invalid. Use a PEP 440 version.")
+
+    if selected_version and installed_version and selected_version != installed_version:
+        raise RuntimeError(
+            f"Selected PyTorch {selected_version} does not match installed PyTorch "
+            f"{installed_version}. Install the selected version."
+        )
+    return version
 
 
 def _get_git_sha():
@@ -29,11 +57,69 @@ def _get_git_sha():
         return None
 
 
-_sha = _get_git_sha()
-version = f"{_base_version}+{_sha}" if _sha else _base_version
+def _get_build_counter():
+    """Get build counter from env (CI) or git commit count (local)."""
+    build = os.environ.get("VERSION_BUILD")
+    if build:
+        return build
+    try:
+        return (
+            subprocess.check_output(
+                ["git", "rev-list", "--count", "HEAD"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
+    except Exception:
+        return "0"
 
-# Disable autoload for builds
-os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+
+def _is_release_branch():
+    """Check if current branch is a release branch."""
+    if os.environ.get("RELEASE_BRANCH"):
+        return True
+    branch = os.environ.get("GIT_BRANCH", "")
+    if not branch:
+        try:
+            branch = (
+                subprocess.check_output(
+                    ["git", "branch", "--show-current"], stderr=subprocess.DEVNULL
+                )
+                .decode()
+                .strip()
+            )
+        except Exception:
+            branch = ""
+    return branch.startswith("release")
+
+
+def _get_version(pytorch_version):
+    """Build version string per versioning scheme.
+
+    Format: {TORCH_MAJOR}.{TORCH_MINOR}.{NEURON_MAJOR}.{NEURON_MINOR}.{BUILD}+{suffix}
+
+    Mainline: 2.14.3.0.4527+8e870898.dev
+    Release:  2.14.3.0.4527+8e870898
+    """
+    version_info = runpy.run_path(Path(__file__).parent / "torch_neuronx" / "_version.py")
+    neuron_version = version_info["NEURON_VERSION"]
+    if not re.fullmatch(r"\d+\.\d+", neuron_version):
+        raise ValueError(
+            f"Neuron version {neuron_version!r} is invalid. Use a major.minor version."
+        )
+
+    torch_parts = pytorch_version.split(".")
+    neuron_parts = neuron_version.split(".")
+    version_prefix = ".".join([*torch_parts[:2], *neuron_parts])
+
+    sha = _get_git_sha() or "unknown"
+    suffix = sha if _is_release_branch() else f"{sha}.dev"
+
+    return f"{version_prefix}.{_get_build_counter()}+{suffix}"
+
+
+pytorch_version = _get_pytorch_version()
+version = _get_version(pytorch_version)
 
 ROOT_DIR = Path(__file__).absolute().parent
 CSRC_DIR = ROOT_DIR / "torch_neuronx/csrc"
@@ -185,14 +271,18 @@ if is_building:
                         build_ext.run(self)
 
                 def _fix_rpath(self, so_path):
-                    """Fix RPATH to find torch libs at runtime.
+                    """Rewrite RPATH for the installed wheel layout.
 
-                    Bazel adds its internal cache paths to RUNPATH, which don't exist
-                    when the wheel is installed. We replace them with:
-                    - $ORIGIN/../torch/lib: finds torch libs relative to _C.so
-                    - /opt/aws/neuron/lib: finds NRT libs at standard location
+                    patchelf --set-rpath REPLACES the RPATH, so every runtime
+                    dependency dir must be listed. EFA/libfabric is loaded via
+                    dlopen at runtime (not linked), so its path is not needed here.
                     """
-                    new_rpath = "$ORIGIN/../torch/lib:/opt/aws/neuron/lib"
+                    new_rpath = (
+                        "$ORIGIN"
+                        ":$ORIGIN/../../../../../torch_neuronx"
+                        ":$ORIGIN/../../torch_neuronx"
+                        ":$ORIGIN/../torch/lib:/opt/aws/neuron/lib"
+                    )
 
                     # Check if patchelf is available
                     patchelf = shutil.which("patchelf")
@@ -258,7 +348,22 @@ if is_building:
 
                     # Copy the Bazel-built extension to the expected location
                     bazel_extension = build_dir / "bazel-bin" / ext.relpath / ext.target_name
-                    target_extension = ROOT_DIR / "torch_neuronx" / ext.target_name
+                    if ext.target_name in (
+                        "_torchMlir.so",
+                        "_mlir.so",
+                        "_stablehlo.so",
+                    ):
+                        target_extension = (
+                            ROOT_DIR
+                            / "third_party"
+                            / "torch-mlir"
+                            / "python"
+                            / "torch_mlir"
+                            / "_mlir_libs"
+                            / ext.target_name
+                        )
+                    else:
+                        target_extension = ROOT_DIR / "torch_neuronx" / ext.target_name
 
                     if bazel_extension.exists():
                         # Remove existing file if it exists to avoid permission issues
@@ -296,8 +401,13 @@ if is_building:
                     without_abi = ext_filename_parts[:-2] + ext_filename_parts[-1:]
                     return ".".join(without_abi)
 
-            # Bazel Extension module with _C library name
-            ext_modules = [BazelExtension("//:_C.so")]
+            # Bazel Extension modules
+            ext_modules = [
+                BazelExtension("//:_C.so"),
+                BazelExtension("//third_party/torch-mlir:_torchMlir.so"),
+                BazelExtension("//third_party/torch-mlir:_mlir.so"),
+                BazelExtension("//third_party/torch-mlir:_stablehlo.so"),
+            ]
 
             cmdclass = {
                 "generate_proto": BuildPyCommand,
@@ -470,15 +580,31 @@ else:
     ext_modules = []
     cmdclass = {}
 
+install_requires = [
+    f"torch=={pytorch_version}",
+    "numpy<2; python_version < '3.12'",
+    "numpy>=2; python_version >= '3.12'",
+    "grpcio-tools",
+    "wheel",
+]
+
 setup(
     name=PACKAGE_NAME,
     version=version,
     author="AWS Neuron Team",
     description="Neuron backend for PyTorch",
-    packages=find_packages(exclude=("test",)),
-    package_data={PACKAGE_NAME: ["*.dll", "*.dylib", "*.so", "protos/**/*.py"]},
+    packages=find_packages(exclude=("test", "tests", "tests.*"))
+    + find_namespace_packages(
+        where="third_party/torch-mlir/python", exclude=("test", "tests", "tests.*")
+    ),
+    package_dir={"torch_mlir": "third_party/torch-mlir/python/torch_mlir"},
+    package_data={
+        PACKAGE_NAME: ["*.dll", "*.dylib", "*.so", "protos/**/*.py", "**/*.jinja"],
+        "torch_mlir": ["*.so", "_mlir_libs/*.so"],
+    },
     ext_modules=ext_modules,
     python_requires=">=3.10",
     cmdclass=cmdclass,
-    license_files=["LICENSE"],
+    license_files=["LICENSE", "third_party/torch-mlir/LICENSE"],
+    install_requires=install_requires,
 )

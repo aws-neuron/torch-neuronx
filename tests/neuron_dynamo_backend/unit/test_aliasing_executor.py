@@ -645,6 +645,16 @@ class TestAliasingInfo:
         alias = next(iter(aliasing_info))
         assert alias.parameter_index is None
 
+    def test_add_duplicate_same_mapping_is_deduplicated(self):
+        """Test adding the same output→input mapping twice is silently deduplicated."""
+        from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+
+        aliasing_info = AliasingInfo()
+        aliasing_info.add(parameter_number=1, parameter_index=[], output_index=1)
+        aliasing_info.add(parameter_number=1, parameter_index=[], output_index=1)
+
+        assert len(aliasing_info) == 1
+
 
 # ============================================================================
 # TEST CLASS: Retain Device Mode with Mutations
@@ -691,6 +701,159 @@ class TestRetainDeviceMutation:
         torch.testing.assert_close(
             result, expected, atol=1e-5, rtol=1e-5, msg="Mutated output value mismatch"
         )
+
+
+# ============================================================================
+# TEST CLASS: Two Outputs Aliasing Same Input
+# ============================================================================
+
+
+class TwoOutputsSameInput(nn.Module):
+    """Model where two outputs both alias the same mutated input."""
+
+    def forward(self, cache, indices, new_values):
+        cache.scatter_(2, indices, new_values)
+        return cache, cache
+
+
+class TestDuplicateInputAlias:
+    """Verify that two outputs aliasing the same input works correctly."""
+
+    def test_two_outputs_alias_same_input(self, device):
+        """Both outputs should reflect the scattered update."""
+        model = TwoOutputsSameInput().eval().to(device)
+        cache = torch.ones(1, 1, 128, 16, device=device)
+        indices = torch.zeros(1, 1, 1, 16, dtype=torch.int64, device=device)
+        new_values = torch.full((1, 1, 1, 16), 5.0, device=device)
+
+        expected_cache = cache.clone()
+        expected_cache.scatter_(2, indices, new_values)
+
+        out1, out2 = compile_and_run(model, cache, indices, new_values)
+
+        torch.testing.assert_close(
+            out1.cpu(),
+            expected_cache.cpu(),
+            atol=1e-5,
+            rtol=1e-5,
+            msg="First output should reflect scattered update",
+        )
+        torch.testing.assert_close(
+            out2.cpu(),
+            expected_cache.cpu(),
+            atol=1e-5,
+            rtol=1e-5,
+            msg="Second output should reflect scattered update",
+        )
+        torch.testing.assert_close(
+            cache.cpu(),
+            expected_cache.cpu(),
+            atol=1e-5,
+            rtol=1e-5,
+            msg="Original input should be mutated in-place",
+        )
+
+
+# ============================================================================
+# TEST CLASS: Downcast (fp64) out= Aliasing
+# ============================================================================
+
+
+class FloatPowerScalarOutModel(nn.Module):
+    """float_power(scalar, tensor, out=) — result dtype is always float64, so the
+    out= buffer is fp64 and gets downcast to fp32 for the NEFF."""
+
+    def forward(self, exponent, out):
+        return torch.float_power(2.0, exponent, out=out)
+
+
+class PowScalarOutModel(nn.Module):
+    """pow(scalar, tensor, out=) into a caller-provided buffer of arbitrary dtype."""
+
+    def forward(self, exponent, out):
+        return torch.pow(2, exponent, out=out)
+
+
+class TestDowncastOutAliasing:
+    """An fp64 out= buffer is downcast to fp32 (a *copy*) before execution, so the
+    NEFF writes an fp32 shadow, not the caller's fp64 tensor. Verify the result is
+    cast back into the caller's fp64 buffer. int64 (a *view* downcast, shared
+    storage) must keep working and must not be corrupted by the fp64 write-back.
+    """
+
+    def test_float_power_scalar_out_fp64(self, device):
+        """float_power.Scalar_out with an fp64 out= buffer: the caller's buffer must
+        be written in place (the bug left it holding its pre-call sentinel)."""
+        model = FloatPowerScalarOutModel().eval().to(device)
+
+        exp_cpu = torch.randn(256, 4096)
+        expected = torch.float_power(2.0, exp_cpu)
+        assert expected.dtype == torch.float64
+
+        exp = exp_cpu.clone().to(device)
+        # Pre-fill the out buffer with a sentinel; if the write-back is missing the
+        # buffer keeps the sentinel (this is exactly the aliasing/downcast bug).
+        out = torch.full((256, 4096), 7.0, dtype=torch.float64, device=device)
+
+        ret = compile_and_run(model, exp, out, fullgraph=True)
+
+        torch.testing.assert_close(
+            out.cpu(),
+            expected,
+            atol=1e-3,
+            rtol=1e-3,
+            msg="fp64 out= buffer not written back (downcast severed the alias)",
+        )
+        torch.testing.assert_close(ret.cpu(), expected, atol=1e-3, rtol=1e-3)
+        assert ret.dtype == torch.float64
+        # aten out= contract: the returned tensor IS the caller's out buffer.
+        assert ret is out
+
+    def test_pow_scalar_out_fp64(self, device):
+        """pow.Scalar_out into an fp64 buffer (fp32 compute, fp64 out): same
+        downcast-alias path, distinct op from float_power."""
+        model = PowScalarOutModel().eval().to(device)
+
+        exp_cpu = torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
+        expected = torch.pow(2, exp_cpu).to(torch.float64)
+
+        exp = exp_cpu.clone().to(device)
+        out = torch.full((6,), 7.0, dtype=torch.float64, device=device)
+
+        ret = compile_and_run(model, exp, out, fullgraph=True)
+
+        torch.testing.assert_close(
+            out.cpu(),
+            expected,
+            atol=1e-3,
+            rtol=1e-3,
+            msg="fp64 out= buffer not written back",
+        )
+        torch.testing.assert_close(ret.cpu(), expected, atol=1e-3, rtol=1e-3)
+        assert out.dtype == torch.float64
+
+    def test_pow_scalar_out_int64_not_corrupted(self, device):
+        """Regression guard for the fp64 write-back: int64 out= downcasts via a
+        storage-sharing .view(), so it is already mutated in place correctly and the
+        fp64-only cast-back must NOT fire on it (a value copy_ would corrupt it)."""
+        model = PowScalarOutModel().eval().to(device)
+
+        exp_cpu = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.int64)
+        expected = torch.pow(2, exp_cpu)
+        assert expected.dtype == torch.int64
+
+        exp = exp_cpu.clone().to(device)
+        out = torch.full((6,), -1, dtype=torch.int64, device=device)
+
+        ret = compile_and_run(model, exp, out, fullgraph=True)
+
+        torch.testing.assert_close(
+            out.cpu(),
+            expected,
+            msg="int64 out= corrupted (fp64 write-back must not touch int64)",
+        )
+        torch.testing.assert_close(ret.cpu(), expected)
+        assert out.dtype == torch.int64
 
 
 # ============================================================================

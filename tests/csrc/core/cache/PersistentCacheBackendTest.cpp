@@ -6,6 +6,7 @@
 #include <thread>
 #include <vector>
 
+#include "tests/csrc/mocks/MockNRT.h"
 #include "torch_neuronx/csrc/core/cache/CacheUtils.h"
 #include "torch_neuronx/csrc/core/cache/CompilationCacheKey.h"
 #include "torch_neuronx/csrc/core/cache/PersistentCacheBackend.h"
@@ -16,7 +17,17 @@ namespace {
 
 class PersistentCacheBackendTest : public ::testing::Test {
  protected:
+  torch_neuronx::testing::MockNRTSession mock_session_;
+  torch_neuronx::testing::MockNRT* mock_nrt_ = torch_neuronx::testing::MockNRT::GetInstance();
+
   void SetUp() override {
+    nrt_instance_info_t info{};
+    info.family = NRT_INSTANCE_TRN3;
+    EXPECT_CALL(*mock_nrt_, nrt_get_instance_info(::testing::_, ::testing::_))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly(
+            ::testing::DoAll(::testing::SetArgPointee<0>(info), ::testing::Return(NRT_SUCCESS)));
+
     // Save and unset env var to ensure explicit path constructor is used
     const char* env_val = std::getenv("TORCH_NEURONX_NEFF_CACHE_DIR");
     if (env_val) {

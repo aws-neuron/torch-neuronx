@@ -57,8 +57,20 @@ class NeuronHooksInterfaceTest : public ::testing::Test {
           return NRT_SUCCESS;
         });
 
+    // Set up mock expectations for tensor slice allocation (needed for split blocks)
+    EXPECT_CALL(*mock_nrt_, nrt_tensor_allocate_slice(_, _, _, _, _))
+        .WillRepeatedly(
+            [](const nrt_tensor_t* base, size_t offset, size_t, const char*, nrt_tensor_t** out) {
+              auto base_addr = reinterpret_cast<uintptr_t>(base);
+              *out = reinterpret_cast<nrt_tensor_t*>(base_addr + offset);
+              return NRT_SUCCESS;
+            });
+
     // Set up mock expectations for tensor operations
-    EXPECT_CALL(*mock_nrt_, nrt_tensor_free(_)).WillRepeatedly(Return());
+    // Frees can be issued by allocator cleanup after the fixture's required
+    // expectations have been verified, so this is a default action rather
+    // than an expected call count.
+    ON_CALL(*mock_nrt_, nrt_tensor_free(_)).WillByDefault(Return());
     EXPECT_CALL(*mock_nrt_, nrt_tensor_get_size(_)).WillRepeatedly(Return(1024));
     EXPECT_CALL(*mock_nrt_, nrt_tensor_get_va(_))
         .WillRepeatedly(::testing::Invoke([](const nrt_tensor* tensor) -> void* {
@@ -103,7 +115,6 @@ class NeuronHooksInterfaceTest : public ::testing::Test {
       at::neuron::synchronize(device);
     }
     c10_neuron::NeuronCachingAllocator::emptyCache();
-    ::testing::Mock::VerifyAndClearExpectations(mock_nrt_);
     mock_session_.reset();
   }
 
@@ -291,6 +302,46 @@ TEST_F(NeuronHooksInterfaceTest, ResizeToSameSize) {
   c10::StorageImpl* post_resize_storage_impl = storage.unsafeGetStorageImpl();
   EXPECT_EQ(static_cast<void*>(original_storage_impl),
             static_cast<void*>(post_resize_storage_impl));
+}
+
+TEST_F(NeuronHooksInterfaceTest, IsPinnedPtrReturnsTrueForPinnedMemory) {
+  // Allocate pinned memory via the host allocator
+  auto* host_alloc = torch_neuronx::GetNeuronHostAllocator();
+  auto data_ptr = host_alloc->allocate(1024);
+  ASSERT_NE(data_ptr.get(), nullptr);
+
+  // Verify isPinnedPtr returns true through the hooks interface
+  auto hooks = torch_neuronx::get_neuron_hooks();
+  ASSERT_NE(hooks, nullptr);
+  EXPECT_TRUE(hooks->isPinnedPtr(data_ptr.get()));
+}
+
+TEST_F(NeuronHooksInterfaceTest, IsPinnedPtrReturnsFalseForNonPinnedMemory) {
+  auto hooks = torch_neuronx::get_neuron_hooks();
+  ASSERT_NE(hooks, nullptr);
+
+  // Arbitrary pointer not allocated by Neuron host allocator
+  int stack_var = 42;
+  EXPECT_FALSE(hooks->isPinnedPtr(&stack_var));
+
+  // Heap pointer not allocated by Neuron host allocator
+  void* heap_ptr = malloc(64);
+  EXPECT_FALSE(hooks->isPinnedPtr(heap_ptr));
+  free(heap_ptr);
+
+  // Nullptr
+  EXPECT_FALSE(hooks->isPinnedPtr(nullptr));
+}
+
+TEST_F(NeuronHooksInterfaceTest, IsPinnedPtrReturnsFalseForDeviceTensor) {
+  // Device tensors should not be considered pinned
+  auto device = at::Device(c10::DeviceType::PrivateUse1, 0);
+  auto options = torch::TensorOptions().device(device).dtype(torch::kFloat32);
+  auto tensor = torch::empty({100}, options);
+
+  auto hooks = torch_neuronx::get_neuron_hooks();
+  ASSERT_NE(hooks, nullptr);
+  EXPECT_FALSE(hooks->isPinnedPtr(tensor.data_ptr()));
 }
 
 TEST_F(NeuronHooksInterfaceTest, ResizeNonResizableStorageFails) {

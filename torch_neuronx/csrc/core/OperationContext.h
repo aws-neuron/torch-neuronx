@@ -27,6 +27,9 @@ namespace at::neuron {
 // OS thread ID via gettid(2) — avoids depending on Kineto's ThreadUtil.h from core code.
 inline int32_t getOsTid() { return static_cast<int32_t>(syscall(SYS_gettid)); }
 
+// Sequence number for kHost completion ordering.
+using HostCompletionSeq = uint64_t;
+
 // Forward declaration
 struct OperationContext;
 
@@ -115,8 +118,8 @@ class ConcatenationState {
   // Returns true if this was the last operation to compile
   bool IncrementAndCheckCompiledCascadingOpsCount() {
     size_t new_count = compiled_cascading_ops_count_.fetch_add(1, std::memory_order_acq_rel) + 1;
-    TORCH_CHECK(new_count <= cascading_operations_.size(),
-                "Compiled count exceeds cascading operations count");
+    EXECUTION_RUNTIME_CHECK(new_count <= cascading_operations_.size(),
+                            "Compiled count exceeds cascading operations count");
     return new_count >= cascading_operations_.size();
   }
 
@@ -152,10 +155,13 @@ struct KernelTypeTraits;
 DEFINE_KERNEL_TYPE_TRAITS(kHLO, XLACompilableKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kCollective, CollectiveDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kCopy, CopyDirectKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kCast, CastDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kWrite, WriteDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kRead, ReadDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kEvent, EventDirectKernelExecution)
-DEFINE_KERNEL_TYPE_TRAITS(kHint, HintDirectKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kAlloc, AllocDirectKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kDealloc, DeallocDirectKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kHost, HostKernelExecution)
 
 #undef DEFINE_KERNEL_TYPE_TRAITS
 
@@ -208,6 +214,12 @@ struct OperationContext {
   // Pipeline state (populated during execution)
   std::string python_stack_trace = "";
 
+  // Per-execution hierarchy string for profiler Layer/Hierarchy view.
+  // Captured at submission time from the live Python call stack.
+  // Forward: "ClassName[attr][count]/..." from nn.Module frames.
+  // Backward: "op_label[backward][count]/" from op_name.
+  std::string hierarchy_string = "";
+
   // Stream context - pointer to the stream this operation belongs to
   StreamImpl* stream = nullptr;
 
@@ -230,6 +242,9 @@ struct OperationContext {
   // Per-operation async completion status, written on completion.
   // Default NRT_FAILURE ensures unset status is treated as error (fail-closed).
   NRT_STATUS nrt_status_{NRT_FAILURE};
+
+  // For kHost ops: the per-stream host-completion seq stamped at kHost dispatch.
+  HostCompletionSeq host_completion_seq_{0};
 
   bool HasNRTError() const { return nrt_status_ != NRT_SUCCESS; }
 
@@ -255,6 +270,7 @@ struct OperationContext {
   std::chrono::steady_clock::time_point execute_end = {};
   std::chrono::steady_clock::time_point concat_start = {};
   std::chrono::steady_clock::time_point concat_end = {};
+  std::chrono::steady_clock::time_point dispatch_start = {};  // RuntimeWorker picks up op
 
   // PyTorch tracing identifiers for linking with torch profiler and neuron-tools.
   // Upon SubmitOperationContext, pytorch_sequence_nr and pytorch_thread_id are populated with the
@@ -272,18 +288,35 @@ struct OperationContext {
 
   // OS thread ID (gettid) of the Neuron stream execution worker that scheduled this operation
   int32_t neuron_stream_os_tid{-1};  // -1 = not yet assigned; valid tids are positive (gettid())
+  int32_t xu_type{-1};               // Resolved XU type after scheduling (NRTA_XU_COMPUTE etc.)
+  int32_t dispatch_slot{-1};         // Inflight slot for parallel trace visualization (0-7 per XU)
+
+  // For kHost ops: index of the HostWorkerPool worker that ran RunHost (-1 if
+  // not a host-pool op).
+  int32_t host_worker_idx{-1};
+
   // Unique event ID for framework-to-NRT event linking
   uint64_t event_id = 0;
 
   explicit OperationContext(std::unique_ptr<at::neuron::NeuronKernelExecution> kernel_exec,
                             const std::string& python_stack_trace = "",
-                            CPUFallbackContext fallback_context = {})
+                            CPUFallbackContext fallback_context = {},
+                            const std::string& hierarchy_string = "")
       : kernel_execution(std::move(kernel_exec)),
         cpu_fallback_context(std::move(fallback_context)),
         python_stack_trace(python_stack_trace),
+        hierarchy_string(hierarchy_string),
         stream(nullptr),
         promise(),
         result_future(promise.get_future().share()) {}
+
+  // OperationContext is non-copyable / non-movable: it owns a std::promise
+  // member (promise) which is move-only, plus std::atomic members which are
+  // neither.
+  OperationContext(const OperationContext&) = delete;
+  OperationContext& operator=(const OperationContext&) = delete;
+  OperationContext(OperationContext&&) = delete;
+  OperationContext& operator=(OperationContext&&) = delete;
 
   // Accessor for CPU fallback context
   const CPUFallbackContext& GetCPUFallbackContext() const { return cpu_fallback_context; }
@@ -367,6 +400,9 @@ struct OperationContext {
   // Check if this operation requires compilation.
   bool RequiresCompilation() const { return kernel_execution->RequiresCompilation(); }
 
+  // Check if this operation has a device execution stage.
+  bool RequiresExecution() const { return kernel_execution->RequiresExecution(); }
+
   // Check if this operation requires preparation (e.g., collectives).
   bool RequiresPrepare() const { return kernel_execution->RequiresPrepare(); }
 
@@ -375,11 +411,22 @@ struct OperationContext {
   // Check if operation is ready for execution
   bool IsExecutionReady() const { return execution_ready_.load(std::memory_order_acquire); }
 
+  // True when the operation has no execution stage after compilation.
+  bool EndsAtCompilation() const { return RequiresCompilation() && !RequiresExecution(); }
+
   // Check if this operation is ready to execute (for event wait primitives)
   bool IsSchedulable() const {
     // Events must be both execution ready (pipeline processed) AND event ready (dependencies met)
     if (GetKernelType() == KernelTypeEnum::kEvent) {
       return IsExecutionReady() && GetKernel<KernelTypeEnum::kEvent>().IsReady();
+    }
+
+    // kAlloc: if we deferred due to NRT_RESOURCE, gate re-entry until the
+    // stream fully drains and clears the pending flag from a completion hook.
+    if (GetKernelType() == KernelTypeEnum::kAlloc &&
+        GetKernel<KernelTypeEnum::kAlloc>().GetAllocState() ==
+            at::neuron::AllocDirectKernelExecution::AllocState::Deferred) {
+      return false;
     }
 
     // If this operation has a concatenated operation, check if the concatenated operation is ready

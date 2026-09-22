@@ -137,3 +137,56 @@ class TestNonzero:
             x = torch.randint(0, 2, (3, 4), device=device)
             out = torch.empty((1, 2), dtype=torch.int64, device=device)
             torch.nonzero(x, out=out, as_tuple=True)
+
+    def test_nonzero_via_bool_index_noncontiguous(self, device):
+        """Test boolean fancy indexing with a non-contiguous bool mask."""
+        mask = torch.zeros(1, 1, 512, dtype=torch.bool, device=device)
+        mask = mask.expand(1, 128, 512)  # non-contiguous, stride-0 on dim 1
+        embeds = torch.randn(1, 128, 512, dtype=torch.bfloat16, device=device)
+
+        result = embeds[mask]
+
+        expected = embeds.cpu()[mask.cpu()]
+        torch.testing.assert_close(result.cpu().float(), expected.float())
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (4096,),
+            (8192,),
+            (65535,),
+            (100000,),
+            (1, 100000),
+            (200, 2048),
+            (1048576,),
+            (1024, 1024),
+            (4096, 1024),
+            (128, 128, 64),
+        ],
+    )
+    @pytest.mark.parametrize("density", [0.3, 1.0])
+    def test_nonzero_large_multichunk(self, device, shape, density):
+        """Large inputs that span multiple NKI tiles (chunk_size=8192).
+
+        Exercises the tiled + compacted flat-nonzero path and the running-offset
+        compaction across chunk boundaries.
+        """
+        with track_neuron_ops():
+            torch.manual_seed(0)
+            x = (torch.rand(shape) < density).to(torch.int32).to(device)
+            neuron_result = torch.nonzero(x)
+            cpu_result = torch.nonzero(x.cpu())
+
+            assert neuron_result.device.type == "neuron"
+            assert neuron_result.shape == cpu_result.shape
+            torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+            assert_op_runs_on_neuron("aten::nonzero")
+
+    def test_nonzero_scalar(self, device):
+        """Test nonzero on 0-dim (scalar) tensor."""
+        x = torch.tensor(5.0, device=device)
+        neuron_result = torch.nonzero(x)
+        cpu_result = torch.nonzero(x.cpu())
+
+        assert neuron_result.shape == cpu_result.shape
+        assert neuron_result.dtype == cpu_result.dtype

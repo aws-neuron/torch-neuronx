@@ -19,6 +19,7 @@ Run [prerequisites.sh](prerequisites.sh)
 
 ## Install neuron compiler from neuron repo
 uv pip install 'neuronx-cc==2.*' --extra-index-url https://pip.repos.neuron.amazonaws.com --prerelease=allow --index-strategy unsafe-best-match
+uv pip install nki --extra-index-url https://pip.repos.neuron.amazonaws.com --prerelease=allow --index-strategy unsafe-best-match
 
 # Clone the repository
 git clone <repository-url>
@@ -27,8 +28,11 @@ cd torch-neuronx
 #If permissions are needed, execute below command
 chmod +x ./tools/*
 
-# Perform the build
+# Perform the build (defaults to Python version in .python-version)
 uv run ./tools/build
+
+# Or specify a Python version explicitly
+uv run ./tools/build --python 3.14
 
 ```
 
@@ -177,15 +181,28 @@ y = compiled_add_op(x1,x2)
 
 ## Examples
 
-### Llama
-
-```sh
-cd examples/llama
-python llama.py
-```
+| Example | Description |
+|---------|-------------|
+| [compile/QUICKSTART.md](examples/compile/QUICKSTART.md) | Getting started with torch.compile on Neuron |
+| [llama](examples/llama) | Llama model inference |
+| [torch_compile/whisper](examples/torch_compile/whisper) | Whisper speech-to-text |
+| [torch_compile/qwen2](examples/torch_compile/qwen2) | Qwen2 model |
+| [fused_attention](examples/fused_attention) | Scaled dot-product and multi-head attention |
+| [simple_moe](examples/simple_moe) | Mixture of Experts |
+| [gpt2-train-loop](examples/gpt2-train-loop) | GPT-2 training loop |
+| [simple_mlp_tpxfsdp](examples/simple_mlp_tpxfsdp) | Tensor parallel + FSDP |
+| [multi_node_tests](examples/multi_node_tests) | Multi-node distributed training |
+| [simple_asr](examples/simple_asr) | Conformer ASR training |
 
 ## Documentation
 
+- [API Compatibility Guide](docs/torch_api_compatibility.md)
+- [Environment Variables](docs/environment_variables.md)
+- [Decompositions](docs/decompositions.md)
+- [NUMA Optimization](docs/numa_optimization.md)
+- [Statistics/Metrics](docs/statistics/torch_neuronx_stats_readme.md)
+
+To build the full docs:
 ```bash
 ./tools/build --docs
 # Output: build/docs/html/index.html

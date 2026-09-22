@@ -24,9 +24,6 @@ static at::Tensor alias_with_sizes_and_strides(const at::Tensor& self, at::IntAr
   impl->set_storage_offset(self.storage_offset());
   impl->set_sizes_and_strides(sizes, strides);
 
-  // Propagate names if any
-  at::namedinference::propagate_names(result, self);
-
   return result;
 }
 
@@ -88,7 +85,6 @@ at::Tensor as_strided_neuron(const at::Tensor& self, at::IntArrayRef size, at::I
       c10::TensorImpl::VIEW, c10::Storage(self.storage()), self.key_set(), self.dtype());
 
   at::native::setStrided(result, size, stride, storage_offset);
-  at::namedinference::propagate_names(result, self);
 
   return result;
 }
@@ -99,43 +95,18 @@ at::Tensor _reshape_alias_neuron(const at::Tensor& self, at::IntArrayRef sizes,
   return view_neuron(self, sizes);
 }
 
-at::Tensor select_backward_neuron(const at::Tensor& grad, c10::SymIntArrayRef input_sizes,
-                                  int64_t dim, c10::SymInt index) {
-  auto sizes_vec = utils::symint_to_sizes(input_sizes);
-  auto index_i = index.expect_int();
-
-  auto options = grad.options();
-
-  auto cpu_options = options.device(at::kCPU);
-  auto grad_cpu = grad.to(at::kCPU);
-  auto grad_input_cpu = at::zeros(sizes_vec, cpu_options);
-  grad_input_cpu.select(dim, index_i).copy_(grad_cpu);
-  return grad_input_cpu.to(grad.device(), grad.scalar_type());
-}
-
-at::Tensor slice_backward_neuron(const at::Tensor& grad, c10::SymIntArrayRef input_sizes,
-                                 int64_t dim, c10::SymInt start, c10::SymInt end,
-                                 c10::SymInt step) {
-  auto sizes_vec = utils::symint_to_sizes(input_sizes);
-  auto start_i = start.expect_int();
-  auto end_i = end.expect_int();
-  auto step_i = step.expect_int();
-
-  auto options = grad.options();
-
-  auto cpu_options = options.device(at::kCPU);
-  auto grad_cpu = grad.to(at::kCPU);
-  auto grad_input_cpu = at::zeros(sizes_vec, cpu_options);
-  grad_input_cpu.slice(dim, start_i, end_i, step_i).copy_(grad_cpu);
-  return grad_input_cpu.to(grad.device(), grad.scalar_type());
-}
-
 // argsort.stable to workaround limitation on writing to non-contiguous destination on device
 at::Tensor argsort_stable_neuron(const at::Tensor& self, bool stable, int64_t dim,
                                  bool descending) {
   auto self_cpu = self.to(at::kCPU);
   auto result_cpu = self_cpu.argsort(stable, dim, descending);
   return result_cpu.to(self.device());
+}
+
+at::Tensor view_as_real_neuron(const at::Tensor& self) { return at::native::view_as_real(self); }
+
+at::Tensor view_as_complex_neuron(const at::Tensor& self) {
+  return at::native::view_as_complex(self);
 }
 
 }  // namespace torch_neuronx

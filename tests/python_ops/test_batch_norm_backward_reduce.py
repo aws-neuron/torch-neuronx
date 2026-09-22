@@ -164,3 +164,56 @@ class TestBatchNormBackwardReduce:
         assert sum_dy_xmu.shape == (8,)
         assert grad_weight.shape == (8,)
         assert grad_bias.shape == (8,)
+
+    def test_batch_norm_backward_reduce_out_variant(self):
+        """Test batch_norm_backward_reduce.out variant with pre-allocated output tensors."""
+        device = "neuron"
+
+        grad_out_cpu = torch.randn(4, 8, 16, 16)
+        input_cpu = torch.randn(4, 8, 16, 16)
+        mean_cpu = torch.randn(8)
+        invstd_cpu = torch.randn(8)
+        weight_cpu = torch.randn(8)
+
+        # Get reference from functional variant
+        ref = torch.ops.aten.batch_norm_backward_reduce(
+            grad_out_cpu.to(device),
+            input_cpu.to(device),
+            mean_cpu.to(device),
+            invstd_cpu.to(device),
+            weight_cpu.to(device),
+            True,
+            True,
+            True,
+        )
+
+        out0 = torch.empty(8, device=device)
+        out1 = torch.empty(8, device=device)
+        out2 = torch.empty(8, device=device)
+        out3 = torch.empty(8, device=device)
+
+        with track_neuron_ops():
+            torch.ops.aten.batch_norm_backward_reduce.out(
+                grad_out_cpu.to(device),
+                input_cpu.to(device),
+                mean_cpu.to(device),
+                invstd_cpu.to(device),
+                weight_cpu.to(device),
+                True,
+                True,
+                True,
+                out0=out0,
+                out1=out1,
+                out2=out2,
+                out3=out3,
+            )
+            assert_op_runs_on_neuron("aten::batch_norm_backward_reduce")
+
+        assert out0.shape == (8,)
+        assert out1.shape == (8,)
+        assert out2.shape == (8,)
+        assert out3.shape == (8,)
+        torch.testing.assert_close(out0.cpu(), ref[0].cpu())
+        torch.testing.assert_close(out1.cpu(), ref[1].cpu())
+        torch.testing.assert_close(out2.cpu(), ref[2].cpu())
+        torch.testing.assert_close(out3.cpu(), ref[3].cpu())

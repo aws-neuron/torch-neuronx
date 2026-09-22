@@ -17,6 +17,9 @@ def _to_copy_fn(src, out_dtype=None, out=None):
     tensor<Nxindex> constant in StableHLO).
     """
     if out_dtype is not None:
+        # Float-to-int requires explicit truncation to match PyTorch semantics
+        if out_dtype in (torch.int32, torch.int16, torch.int8) and src.is_floating_point():
+            src = src.trunc()
         return src.to(out_dtype)
     return src.clone()
 
@@ -32,6 +35,18 @@ class ToCopyMLIRImpl(TorchMlirOpImpl):
             output_params=None,
             static_argnames=("out_dtype",),
         )
+        # Override the kernel's infer_output_dtypes with _to_copy-specific logic:
+        # output dtype is the target dtype kwarg, or src dtype if not specified.
+        self.kernel.infer_output_dtypes = self._infer_to_copy_output_dtypes
+
+    def _infer_to_copy_output_dtypes(self, *args, **kwargs):
+        """For _to_copy, output dtype is kwargs['dtype'] or src dtype."""
+        dtype = kwargs.get("dtype")
+        if dtype is None and args:
+            src = args[0]
+            if isinstance(src, torch.Tensor):
+                dtype = src.dtype
+        return [dtype] if dtype is not None else []
 
     def can_handle(self, *args, **kwargs) -> bool:
         """Only handle neuron-to-neuron tensor copies.
@@ -57,10 +72,8 @@ class ToCopyMLIRImpl(TorchMlirOpImpl):
 
         # Only handle neuron-to-neuron copies, excluding dtypes that need special handling:
         # - float64: Not natively supported on device, handled by NRT-based implementation
-        # - bool: Requires special handling, handled by NRT-based implementation
-        # - int32: Requires special handling, handled by NRT-based implementation
         # - int64/uint64: Not natively supported on device, handled by NRT-based implementation
-        unsupported_dtypes = (torch.float64, torch.bool, torch.int32, torch.int64, torch.uint64)
+        unsupported_dtypes = (torch.float64, torch.int64, torch.uint64)
         if not (
             src.device.type == "neuron"
             and target_device.type == "neuron"
@@ -102,7 +115,15 @@ class ToCopyMLIRImpl(TorchMlirOpImpl):
 
             src_prepared = ensure_contiguous_on_device(src)
 
-        out = io_tensor.empty(src.shape, dtype=target_dtype, device=target_device)
+        # Preserve source strides in output (matches PyTorch .to(dtype) semantics)
+        # PyTorch preserves strides only for non-overlapping-and-dense tensors (e.g. transpose);
+        # for tensors with gaps (e.g. slices), output is contiguous.
+        if not src.is_contiguous() and torch.ops.aten.is_non_overlapping_and_dense(src):
+            out = torch.empty_strided(
+                src.shape, src.stride(), dtype=target_dtype, device=target_device
+            )
+        else:
+            out = io_tensor.empty(src.shape, dtype=target_dtype, device=target_device)
 
         mlir_kwargs = {}
         if src_prepared.dtype != target_dtype:
@@ -110,3 +131,24 @@ class ToCopyMLIRImpl(TorchMlirOpImpl):
         mlir_kwargs["out"] = out
 
         return super().execute(src_prepared, **mlir_kwargs)
+
+    def get_lower_func(self):
+        """Return a lower function that translates aten::_to_copy args to kernel kwargs.
+
+        C++ Dispatch calls lower_func(src, dtype=..., layout=..., device=..., ...) with
+        raw aten kwargs. The kernel expects lower(src, out_dtype=..., out=...).
+        """
+        kernel = self.kernel
+
+        def to_copy_lower(*args, **kwargs):
+            src = args[0]
+            target_dtype = kwargs.get("dtype", src.dtype)
+
+            # Translate to kernel kwargs
+            translated_kwargs = {}
+            if target_dtype != src.dtype:
+                translated_kwargs["out_dtype"] = target_dtype
+
+            return kernel.lower(src, **translated_kwargs)
+
+        return to_copy_lower

@@ -2,6 +2,7 @@
 
 import torch
 
+from ...auto_registration import neuron_op
 from ..op_impl import TorchMlirOpImpl
 
 
@@ -10,6 +11,7 @@ def _scatter_add_fn(input, dim, index, src, *, out=None):
     return torch.scatter_add(input, dim, index, src)
 
 
+@neuron_op("aten::scatter_add", priority=40)
 class ScatterAddMLIRImpl(TorchMlirOpImpl):
     """Register scatter_add, scatter_add_, and scatter_add.out"""
 
@@ -54,6 +56,7 @@ class ScatterAddMLIRImpl(TorchMlirOpImpl):
         return super().execute(*args, **kwargs)
 
 
+@neuron_op("aten::scatter_add_", priority=40)
 class ScatterAddInplaceMLIRImpl(ScatterAddMLIRImpl):
     def __init__(self):
         super().__init__("scatter_add_")

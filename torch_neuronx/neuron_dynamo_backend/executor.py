@@ -3,19 +3,27 @@ NEFF execution for TorchNeuronEager async runtime
 """
 
 import logging
+import math
 from typing import Final
 
 import torch
 
 import torch_neuronx
 from torch_neuronx.neuron_dynamo_backend.exceptions import NEFFExecutionError
-from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import NoneOutputInfo
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+    PassMutations,
+    apply_input_mutations,
+    apply_output_mutations,
+    get_mutation_copy_back_inputs,
+)
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
-from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
 from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import (
     FunctionIO,
-    RandomInputInfo,
     TensorSpec,
+)
+from torch_neuronx.neuron_dynamo_backend.wlo_contract import (
+    WLOContractError,
+    validate_transform,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,8 +49,9 @@ class Executor:
         cast_spec: list[TensorSpec],
         has_collectives: bool = False,
         retain_device: bool = False,
-        mutation_info: AliasingInfo | None = None,
-        none_output_info: NoneOutputInfo | None = None,
+        pass_mutations: list[PassMutations] | None = None,
+        alias_buffer_map: dict[int, int] | None = None,
+        wlo_transforms: list | None = None,
     ):
         """Initialize executor with cache key and I/O specifications.
 
@@ -53,18 +62,34 @@ class Executor:
             cast_spec (list[TensorSpec]): Output specifications for final dtype casting.
             has_collectives (bool): Whether graph contains collective operations.
             retain_device (bool): Whether to cast results back to the input device (default: False)
-            mutation_info (AliasingInfo | None): Input-output mutation relationships.
-            none_output_info (NoneOutputInfo | None): Metadata for None output restoration.
+            pass_mutations (list[PassMutations] | None): Per-pass input/output mutations.
+            alias_buffer_map (dict[int, int] | None): NEFF output→input index map for buffer reuse.
+            wlo_transforms (list | None): Weight-layout relayout rules discovered at compile
+                time. Each rule follows the shared contract in wlo_contract (reshape = target
+                dims, transpose = permutation of the reshape rank); see _prepare_inputs.
         """
         self.graph_name = graph_name
         self.cache_key = cache_key
         self.io_spec = io_spec
         self.cast_spec = cast_spec
         self.has_collectives = has_collectives
-        self.mutation_info = mutation_info
-        self.none_output_info = none_output_info
+        self.pass_mutations = pass_mutations or []
+        self.alias_buffer_map = alias_buffer_map
+        self.copy_back_map = get_mutation_copy_back_inputs(self.pass_mutations)
 
         self.retain_device = retain_device
+
+        self.wlo_transforms = wlo_transforms or []
+        self._wlo_cache: dict[int, tuple[int, torch.Tensor]] = {}
+
+        for t in self.wlo_transforms:
+            validate_transform(t)
+            if not 0 <= t["input_index"] < len(self.io_spec.inputs):
+                raise WLOContractError(
+                    f"WLO transform input_index {t['input_index']} out of range for a graph "
+                    f"with {len(self.io_spec.inputs)} input(s); the relayout rules do not match "
+                    "this graph (likely a stale or mismatched cache entry)"
+                )
 
         logger.debug(
             f"Executor initialized: cache_key={cache_key}, has_collectives={has_collectives}"
@@ -111,6 +136,8 @@ class Executor:
             else:
                 tensor = inp
 
+            if not tensor.is_contiguous():
+                tensor = tensor.contiguous()
             if tensor.dtype in self.INT_64_TO_32:
                 if tensor.dim() == 0:
                     tensor = tensor.reshape(1).view(self.INT_64_TO_32[tensor.dtype])
@@ -118,60 +145,72 @@ class Executor:
                     tensor = tensor.view(self.INT_64_TO_32[tensor.dtype])
             elif tensor.dtype == torch.float64:
                 tensor = tensor.to(torch.float32)
+            elif tensor.dtype == torch.complex128:
+                tensor = tensor.to(torch.complex64)
+
+            if self.wlo_transforms:
+                for t in self.wlo_transforms:
+                    if t["input_index"] == i:
+                        ptr = inp.data_ptr() if isinstance(inp, torch.Tensor) else id(inp)
+                        cached = self._wlo_cache.get(i)
+                        if cached is not None and cached[0] == ptr:
+                            tensor = cached[1]
+                        else:
+                            original_shape = tensor.shape
+                            reshape_numel = math.prod(t["reshape"])
+                            if reshape_numel != tensor.numel():
+                                raise RuntimeError(
+                                    f"WLO: transform for input {i} expects {reshape_numel} "
+                                    f"elements (reshape={t['reshape']}) but the runtime tensor "
+                                    f"has {tensor.numel()} (shape={tuple(original_shape)}, "
+                                    f"dtype={tensor.dtype}). The weight-layout rules do not "
+                                    "match this input; refusing to relayout."
+                                )
+                            # Apply the wlo_contract relayout: reshape to the target
+                            # dims, permute, then materialize the optimal byte layout
+                            # with contiguous(). The final reshape is the compiler's
+                            # reshape-back -- reconstructed from original_shape, which
+                            # always equals the weight's original shape -- so the NEFF
+                            # still sees the original shape with only the bytes relaid out.
+                            tensor = (
+                                tensor.reshape(t["reshape"])
+                                .permute(t["transpose"])
+                                .contiguous()
+                                .reshape(original_shape)
+                            )
+                            self._wlo_cache[i] = (ptr, tensor)
+                        break
+
             yield tensor
 
     def _process_outputs(self, outputs):
-        """Process execution outputs with dtype upcasting and alias filtering.
+        """Process execution outputs with dtype upcasting and shape correction.
 
         Neuron hardware operates on 32-bit dtypes, so this method restores
-        original 64-bit dtypes where needed. Aliased outputs are skipped since
-        they were written directly to input buffers during execution.
+        original 64-bit dtypes where needed. For aliased passthrough outputs
+        that reuse an input buffer, inserts view ops to match expected shapes.
 
         Args:
             outputs (list[torch.Tensor]): Output tensors from graph execution.
 
-        Yields:
-            torch.Tensor: Processed tensors with dtypes matching cast_spec.
-                - int32/uint32 tensors are reinterpreted as int64/uint64 via view()
-                - float32 tensors are converted to float64 via to()
-                - Aliased outputs are excluded from the results.
-                  Combination of AOTAutograd and Compiler handle mapping of
-                  outputs to inputs.
+        Returns:
+            list[torch.Tensor]: Tensors with dtypes matching cast_spec.
         """
-        # Apply casting
         tensors = []
         for tensor, cast_spec in zip(outputs, self.cast_spec, strict=False):
             if cast_spec.dtype in self.INT_64_TO_32:
                 tensor = tensor.view(cast_spec.dtype).reshape(cast_spec.shape)
-            elif cast_spec.dtype == torch.float64:
+            elif cast_spec.dtype == torch.float64 or cast_spec.dtype == torch.complex128:
                 tensor = tensor.to(cast_spec.dtype)
             tensors.append(tensor)
 
-        # Re-insert None outputs into list of outputs
-        if self.none_output_info:
-            assert len(tensors) == len(
-                self.none_output_info.non_none_positions
-            ), "Length of outputs does not match non_none_positions:"
-            f"{len(tensors)=} {len(self.none_output_info.non_none_positions)=}"
-            tensors_with_nones = [None for _ in range(self.none_output_info.original_output_count)]
-            for i in range(len(tensors)):
-                index = self.none_output_info.non_none_positions[i]
-                tensors_with_nones[index] = tensors[i]
-            tensors = tensors_with_nones
-
-        # Filter aliased outputs
-        if self.mutation_info:
-            aliased_output_indices = {alias.output_index for alias in self.mutation_info.aliases}
-            tensors = (
-                tensor for i, tensor in enumerate(tensors) if i not in aliased_output_indices
-            )
-        yield from tensors
+        return tensors
 
     def _allocate_output(self, i, out, neuron_inputs, device_str):
         """Allocate a single output buffer for graph execution.
 
-        For aliased outputs (in-place mutations), reuses the corresponding input
-        buffer so mutations are visible to the caller. For non-aliased outputs,
+        For aliased outputs (in-place mutations) or pass-through outputs,
+        reuses the corresponding input buffer. For other outputs,
         allocates a new empty tensor.
 
         Args:
@@ -183,18 +222,14 @@ class Executor:
         Returns:
             torch.Tensor: Reused input buffer or newly allocated empty tensor.
         """
-        if self.mutation_info is not None:
-            mutated_output_to_input = dict(
-                sorted(
-                    (alias.output_index, alias.parameter_number)
-                    for alias in self.mutation_info.aliases
-                )
+        if self.alias_buffer_map and i in self.alias_buffer_map:
+            in_idx = self.alias_buffer_map[i]
+            assert in_idx < len(neuron_inputs), (
+                f"alias_buffer_map[{i}]={in_idx} is out of range for neuron_inputs "
+                f"(len={len(neuron_inputs)})"
             )
-        else:
-            mutated_output_to_input = {}
+            return neuron_inputs[in_idx]
 
-        if i in mutated_output_to_input:
-            return neuron_inputs[mutated_output_to_input[i]]
         return torch.empty(out.shape, dtype=out.dtype, device=device_str)
 
     def _cast_output_device(self, original_inputs, outputs):
@@ -229,77 +264,70 @@ class Executor:
                 and output_device is not None
                 and output.device.type != output_device
             ):
-                if self.mutation_info:
-                    # mutations need to be propagated back to cpu inputs
-                    # that were automatically cast to neuron
-                    # SEE: test_retain_device_copies_mutated_output_to_original_input in
-                    # test_aliasing_executor.py
-                    input_idx = self.mutation_info.get_input_index(i)
-                    if input_idx is not None:
-                        original_input = original_inputs[input_idx]
-                        yield original_input.copy_(output.to(original_input.device))
-                        continue
+                if i in self.copy_back_map:
+                    # Mutation result: copy back into the original caller input tensor
+                    original_input = original_inputs[self.copy_back_map[i]]
+                    yield original_input.copy_(output.to(original_input.device))
+                    continue
                 yield output.to(output_device)
             else:
                 yield output
 
-    def _generate_random_inputs(
-        self, random_input_info: RandomInputInfo, device_str: str
-    ) -> list[torch.Tensor]:
-        """Generate random mask inputs for dropout operations.
+    def _writeback_downcast_aliases(self, inputs, neuron_outputs, tensors):
+        """Write fp64 aliased-out results back into the caller's buffer.
 
-        Args:
-            random_input_info: Metadata about random inputs needed
-            device_str: Target device string (e.g., "neuron:0")
-
-        Returns:
-            List of random tensor inputs
+        An fp64 out= input is downcast to fp32 by a copy, so the NEFF writes the
+        shadow, not the caller's tensor. int64 downcasts via a storage-sharing
+        view and is already correct, so it's skipped.
         """
-        return [op.sample(device_str) for op in random_input_info.ops]
+        for out_idx, caller_in_idx in self.copy_back_map.items():
+            orig = inputs[caller_in_idx]
+            shadow = neuron_outputs[out_idx]
+            if (
+                isinstance(orig, torch.Tensor)
+                and orig.dtype == torch.float64
+                and shadow.dtype == torch.float32
+            ):
+                orig.copy_(shadow)
+                tensors[out_idx] = orig
+        return tensors
 
     def __call__(self, *inputs) -> tuple[torch.Tensor, ...]:
         """Execute the compiled graph using cache-based execution.
 
         Workflow:
-        1. Validate input count matches io_spec.inputs
-        2. Prepare inputs (device transfer + dtype downcast)
-        3. Generate random inputs for dropout masks if needed
+        1. Apply input mutations (remove/add inputs as specified by FX passes)
+        2. Validate input count matches io_spec.inputs
+        3. Prepare inputs (device transfer + dtype downcast)
         4. Allocate output buffers with 32-bit dtypes
         5. Execute compiled graph via C++ runtime
         6. Process outputs (dtype upcast to match specs)
+        7. Apply output mutations (restore original signature)
 
         Args:
-            *inputs: Input tensors matching io_spec.inputs.
+            *inputs: Input tensors matching the original graph signature.
 
         Returns:
-            tuple[torch.Tensor, ...]: Output tensors on Neuron device with dtypes
-                matching cast_spec.
+            tuple[torch.Tensor, ...]: Output tensors matching the original graph signature.
 
         Raises:
-            NEFFExecutionError: If input count doesn't match expected count.
+            NEFFExecutionError: If input count doesn't match expected count after mutations.
         """
         logger.debug(f"Executor invoked: cache_key={self.cache_key}")
 
-        random_input_count = 0
-        if self.io_spec.random_input_info:
-            random_input_count = (
-                self.io_spec.random_input_info.new_input_count
-                - self.io_spec.random_input_info.original_input_count
-            )
-        if len(inputs) != (len(self.io_spec.inputs) - random_input_count):
-            raise NEFFExecutionError(
-                f"Expected {len(self.io_spec.inputs)} inputs, got {len(inputs)}"
-            )
-
         device_id = torch.neuron.current_device()
         device_str = f"neuron:{device_id}"
-        neuron_inputs = list(self._prepare_inputs(inputs, device_id))
 
-        # Generate and append random inputs for dropout masks
-        if self.io_spec.random_input_info:
-            random_inputs = self._generate_random_inputs(self.io_spec.random_input_info, device_str)
-            neuron_inputs.extend(random_inputs)
-            logger.debug(f"Added {len(random_inputs)} random inputs for dropout masks")
+        # Apply input mutations to transform caller inputs into NEFF inputs
+        mutated_inputs = apply_input_mutations(list(inputs), self.pass_mutations, device_str)
+
+        if len(mutated_inputs) != len(self.io_spec.inputs):
+            raise NEFFExecutionError(
+                f"Expected {len(self.io_spec.inputs)} inputs after mutations, "
+                f"got {len(mutated_inputs)}"
+            )
+
+        neuron_inputs = list(self._prepare_inputs(mutated_inputs, device_id))
 
         neuron_outputs = [
             self._allocate_output(i, out, neuron_inputs, device_str)
@@ -315,9 +343,14 @@ class Executor:
             self.has_collectives,
         )
 
-        outputs = tuple(self._process_outputs(neuron_outputs))
+        tensors = self._process_outputs(neuron_outputs)
+        tensors = self._writeback_downcast_aliases(inputs, neuron_outputs, tensors)
 
         if self.retain_device:
-            return tuple(self._cast_output_device(inputs, outputs))
-        else:
-            return outputs
+            # Apply copy-back from NEFF outputs directly back to caller inputs
+            tensors = list(self._cast_output_device(inputs, tensors))
+
+        # Apply output mutations to restore original graph signature
+        tensors = apply_output_mutations(tensors, self.pass_mutations, device_str, list(inputs))
+
+        return tuple(tensors)

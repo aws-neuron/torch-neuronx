@@ -43,6 +43,27 @@ class TestAddRegistration:
         expected[:, 3].add_(2)
         torch.testing.assert_close(m1.cpu(), expected)
 
+    def test_add_inplace_wider_int_operand_no_promotion(self):
+        """int32.add_(int64) keeps self's shape+dtype — in-place does not promote."""
+        with track_neuron_ops():
+            a = torch.ones([4, 4, 4], dtype=torch.int32, device="neuron")
+            b = torch.ones([4, 4, 4], dtype=torch.int64, device="neuron")
+            a.add_(b)
+
+            expected = torch.ones([4, 4, 4], dtype=torch.int32)
+            expected.add_(torch.ones([4, 4, 4], dtype=torch.int64))
+
+            assert a.device.type == "neuron"
+            assert a.dtype == torch.int32
+            assert tuple(a.shape) == (4, 4, 4)
+            torch.testing.assert_close(a.cpu(), expected)
+
+    @assert_raises(RuntimeError, match="can't be cast")
+    def test_add_inplace_float_into_int_raises(self):
+        """int.add_(float) is rejected — a float result can't be cast to int."""
+        a = torch.ones([4], dtype=torch.int32, device="neuron")
+        a.add_(1.5)
+
     def test_add_operator_syntax(self):
         """Test that a + b syntax works with neuron tensors."""
         # Create neuron tensors
@@ -205,3 +226,94 @@ class TestAddRegistration:
         c = a_neuron + b_cpu
 
         torch.testing.assert_close(c.cpu(), expected)
+
+    @pytest.mark.parametrize("alpha", [1, 2, -1, 0])
+    def test_add_bool_with_alpha(self, alpha):
+        """torch.add(bool, bool, alpha=N) should match CPU dtype and values."""
+        x_cpu = torch.tensor([False, True, False, True])
+        y_cpu = torch.tensor([True, False, True, False])
+        x = x_cpu.to("neuron")
+        y = y_cpu.to("neuron")
+
+        result = torch.add(x, y, alpha=alpha)
+        expected = torch.add(x_cpu, y_cpu, alpha=alpha)
+
+        assert (
+            result.dtype == expected.dtype
+        ), f"alpha={alpha}: expected {expected.dtype} but got {result.dtype}"
+        torch.testing.assert_close(result.cpu(), expected)
+
+
+class TestAddDtypePromotion:
+    """Test that Tensor.add_ raises for int+float inplace, matching CPU."""
+
+    @pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32, torch.uint8])
+    def test_add_inplace_int_float_scalar_raises(self, dtype):
+        """Tensor.add_(int_tensor, float_scalar) raises matching CPU."""
+        t = torch.tensor([-3, -1, 0, 1, 5], dtype=dtype, device="neuron")
+        with pytest.raises(RuntimeError, match="can't be cast"):
+            t.add_(0.883)
+
+    @pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32, torch.uint8])
+    def test_add_inplace_int_int_scalar_succeeds(self, dtype):
+        """Tensor.add_(int_tensor, int_scalar) succeeds — no dtype promotion."""
+        t = torch.tensor([1, 2, 3], dtype=dtype, device="neuron")
+        t.add_(5)
+        expected = torch.tensor([6, 7, 8], dtype=dtype)
+        torch.testing.assert_close(t.cpu(), expected)
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.bfloat16])
+    def test_add_inplace_float_float_scalar_succeeds(self, dtype):
+        """Tensor.add_(float_tensor, float_scalar) succeeds — same dtype class."""
+        t = torch.tensor([1.0, 2.0, 3.0], dtype=dtype, device="neuron")
+        t.add_(0.5)
+        expected = torch.tensor([1.5, 2.5, 3.5], dtype=dtype)
+        torch.testing.assert_close(t.cpu(), expected)
+
+    @pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32])
+    def test_add_outplace_int_float_scalar_does_not_raise(self, dtype):
+        """Outplace torch.add(int, float_scalar) succeeds (no raise for outplace)."""
+        t = torch.tensor([1, 2, 3], dtype=dtype, device="neuron")
+        torch.add(t, 0.5)  # should not raise
+
+    @pytest.mark.parametrize(
+        "dtype", [torch.int32, torch.bool, torch.float32, torch.bfloat16, torch.float16]
+    )
+    def test_add_float_scalar_weak_promotion(self, dtype):
+        """torch.add(tensor, <python float>) follows weak-scalar typing: a python
+        float never upcasts a tensor operand. result_type is float32 for an int/bool
+        tensor and the float tensor's own dtype for a float tensor -- never float64
+        (which Neuron drops). Fences the wrapped-float64-scalar handling in
+        DispatchImpl (csrc/core/dispatch/NeuronDispatcher.cpp)."""
+        x = torch.tensor([1, 0, 1], dtype=dtype, device="neuron")
+        got = (x + 1.0).dtype
+        exp = torch.result_type(x, 1.0)
+        assert got == exp, f"{dtype} + 1.0 -> {got}, expected {exp}"
+
+    @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+    def test_add_float_scalar_0dim_weak_promotion(self, dtype):
+        """0-dim float tensor + python float keeps the tensor's dtype (not
+        float64). Neuron only anchors output dtype on dim>0 float operands, so the
+        weak-scalar rewrite in DispatchImpl must still fire for a 0-dim float
+        tensor. Regression fence for the merge-queue dtype-inference fix."""
+        x = torch.tensor(2.0, dtype=dtype, device="neuron")  # 0-dim
+        got = (x + 1.0).dtype
+        exp = torch.result_type(x, 1.0)
+        assert got == exp == dtype, f"0-dim {dtype} + 1.0 -> {got}, expected {dtype}"
+
+    def test_add_half_scalar_out_of_range_no_overflow(self):
+        """A python float outside half's range must not be narrowed to half before
+        the op (which would overflow to inf); computed in float opmath the result
+        is finite. Fences 'do not narrow the scalar to a dim>0 float tensor's
+        dtype'."""
+        x = torch.tensor([60000.0], dtype=torch.half, device="neuron")
+        r = torch.add(x, -70000.0).cpu()
+        assert not (r.isnan().any() or r.isinf().any()), f"half + (-70000.0) -> {r}"
+
+    @pytest.mark.parametrize("dtype", [torch.uint16, torch.uint32, torch.uint64])
+    def test_dispatch_no_promotetypes_crash_on_uint(self, dtype):
+        """Ops over uint16/uint32/uint64 must not trip 'Unsupported ScalarType'
+        from the weak-scalar block, which feeds only standard floats to
+        c10::promoteTypes."""
+        x = torch.tensor([5, 5, 5], dtype=dtype, device="neuron")
+        torch.testing.assert_close(x, x.clone(), rtol=0, atol=0)

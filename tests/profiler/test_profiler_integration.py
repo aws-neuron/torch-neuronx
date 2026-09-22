@@ -13,8 +13,10 @@ Tests are split into three groups:
     verifying output structure, chrome trace export, events, flow arrows, and metadata.
 """
 
+import contextlib
 import json
 import os
+import time
 
 import pytest
 import torch
@@ -22,7 +24,17 @@ from torch._C._profiler import _ExperimentalConfig
 from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
 import torch_neuronx
-from torch_neuronx.profiling import NeuronConfig, NeuronProfiler, ProfileMode
+from torch_neuronx.kernels.cache_utils import get_nfs_cache_dir
+from torch_neuronx.profiling import (
+    ContinuousExportConfig,
+    InspectExportMask,
+    NeuronConfig,
+    NeuronProfiler,
+    ProfileMode,
+    correlate_device_time,
+    export_now,
+    request_export,
+)
 
 
 @pytest.mark.skipif(
@@ -265,15 +277,79 @@ class TestNeuronProfilerIntegration:
             f"Metadata names: {meta_names}"
         )
 
-    def test_no_activities(self):
-        """Case 1: profile(activities=[]) falls back to supported_activities() defaults.
+    def _session_trace_dir(self, output_dir):
+        """Resolve the concrete NRT trace directory under a profiler output root.
 
-        In PyTorch, an empty activities list is falsy, so the profile() constructor
-        treats it the same as activities=None and uses supported_activities() defaults.
-        This means CPU is included and framework traces are captured.
+        NRT lays out artifacts as
+            {output_dir}/{instance_id}_pid_{pid}/{session_init_time_ns}/
+        Both the instance and the numeric timestamp subdirectory are created by
+        nrt_inspect_begin, so this only resolves while a session is (or has been)
+        active. Returns the innermost timestamp directory, where ntrace.pb, the
+        mid-session ntrace.nc<idx>.part files, and the monitoring .pb files land.
         """
-        # activities=[] is falsy in Python, so profile() uses supported_activities()
-        with profile(activities=[]) as prof, record_function("model_inference"):
+        instance_subdirs = [
+            d
+            for d in os.listdir(output_dir)
+            if os.path.isdir(os.path.join(output_dir, d)) and "_pid_" in d
+        ]
+        assert (
+            len(instance_subdirs) == 1
+        ), f"Expected exactly one instance subdirectory, found: {instance_subdirs}"
+        instance_dir = os.path.join(output_dir, instance_subdirs[0])
+
+        numeric_subdirs = [
+            d
+            for d in os.listdir(instance_dir)
+            if os.path.isdir(os.path.join(instance_dir, d)) and d.isdigit()
+        ]
+        assert (
+            len(numeric_subdirs) >= 1
+        ), f"Expected a numeric session subdirectory in {instance_dir}, found: {numeric_subdirs}"
+        return os.path.join(instance_dir, numeric_subdirs[0])
+
+    @staticmethod
+    def _count_ntrace_records(path):
+        """Count events in an ntrace.pb and assert its framing is intact.
+
+        ntrace.pb is a headerless, footerless stream of back-to-back
+        ``[uint32 LE size][event bytes]`` records (write_event_proto_to_file in
+        KaenaRuntime nrt_inspect.cpp). Walking the length prefixes counts events
+        and validates framing without a protobuf dependency: a clean file is
+        consumed exactly, so a trailing partial record signals corruption.
+        """
+        with open(path, "rb") as f:
+            data = f.read()
+
+        count = 0
+        offset = 0
+        total = len(data)
+        while offset < total:
+            assert (
+                offset + 4 <= total
+            ), f"Truncated length prefix at byte {offset} of {total} in {path}"
+            size = int.from_bytes(data[offset : offset + 4], "little")
+            offset += 4
+            assert offset + size <= total, (
+                f"Record at byte {offset} claims {size} bytes but only "
+                f"{total - offset} remain in {path}"
+            )
+            offset += size
+            count += 1
+        assert offset == total, f"Trailing bytes after last record in {path}"
+        return count
+
+    def test_no_activities(self):
+        """Case 1: profile(activities=None) uses supported_activities() defaults.
+
+        torch 2.12 changed the profile() constructor to check ``activities is not
+        None`` instead of truthiness, so an empty list is now taken literally (an
+        empty activity set raises ``AssertionError: No valid profiler activities
+        found``) rather than falling back to defaults. Passing ``activities=None``
+        selects supported_activities() defaults, which include CPU, so framework
+        traces are captured.
+        """
+        # activities=None -> profile() uses supported_activities() defaults
+        with profile(activities=None) as prof, record_function("model_inference"):
             x = torch.randn(10, 5)
             _ = x + x
 
@@ -502,8 +578,15 @@ class TestNeuronProfilerIntegration:
         end_ids = {e["id"] for e in flow_ends}
         assert start_ids & end_ids, "No matching flow IDs between start/end"
 
-        # RUNTIME event metadata
-        for evt in runtime_evts:
+        # SUBMIT events have nrt_sequence_id; DISPATCH events have dispatch_slot.
+        # Filter to our SUBMIT events (have stream_id but not dispatch_slot).
+        submit_evts = [
+            e
+            for e in runtime_evts
+            if "stream_id" in e.get("args", {}) and "dispatch_slot" not in e.get("args", {})
+        ]
+        assert len(submit_evts) > 0, "No SUBMIT events found"
+        for evt in submit_evts:
             args = evt.get("args", {})
             assert "nrt_sequence_id" in args
             assert "stream_id" in args
@@ -666,6 +749,86 @@ class TestNeuronProfilerIntegration:
             "trace.json" not in root_files
         ), f"trace.json should not be in root directory. Root files: {root_files}"
 
+    def test_neuron_profiler_with_neff_cache_configured(self):
+        """Test that NEFFs from a configured neff_cache_dir are copied to a shared
+        neffs/ directory in the profile output at profile close.
+
+        NRT's neff_cache_dir copy path (nrt_inspect_copy_neffs_from_cache) copies
+        only NEFFs that are *actually executed* during the profiled session AND
+        found in the cache directory under their real 2-level-sharded cache-key
+        path. It does not blindly copy arbitrary files placed in the directory.
+
+        This test asserts both halves of that contract:
+        - positive: warm-compile the workload (writing its real NEFF into the
+          effective NFS cache dir), profile a re-run, and assert the executed
+          NEFF was copied into neffs/.
+        - negative: seed a fake NEFF into the same cache dir that is never
+          executed, and assert it was NOT copied.
+        """
+        # Use the effective NFS cache dir so eager's compile-cache writes and
+        # NRT's copy source are the same directory. The persistent cache binds
+        # TORCH_NEURONX_NEFF_CACHE_DIR at first compile, so it cannot be
+        # repointed from inside the test.
+        cache_dir = get_nfs_cache_dir()
+
+        # Seed a fake NEFF (never executed) into the 2-level shard layout. NRT
+        # must NOT copy it, since it is not executed during the session. Track
+        # it for cleanup so it does not leak into the shared NFS cache dir.
+        fake_key = "abcd" + "0" * 28
+        fake_shard = os.path.join(cache_dir, fake_key[:2], fake_key[2:4])
+        os.makedirs(fake_shard, exist_ok=True)
+        fake_neff_name = fake_key + ".neff"
+        fake_neff_path = os.path.join(fake_shard, fake_neff_name)
+        with open(fake_neff_path, "wb") as f:
+            f.write(b"\x00" * 12)
+
+        try:
+            # Warm up: run the workload OUTSIDE profiling so its NEFF is compiled
+            # and written into cache_dir under its real cache-key shard path.
+            self._run_neuron_workload()
+
+            exp_config = NeuronConfig(
+                modes=[ProfileMode.DEVICE, ProfileMode.RUNTIME],
+                profile_output_dir=self.test_dir,
+                neff_cache_dir=cache_dir,
+            )
+
+            with profile(
+                activities=[ProfilerActivity.PrivateUse1],
+                experimental_config=exp_config,
+            ):
+                # Re-run the SAME workload so its cached NEFF executes; NRT then
+                # matches the executed NEFF against cache_dir and copies it.
+                self._run_neuron_workload()
+
+            shared_neffs_dir = os.path.join(self.test_dir, "neffs")
+            assert os.path.isdir(shared_neffs_dir), (
+                f"Expected shared neffs/ directory at {shared_neffs_dir}. "
+                f"Output contents: {os.listdir(self.test_dir)}"
+            )
+            copied_names = {f for _root, _dirs, files in os.walk(shared_neffs_dir) for f in files}
+            # Positive: NRT also emits a barrier_*.neff via a separate path
+            # (save_barrier_neff) unrelated to the cache copy, so require a
+            # non-barrier NEFF that can only have come from copying the executed
+            # workload out of cache_dir.
+            copied_workload_neffs = [
+                f for f in copied_names if f.endswith(".neff") and not f.startswith("barrier_")
+            ]
+            assert copied_workload_neffs, (
+                "No cached workload NEFF was copied into shared neffs/. "
+                f"Directory tree: {os.listdir(shared_neffs_dir)}"
+            )
+            # Negative: the fake NEFF was never executed, so it must not be copied.
+            assert fake_neff_name not in copied_names, (
+                f"Unexecuted NEFF {fake_neff_name} should not be copied from the cache dir; "
+                f"found copied files: {sorted(copied_names)}"
+            )
+        finally:
+            # Remove only this file. cache_dir is now shared across workers, so
+            # removing the shard directory would take real entries with it.
+            with contextlib.suppress(OSError):
+                os.remove(fake_neff_path)
+
     def test_neuron_profiler_on_trace_ready(self):
         """Test NeuronProfiler.export_trace used as on_trace_ready callback."""
         exp_config = NeuronConfig(
@@ -686,6 +849,323 @@ class TestNeuronProfilerIntegration:
         assert os.path.exists(trace_path), f"trace.json not found at {trace_path}"
         assert os.path.getsize(trace_path) > 0, "trace.json is empty"
 
+    @pytest.mark.xfail(
+        reason="Upstream kineto bug (fixed upstream, not yet in our pinned PyTorch): "
+        "ChromeTraceLogger did not JSON-escape double quotes in event names. With with_stack=True "
+        "+ torch.compile, dynamo-generated frames carry co_filename strings containing double "
+        'quotes (e.g. {"device": "cpu", "dtype": "float32"}), corrupting the exported chrome trace '
+        "so json.load raises JSONDecodeError. Fixed by pytorch/kineto#1459 (fixes "
+        "pytorch/pytorch#146900); not present in the torch version currently pinned here.",
+        strict=False,
+    )
+    def test_compile_profile(self):
+        """Profile a torch.compile MLP workload on Neuron.
+
+        Verifies:
+        - NRT runtime artifacts (ntrace.pb and monitoring files) are produced
+        - Chrome trace JSON is exported and non-empty
+        """
+        import torch.nn as nn
+
+        class MLP(nn.Module):
+            def __init__(self, hidden: int = 256):
+                super().__init__()
+                self.fc1 = nn.Linear(hidden, hidden * 4, bias=False)
+                self.fc2 = nn.Linear(hidden * 4, hidden, bias=False)
+
+            def forward(self, x):
+                return self.fc2(torch.relu(self.fc1(x)))
+
+        device = torch.device("neuron")
+        model = MLP(hidden=256).to(device, dtype=torch.bfloat16)
+        compiled_model = torch.compile(model, backend="neuron", dynamic=False)
+        x = torch.randn(4, 256, device=device, dtype=torch.bfloat16)
+
+        exp_config = NeuronConfig(
+            modes=[ProfileMode.DEVICE, ProfileMode.RUNTIME],
+            profile_output_dir=self.test_dir,
+        )
+
+        with (
+            profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+                experimental_config=exp_config,
+                with_stack=True,
+            ) as prof,
+            record_function("compiled_model_inference"),
+            torch.inference_mode(),
+        ):
+            for _ in range(2):  # warmup
+                _ = compiled_model(x)
+            torch_neuronx.synchronize()
+            for _ in range(3):  # benchmark
+                _ = compiled_model(x)
+            torch_neuronx.synchronize()
+
+        # Verify NRT runtime artifacts exist
+        self._validate_nrt_output_files(
+            self.test_dir,
+            expect_ntff=True,
+            expect_ntrace=True,
+        )
+
+        # Verify chrome trace
+        self._validate_chrome_trace_basics(prof, self.test_dir)
+
+    def test_compile_profile_persistent_cache_key(self):
+        """Verify profiler events carry the correct persistent_cache_key for torch.compile NEFFs.
+
+        The execute op (NeffDirectKernelExecution) carries only a cache-key string, so
+        without the fix GetPersistentKey() returns nullptr or a mismatched hash. This
+        test profiles 3 inference iterations and asserts that persistent_cache_key in
+        each RUNTIME/DRIVER event matches get_neff_info for the same base key — both
+        read from the same CacheEntry, so they must agree.
+        """
+
+        class MLP(torch.nn.Module):
+            def __init__(self, hidden: int = 256):
+                super().__init__()
+                self.fc1 = torch.nn.Linear(hidden, hidden * 4, bias=False)
+                self.fc2 = torch.nn.Linear(hidden * 4, hidden, bias=False)
+
+            def forward(self, x):
+                return self.fc2(torch.relu(self.fc1(x)))
+
+        device = torch.device("neuron")
+        model = MLP(hidden=256).to(device, dtype=torch.bfloat16)
+        compiled_model = torch.compile(model, backend="neuron", dynamic=False)
+        x = torch.randn(4, 256, device=device, dtype=torch.bfloat16)
+
+        # Warmup: ensures the NEFF is in the C++ in-memory cache before profiling.
+        compiled_model(x)
+        torch_neuronx.synchronize()
+
+        exp_config = NeuronConfig(
+            modes=[ProfileMode.RUNTIME],
+            profile_output_dir=self.test_dir,
+        )
+
+        with (
+            profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+                experimental_config=exp_config,
+            ) as prof,
+            torch.inference_mode(),
+        ):
+            for _ in range(3):
+                compiled_model(x)
+            torch_neuronx.synchronize()
+
+        trace_file = os.path.join(self.test_dir, "neuron_trace.json")
+        prof.export_chrome_trace(trace_file)
+        with open(trace_file) as f:
+            trace = json.load(f)
+
+        trace_events = [e for e in trace["traceEvents"] if e.get("ph") == "X"]
+        runtime_evts = [e for e in trace_events if e.get("cat") == "privateuse1_runtime"]
+        driver_evts = [e for e in trace_events if e.get("cat") == "privateuse1_driver"]
+
+        neff_events = [
+            e
+            for e in runtime_evts + driver_evts
+            if "persistent_cache_key" in e.get("args", {}) and e["args"].get("neff_cache_key")
+        ]
+
+        assert (
+            len(neff_events) > 0
+        ), "No NEFF execution events with persistent_cache_key found in trace."
+
+        for evt in neff_events:
+            base_key = evt["args"]["neff_cache_key"]
+            key_in_trace = evt["args"]["persistent_cache_key"]
+
+            assert key_in_trace, f"persistent_cache_key is empty for event {evt['name']!r}"
+            assert (
+                len(key_in_trace) == 32
+            ), f"persistent_cache_key {key_in_trace!r} is not a 32-char XXH3_128 hex string"
+
+            # Both ResolvePersistentCacheKey and get_neff_info read from the same
+            # CacheEntry keyed by the base compile key, so they must agree.
+            result = torch_neuronx._C.get_neff_info(base_key)
+            assert result is not None, f"get_neff_info returned None for base key {base_key!r}"
+            assert key_in_trace == result[0], (
+                f"persistent_cache_key in trace {key_in_trace!r} does not match "
+                f"get_neff_info result {result[0]!r} for base key {base_key!r}"
+            )
+
+    @staticmethod
+    def _part_files_size(trace_dir):
+        """Total bytes across the per-core mid-session part files in trace_dir.
+
+        Mid-session export appends each core's drained events to its own
+        ntrace.nc<idx>.part (KaenaRuntime export_events_to_parts). N exports do
+        NOT create N files -- each tick appends to the same per-core file -- so
+        the observable of "more was exported" is total bytes growing, not file
+        count. A core that drained nothing leaves no part file (lazy creation).
+        """
+        parts = [
+            f for f in os.listdir(trace_dir) if f.startswith("ntrace.nc") and f.endswith(".part")
+        ]
+        return sum(os.path.getsize(os.path.join(trace_dir, p)) for p in parts)
+
+    @pytest.mark.parametrize("export_api", ["sync", "async"])
+    def test_multi_step_export_accrues_parts_mid_session(self, export_api):
+        """Mid-session export drains events to disk incrementally, step by step.
+
+        This is the headline continuous-export capability: instead of a single
+        drain at session end, the workload calls export repeatedly during the
+        session and each call drains the rings to per-core part files. We assert
+        the part files accrue bytes across steps (so the rings never have to hold
+        the whole session), then that session stop merges the parts into a valid
+        ntrace.pb and leaves no part/tmp residue.
+
+        Parametrized over both export APIs (see the export_api fixture):
+          - "sync":  export_now(...)     -- drain is on disk when the call returns.
+          - "async": request_export(...) -- serviced by the background worker, so
+                     we poll (bounded) until the part bytes grow; the drain
+                     outcome is never reported back to Python.
+        """
+        is_async = export_api == "async"
+        exp_config = NeuronConfig(
+            modes=[ProfileMode.RUNTIME],
+            profile_output_dir=self.test_dir,
+            continuous_export=ContinuousExportConfig() if is_async else None,
+        )
+
+        num_steps = 4
+        poll_deadline_s = 5.0
+        poll_interval_s = 0.05
+        mask = InspectExportMask.SYSTEM_PROFILE
+
+        with profile(
+            activities=[ProfilerActivity.PrivateUse1],
+            experimental_config=exp_config,
+        ):
+            # The timestamped session dir only resolves while the session is live.
+            trace_dir = self._session_trace_dir(self.test_dir)
+
+            sizes = []
+            for _ in range(num_steps):
+                self._run_neuron_workload()
+                prev = self._part_files_size(trace_dir)
+                if is_async:
+                    request_export(mask)
+                    # The async drain lands on a background thread; wait for the
+                    # bytes to grow rather than racing the assertion against it.
+                    deadline = time.monotonic() + poll_deadline_s
+                    while self._part_files_size(trace_dir) <= prev and time.monotonic() < deadline:
+                        time.sleep(poll_interval_s)
+                else:
+                    export_now(mask)
+                sizes.append(self._part_files_size(trace_dir))
+
+            # Part files exist mid-session (before stop merges and deletes them).
+            assert any(
+                f.startswith("ntrace.nc") and f.endswith(".part") for f in os.listdir(trace_dir)
+            ), f"No ntrace.nc*.part files accrued mid-session in {trace_dir}"
+
+            # Appends only grow the parts, and multiple exports accrued more than
+            # the first. (Net growth + monotonicity, not strict step-wise growth:
+            # a step that happens to drain zero new events must not fail the test.)
+            assert sizes == sorted(sizes), f"Part-file bytes were not monotonic: {sizes}"
+            assert (
+                sizes[-1] > sizes[0]
+            ), f"Expected mid-session exports to accrue bytes across steps, got {sizes}"
+
+        # After stop: parts are merged into ntrace.pb and removed.
+        leftover_parts = [
+            f for f in os.listdir(trace_dir) if f.startswith("ntrace.nc") and f.endswith(".part")
+        ]
+        assert leftover_parts == [], f"Part files not consumed at stop: {leftover_parts}"
+        assert not os.path.exists(
+            os.path.join(trace_dir, "ntrace.pb.tmp")
+        ), "Unmerged ntrace.pb.tmp left behind after stop"
+
+        self._validate_nrt_output_files(self.test_dir, expect_ntrace=True)
+        assert (
+            self._count_ntrace_records(os.path.join(trace_dir, "ntrace.pb")) > 0
+        ), "Merged ntrace.pb has no records"
+
+    def test_export_never_vs_driven_produces_equivalent_output(self):
+        """Final on-disk output is equivalent whether export is driven or never.
+
+        The core guarantee: driving export N times mid-session must not change
+        the final trace versus never driving it -- the session-end merge sweeps
+        whatever the periodic ticks left behind. Byte-for-byte equality is not
+        achievable across two hardware runs (per-event timestamps/durations
+        differ), so we assert the invariants that must hold for the same workload:
+        identical output file set and count, identical event/record count (no
+        events lost or duplicated by mid-session draining), both files valid, and
+        no part/tmp residue in either run.
+        """
+        num_steps = 4
+        mask = InspectExportMask.SYSTEM_PROFILE
+
+        def run(subdir, *, drive_export):
+            output_dir = os.path.join(self.test_dir, subdir)
+            os.makedirs(output_dir, exist_ok=True)
+            exp_config = NeuronConfig(
+                modes=[ProfileMode.RUNTIME],
+                profile_output_dir=output_dir,
+            )
+            with profile(
+                activities=[ProfilerActivity.PrivateUse1],
+                experimental_config=exp_config,
+            ):
+                trace_dir = self._session_trace_dir(output_dir)
+                for _ in range(num_steps):
+                    self._run_neuron_workload()
+                    if drive_export:
+                        export_now(mask)
+            return trace_dir
+
+        # The FIRST profiled session in a process captures one-time runtime work
+        # -- NEFF load and device-memory setup (mem_handle / total_bytes /
+        # physical_address / hbm_idx events) -- that every later session reuses
+        # from cache. Measured on trn2: session 1 emits ~798 records and every
+        # session after it emits 368, whether or not export is driven. Comparing
+        # a first session against a second would therefore attribute that
+        # one-time work to mid-session export. Burn one throwaway session first
+        # so both measured runs are steady-state and differ only in export.
+        run("warmup", drive_export=False)
+
+        driven_dir = run("driven", drive_export=True)
+        never_dir = run("never", drive_export=False)
+
+        # .neff files are compilation artifacts, not profiling output: NRT dumps
+        # them only on first compilation in a process, so whichever run compiles
+        # the shape first gets them and the other reuses the cache. Exclude them
+        # from the equivalence comparison (same rationale as
+        # _validate_nrt_output_structure).
+        def profiling_output(trace_dir):
+            return sorted(f for f in os.listdir(trace_dir) if not f.endswith(".neff"))
+
+        driven_files = profiling_output(driven_dir)
+        never_files = profiling_output(never_dir)
+
+        # Same output file names and count.
+        assert (
+            driven_files == never_files
+        ), f"Output file set differs: driven={driven_files} never={never_files}"
+
+        # No mid-session residue survived stop in either run.
+        for label, files in (("driven", driven_files), ("never", never_files)):
+            assert not any(
+                f.startswith("ntrace.nc") and f.endswith(".part") for f in files
+            ), f"{label} run left part files behind: {files}"
+            assert "ntrace.pb.tmp" not in files, f"{label} run left ntrace.pb.tmp behind"
+
+        # Same event count, both valid framing, non-empty.
+        driven_records = self._count_ntrace_records(os.path.join(driven_dir, "ntrace.pb"))
+        never_records = self._count_ntrace_records(os.path.join(never_dir, "ntrace.pb"))
+        assert (
+            driven_records > 0 and never_records > 0
+        ), f"Empty trace: driven={driven_records} never={never_records}"
+        assert driven_records == never_records, (
+            "Mid-session export changed the event count: "
+            f"driven={driven_records} never={never_records}"
+        )
+
 
 class TestProfileMode:
     """Test cases for ProfileMode enum."""
@@ -704,17 +1184,20 @@ class TestNeuronConfig:
     def test_default_modes(self):
         """Test NeuronConfig() defaults to device + runtime."""
         config = NeuronConfig()
-        assert config.custom_profiler_config == "neuron_profile:device,runtime"
+        parts = config.custom_profiler_config.split(";")
+        assert parts[0] == "neuron_profile:device,runtime"
 
     def test_device_only(self):
         """Test NeuronConfig with device mode only."""
         config = NeuronConfig(modes=[ProfileMode.DEVICE])
-        assert config.custom_profiler_config == "neuron_profile:device"
+        parts = config.custom_profiler_config.split(";")
+        assert parts[0] == "neuron_profile:device"
 
     def test_runtime_only(self):
         """Test NeuronConfig with runtime mode only."""
         config = NeuronConfig(modes=[ProfileMode.RUNTIME])
-        assert config.custom_profiler_config == "neuron_profile:runtime"
+        parts = config.custom_profiler_config.split(";")
+        assert parts[0] == "neuron_profile:runtime"
 
     def test_all_modes(self):
         """Test NeuronConfig with all modes."""
@@ -726,7 +1209,8 @@ class TestNeuronConfig:
                 ProfileMode.HOST_MEMORY,
             ]
         )
-        assert config.custom_profiler_config == "neuron_profile:device,runtime,cpu_util,host_memory"
+        parts = config.custom_profiler_config.split(";")
+        assert parts[0] == "neuron_profile:device,runtime,cpu_util,host_memory"
 
     def test_empty_modes_raises_value_error(self):
         """Test that empty modes list raises ValueError."""
@@ -768,6 +1252,28 @@ class TestNeuronConfig:
         assert "neuron_profile:device,runtime" in config.custom_profiler_config
         assert "profile_output_dir:/tmp/traces" in config.custom_profiler_config
 
+    def test_neff_cache_dir_from_env(self):
+        """Test NeuronConfig with neff_cache_dir set from env when not
+        explicitly provided and TORCH_NEURONX_NEFF_CACHE_DIR is set.
+        """
+        # for safety, set the env variable here so it is not affected by ordering of tests
+        fake_cache_path = "/tmp/neff_cache_from_env"
+        old_env = os.environ.get("TORCH_NEURONX_NEFF_CACHE_DIR", "")
+        os.environ["TORCH_NEURONX_NEFF_CACHE_DIR"] = fake_cache_path
+        # should read from the environment variable on init
+        config = NeuronConfig()
+        # reset to the old env value before asserting
+        os.environ["TORCH_NEURONX_NEFF_CACHE_DIR"] = old_env
+        parts = config.custom_profiler_config.split(";")
+        assert f"neff_cache_dir:{fake_cache_path}" in parts
+
+    def test_neff_cache_dir_provided(self):
+        """Test NeuronConfig with neff_cache_dir parameter."""
+        fake_cache_path = "/tmp/neuron_config_neff_cache"
+        config = NeuronConfig(neff_cache_dir=fake_cache_path)
+        parts = config.custom_profiler_config.split(";")
+        assert f"neff_cache_dir:{fake_cache_path}" in parts
+
     def test_all_nrt_params(self):
         """Test NeuronConfig with all NRT config parameters specified."""
         config = NeuronConfig(
@@ -786,3 +1292,124 @@ class TestNeuronConfig:
         """Test that NeuronConfig is an instance of _ExperimentalConfig."""
         config = NeuronConfig()
         assert isinstance(config, _ExperimentalConfig)
+
+
+class TestCorrelateDeviceTimeIntegration:
+    """Integration tests for correlate_device_time with NeuronProfiler."""
+
+    @pytest.fixture(autouse=True)
+    def _test_dir(self, tmp_path):
+        self.test_dir = str(tmp_path)
+
+    @pytest.fixture
+    def neuron_tensor(self):
+        x = torch.randn(4, 4, device="neuron")
+        for _ in range(3):
+            _ = x * 2 + 1
+            torch.neuron.synchronize()
+        return x
+
+    def test_auto_correlation_via_neuron_profiler(self, neuron_tensor):
+        """NeuronProfiler.export_trace() auto-correlates when config enabled."""
+        nc = NeuronConfig(
+            modes=[ProfileMode.RUNTIME],
+            profile_output_dir=self.test_dir,
+            correlate_device_time=True,
+        )
+        exporter = NeuronProfiler(nc)
+
+        results = []
+
+        def on_trace_ready(p):
+            exporter.export_trace(p)
+            ka = p.key_averages()
+            results.append(sum(e.self_device_time_total for e in ka))
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            experimental_config=nc,
+            schedule=schedule(wait=0, warmup=3, active=1),
+            on_trace_ready=on_trace_ready,
+        ) as prof:
+            for _ in range(4):
+                _ = neuron_tensor * 2 + 1
+                torch.neuron.synchronize()
+                prof.step()
+
+        assert len(results) > 0, "on_trace_ready was never called"
+        assert results[0] > 0, "Expected non-zero NEURON time from auto-correlation"
+
+    def test_disabled_via_config(self, neuron_tensor):
+        """correlate_device_time=False should skip correlation."""
+        nc = NeuronConfig(
+            modes=[ProfileMode.RUNTIME],
+            profile_output_dir=self.test_dir,
+            correlate_device_time=False,
+        )
+        exporter = NeuronProfiler(nc)
+
+        results = []
+
+        def on_trace_ready(p):
+            exporter.export_trace(p)
+            ka = p.key_averages()
+            results.append(sum(e.self_device_time_total for e in ka))
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            experimental_config=nc,
+            schedule=schedule(wait=0, warmup=3, active=1),
+            on_trace_ready=on_trace_ready,
+        ) as prof:
+            for _ in range(4):
+                _ = neuron_tensor * 2 + 1
+                torch.neuron.synchronize()
+                prof.step()
+
+        assert len(results) > 0, "on_trace_ready was never called"
+        assert results[0] == 0, "Expected zero NEURON time when correlation disabled"
+
+    def test_manual_correlate_without_schedule(self, neuron_tensor):
+        """correlate_device_time(prof) populates key_averages without schedule."""
+        nc = NeuronConfig(modes=[ProfileMode.RUNTIME], profile_output_dir=self.test_dir)
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            experimental_config=nc,
+        ) as prof:
+            _ = neuron_tensor * 2 + 1
+            torch.neuron.synchronize()
+
+        correlate_device_time(prof)
+        ka = prof.key_averages()
+        total = sum(e.self_device_time_total for e in ka)
+        assert total > 0, "Expected non-zero NEURON time after correlate_device_time()"
+
+    def test_correlate_via_export_trace_with_schedule(self, neuron_tensor):
+        """NeuronProfiler.export_trace() correlates inside on_trace_ready with schedule."""
+        nc = NeuronConfig(
+            modes=[ProfileMode.RUNTIME],
+            profile_output_dir=self.test_dir,
+            correlate_device_time=True,
+        )
+        exporter = NeuronProfiler(nc)
+
+        results = []
+
+        def on_trace_ready(p):
+            exporter.export_trace(p)
+            results.append(sum(e.self_device_time_total for e in p.key_averages()))
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            experimental_config=nc,
+            schedule=schedule(wait=0, warmup=3, active=1),
+            on_trace_ready=on_trace_ready,
+        ) as prof:
+            for _ in range(4):
+                _ = neuron_tensor * 2 + 1
+                torch.neuron.synchronize()
+                prof.step()
+
+        assert len(results) > 0, "on_trace_ready was never called"
+        assert results[0] > 0, "Expected non-zero NEURON time with schedule"

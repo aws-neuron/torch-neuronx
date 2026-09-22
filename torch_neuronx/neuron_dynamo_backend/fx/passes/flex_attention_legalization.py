@@ -12,8 +12,13 @@ from dataclasses import dataclass
 import torch
 import torch.fx as fx
 from torch.fx import Node
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
 from torch.fx.passes.shape_prop import TensorMetadata
+
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
+    NeuronFXPass,
+    NeuronFXPassState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +35,7 @@ class AttentionShapes:
     E: int  # head dimension
 
 
-class FlexAttentionLegalization(PassBase):
+class FlexAttentionLegalization(NeuronFXPass):
     """Flex Attention Legalization Pass for PyTorch FX Graphs.
 
     This pass legalizes flex_attention higher-order operators by decomposing
@@ -41,11 +46,13 @@ class FlexAttentionLegalization(PassBase):
     handles them explicitly.
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, state: NeuronFXPassState | None = None):
+        super().__init__(state)
         self._forward_score_mod_name: str | None = None
         self._forward_score_mod_module: fx.GraphModule | None = None
         self._forward_mask_mod_module: fx.GraphModule | None = None
+        self._forward_score_mod_other_buffers: tuple = ()
+        self._forward_mask_mod_other_buffers: tuple = ()
 
     @property
     def name(self) -> str:
@@ -65,8 +72,31 @@ class FlexAttentionLegalization(PassBase):
 
         if example_tensor is not None:
             node.meta["val"] = example_tensor
+            # Also set tensor_meta for torch-mlir
+            if hasattr(example_tensor, "shape"):
+                node.meta["tensor_meta"] = TensorMetadata(
+                    shape=example_tensor.shape,
+                    dtype=example_tensor.dtype,
+                    requires_grad=False,
+                    stride=example_tensor.stride()
+                    if hasattr(example_tensor, "stride")
+                    else tuple(range(len(example_tensor.shape) - 1, -1, -1)),
+                    memory_format=torch.contiguous_format,
+                    is_quantized=False,
+                    qparams={},
+                )
         elif shape is not None and dtype is not None:
             node.meta["val"] = torch.empty(shape, dtype=dtype)
+            # Also set tensor_meta for torch-mlir
+            node.meta["tensor_meta"] = TensorMetadata(
+                shape=torch.Size(shape) if not isinstance(shape, torch.Size) else shape,
+                dtype=dtype,
+                requires_grad=False,
+                stride=tuple(range(len(shape) - 1, -1, -1)),
+                memory_format=torch.contiguous_format,
+                is_quantized=False,
+                qparams={},
+            )
 
         return node
 
@@ -269,43 +299,124 @@ class FlexAttentionLegalization(PassBase):
 
     def _compute_softmax(
         self, graph: fx.Graph, scores: fx.Node, shapes: AttentionShapes, dtype: torch.dtype
-    ) -> tuple[fx.Node, fx.Node, fx.Node]:
-        """Compute numerically stable softmax over the last dimension."""
+    ) -> tuple[fx.Node, fx.Node]:
+        """Compute numerically stable softmax over the last dimension.
+
+        Computes in the wider of the scores' actual dtype and `dtype` (a score_mod
+        may promote, e.g. bf16 -> f32 for alibi), then casts attn_weights back to
+        `dtype` so the caller gets weights matching the original Q/K/V dtype.
+
+        Returns:
+            (attn_weights, logsumexp) where attn_weights has the caller's `dtype`
+            and logsumexp is always float32 with shape [B, H, L].
+        """
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        # Compute in the wider dtype so a promoting score_mod doesn't lose precision
+        # and the metadata matches the actual tensors.
+        scores_dtype = scores.meta["val"].dtype if "val" in scores.meta else dtype
+        compute_dtype = max((scores_dtype, dtype), key=lambda d: torch.finfo(d).bits)
+
         # max_scores = max(scores, dim=-1, keepdim=True)
         max_result = graph.call_function(torch.ops.aten.max.dim, args=(scores, -1, True))
-        max_result.meta["val"] = (
-            torch.empty([shapes.B, shapes.H_q, shapes.L, 1], dtype=dtype),
-            torch.empty([shapes.B, shapes.H_q, shapes.L, 1], dtype=torch.int64),
+
+        # max.dim returns a tuple (values, indices), use FakeTensors for torch-mlir compatibility
+        # torch-mlir unpacks tuples and needs each element to be a FakeTensor
+        max_result_shape = [shapes.B, shapes.H_q, shapes.L, 1]
+        with FakeTensorMode():
+            fake_values = torch.empty(max_result_shape, dtype=compute_dtype)
+            fake_indices = torch.empty(max_result_shape, dtype=torch.int64)
+
+        max_result_stride = fake_values.stride()
+        max_result.meta["val"] = (fake_values, fake_indices)
+        # For tuple returns, tensor_meta should also be a tuple
+        max_result.meta["tensor_meta"] = (
+            TensorMetadata(
+                shape=torch.Size(max_result_shape),
+                dtype=compute_dtype,
+                requires_grad=False,
+                stride=max_result_stride,
+                memory_format=torch.contiguous_format,
+                is_quantized=False,
+                qparams={},
+            ),
+            TensorMetadata(
+                shape=torch.Size(max_result_shape),
+                dtype=torch.int64,
+                requires_grad=False,
+                stride=max_result_stride,
+                memory_format=torch.contiguous_format,
+                is_quantized=False,
+                qparams={},
+            ),
         )
 
         max_scores = graph.call_function(operator.getitem, args=(max_result, 0))
         self._add_metadata_to_node(
-            max_scores, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=dtype
+            max_scores, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=compute_dtype
         )
 
         # scores_centered = scores - max_scores
         scores_centered = graph.call_function(torch.ops.aten.sub.Tensor, args=(scores, max_scores))
         self._add_metadata_to_node(
-            scores_centered, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=dtype
+            scores_centered, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=compute_dtype
         )
 
         # exp_scores = exp(scores_centered)
         exp_scores = graph.call_function(torch.ops.aten.exp.default, args=(scores_centered,))
         self._add_metadata_to_node(
-            exp_scores, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=dtype
+            exp_scores, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=compute_dtype
         )
 
         # denom = sum(exp_scores, dim=-1, keepdim=True)
         denom = graph.call_function(torch.ops.aten.sum.dim_IntList, args=(exp_scores, [-1], True))
-        self._add_metadata_to_node(denom, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=dtype)
+        self._add_metadata_to_node(
+            denom, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=compute_dtype
+        )
 
         # attn_weights = exp_scores / denom
         attn_weights = graph.call_function(torch.ops.aten.div.Tensor, args=(exp_scores, denom))
         self._add_metadata_to_node(
-            attn_weights, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=dtype
+            attn_weights, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=compute_dtype
         )
 
-        return attn_weights, exp_scores, denom
+        # Cast attn_weights back to caller dtype if we computed in a wider type
+        if compute_dtype != dtype:
+            attn_weights = graph.call_function(
+                torch.ops.aten._to_copy.default, args=(attn_weights,), kwargs={"dtype": dtype}
+            )
+            self._add_metadata_to_node(
+                attn_weights, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=dtype
+            )
+
+        # Compute real logsumexp = max + log(sum(exp(scores - max)))
+        # log(denom) has shape [B, H, L, 1] (keepdim from sum)
+        log_denom = graph.call_function(torch.ops.aten.log.default, args=(denom,))
+        self._add_metadata_to_node(
+            log_denom, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=compute_dtype
+        )
+
+        # lse_keepdim = max_scores + log_denom, shape [B, H, L, 1]
+        lse_keepdim = graph.call_function(torch.ops.aten.add.Tensor, args=(max_scores, log_denom))
+        self._add_metadata_to_node(
+            lse_keepdim, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=compute_dtype
+        )
+
+        # Cast to float32 before squeeze for backward compatibility
+        lse_keepdim = graph.call_function(
+            torch.ops.aten._to_copy.default, args=(lse_keepdim,), kwargs={"dtype": torch.float32}
+        )
+        self._add_metadata_to_node(
+            lse_keepdim, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=torch.float32
+        )
+
+        # Squeeze to [B, H, L]
+        logsumexp = graph.call_function(torch.ops.aten.squeeze.dim, args=(lse_keepdim, -1))
+        self._add_metadata_to_node(
+            logsumexp, shape=[shapes.B, shapes.H_q, shapes.L], dtype=torch.float32
+        )
+
+        return attn_weights, logsumexp
 
     def _compute_attention_scores(
         self,
@@ -345,143 +456,104 @@ class FlexAttentionLegalization(PassBase):
         self,
         new_node: fx.Node,
         original_node: fx.Node,
-        scaled_scores: fx.Node,
-        shapes: AttentionShapes,
     ):
-        """Fix metadata for score_mod operations that need shape correction."""
-        comparison_ops = [
-            torch.ops.aten.ge.Tensor,
-            torch.ops.aten.le.Tensor,
-            torch.ops.aten.gt.Tensor,
-            torch.ops.aten.lt.Tensor,
-            torch.ops.aten.eq.Tensor,
-            torch.ops.aten.ne.Tensor,
-        ]
-
-        scalar_comparison_ops = [
-            torch.ops.aten.ge.Scalar,
-            torch.ops.aten.le.Scalar,
-            torch.ops.aten.gt.Scalar,
-            torch.ops.aten.lt.Scalar,
-            torch.ops.aten.eq.Scalar,
-            torch.ops.aten.ne.Scalar,
-        ]
-
-        arithmetic_ops = [
-            torch.ops.aten.sub.Tensor,
-            torch.ops.aten.add.Tensor,
-            torch.ops.aten.mul.Tensor,
-        ]
-
-        bitwise_ops = [
-            torch.ops.aten.bitwise_or.Tensor,
-            torch.ops.aten.bitwise_and.Tensor,
-        ]
-
-        masked_fill_ops = [
-            torch.ops.aten.masked_fill.Scalar,
-        ]
-
-        if original_node.target in scalar_comparison_ops and len(new_node.args) >= 1:
-            # Scalar comparison: result shape matches first operand
-            arg1 = new_node.args[0]
-            if hasattr(arg1, "meta") and "val" in arg1.meta:
-                result_shape = list(arg1.meta["val"].shape)
-                new_node.meta["val"] = torch.empty(
-                    result_shape, dtype=torch.bool, device=arg1.meta["val"].device
+        """Fix metadata for score_mod operations using generic execution on meta tensors."""
+        meta_args = []
+        for arg in new_node.args:
+            if isinstance(arg, fx.Node) and hasattr(arg, "meta") and "val" in arg.meta:
+                meta_args.append(
+                    torch.empty(arg.meta["val"].shape, dtype=arg.meta["val"].dtype, device="meta")
                 )
-                new_node.meta["tensor_meta"] = TensorMetadata(
-                    shape=torch.Size(result_shape),
-                    dtype=torch.bool,
-                    requires_grad=False,
-                    stride=tuple(range(len(result_shape) - 1, -1, -1)),
-                    memory_format=torch.contiguous_format,
-                    is_quantized=False,
-                    qparams={},
+            elif isinstance(arg, list | tuple):
+                meta_args.append(
+                    type(arg)(
+                        torch.empty(a.meta["val"].shape, dtype=a.meta["val"].dtype, device="meta")
+                        if isinstance(a, fx.Node) and hasattr(a, "meta") and "val" in a.meta
+                        else a
+                        for a in arg
+                    )
                 )
+            elif isinstance(arg, int | float | bool | str | type(None)):
+                meta_args.append(arg)
+            else:
                 return
 
-        if original_node.target in masked_fill_ops and len(new_node.args) >= 1:
-            # masked_fill: result shape and dtype match first operand
-            arg1 = new_node.args[0]
-            if hasattr(arg1, "meta") and "val" in arg1.meta:
-                result_shape = list(arg1.meta["val"].shape)
-                result_dtype = arg1.meta["val"].dtype
-                new_node.meta["val"] = torch.empty(
-                    result_shape, dtype=result_dtype, device=arg1.meta["val"].device
+        meta_kwargs = {}
+        for k, v in original_node.kwargs.items():
+            if isinstance(v, fx.Node) and hasattr(v, "meta") and "val" in v.meta:
+                meta_kwargs[k] = torch.empty(
+                    v.meta["val"].shape, dtype=v.meta["val"].dtype, device="meta"
                 )
-                new_node.meta["tensor_meta"] = TensorMetadata(
-                    shape=torch.Size(result_shape),
-                    dtype=result_dtype,
-                    requires_grad=False,
-                    stride=tuple(range(len(result_shape) - 1, -1, -1)),
-                    memory_format=torch.contiguous_format,
-                    is_quantized=False,
-                    qparams={},
-                )
-                return
+            else:
+                meta_kwargs[k] = v
 
-        if (
-            original_node.target in comparison_ops
-            or original_node.target in arithmetic_ops
-            or original_node.target in bitwise_ops
-        ) and len(new_node.args) >= 2:
-            # Compute broadcast shape from operands using the actual aten operation
-            # This provides wider coverage by using PyTorch's actual op semantics
-            arg1, arg2 = new_node.args[0], new_node.args[1]
-            if (
-                hasattr(arg1, "meta")
-                and "val" in arg1.meta
-                and hasattr(arg2, "meta")
-                and "val" in arg2.meta
-            ):
-                # Create meta tensors from the operands
-                meta_tensor1 = torch.empty(
-                    arg1.meta["val"].shape, dtype=arg1.meta["val"].dtype, device="meta"
-                )
-                meta_tensor2 = torch.empty(
-                    arg2.meta["val"].shape, dtype=arg2.meta["val"].dtype, device="meta"
-                )
+        if not callable(original_node.target):
+            raise TypeError(
+                f"Expected callable target for node '{original_node.name}', "
+                f"got {type(original_node.target)}: {original_node.target}"
+            )
 
-                # Apply the actual aten operation to compute broadcast shape and dtype
-                result = original_node.target(meta_tensor1, meta_tensor2)
-                result_shape = list(result.shape)
-                result_dtype = result.dtype
+        result = original_node.target(*meta_args, **meta_kwargs)
 
-                new_node.meta["val"] = torch.empty(
-                    result_shape, dtype=result_dtype, device=result.device
-                )
-                new_node.meta["tensor_meta"] = TensorMetadata(
-                    shape=torch.Size(result_shape),
-                    dtype=result_dtype,
-                    requires_grad=False,
-                    stride=tuple(range(len(result_shape) - 1, -1, -1)),
-                    memory_format=torch.contiguous_format,
-                    is_quantized=False,
-                    qparams={},
-                )
-                return
+        if isinstance(result, tuple):
+            result = result[0]
 
-        # Fallback for where.self
-        if original_node.target == torch.ops.aten.where.self and "val" in scaled_scores.meta:
-            score_shape = scaled_scores.meta["val"].shape
-            score_dtype = scaled_scores.meta["val"].dtype
+        if hasattr(result, "shape") and hasattr(result, "dtype"):
             new_node.meta["val"] = torch.empty(
-                score_shape, dtype=score_dtype, device=scaled_scores.meta["val"].device
+                result.shape, dtype=result.dtype, device=result.device
             )
             new_node.meta["tensor_meta"] = TensorMetadata(
-                shape=score_shape,
-                dtype=score_dtype,
+                shape=torch.Size(result.shape),
+                dtype=result.dtype,
                 requires_grad=False,
-                stride=tuple(range(len(score_shape) - 1, -1, -1)),
+                stride=tuple(range(len(result.shape) - 1, -1, -1)),
                 memory_format=torch.contiguous_format,
                 is_quantized=False,
                 qparams={},
             )
+            return
+
+        # Generic fallback: re-execute the op on meta tensors to infer correct shape
+        # Handles ops not covered above (e.g. aten.index.Tensor for free variable indexing)
+        if original_node.op == "call_function" and callable(original_node.target):
+            try:
+
+                def _to_meta(arg):
+                    if isinstance(arg, fx.Node) and hasattr(arg, "meta") and "val" in arg.meta:
+                        v = arg.meta["val"]
+                        return torch.empty(v.shape, dtype=v.dtype, device="meta")
+                    elif isinstance(arg, list | tuple):
+                        return type(arg)(_to_meta(a) if a is not None else None for a in arg)
+                    return arg
+
+                meta_args = tuple(_to_meta(a) for a in new_node.args)
+                meta_kwargs = {k: _to_meta(v) for k, v in new_node.kwargs.items()}
+                result = original_node.target(*meta_args, **meta_kwargs)
+                if isinstance(result, torch.Tensor):
+                    new_node.meta["val"] = result
+                    new_node.meta["tensor_meta"] = TensorMetadata(
+                        shape=result.shape,
+                        dtype=result.dtype,
+                        requires_grad=False,
+                        stride=tuple(range(len(result.shape) - 1, -1, -1)),
+                        memory_format=torch.contiguous_format,
+                        is_quantized=False,
+                        qparams={},
+                    )
+            except Exception:
+                pass
 
     def _map_node_args(self, node_args: tuple, value_map: dict[fx.Node, fx.Node]) -> list:
         """Map node arguments through value_map, handling both Node and non-Node args."""
-        return [value_map[arg] if isinstance(arg, fx.Node) else arg for arg in node_args]
+
+        def _map_arg(arg):
+            if isinstance(arg, fx.Node):
+                return value_map[arg]
+            elif isinstance(arg, list | tuple):
+                return type(arg)(_map_arg(a) for a in arg)
+            return arg
+
+        return [_map_arg(arg) for arg in node_args]
 
     def _map_node_kwargs(self, node_kwargs: dict, value_map: dict[fx.Node, fx.Node]) -> dict:
         """Map node kwargs through value_map, handling both Node and non-Node values."""
@@ -495,20 +567,18 @@ class FlexAttentionLegalization(PassBase):
         new_args: tuple,
         new_kwargs: dict,
         module_prefix: str,
+        submodule: fx.GraphModule,
     ) -> fx.Node:
         """Create a new node in the graph based on the operation type."""
         if node.op == "get_attr":
             # Copy the attribute from submodule to main module
             attr_name = node.target
-            # Get the parent module by traversing the graph module hierarchy
-            parent_module = gm
-            for part in module_prefix.split(".")[:-1]:
-                if part:
-                    parent_module = getattr(parent_module, part)
-
-            attr_value = getattr(parent_module, attr_name)
+            attr_value = getattr(submodule, attr_name)
             new_attr_name = f"_inlined_{module_prefix}_{attr_name}".replace(".", "_")
-            setattr(gm, new_attr_name, attr_value)
+            if isinstance(attr_value, torch.Tensor):
+                gm.register_buffer(new_attr_name, attr_value)
+            else:
+                setattr(gm, new_attr_name, attr_value)
             new_node = graph.get_attr(new_attr_name)
 
             # Set metadata based on actual tensor value
@@ -537,6 +607,50 @@ class FlexAttentionLegalization(PassBase):
         method = getattr(graph, node.op)
         return method(node.target, args=new_args, kwargs=new_kwargs)
 
+    def _inline_submodule(
+        self,
+        graph: fx.Graph,
+        gm: fx.GraphModule,
+        submodule: fx.GraphModule,
+        module_prefix: str,
+        placeholder_values: list[fx.Node],
+    ) -> fx.Node | None:
+        """Inline a submodule's operations into the main graph.
+
+        Maps placeholders to the provided values, copies all interior nodes,
+        and returns the output node (or None if the submodule has no output).
+        """
+        value_map = {}
+        placeholders = [n for n in submodule.graph.nodes if n.op == "placeholder"]
+
+        for placeholder, actual_value in zip(placeholders, placeholder_values, strict=False):
+            value_map[placeholder] = actual_value
+
+        result = None
+
+        for sub_node in submodule.graph.nodes:
+            if sub_node.op == "placeholder":
+                continue
+
+            if sub_node.op == "output":
+                result = value_map[sub_node.args[0]]
+                break
+
+            new_args = tuple(self._map_node_args(sub_node.args, value_map))
+            new_kwargs = self._map_node_kwargs(sub_node.kwargs, value_map)
+
+            new_node = self._create_node_from_op(
+                graph, gm, sub_node, new_args, new_kwargs, module_prefix, submodule
+            )
+
+            if sub_node.meta and sub_node.op != "get_attr":
+                new_node.meta = sub_node.meta.copy()
+                self._fix_score_mod_metadata(new_node, sub_node)
+
+            value_map[sub_node] = new_node
+
+        return result
+
     def _inline_score_mod(
         self,
         graph: fx.Graph,
@@ -546,47 +660,17 @@ class FlexAttentionLegalization(PassBase):
         scaled_scores: fx.Node,
         index_tensors: tuple[fx.Node, fx.Node, fx.Node, fx.Node],
         shapes: AttentionShapes,
+        other_buffers: tuple = (),
     ) -> fx.Node:
         """Inline score_mod submodule operations into the main graph."""
-        logger.debug(f"Inlining score_mod submodule: {score_mod_name}")
-
-        # Build value map from placeholders to actual args
-        value_map = {}
-        placeholders = [n for n in score_mod_module.graph.nodes if n.op == "placeholder"]
-        actual_args = [scaled_scores, *index_tensors]
-
-        for placeholder, actual_value in zip(placeholders, actual_args, strict=False):
-            value_map[placeholder] = actual_value
-
-        final_scores = scaled_scores
-
-        # Copy all non-placeholder, non-output nodes from score_mod graph
-        for score_mod_node in score_mod_module.graph.nodes:
-            if score_mod_node.op == "placeholder":
-                continue
-
-            if score_mod_node.op == "output":
-                final_scores = value_map[score_mod_node.args[0]]
-                break
-
-            # Map args and kwargs through value_map
-            new_args = tuple(self._map_node_args(score_mod_node.args, value_map))
-            new_kwargs = self._map_node_kwargs(score_mod_node.kwargs, value_map)
-
-            # Create the new node in our graph
-            new_node = self._create_node_from_op(
-                graph, gm, score_mod_node, new_args, new_kwargs, score_mod_name
-            )
-
-            # Copy and fix metadata
-            if score_mod_node.meta:
-                new_node.meta = score_mod_node.meta.copy()
-                self._fix_score_mod_metadata(new_node, score_mod_node, scaled_scores, shapes)
-
-            value_map[score_mod_node] = new_node
-
-        logger.debug("Successfully inlined score_mod operations")
-        return final_scores
+        result = self._inline_submodule(
+            graph,
+            gm,
+            score_mod_module,
+            score_mod_name,
+            [scaled_scores, *index_tensors, *other_buffers],
+        )
+        return result if result is not None else scaled_scores
 
     def _apply_combined_mask_score_mod(
         self,
@@ -596,44 +680,16 @@ class FlexAttentionLegalization(PassBase):
         scores: fx.Node,
         index_tensors: tuple[fx.Node, fx.Node, fx.Node, fx.Node],
         shapes: AttentionShapes,
+        other_buffers: tuple = (),
     ) -> fx.Node:
         """Apply mask_mod by combining it with score using torch.where pattern."""
-        logger.debug("Applying combined mask_mod with score_mod pattern")
-
-        # Build value map from placeholders to actual args (mask_mod takes b, h, q_idx, kv_idx)
-        value_map = {}
-        placeholders = [n for n in mask_mod_module.graph.nodes if n.op == "placeholder"]
-
-        for placeholder, actual_value in zip(placeholders, index_tensors, strict=False):
-            value_map[placeholder] = actual_value
-
-        mask_result = None
-
-        # Copy all non-placeholder, non-output nodes from mask_mod graph
-        for mask_mod_node in mask_mod_module.graph.nodes:
-            if mask_mod_node.op == "placeholder":
-                continue
-
-            if mask_mod_node.op == "output":
-                mask_result = value_map[mask_mod_node.args[0]]
-                break
-
-            # Map args and kwargs through value_map
-            new_args = tuple(self._map_node_args(mask_mod_node.args, value_map))
-            new_kwargs = self._map_node_kwargs(mask_mod_node.kwargs, value_map)
-
-            # Create the new node in our graph
-            new_node = self._create_node_from_op(
-                graph, gm, mask_mod_node, new_args, new_kwargs, "mask_mod"
-            )
-
-            # Copy metadata
-            if mask_mod_node.meta:
-                new_node.meta = mask_mod_node.meta.copy()
-
-            value_map[mask_mod_node] = new_node
-
-        # Now apply the mask using torch.where pattern: torch.where(mask, score, -inf)
+        mask_result = self._inline_submodule(
+            graph,
+            gm,
+            mask_mod_module,
+            "mask_mod",
+            [*index_tensors, *other_buffers],
+        )
         if mask_result:
             neg_inf = graph.call_function(
                 torch.ops.aten.full_like.default,
@@ -655,80 +711,10 @@ class FlexAttentionLegalization(PassBase):
                 dtype=scores.meta["val"].dtype,
             )
 
-            logger.debug("Successfully applied combined mask_mod with score_mod pattern")
             return masked_scores
 
-        logger.warning("mask_mod did not produce a result, returning original scores")
+        logger.warning("mask_mod produced no result, returning original scores")
         return scores
-
-    # =========================================================================
-    # Sort Replacement
-    # =========================================================================
-
-    def _replace_sort_stable_with_identity(self, graph: fx.Graph) -> bool:
-        """Replace sort.stable with identity (input passthrough + dummy indices)."""
-        modified = False
-
-        for node in list(graph.nodes):
-            if node.op == "call_function" and node.target == torch.ops.aten.sort.stable:
-                logger.debug(f"Replacing sort.stable node: {node.name} with identity")
-
-                input_node = node.args[0]
-                dim = node.kwargs.get("dim", node.args[2] if len(node.args) > 2 else -1)
-
-                if "val" not in input_node.meta:
-                    logger.warning(f"No metadata for {input_node.name}, skipping sort replacement")
-                    continue
-
-                input_val = input_node.meta["val"]
-                shape = list(input_val.shape)
-                ndim = len(shape)
-                actual_dim = dim if dim >= 0 else ndim + dim
-                dim_size = shape[actual_dim]
-
-                with graph.inserting_before(node):
-                    # Create indices: arange -> view -> expand
-                    indices = graph.call_function(
-                        torch.ops.aten.arange.default,
-                        args=(dim_size,),
-                        kwargs={"dtype": torch.int64},
-                    )
-                    self._add_metadata_to_node(indices, shape=[dim_size], dtype=torch.int64)
-
-                    view_shape = [1] * ndim
-                    view_shape[actual_dim] = dim_size
-                    indices_viewed = graph.call_function(
-                        torch.ops.aten.view.default, args=(indices, view_shape)
-                    )
-                    self._add_metadata_to_node(indices_viewed, shape=view_shape, dtype=torch.int64)
-
-                    indices_expanded = graph.call_function(
-                        torch.ops.aten.expand.default, args=(indices_viewed, shape)
-                    )
-                    self._add_metadata_to_node(indices_expanded, shape=shape, dtype=torch.int64)
-
-                # Replace getitem users
-                for user in list(node.users):
-                    if user.op == "call_function" and user.target == operator.getitem:
-                        idx = user.args[1]
-                        if idx == 0:  # sorted values -> use input (identity)
-                            user.replace_all_uses_with(input_node)
-                        else:  # indices -> use dummy arange indices
-                            user.replace_all_uses_with(indices_expanded)
-                        graph.erase_node(user)
-
-                if len(node.users) == 0:
-                    graph.erase_node(node)
-                    logger.debug(f"  Successfully replaced {node.name}")
-                else:
-                    logger.warning(f"{node.name} still has users: {[u.name for u in node.users]}")
-
-                modified = True
-
-        if not modified:
-            logger.debug("  No sort.stable operations found to replace")
-
-        return modified
 
     # =========================================================================
     # Forward Pass Legalization
@@ -736,8 +722,6 @@ class FlexAttentionLegalization(PassBase):
 
     def _legalize_flex_forward(self, graph: fx.Graph, gm: fx.GraphModule, node: fx.Node) -> bool:
         """Legalize a flex_attention forward node."""
-        logger.debug(f"Legalizing flex_attention forward node: {node.name}")
-
         # Use local variables to avoid state carryover between nodes
         forward_score_mod_name = None
         forward_score_mod_module = None
@@ -755,25 +739,28 @@ class FlexAttentionLegalization(PassBase):
         block_mask_node = node.args[4]
         scale = node.args[5]
 
+        # external buffers (free variable buffers)
+        score_mod_other_buffers = node.args[7] if len(node.args) > 7 else ()
+        mask_mod_other_buffers = node.args[8] if len(node.args) > 8 else ()
+
         # Get score_mod info
         if score_mod_node is not None and hasattr(score_mod_node, "target"):
             forward_score_mod_name = score_mod_node.target
             forward_score_mod_module = getattr(gm, forward_score_mod_name, None)
-            logger.debug(f"Found score_mod: {forward_score_mod_name}")
 
         # Get mask_mod from block_mask if present
+        # mask_mod is always the last element: index 12 in PT2.12, index 16 in PT2.13
         if (
             isinstance(block_mask_node, tuple)
-            and len(block_mask_node) > 12
-            and hasattr(block_mask_node[12], "target")
+            and len(block_mask_node) >= 13
+            and hasattr(block_mask_node[-1], "target")
         ):
-            mask_fn_node = block_mask_node[12]
+            mask_fn_node = block_mask_node[-1]
             forward_mask_mod_module = getattr(gm, mask_fn_node.target, None)
-            logger.debug(f"Found mask_mod in block_mask: {mask_fn_node.target}")
 
         # Get shape information
         if "val" not in query.meta or "val" not in key.meta:
-            logger.warning("  Missing shape metadata, cannot legalize flex_attention")
+            logger.warning("Missing shape metadata, cannot legalize flex_attention")
             return False
 
         q_shape = query.meta["val"].shape
@@ -789,7 +776,8 @@ class FlexAttentionLegalization(PassBase):
         query_dtype = query.meta["val"].dtype
 
         logger.debug(
-            f"Shape: B={shapes.B}, H_q={shapes.H_q}, L={shapes.L}, " f"S={shapes.S}, E={shapes.E}"
+            f"Legalizing flex_attention: B={shapes.B}, H_q={shapes.H_q}, "
+            f"H_kv={shapes.H_kv}, L={shapes.L}, S={shapes.S}, E={shapes.E}"
         )
 
         with graph.inserting_before(node):
@@ -817,6 +805,7 @@ class FlexAttentionLegalization(PassBase):
                     final_scores,
                     index_tensors,
                     shapes,
+                    other_buffers=score_mod_other_buffers,
                 )
 
             # Apply mask_mod by combining it with score_mod pattern
@@ -828,10 +817,13 @@ class FlexAttentionLegalization(PassBase):
                     final_scores,
                     index_tensors,
                     shapes,
+                    other_buffers=mask_mod_other_buffers,
                 )
 
             # Compute softmax
-            attn_weights, _, _ = self._compute_softmax(graph, final_scores, shapes, query_dtype)
+            attn_weights, logsumexp = self._compute_softmax(
+                graph, final_scores, shapes, query_dtype
+            )
 
             # Compute output: attn_weights @ value
             output = graph.call_function(
@@ -848,25 +840,57 @@ class FlexAttentionLegalization(PassBase):
         self._forward_score_mod_name = forward_score_mod_name
         self._forward_score_mod_module = forward_score_mod_module
         self._forward_mask_mod_module = forward_mask_mod_module
+        self._forward_score_mod_other_buffers = score_mod_other_buffers
+        self._forward_mask_mod_other_buffers = mask_mod_other_buffers
 
         # Replace users of the flex_attention node
-        self._replace_flex_forward_users(graph, node, output)
+        self._replace_flex_forward_users(graph, node, output, logsumexp)
         return True
 
-    def _replace_flex_forward_users(self, graph: fx.Graph, node: fx.Node, output: fx.Node):
-        """Replace all users of a flex_attention forward node."""
+    def _replace_flex_forward_users(
+        self, graph: fx.Graph, node: fx.Node, output: fx.Node, logsumexp: fx.Node
+    ):
+        """Replace all users of a flex_attention forward node.
+
+        flex_attention HOP returns (out, lse, max_scores):
+            index 0 -> attention output
+            index 1 -> logsumexp
+            index 2 -> max_scores
+        """
         users_to_replace = list(node.users)
 
         for user in users_to_replace:
             if user.op == "call_function" and user.target == operator.getitem:
                 index = user.args[1]
-                if index == 0 or index == 1:  # output
+                if index == 0:  # attention output
                     user.replace_all_uses_with(output)
-                graph.erase_node(user)
+                elif index == 1:  # logsumexp
+                    user.replace_all_uses_with(logsumexp)
+                elif (
+                    index == 2 and len(user.users) > 0
+                ):  # max_scores — unused, create dummy zeros [B, H, L]
+                    lse_shape = list(logsumexp.meta["val"].shape)
+                    with graph.inserting_before(user):
+                        dummy_max = graph.call_function(
+                            torch.ops.aten.zeros.default,
+                            args=(lse_shape,),
+                            kwargs={
+                                "dtype": output.meta["val"].dtype,
+                                "device": output.meta["val"].device,
+                            },
+                        )
+                        self._add_metadata_to_node(
+                            dummy_max, shape=lse_shape, dtype=output.meta["val"].dtype
+                        )
+                    user.replace_all_uses_with(dummy_max)
+
+                if len(user.users) == 0:
+                    graph.erase_node(user)
             else:
                 user.replace_all_uses_with(output)
 
-        graph.erase_node(node)
+        if len(node.users) == 0:
+            graph.erase_node(node)
 
     # =========================================================================
     # Backward Pass Legalization
@@ -874,8 +898,6 @@ class FlexAttentionLegalization(PassBase):
 
     def _legalize_flex_backward(self, graph: fx.Graph, gm: fx.GraphModule, node: fx.Node) -> bool:
         """Legalize a flex_attention backward node."""
-        logger.debug(f"Legalizing flex_attention_backward node: {node.name}")
-
         if len(node.args) < 11:
             logger.warning(f"Unexpected number of args: {len(node.args)}, skipping")
             return False
@@ -889,7 +911,7 @@ class FlexAttentionLegalization(PassBase):
 
         # Get shape information
         if "val" not in query.meta or "val" not in key.meta:
-            logger.warning("  Missing shape metadata, cannot legalize flex_attention_backward")
+            logger.warning("Missing shape metadata, cannot legalize flex_attention_backward")
             return False
 
         q_shape = query.meta["val"].shape
@@ -904,9 +926,6 @@ class FlexAttentionLegalization(PassBase):
         )
         query_dtype = query.meta["val"].dtype
 
-        if self._forward_score_mod_name:
-            logger.debug(f"Using score_mod from forward pass: {self._forward_score_mod_name}")
-
         with graph.inserting_before(node):
             # Handle GQA
             key_expanded, value_expanded = self._expand_kv_for_gqa(graph, key, value, shapes)
@@ -917,13 +936,13 @@ class FlexAttentionLegalization(PassBase):
             )
 
             # Apply score_mod and mask_mod if available
-            index_tensors = self._create_index_tensors(graph, shapes)
+            query_device = query.meta["val"].device if "val" in query.meta else None
+            index_tensors = self._create_index_tensors(graph, shapes, query_device)
 
             final_scores = scaled_scores
 
             # Apply score_mod first if available
             if self._forward_score_mod_module is not None:
-                logger.debug(f"Applying score_mod in backward: {self._forward_score_mod_name}")
                 final_scores = self._inline_score_mod(
                     graph,
                     gm,
@@ -932,11 +951,11 @@ class FlexAttentionLegalization(PassBase):
                     final_scores,
                     index_tensors,
                     shapes,
+                    other_buffers=self._forward_score_mod_other_buffers,
                 )
 
             # Apply mask_mod if available
             if self._forward_mask_mod_module is not None:
-                logger.debug("Applying mask_mod in backward pass")
                 final_scores = self._apply_combined_mask_score_mod(
                     graph,
                     gm,
@@ -944,10 +963,11 @@ class FlexAttentionLegalization(PassBase):
                     final_scores,
                     index_tensors,
                     shapes,
+                    other_buffers=self._forward_mask_mod_other_buffers,
                 )
 
             # Recompute softmax
-            attn_weights, _, _ = self._compute_softmax(graph, final_scores, shapes, query_dtype)
+            attn_weights, _ = self._compute_softmax(graph, final_scores, shapes, query_dtype)
 
             # Backward through attention
             grad_query, grad_key_expanded, grad_value_expanded = self._compute_attention_backward(
@@ -969,8 +989,6 @@ class FlexAttentionLegalization(PassBase):
 
         # Replace users of the backward node
         self._replace_flex_backward_users(graph, node, grad_query, grad_key_final, grad_value_final)
-
-        logger.debug("Successfully legalized flex_attention_backward")
         return True
 
     def _compute_attention_backward(
@@ -1105,9 +1123,12 @@ class FlexAttentionLegalization(PassBase):
                 elif index == 3:
                     # grad_score_mod_buffers - not supported, use None
                     pass
-                graph.erase_node(user)
 
-        graph.erase_node(node)
+                if len(user.users) == 0:
+                    graph.erase_node(user)
+
+        if len(node.users) == 0:
+            graph.erase_node(node)
 
     # =========================================================================
     # Finalization
@@ -1117,16 +1138,16 @@ class FlexAttentionLegalization(PassBase):
         """Finalize the legalization by cleaning up and running shape propagation."""
         graph = gm.graph
 
-        # Replace sort.stable operations
-        logger.debug("Replacing sort.stable operations with identity...")
-        self._replace_sort_stable_with_identity(graph)
+        # Remove aten.detach nodes (identity ops from autograd)
+        for node in list(graph.nodes):
+            if node.op == "call_function" and node.target == torch.ops.aten.detach.default:
+                node.replace_all_uses_with(node.args[0])
+                graph.erase_node(node)
 
-        # Eliminate dead code and recompile
         graph.eliminate_dead_code()
         gm.recompile()
 
-        # Fix inconsistent metadata
-        logger.debug("Fixing inconsistent metadata before shape propagation...")
+        # Fix inconsistent metadata between val and tensor_meta
         for node in graph.nodes:
             if node.meta and "val" in node.meta and "tensor_meta" in node.meta:
                 val = node.meta["val"]
@@ -1137,10 +1158,6 @@ class FlexAttentionLegalization(PassBase):
                     and val.shape != tensor_meta.shape
                 )
                 if has_mismatched_shapes:
-                    logger.debug(
-                        f"Fixing metadata for {node.name}: "
-                        f"val.shape={val.shape}, tensor_meta.shape={tensor_meta.shape}"
-                    )
                     node.meta["tensor_meta"] = TensorMetadata(
                         shape=val.shape,
                         dtype=val.dtype if hasattr(val, "dtype") else tensor_meta.dtype,
@@ -1177,41 +1194,19 @@ class FlexAttentionLegalization(PassBase):
         graph = gm.graph
         modified = False
 
-        logger.debug("Scanning graph for flex_attention nodes...")
-        flex_nodes = []
-        has_backward = False
-        has_sort_stable = False
+        has_flex = False
 
         for node in graph.nodes:
-            if self._is_flex_attention_forward(node):
-                logger.debug(f"Found flex_attention forward: {node.name}")
-                flex_nodes.append(node)
-            elif self._is_flex_attention_backward(node):
-                logger.debug(f"Found flex_attention backward: {node.name}")
-                flex_nodes.append(node)
-                has_backward = True
+            if self._is_flex_attention_forward(node) or self._is_flex_attention_backward(node):
+                has_flex = True
 
-            if node.op == "call_function" and node.target == torch.ops.aten.sort.stable:
-                has_sort_stable = True
-                logger.debug(f"Found sort.stable node: {node.name}")
-
-        if not flex_nodes:
-            logger.debug("  No flex_attention nodes found in graph")
-            if has_sort_stable:
-                logger.debug("  Found orphaned sort.stable operations, replacing with identity...")
-                self._replace_sort_stable_with_identity(graph)
-                graph.eliminate_dead_code()
-                gm.recompile()
+        if not has_flex:
             return PassResult(gm, modified=False)
-
-        if has_backward:
-            logger.debug("  Backward pass detected - will legalize both forward and backward")
 
         for node in list(graph.nodes):
             if self._is_flex_attention_forward(node):
                 if self._legalize_flex_forward(graph, gm, node):
                     modified = True
-
             elif self._is_flex_attention_backward(node) and self._legalize_flex_backward(
                 graph, gm, node
             ):

@@ -26,6 +26,10 @@ class ContiguousFunction(torch.autograd.Function):
         return output
 
     @staticmethod
+    def jvp(ctx, grad_input, grad_memory_format):
+        return grad_input
+
+    @staticmethod
     def backward(ctx, grad_output):
         # For contiguous operation, the gradient can flow back unchanged
         # since making a tensor contiguous doesn't change the mathematical operation
@@ -133,7 +137,7 @@ class ContiguousNKIImpl(OperationImplementation):
             dtype=self_tensor.dtype,
             device=self_tensor.device,
         )
-        _C._nrt_copy_strided_neuron_to_neuron(src, output)
+        _C._nki_copy_strided_neuron_to_neuron(src, output)
         return ExecutionResult(success=True, output=output)
 
     def _channels_last_strides(self, shape, memory_format):
@@ -150,12 +154,31 @@ class ContiguousNKIImpl(OperationImplementation):
             raise ValueError(f"Unsupported memory_format {memory_format} for shape {shape}")
 
 
+@torch._dynamo.disable
 def contiguous_internal(self_tensor, memory_format=None):
-    """Internal contiguous implementation that can be called from C++ without dispatcher"""
-    from .cast_policy import validate_neuron_memory_format
+    """Internal contiguous implementation that can be called from C++ without dispatcher.
 
-    validate_neuron_memory_format(memory_format, op_name="aten::contiguous")
+    Decorated with @torch._dynamo.disable because this function is called from
+    C++ (NeuronDispatcher) via pybind11. Without this, Dynamo tracing leaks into
+    this function when the C++ dispatcher invokes it during graph capture, corrupting
+    the traced graph (e.g. causing "No outputs found in the module" errors for
+    side-effect-only torch.compile subgraphs).
+    """
+    prior = torch._dynamo.eval_frame.set_eval_frame(None)
+    try:
+        # Explicitly disable dynamo tracing — the decorator may not take effect when
+        # called from C++ via pybind11, because pybind11 may resolve the underlying
+        # unwrapped function.
+        from .cast_policy import validate_neuron_memory_format
 
+        validate_neuron_memory_format(memory_format, op_name="aten::contiguous")
+        return _contiguous_internal_impl(self_tensor, memory_format)
+    finally:
+        torch._dynamo.eval_frame.set_eval_frame(prior)
+
+
+def _contiguous_internal_impl(self_tensor, memory_format=None):
+    """Implementation of contiguous_internal, runs with dynamo disabled."""
     implementations = [
         ContiguousTransposeMLIRImpl(),
         ContiguousBroadcastMLIRImpl(),

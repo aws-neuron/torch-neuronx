@@ -5,9 +5,17 @@ import torch
 
 import torch_neuronx
 from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, assert_raises
-from torch_neuronx.python_ops.compilation.cache import CompilationCache
 from torch_neuronx.python_ops.kernel_cache import kernel_cache_size
-from torch_neuronx.utils import is_sync_mode_enabled
+
+
+def _get_compilation_cache_size():
+    """Get the compilation cache size from the C++ CompilationCache.
+
+    Always uses the C++ cache stats because C++ dispatch (enabled by default)
+    routes all compilations through the C++ CompilationCache regardless of
+    sync/async mode.
+    """
+    return torch_neuronx._C._get_compilation_cache_stats()["total_entries"]
 
 
 class TestAddCompositeOp:
@@ -111,7 +119,8 @@ class TestAddCompositeOp:
     @assert_raises(
         RuntimeError,
         match=r"(Non-scalar tensor arg2 is on cpu device, expected neuron|"
-        r"Expected all tensors to be on the same device)",
+        r"Expected all tensors to be on the same device|"
+        r"input tensor is on cpu device, expected neuron)",
     )
     def test_composite_func_with_tensor_not_on_device(self, composite_func):
         """Test composite_func when one tensor is not on device"""
@@ -206,31 +215,20 @@ class TestAddCompositeOp:
 
         # Clear operation tracking
         torch_neuronx.clear_op_tracking()
-        cache = CompilationCache()
 
         # First execution with value=1.0
         out1 = composite_func(input_neuron, tensor1_neuron, tensor2_neuron, value=1.0)
         torch.neuron.synchronize()
         # Get cache sizes after first execution
         after_first_kernel_cache_size = kernel_cache_size()
-        if not is_sync_mode_enabled():
-            after_first_compilation_cache_size = torch_neuronx._C._get_compilation_cache_stats()[
-                "total_entries"
-            ]
-        else:
-            after_first_compilation_cache_size = cache.size()
+        after_first_compilation_cache_size = _get_compilation_cache_size()
 
         # Second execution with different value=2.0
         out2 = composite_func(input_neuron, tensor1_neuron, tensor2_neuron, value=2.0)
         torch.neuron.synchronize()
         # Get cache sizes after second execution
         after_second_kernel_cache_size = kernel_cache_size()
-        if not is_sync_mode_enabled():
-            after_second_compilation_cache_size = torch_neuronx._C._get_compilation_cache_stats()[
-                "total_entries"
-            ]
-        else:
-            after_second_compilation_cache_size = cache.size()
+        after_second_compilation_cache_size = _get_compilation_cache_size()
 
         # Verify that cache sizes didn't increase after the first compilation
         # This indicates that the same compiled kernel was reused
@@ -254,9 +252,11 @@ class TestAddCompositeOp:
         # set env var to collect metrics
         os.environ["TORCH_NEURONX_METRICS_ENABLED"] = "1"
         device = "neuron"
-        input = torch.randn(3, 3)
-        tensor1 = torch.randn(3, 3)
-        tensor2 = torch.randn(3, 3)
+        # Use unique shape so cache entries from earlier tests don't
+        # satisfy the lookup and hide the expected new compilation.
+        input = torch.randn(5, 7)
+        tensor1 = torch.randn(5, 7)
+        tensor2 = torch.randn(5, 7)
 
         # Move tensors to device
         input_neuron = input.to(device)
@@ -265,7 +265,6 @@ class TestAddCompositeOp:
 
         # Clear operation tracking
         torch_neuronx.clear_op_tracking()
-        cache = CompilationCache()
 
         # First execution with value=2.0
         out1 = composite_func(input_neuron, tensor1_neuron, tensor2_neuron, value=2.0)
@@ -273,12 +272,7 @@ class TestAddCompositeOp:
 
         # Get cache sizes after first execution
         after_first_kernel_cache_size = kernel_cache_size()
-        if not is_sync_mode_enabled():
-            after_first_compilation_cache_size = torch_neuronx._C._get_compilation_cache_stats()[
-                "total_entries"
-            ]
-        else:
-            after_first_compilation_cache_size = cache.size()
+        after_first_compilation_cache_size = _get_compilation_cache_size()
 
         # Second execution with different value=2
         out2 = composite_func(input_neuron, tensor1_neuron, tensor2_neuron, value=2)
@@ -286,12 +280,7 @@ class TestAddCompositeOp:
 
         # Get cache sizes after second execution
         after_second_kernel_cache_size = kernel_cache_size()
-        if not is_sync_mode_enabled():
-            after_second_compilation_cache_size = torch_neuronx._C._get_compilation_cache_stats()[
-                "total_entries"
-            ]
-        else:
-            after_second_compilation_cache_size = cache.size()
+        after_second_compilation_cache_size = _get_compilation_cache_size()
 
         # Verify that cache sizes didn't increase after the first compilation
         # Different value dtype still uses the same kernel since they are non-static value
@@ -308,3 +297,43 @@ class TestAddCompositeOp:
         assert torch.equal(out1, out2)
         # reset environment variables
         os.environ.pop("TORCH_NEURONX_METRICS_ENABLED", None)
+
+    def test_addcmul_bool_raises(self):
+        """addcmul on bool tensors should raise, matching CPU."""
+        device = "neuron"
+        t = torch.ones(5, device=device, dtype=torch.bool)
+        with pytest.raises(RuntimeError):
+            torch.addcmul(t, t, t, value=1)
+
+    def test_addcmul_inplace_bool_raises(self):
+        """Tensor.addcmul_ on bool should raise, matching CPU."""
+        device = "neuron"
+        t = torch.ones(5, device=device, dtype=torch.bool)
+        with pytest.raises(RuntimeError):
+            t.addcmul_(t, t, value=1)
+
+    def test_addcdiv_int_raises(self):
+        """addcdiv on integer tensors should raise, matching CPU."""
+        device = "neuron"
+        t = torch.ones(5, device=device, dtype=torch.int32)
+        with pytest.raises(RuntimeError):
+            torch.addcdiv(t, t, t, value=1)
+
+    def test_addcdiv_inplace_int_raises(self):
+        """Tensor.addcdiv_ on int should raise, matching CPU."""
+        device = "neuron"
+        t = torch.ones(5, device=device, dtype=torch.int32)
+        with pytest.raises(RuntimeError):
+            t.addcdiv_(t, t, value=1)
+
+    @pytest.mark.parametrize("value", [0.5, 0.1, 2.0])
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int16])
+    def test_addcmul_integer_dtype_float_value(self, value, dtype):
+        """addcmul with integer tensors and float value keeps integer dtype."""
+        x = torch.tensor([1, 2, 3], dtype=dtype, device="neuron")
+        t1 = torch.tensor([4, 5, 6], dtype=dtype, device="neuron")
+        t2 = torch.tensor([7, 8, 9], dtype=dtype, device="neuron")
+        r_n = torch.addcmul(x, t1, t2, value=value)
+        r_c = torch.addcmul(x.cpu(), t1.cpu(), t2.cpu(), value=value)
+        assert r_n.dtype == r_c.dtype, f"dtype: {r_n.dtype} vs {r_c.dtype}"
+        torch.testing.assert_close(r_n.cpu(), r_c)

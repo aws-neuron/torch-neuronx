@@ -8,6 +8,9 @@
 namespace at::neuron {
 
 // TensorContext stores tensor metadata without holding references to the actual tensor.
+// Complementary to TensorDataRef: TensorDataRef owns runtime pointers (*where* data lives),
+// TensorContext carries shape/offset metadata (*what region* to slice via HandleContiguousSlicing).
+// Both must be propagated together during concatenation.
 struct TensorContext {
   size_t numel;                // Number of elements
   size_t size_bytes;           // Total size in bytes

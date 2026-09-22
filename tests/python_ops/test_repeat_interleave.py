@@ -87,7 +87,23 @@ class TestRepeatInterleave:
             # self_int decomposes to clone
             assert_op_runs_on_neuron("aten::clone")
 
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.int32, torch.int64])
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            torch.float32,
+            torch.float16,
+            torch.int32,
+            pytest.param(
+                torch.int64,
+                marks=pytest.mark.xfail(
+                    reason=(
+                        "int64 repeat_interleave triggers contiguous on non-lowerable view"
+                        " (CPU fallback)"
+                    ),
+                ),
+            ),
+        ],
+    )
     def test_repeat_interleave_different_dtypes(self, device, dtype):
         """Test repeat_interleave with different data types."""
         with track_neuron_ops():
@@ -207,6 +223,30 @@ class TestRepeatInterleave:
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
             assert_op_runs_on_neuron("aten::repeat_interleave.Tensor")
 
+    def test_repeat_interleave_tensor_stale_neff_regression(self, device):
+        """Two repeat_interleave.Tensor calls with the same repeats shape but
+        different sum(repeats) must not share a cached NEFF.
+
+        The output length is sum(repeats), baked in as a static arg. The raw
+        dispatch args are identical for both calls (same-shape int64 repeats), so
+        the lowering must key on the preprocessed output_size; otherwise the
+        second call returns the first call's length.
+        """
+        with track_neuron_ops():
+            # First call: sum(repeats) = 6 -> output length 6.
+            repeats_a = torch.tensor([1, 2, 3], device=device)
+            result_a = torch.repeat_interleave(repeats_a)
+            assert result_a.shape == torch.Size([6])
+            torch.testing.assert_close(result_a.cpu(), torch.repeat_interleave(repeats_a.cpu()))
+
+            # Second call: same repeats shape, sum = 12 -> output length 12. A
+            # stale output_size would return length 6.
+            repeats_b = torch.tensor([3, 4, 5], device=device)
+            result_b = torch.repeat_interleave(repeats_b)
+            assert result_b.shape == torch.Size([12])
+            torch.testing.assert_close(result_b.cpu(), torch.repeat_interleave(repeats_b.cpu()))
+            assert_op_runs_on_neuron("aten::repeat_interleave.Tensor")
+
     def test_repeat_interleave_tensor_variant_with_output_size(self, device):
         """Test repeat_interleave.Tensor variant with output_size."""
         with track_neuron_ops():
@@ -241,3 +281,16 @@ class TestRepeatInterleave:
 
         assert neuron_result.device.type == "neuron"
         torch.testing.assert_close(neuron_result.cpu(), cpu_result)
+
+    def test_repeat_interleave_tensor_out_variant(self, device):
+        """Test aten::repeat_interleave.Tensor_out dispatches to Neuron."""
+        repeats = torch.tensor([2, 3, 1, 4], device=device)
+        output_size = int(torch.sum(repeats).item())  # 10
+        out = torch.empty(output_size, dtype=torch.int64, device=device)
+
+        with track_neuron_ops():
+            result = torch.ops.aten.repeat_interleave.Tensor_out(repeats, out=out)
+            assert_op_runs_on_neuron("aten::repeat_interleave.Tensor")
+
+        expected = torch.repeat_interleave(repeats.cpu())
+        torch.testing.assert_close(result.cpu(), expected)

@@ -60,7 +60,7 @@ def _clone_pytorch_tests(torch_version, test_dir, pytorch_tests_dir):
 
         try:
             source_test_dir.rename(test_dir)
-        except FileExistsError:
+        except OSError:
             # Another worker already renamed the temp directory, skip this
             print(f"Directory {test_dir} already exists, skipping.")
 
@@ -70,7 +70,7 @@ def _clone_pytorch_tests(torch_version, test_dir, pytorch_tests_dir):
         if source_tools_dir.exists():
             try:
                 source_tools_dir.rename(tools_dir)
-            except FileExistsError:
+            except OSError:
                 print(f"Directory {tools_dir} already exists, skipping.")
 
 
@@ -87,8 +87,8 @@ def clone_pytorch_tests(torch_version=None):
         torch_version = get_torch_version()
 
     # fetch pre-release branch
-    if "2.10" in torch_version:
-        torch_version = "release/2.10"
+    if "2.11" in torch_version:
+        torch_version = "release/2.11"
     # Convert released version to tag format
     elif not torch_version.startswith("v"):
         torch_version = f"v{torch_version}"

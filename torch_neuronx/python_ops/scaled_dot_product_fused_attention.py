@@ -10,24 +10,180 @@ import math
 import torch
 from torch._meta_registrations import alloc_with_matching_layout
 
+from torch_neuronx._C import _is_epilogue_enabled
 from torch_neuronx.neuron_dynamo_backend.decompositions import (
     _can_use_nki_flash_attention,
     _can_use_nki_flash_attention_backward,
+    _compute_attention_backward_nki,
+    _compute_attention_nki,
+    _prepare_backward_inputs,
+    _reduce_gqa_gradients,
+    compute_attention_backward_decomposition,
+    scaled_dot_product_attention_decomposition,
 )
 
 from .base import AttentionOpImpl, ExecutionResult, Operation
+from .lowering_result import LoweringResult
+from .tensor_layout_utils import match_layout
+from .torch_mlir.kernel import TorchMlirKernel
 
 
-def match_layout(
-    source: torch.Tensor, reference: torch.Tensor, out: torch.Tensor = None
-) -> torch.Tensor:
-    """Return source with the same layout as reference, copying only if needed, in out tensor."""
-    if source.stride() == reference.stride():
-        return source
-    if out is None:
-        out = torch.empty_like(reference)
-    out.copy_(source)
-    return out
+def _compute_output_strides_from_ref(ref_tensor, output_shape):
+    """Compute dense output strides matching ref_tensor's dimension ordering.
+
+    Returns a tuple of strides for output_shape that preserves the memory layout
+    (dimension ordering) of ref_tensor, or None if:
+    - ref_tensor has zero strides (from expand)
+    - ref_tensor has duplicate strides (ambiguous ordering)
+    - The resulting strides would be contiguous (no epilogue needed)
+    """
+    strides = ref_tensor.stride()
+    ndim = len(strides)
+    if ndim != len(output_shape):
+        return None
+    # Reject zero strides (expand) and duplicate strides (ambiguous)
+    if 0 in strides or len(set(strides)) != ndim:
+        return None
+    # Dimension ordering: sort by stride descending (outermost first)
+    perm = sorted(range(ndim), key=lambda d: strides[d], reverse=True)
+    # Compute dense strides for output_shape in this order
+    out_strides = [0] * ndim
+    s = 1
+    for d in reversed(perm):
+        out_strides[d] = s
+        s *= output_shape[d]
+    out_strides = tuple(out_strides)
+    # Skip if already contiguous
+    contiguous = []
+    s = 1
+    for d in reversed(range(ndim)):
+        contiguous.append(s)
+        s *= output_shape[d]
+    contiguous.reverse()
+    if out_strides == tuple(contiguous):
+        return None
+    return out_strides
+
+
+def _sdpa_fwd_traceable(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_bias: torch.Tensor,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    return_debug_mask: bool = False,
+    scale: float | None = None,
+):
+    """Traceable forward wrapper for make_fx. Mirrors sdpa_fused_overrideable decomposition."""
+    if dropout_p > 0.0:
+        philox_seed = torch.randint(0, 2**31 - 1, (1,), device=query.device, dtype=torch.int32)
+        philox_offset = torch.zeros(1, device=query.device, dtype=torch.int32)
+    else:
+        philox_seed = (query.flatten()[0] * 0).to(torch.int32)
+        philox_offset = (query.flatten()[0] * 0).to(torch.int32)
+
+    # Use 0-dim tensor placeholders for None slots (make_fx can't trace None)
+    placeholder = query.new_zeros(())
+
+    # max_q and max_k are plain ints in the ATen schema output — they cannot
+    # be part of the traced HLO.  Return only tensor outputs from the traceable
+    # function; the lower_func wrapper will splice max_q/max_k back in.
+    if _can_use_nki_flash_attention(query, key, value, attn_bias, dropout_p, scale):
+        output, logsumexp = _compute_attention_nki(
+            query, key, value, is_causal, scale, training=True
+        )
+        return (
+            output,
+            logsumexp,
+            placeholder,
+            placeholder,
+            philox_seed,
+            philox_offset,
+            placeholder,
+        )
+
+    output, logsumexp, dropout_mask = scaled_dot_product_attention_decomposition(
+        query,
+        key,
+        value,
+        attn_bias,
+        dropout_p,
+        is_causal,
+        scale,
+        enable_gqa=True,
+        philox_seed=philox_seed,
+    )
+    philox_seed = dropout_mask
+    return (output, logsumexp, placeholder, placeholder, philox_seed, philox_offset, placeholder)
+
+
+def _sdpa_bwd_traceable(
+    grad_out: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_bias: torch.Tensor,
+    grad_input_mask: list[bool],
+    out: torch.Tensor,
+    logsumexp: torch.Tensor,
+    cum_seq_q: torch.Tensor,
+    cum_seq_k: torch.Tensor,
+    max_q: int,
+    max_k: int,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    philox_seed: torch.Tensor | None = None,
+    philox_offset: torch.Tensor | None = None,
+    scale: float | None = None,
+):
+    """Traceable backward wrapper for make_fx. Mirrors the backward decomposition."""
+    if _can_use_nki_flash_attention_backward(query, key, value, attn_bias, dropout_p, scale):
+        grad_q, grad_k, grad_v = _compute_attention_backward_nki(
+            grad_out,
+            query,
+            key,
+            value,
+            out,
+            logsumexp,
+            is_causal,
+            scale,
+        )
+        grad_attn_bias = query.new_zeros(())
+        return grad_q, grad_k, grad_v, grad_attn_bias
+
+    # Fallback
+    orig_k_shape = key.shape
+
+    b, q_heads, seq_q, e, seq_k, orig_kv_heads, scale_val, is_gqa, key, value = (
+        _prepare_backward_inputs(query, key, value, orig_k_shape, scale)
+    )
+
+    if attn_bias is None or attn_bias.numel() == 0:
+        attn_bias = torch.zeros((1,), dtype=query.dtype, device=query.device)
+
+    grad_q, grad_k, grad_v, grad_attn_bias = compute_attention_backward_decomposition(
+        grad_out,
+        query,
+        key,
+        value,
+        attn_bias,
+        out,
+        logsumexp,
+        scale_val,
+        is_causal,
+        dropout_p,
+        philox_seed,
+    )
+
+    grad_k, grad_v = _reduce_gqa_gradients(
+        grad_k, grad_v, is_gqa, b, orig_kv_heads, q_heads, seq_k, e
+    )
+
+    if grad_attn_bias is None or grad_attn_bias.numel() == 1:
+        grad_attn_bias = query.new_zeros(())
+
+    return grad_q, grad_k, grad_v, grad_attn_bias
 
 
 class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
@@ -50,7 +206,9 @@ class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
         ):
             return False
 
-        return _can_use_nki_flash_attention(query, key, value, attn_bias, dropout_p=dropout_p)
+        return _can_use_nki_flash_attention(
+            query, key, value, attn_bias, dropout_p=dropout_p, scale=scale
+        )
 
     def _execute_impl(
         self,
@@ -78,8 +236,11 @@ class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
             if scale is None:
                 scale = 1.0 / math.sqrt(embed_dim)
 
-            # Determine if we're in training mode
-            training = dropout_p > 0.0 or torch.is_grad_enabled()
+            if hasattr(self, "_returns_single_tensor"):
+                training = dropout_p > 0.0 or torch.is_grad_enabled()
+            else:
+                # overrideable API always returns LSE per ATen contract
+                training = True
 
             # Prepare RNG state for dropout
             if dropout_p > 0.0:
@@ -93,17 +254,12 @@ class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
                 philox_seed = torch.empty((0,), dtype=torch.int32, device=query.device)
                 philox_offset = torch.empty((0,), dtype=torch.int32, device=query.device)
 
-            # Allocate LSE buffer for training/backward pass
+            # Allocate LSE buffer for training/backward pass with ATen spec shape [B, H, S]
             if training:
-                # LSE shape: (batch, q_heads, B_P_SIZE, n_tile_q) where B_P_SIZE=128
-                # and n_tile_q = seq_len_q // B_P_SIZE
-                b_p_size = 128
-                n_tile_q = seq_len_q // b_p_size
                 lse = torch.empty(
                     batch_size,
                     q_heads,
-                    b_p_size,
-                    n_tile_q,
+                    seq_len_q,
                     dtype=torch.float32,
                     device=query.device,
                 )
@@ -170,6 +326,38 @@ class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
 
         except Exception as e:
             return ExecutionResult(success=False, error_msg=str(e))
+
+    def get_lower_func(self):
+        """Return a lower function for C++ dispatch of NKI SDPA forward."""
+        op_name = "_scaled_dot_product_fused_attention_overrideable"
+        # static_argnums: 4=dropout_p, 5=is_causal, 6=return_debug_mask, 7=scale
+        kernel = TorchMlirKernel(
+            _sdpa_fwd_traceable,
+            op_name,
+            static_argnums=(4, 5, 6, 7),
+        )
+
+        def sdpa_fwd_lower(*args, **kwargs):
+            query = args[0] if args else kwargs.get("query")
+            if query.device.type == "meta":
+                return LoweringResult(
+                    op_name=op_name,
+                    original_output_specs=[],
+                    is_empty_tensor=True,
+                    stablehlo_bytes=b"",
+                )
+            result = kernel.lower(*args, **kwargs)
+            # Inject target_strides for output[0] (attention) so the epilogue
+            # fuses the stride relayout into the NEFF instead of a post-hoc copy.
+            # Only valid when query strides represent a simple permutation (no gaps/zeros).
+            if _is_epilogue_enabled() and result.output_specs and len(result.output_specs) > 0:
+                target = _compute_output_strides_from_ref(query, result.output_specs[0][0])
+                if target is not None:
+                    spec = result.output_specs[0]
+                    result.output_specs[0] = (spec[0], spec[1], target)
+            return result
+
+        return sdpa_fwd_lower
 
 
 class ScaledDotProductFusedAttentionOp(Operation):
@@ -248,11 +436,12 @@ class ScaledDotProductAttentionBackwardNKIImpl(AttentionOpImpl):
         value = args[3] if len(args) > 3 else kwargs.get("value")
         attn_bias = args[4] if len(args) > 4 else kwargs.get("attn_bias")
         dropout_p = args[12] if len(args) > 12 else kwargs.get("dropout_p", 0.0)
+        scale = args[16] if len(args) > 16 else kwargs.get("scale")
 
         if not super().can_handle(query, key, value, attn_bias):
             return False
 
-        return _can_use_nki_flash_attention_backward(query, key, value, attn_bias, dropout_p)
+        return _can_use_nki_flash_attention_backward(query, key, value, attn_bias, dropout_p, scale)
 
     def _execute_impl(self, *args, **kwargs) -> ExecutionResult:
         """Execute the backward pass"""
@@ -337,6 +526,41 @@ class ScaledDotProductAttentionBackwardNKIImpl(AttentionOpImpl):
                     "Please ensure all input tensors have non-zero elements.",
                 )
         return None
+
+    def get_lower_func(self):
+        """Return a lower function for C++ dispatch of NKI SDPA backward."""
+        op_name = "_scaled_dot_product_fused_attention_overrideable_backward"
+        # static_argnums: 5=grad_input_mask, 10=max_q, 11=max_k,
+        #                 12=dropout_p, 13=is_causal, 16=scale
+        kernel = TorchMlirKernel(
+            _sdpa_bwd_traceable,
+            op_name,
+            static_argnums=(5, 10, 11, 12, 13, 16),
+        )
+
+        def sdpa_bwd_lower(*args, **kwargs):
+            query = args[1] if len(args) > 1 else kwargs.get("query")
+            if query.device.type == "meta":
+                return LoweringResult(
+                    op_name=op_name,
+                    original_output_specs=[],
+                    is_empty_tensor=True,
+                    stablehlo_bytes=b"",
+                )
+            result = kernel.lower(*args, **kwargs)
+            # Inject target_strides for grad outputs [0,1,2] matching query/key/value strides
+            # so the epilogue fuses the stride relayout into the NEFF.
+            if _is_epilogue_enabled() and result.output_specs and len(result.output_specs) >= 3:
+                refs = [args[1], args[2], args[3]]  # query, key, value
+                for i in range(3):
+                    spec = result.output_specs[i]
+                    if isinstance(spec, tuple) and len(spec) >= 2:
+                        target = _compute_output_strides_from_ref(refs[i], spec[0])
+                        if target is not None:
+                            result.output_specs[i] = (spec[0], spec[1], target)
+            return result
+
+        return sdpa_bwd_lower
 
 
 class ScaledDotProductAttentionBackwardOp(Operation):

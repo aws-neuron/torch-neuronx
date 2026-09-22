@@ -60,9 +60,9 @@ class AliasingInfo:
                     f"Output {output_index} already aliases input {existing_input}, "
                     f"cannot also alias input {parameter_number}."
                 )
-
-        self.aliases.append(AliasInfo(parameter_number, parameter_index, output_index))
-        self.output_to_input[output_index] = parameter_number
+        else:
+            self.aliases.append(AliasInfo(parameter_number, parameter_index, output_index))
+            self.output_to_input[output_index] = parameter_number
 
     def __iter__(self):
         """Iterate over aliasing relationships.

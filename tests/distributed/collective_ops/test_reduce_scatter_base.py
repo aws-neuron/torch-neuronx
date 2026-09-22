@@ -233,6 +233,12 @@ def run_reduce_scatter_partial_group_test(rank, world_size, kwargs):
         # Ranks not in partial_group don't participate
         pass
 
+    # Barrier on the default group: participating ranks can finish at
+    # different times; the compilation service is single-owner by design,
+    # and the first rank to exit tears down its shared socket, starving
+    # any in-flight compiles on peers.
+    dist.barrier()
+
 
 def run_bucketing_memory_test(rank, world_size, kwargs):
     """Test reduce_scatter_tensor with bucketing to ensure memory stays under 1GB."""

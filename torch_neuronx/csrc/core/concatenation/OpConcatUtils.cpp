@@ -180,66 +180,59 @@ DependencyAnalysis analyzeDependencies(const std::vector<void*>& module1_input_a
   return analysis;
 }
 
+static std::string typeToString(mlir::Type type) {
+  std::string result;
+  llvm::raw_string_ostream stream(result);
+  type.print(stream);
+  return result;
+}
+
+static int64_t getNumElements(mlir::RankedTensorType tensorType) {
+  if (!tensorType) return 0;
+  auto shape = tensorType.getShape();
+  int64_t total = 1;
+  for (auto dim : shape) {
+    if (dim < 0) return -1;
+    total *= dim;
+  }
+  return total;
+}
+
+// Detect an int64 packed/unpacked representation boundary between a producer
+// output and a consumer input: one side is unpacked int64 (tensor<...xi64>),
+// the other is the packed physical view (tensor<...x2xi32>). In the native
+// int64 cascade these two representations legitimately coexist (NATIVE ops emit
+// S64 int64; packed/DOWNCAST ops use int32[...,2]); such a pair must not be
+// fused, but the ops are correct when run separately (the consumer's input
+// binding re-packs the int64).
+static bool IsInt64PackUnpackBoundary(mlir::Type a, mlir::Type b) {
+  auto ta = mlir::dyn_cast<mlir::RankedTensorType>(a);
+  auto tb = mlir::dyn_cast<mlir::RankedTensorType>(b);
+  if (!ta || !tb) return false;
+  const bool a_i64 = ta.getElementType().isInteger(64);
+  const bool a_i32 = ta.getElementType().isInteger(32);
+  const bool b_i64 = tb.getElementType().isInteger(64);
+  const bool b_i32 = tb.getElementType().isInteger(32);
+  return (a_i64 && b_i32) || (a_i32 && b_i64);
+}
+
 /**
  * @brief Validates dependency compatibility between modules based on dependency analysis
  *
- * Checks both type and shape compatibility for dependencies and common inputs.
+ * Strict validation requiring exact type matching.
+ * For in-order merges that allow reshapes, use validateDepCompatibilityInOrder instead.
  *
  * @param main1 First module's main function
  * @param main2 Second module's main function
  * @param analysis Dependency analysis results
  *
- * @throws std::runtime_error if type or shape mismatches are detected in dependencies or common
- * inputs
+ * @throws std::runtime_error if type mismatches are detected in dependencies or common inputs
  */
 static bool validateDepCompatibility(mlir::func::FuncOp main1, mlir::func::FuncOp main2,
                                      const DependencyAnalysis& analysis) {
-  TORCH_NEURONX_DEBUG("validateDepCompatibility: Starting dependency compatibility validation");
+  TORCH_NEURONX_DEBUG("validateDepCompatibility: Starting strict dependency validation");
 
-  // Helper function to convert MLIR type to string for error messages
-  auto typeToString = [](mlir::Type type) -> std::string {
-    std::string result;
-    llvm::raw_string_ostream stream(result);
-    type.print(stream);
-    return result;
-  };
-
-  // Helper function to validate shape compatibility between two types
-  auto validateShapeCompatibility = [&typeToString](mlir::Type type1, mlir::Type type2,
-                                                    const std::string& context) {
-    // Try to cast both types to RankedTensorType to access shape information
-    auto tensorType1 = llvm::dyn_cast<mlir::RankedTensorType>(type1);
-    auto tensorType2 = llvm::dyn_cast<mlir::RankedTensorType>(type2);
-
-    // If both are ranked tensors, validate their shapes
-    if (tensorType1 && tensorType2) {
-      auto shape1 = tensorType1.getShape();
-      auto shape2 = tensorType2.getShape();
-
-      // Check if ranks match
-      if (shape1.size() != shape2.size()) {
-        throw std::runtime_error("Shape rank mismatch in " + context + ": shape1 has rank " +
-                                 std::to_string(shape1.size()) + " (" + typeToString(type1) +
-                                 ") but shape2 has rank " + std::to_string(shape2.size()) + " (" +
-                                 typeToString(type2) + ")");
-      }
-
-      // Check if each dimension matches
-      for (size_t dim = 0; dim < shape1.size(); ++dim) {
-        if (shape1[dim] != shape2[dim]) {
-          throw std::runtime_error(
-              "Shape mismatch in " + context + " at dimension " + std::to_string(dim) +
-              ": shape1[" + std::to_string(dim) + "]=" + std::to_string(shape1[dim]) +
-              " but shape2[" + std::to_string(dim) + "]=" + std::to_string(shape2[dim]) +
-              " (full types: " + typeToString(type1) + " vs " + typeToString(type2) + ")");
-        }
-      }
-      TORCH_NEURONX_DEBUG("Shape validation passed for ", context);
-    }
-  };
-
-  // Validate module1 -> module2 dependencies
-  // Support duplicate inputs by iterating through all input indices for each output
+  // Validate module1 -> module2 dependencies (strict type matching)
   for (const auto& dep : analysis.module1ToModule2Deps) {
     size_t output_idx = dep.first;
     const std::vector<size_t>& input_indices = dep.second;
@@ -251,7 +244,6 @@ static bool validateDepCompatibility(mlir::func::FuncOp main1, mlir::func::FuncO
 
     auto output_type = main1.getResultTypes()[output_idx];
 
-    // Validate each input that depends on this output
     for (size_t input_idx : input_indices) {
       if (input_idx >= main2.getNumArguments()) {
         throw std::runtime_error("Invalid dependency: module2 input index " +
@@ -260,26 +252,32 @@ static bool validateDepCompatibility(mlir::func::FuncOp main1, mlir::func::FuncO
 
       auto input_type = main2.getArgumentTypes()[input_idx];
 
+      // Strict: exact type match required
       if (output_type != input_type) {
+        // int64 packed/unpacked boundary: in the native cascade a NATIVE op
+        // emits *unpacked* int64 (tensor<...xi64>) while a packed/DOWNCAST op
+        // expects the packed physical view (tensor<...x2xi32>). These can't be
+        // strictly linked, but the ops are individually correct when NOT fused
+        // — run separately, the consumer's input binding re-packs the int64.
+        // So skip the merge (return false) rather than fail the op. See
+        // native int64 packed/native representation handling.
+        if (IsInt64PackUnpackBoundary(output_type, input_type)) {
+          TORCH_NEURONX_DEBUG("Skipping merge: int64 packed/unpacked boundary at module1_output[",
+                              output_idx, "] -> module2_input[", input_idx, "]");
+          return false;
+        }
         throw std::runtime_error("Type mismatch in dependency: module1 output " +
                                  std::to_string(output_idx) + " (" + typeToString(output_type) +
                                  ") cannot connect to module2 input " + std::to_string(input_idx) +
                                  " (expected " + typeToString(input_type) + ")");
       }
 
-      // Validate shape compatibility
-      validateShapeCompatibility(output_type, input_type,
-                                 "dependency module1_output[" + std::to_string(output_idx) +
-                                     "] -> module2_input[" + std::to_string(input_idx) + "]");
-
       TORCH_NEURONX_DEBUG("Validated dependency: module1_output[", output_idx,
-                          "] -> module2_input[", input_idx,
-                          "] types match: ", typeToString(output_type));
+                          "] -> module2_input[", input_idx, "]");
     }
   }
 
-  // Validate module2 -> module1 dependencies
-  // Support duplicate inputs by iterating through all input indices for each output
+  // Validate module2 -> module1 dependencies (strict type matching)
   for (const auto& dep : analysis.module2ToModule1Deps) {
     size_t output_idx = dep.first;
     const std::vector<size_t>& input_indices = dep.second;
@@ -291,7 +289,6 @@ static bool validateDepCompatibility(mlir::func::FuncOp main1, mlir::func::FuncO
 
     auto output_type = main2.getResultTypes()[output_idx];
 
-    // Validate each input that depends on this output
     for (size_t input_idx : input_indices) {
       if (input_idx >= main1.getNumArguments()) {
         throw std::runtime_error("Invalid dependency: module1 input index " +
@@ -300,25 +297,25 @@ static bool validateDepCompatibility(mlir::func::FuncOp main1, mlir::func::FuncO
 
       auto input_type = main1.getArgumentTypes()[input_idx];
 
+      // Strict: exact type match required
       if (output_type != input_type) {
+        if (IsInt64PackUnpackBoundary(output_type, input_type)) {
+          TORCH_NEURONX_DEBUG("Skipping merge: int64 packed/unpacked boundary at module2_output[",
+                              output_idx, "] -> module1_input[", input_idx, "]");
+          return false;
+        }
         throw std::runtime_error("Type mismatch in dependency: module2 output " +
                                  std::to_string(output_idx) + " (" + typeToString(output_type) +
                                  ") cannot connect to module1 input " + std::to_string(input_idx) +
                                  " (expected " + typeToString(input_type) + ")");
       }
 
-      // Validate shape compatibility
-      validateShapeCompatibility(output_type, input_type,
-                                 "dependency module2_output[" + std::to_string(output_idx) +
-                                     "] -> module1_input[" + std::to_string(input_idx) + "]");
-
       TORCH_NEURONX_DEBUG("Validated dependency: module2_output[", output_idx,
-                          "] -> module1_input[", input_idx,
-                          "] types match: ", typeToString(output_type));
+                          "] -> module1_input[", input_idx, "]");
     }
   }
 
-  // Validate common inputs have matching types
+  // Validate common inputs have matching types (strict)
   for (const auto& common : analysis.commonInputs) {
     size_t module1_idx = common.first;
     size_t module2_idx = common.second;
@@ -349,16 +346,11 @@ static bool validateDepCompatibility(mlir::func::FuncOp main1, mlir::func::FuncO
       return false;
     }
 
-    // Validate shape compatibility
-    validateShapeCompatibility(type1, type2,
-                               "common input module1[" + std::to_string(module1_idx) +
-                                   "] vs module2[" + std::to_string(module2_idx) + "]");
-
     TORCH_NEURONX_DEBUG("Validated common input: module1[", module1_idx, "] == module2[",
-                        module2_idx, "] types match: ", typeToString(type1));
+                        module2_idx, "]");
   }
 
-  TORCH_NEURONX_DEBUG("validateDepCompatibility: All dependency compatibility checks passed");
+  TORCH_NEURONX_DEBUG("validateDepCompatibility: All strict validation checks passed");
   return true;
 }
 
@@ -956,12 +948,11 @@ static void addAliasingForConcatenatedModule(mlir::ModuleOp& mergedModule,
       void* input_addr = (input_module == 1) ? module1_input_addrs[orig_input_idx]
                                              : module2_input_addrs[orig_input_idx];
 
-      // Check if addresses match
+      // Check if addresses match — one alias entry per output (first matching input wins)
       if (input_addr == output_addr && input_addr != nullptr) {
         TORCH_NEURONX_DEBUG("Found aliasing: merged_input[", merged_input_idx,
                             "] == merged_output[", merged_output_idx, "] addr=", input_addr);
 
-        // Build alias attribute
         auto paramNumAttr = builder.getI64IntegerAttr(merged_input_idx);
         auto paramIdxAttr = builder.getDenseI64ArrayAttr({});
         auto kindAttr = builder.getStringAttr("must_alias");
@@ -979,6 +970,7 @@ static void addAliasingForConcatenatedModule(mlir::ModuleOp& mergedModule,
 
         aliasList.push_back(aliasOuter);
         TORCH_NEURONX_DEBUG("Added alias entry #", aliasList.size());
+        break;
       }
     }
   }
@@ -998,12 +990,13 @@ static void addAliasingForConcatenatedModule(mlir::ModuleOp& mergedModule,
 /**
  * @brief Prepares arguments for the second-executing module
  * Now supports duplicate inputs (e.g., x + x) via vector-based dependencies
+ * Also handles scalar <-> shaped tensor conversion via stablehlo.reshape
  */
 static llvm::SmallVector<mlir::Value> prepareSecondModuleArguments(
     mlir::func::FuncOp secondMain,
     const std::vector<std::optional<size_t>>& secondModuleInputMapping,
     const std::unordered_map<size_t, std::vector<size_t>>& deps, mlir::func::CallOp firstCall,
-    llvm::ArrayRef<mlir::BlockArgument> args) {
+    llvm::ArrayRef<mlir::BlockArgument> args, mlir::OpBuilder& builder) {
   llvm::SmallVector<mlir::Value> secondArgs;
   secondArgs.resize(secondMain.getNumArguments());
 
@@ -1033,7 +1026,30 @@ static llvm::SmallVector<mlir::Value> prepareSecondModuleArguments(
 
         // Check if this input index is in this dependency's vector
         if (std::find(input_indices.begin(), input_indices.end(), i) != input_indices.end()) {
-          secondArgs[i] = firstCall.getResult(output_idx);
+          mlir::Value outputValue = firstCall.getResult(output_idx);
+          mlir::Type outputType = outputValue.getType();
+          mlir::Type expectedType = secondMain.getArgumentTypes()[i];
+
+          // Check if we need to insert a reshape for scalar <-> shaped tensor conversion
+          if (outputType != expectedType) {
+            auto outputTensor = llvm::dyn_cast<mlir::RankedTensorType>(outputType);
+            auto expectedTensor = llvm::dyn_cast<mlir::RankedTensorType>(expectedType);
+
+            if (outputTensor && expectedTensor &&
+                outputTensor.getElementType() == expectedTensor.getElementType() &&
+                getNumElements(outputTensor) == getNumElements(expectedTensor) &&
+                getNumElements(outputTensor) > 0) {
+              // Insert stablehlo.reshape to convert between compatible shapes
+              TORCH_NEURONX_DEBUG("RESHAPE INSERTED during merge: output[", output_idx,
+                                  "] -> input[", i, "]", " from shape ",
+                                  outputTensor.getShape().size(), "D", " to shape ",
+                                  expectedTensor.getShape().size(), "D");
+              outputValue = builder.create<mlir::stablehlo::ReshapeOp>(builder.getUnknownLoc(),
+                                                                       expectedType, outputValue);
+            }
+          }
+
+          secondArgs[i] = outputValue;
           TORCH_NEURONX_DEBUG("✓ Mapped: secondModule input[", i, "] = firstCall.result[",
                               output_idx, "]");
           found = true;
@@ -1048,7 +1064,29 @@ static llvm::SmallVector<mlir::Value> prepareSecondModuleArguments(
       }
     } else {
       // This input comes from merged function arguments
-      secondArgs[i] = args[secondModuleInputMapping[i].value()];
+      mlir::Value argValue = args[secondModuleInputMapping[i].value()];
+      mlir::Type expectedType = secondMain.getArgumentTypes()[i];
+
+      // Insert reshape if the merged function argument type differs from what module2 expects
+      // (happens for reshape-compatible common inputs with different shapes)
+      if (argValue.getType() != expectedType) {
+        auto argTensor = llvm::dyn_cast<mlir::RankedTensorType>(argValue.getType());
+        auto expectedTensor = llvm::dyn_cast<mlir::RankedTensorType>(expectedType);
+
+        if (argTensor && expectedTensor &&
+            argTensor.getElementType() == expectedTensor.getElementType() &&
+            getNumElements(argTensor) == getNumElements(expectedTensor) &&
+            getNumElements(argTensor) > 0) {
+          TORCH_NEURONX_DEBUG("RESHAPE INSERTED for common input: mergedFunction arg[",
+                              secondModuleInputMapping[i].value(), "] -> secondModule input[", i,
+                              "]", " from shape ", argTensor.getShape().size(), "D", " to shape ",
+                              expectedTensor.getShape().size(), "D");
+          argValue = builder.create<mlir::stablehlo::ReshapeOp>(builder.getUnknownLoc(),
+                                                                expectedType, argValue);
+        }
+      }
+
+      secondArgs[i] = argValue;
       TORCH_NEURONX_DEBUG("✓ Mapped: secondModule input[", i, "] = mergedFunction arg[",
                           secondModuleInputMapping[i].value(), "]");
     }
@@ -1059,38 +1097,47 @@ static llvm::SmallVector<mlir::Value> prepareSecondModuleArguments(
 }
 
 /**
- * @brief Core merge implementation that takes pre-computed dependency analysis
+ * @brief Core merge implementation that takes pre-computed dependency analysis and pre-validated
+ * main functions
  *
  * This is the low-level merge function that performs the actual MLIR merging.
- * It does NOT call analyzeDependencies - the caller must provide the analysis.
+ * It does NOT call analyzeDependencies or validateDepCompatibility - the caller must:
+ * 1. Provide the analysis (from analyzeDependencies or analyzeDependenciesInOrder)
+ * 2. Pre-validate main functions using validateAndGetMainFunctions
+ * 3. Pre-validate dependency compatibility using validateDepCompatibility (or a variant)
+ *
+ * This separation allows in-order merges to use different validation logic than non-in-order
+ * merges, enabling features like automatic reshape insertion for module2 inputs.
  *
  * @param module1 First MLIR module to merge
  * @param module2 Second MLIR module to merge
+ * @param main1 Pre-validated main function from module1
+ * @param main2 Pre-validated main function from module2
  * @param context MLIR context with required dialects loaded
- * @param module1_input_addrs Tensor addresses for module1 inputs
- * @param module1_output_addrs Tensor addresses for module1 outputs
- * @param module2_input_addrs Tensor addresses for module2 inputs
- * @param module2_output_addrs Tensor addresses for module2 outputs
- * @param analysis Pre-computed dependency analysis (from analyzeDependencies or
- * analyzeDependenciesInOrder)
+ * @param module1_input_addrs Tensor addresses for module1 inputs (used for aliasing)
+ * @param module1_output_addrs Tensor addresses for module1 outputs (used for aliasing)
+ * @param module2_input_addrs Tensor addresses for module2 inputs (used for aliasing)
+ * @param module2_output_addrs Tensor addresses for module2 outputs (used for aliasing)
+ * @param analysis Pre-computed dependency analysis
  * @param mapping Optional pointer to capture mapping information
  * @param verify_output Whether to verify the merged module
  * @param module1_outputs_to_skip Set of module1 output indices to skip (for skip intermediates)
  * @param module2_outputs_to_skip Set of module2 output indices to skip (for skip intermediates)
  */
-mlir::OwningOpRef<mlir::ModuleOp> mergeModulesWithAnalysis(
-    mlir::ModuleOp module1, mlir::ModuleOp module2, mlir::MLIRContext* context,
+mlir::OwningOpRef<mlir::ModuleOp> mergeModulesCore(
+    mlir::ModuleOp module1, mlir::ModuleOp module2, mlir::func::FuncOp main1,
+    mlir::func::FuncOp main2, mlir::MLIRContext* context,
     const std::vector<void*>& module1_input_addrs, const std::vector<void*>& module1_output_addrs,
     const std::vector<void*>& module2_input_addrs, const std::vector<void*>& module2_output_addrs,
     const DependencyAnalysis& analysis, MergeMapping* mapping = nullptr, bool verify_output = true,
     const std::unordered_set<size_t>& module1_outputs_to_skip = {},
     const std::unordered_set<size_t>& module2_outputs_to_skip = {}, bool run_optimization = true) {
   TORCH_NEURONX_TRACE_FUNCTION_WITH_ARGS(
-      "mod1_inputs:", module1_input_addrs.size(), "mod1_outputs:", module1_output_addrs.size(),
-      "mod2_inputs:", module2_input_addrs.size(), "mod2_outputs:", module2_output_addrs.size());
-  TORCH_NEURONX_DEBUG("mergeModulesWithAnalysis: Starting module merge with pre-computed analysis");
-  TORCH_NEURONX_DEBUG("mergeModulesWithAnalysis: Skip sets - Module1: ",
-                      module1_outputs_to_skip.size(), " Module2: ", module2_outputs_to_skip.size());
+      "mod1_args:", main1.getNumArguments(), "mod1_results:", main1.getNumResults(),
+      "mod2_args:", main2.getNumArguments(), "mod2_results:", main2.getNumResults());
+  TORCH_NEURONX_DEBUG("mergeModulesCore: Starting module merge with pre-computed analysis");
+  TORCH_NEURONX_DEBUG("mergeModulesCore: Skip sets - Module1: ", module1_outputs_to_skip.size(),
+                      " Module2: ", module2_outputs_to_skip.size());
 
   // Validate context parameter
   if (context == nullptr) {
@@ -1103,25 +1150,8 @@ mlir::OwningOpRef<mlir::ModuleOp> mergeModulesWithAnalysis(
   auto& mergedBody = mergedModule->getBodyRegion().front();
   builder.setInsertionPointToEnd(&mergedBody);
 
-  // Validate and get main functions using helper
-  auto [main1, main2] =
-      validateAndGetMainFunctions(module1, module2, module1_input_addrs, module1_output_addrs,
-                                  module2_input_addrs, module2_output_addrs);
-
-  TORCH_NEURONX_DEBUG("mergeModulesWithAnalysis: Tensor address validation passed");
-
-  // Validate type and shape compatibility for dependencies and common inputs.
-  // Returns false if common inputs have type mismatches (e.g., FSDP shared storage
-  // where different prologue transformations produce different base tensor shapes).
-  // In this case, skip concatenation and let operations execute individually.
-  if (!validateDepCompatibility(main1, main2, analysis)) {
-    TORCH_NEURONX_DEBUG(
-        "mergeModulesWithAnalysis: Skipping merge due to incompatible common inputs");
-    return nullptr;
-  }
-
   // Unified merge logic that handles all scenarios
-  TORCH_NEURONX_DEBUG("mergeModulesWithAnalysis: Processing scenario ", analysis.scenario);
+  TORCH_NEURONX_DEBUG("mergeModulesCore: Processing scenario ", analysis.scenario);
 
   // Determine execution order
   auto firstMain = analysis.module1First ? main1 : main2;
@@ -1136,9 +1166,8 @@ mlir::OwningOpRef<mlir::ModuleOp> mergeModulesWithAnalysis(
   auto outputInfo = buildInclusionMasks(firstMain, secondMain, analysis, module1_outputs_to_skip,
                                         module2_outputs_to_skip);
 
-  TORCH_NEURONX_DEBUG("mergeModulesWithAnalysis: Merged function will have ",
-                      inputInfo.inputTypes.size(), " inputs, ", outputInfo.outputTypes.size(),
-                      " outputs");
+  TORCH_NEURONX_DEBUG("mergeModulesCore: Merged function will have ", inputInfo.inputTypes.size(),
+                      " inputs, ", outputInfo.outputTypes.size(), " outputs");
 
   // Populate mapping information if requested (using helper functions)
   if (mapping) {
@@ -1191,7 +1220,7 @@ mlir::OwningOpRef<mlir::ModuleOp> mergeModulesWithAnalysis(
 
   // Prepare arguments for second-executing module using helper function
   auto secondArgs = prepareSecondModuleArguments(secondMain, inputInfo.secondModuleInputMapping,
-                                                 deps, firstCall, args);
+                                                 deps, firstCall, args, builder);
 
   // Call second-executing module
   auto secondCall = builder.create<mlir::func::CallOp>(builder.getUnknownLoc(), secondFuncName,
@@ -1240,7 +1269,7 @@ mlir::OwningOpRef<mlir::ModuleOp> mergeModulesWithAnalysis(
                                      module2_input_addrs, module2_output_addrs, analysis, mapping);
   }
 
-  TORCH_NEURONX_DEBUG("mergeModulesWithAnalysis: Successfully merged modules");
+  TORCH_NEURONX_DEBUG("mergeModulesCore: Successfully merged modules");
 
   // Verify the merged module for correctness (if enabled)
   if (verify_output) {
@@ -1248,10 +1277,9 @@ mlir::OwningOpRef<mlir::ModuleOp> mergeModulesWithAnalysis(
       TORCH_NEURONX_DEBUG("ERROR: mergeModules: Merged module failed MLIR verification");
       throw std::runtime_error("Merged module failed MLIR verification - invalid IR generated");
     }
-    TORCH_NEURONX_DEBUG("mergeModulesWithAnalysis: Merged module passed MLIR verification");
+    TORCH_NEURONX_DEBUG("mergeModulesCore: Merged module passed MLIR verification");
   } else {
-    TORCH_NEURONX_DEBUG(
-        "mergeModulesWithAnalysis: Skipping MLIR verification (verify_output=false)");
+    TORCH_NEURONX_DEBUG("mergeModulesCore: Skipping MLIR verification (verify_output=false)");
   }
 
   // Run optimization pipeline on the merged module (if enabled)
@@ -1259,8 +1287,7 @@ mlir::OwningOpRef<mlir::ModuleOp> mergeModulesWithAnalysis(
     return runOptimizationPipeline(std::move(mergedModule), context, verify_output);
   }
 
-  TORCH_NEURONX_DEBUG(
-      "mergeModulesWithAnalysis: Skipping optimization pipeline (run_optimization=false)");
+  TORCH_NEURONX_DEBUG("mergeModulesCore: Skipping optimization pipeline (run_optimization=false)");
   return mergedModule;
 }
 
@@ -1268,7 +1295,7 @@ mlir::OwningOpRef<mlir::ModuleOp> mergeModulesWithAnalysis(
  * @brief Enhanced mergeModules with dependency analysis support (wrapper)
  *
  * This is a convenience wrapper that calls analyzeDependencies() internally,
- * then delegates to mergeModulesWithAnalysis().
+ * then delegates to mergeModulesCore().
  *
  * Merges two MLIR StableHLO modules based on tensor address analysis to handle:
  * 1. Independent modules
@@ -1302,11 +1329,24 @@ mlir::OwningOpRef<mlir::ModuleOp> mergeModules(
   auto analysis = analyzeDependencies(module1_input_addrs, module1_output_addrs,
                                       module2_input_addrs, module2_output_addrs);
 
-  // Delegate to mergeModulesWithAnalysis with pre-computed analysis
-  return mergeModulesWithAnalysis(module1, module2, context, module1_input_addrs,
-                                  module1_output_addrs, module2_input_addrs, module2_output_addrs,
-                                  analysis, mapping, verify_output, module1_outputs_to_skip,
-                                  module2_outputs_to_skip, run_optimization);
+  // Validate and get main functions
+  auto [main1, main2] =
+      validateAndGetMainFunctions(module1, module2, module1_input_addrs, module1_output_addrs,
+                                  module2_input_addrs, module2_output_addrs);
+
+  TORCH_NEURONX_DEBUG("mergeModules: Tensor address validation passed");
+
+  // Validate type and shape compatibility for dependencies and common inputs
+  if (!validateDepCompatibility(main1, main2, analysis)) {
+    TORCH_NEURONX_DEBUG("mergeModules: Skipping merge due to incompatible common inputs");
+    return nullptr;
+  }
+
+  // Delegate to core merge function
+  return mergeModulesCore(module1, module2, main1, main2, context, module1_input_addrs,
+                          module1_output_addrs, module2_input_addrs, module2_output_addrs, analysis,
+                          mapping, verify_output, module1_outputs_to_skip, module2_outputs_to_skip,
+                          run_optimization);
 }
 
 /**
@@ -2171,11 +2211,126 @@ DependencyAnalysis analyzeDependenciesInOrder(const std::vector<void*>& module1_
 }
 
 /**
+ * @brief Validates dependency compatibility for in-order merges (module1 -> module2)
+ *
+ * This variant allows trivial reshapes (element-compatible types with same element count)
+ * for module1 outputs -> module2 inputs, since we can insert stablehlo.reshape during merge.
+ * The non-in-order version is stricter because it's harder to insert reshapes in both directions.
+ */
+static bool validateDepCompatibilityInOrder(mlir::func::FuncOp main1, mlir::func::FuncOp main2,
+                                            const DependencyAnalysis& analysis) {
+  TORCH_NEURONX_DEBUG(
+      "validateDepCompatibilityInOrder: Starting in-order dependency compatibility validation");
+
+  // NOTE on reshape safety: In StableHLO, all tensors are dense row-major with no
+  // stride concept. The shape mismatches we handle here arise from PyTorch view/reshape
+  // ops that were skipped (no-ops in torch_neuronx). These skipped ops either require
+  // contiguous input (.view()) or guarantee contiguous output (.reshape()), so the
+  // underlying data is always a flat contiguous buffer. A stablehlo.reshape between
+  // shapes with the same element count is therefore always a valid reinterpretation.
+  // Element count and element type compatibility are already enforced above.
+
+  // Validate module1 -> module2 dependencies (allow trivial reshapes)
+  for (const auto& dep : analysis.module1ToModule2Deps) {
+    size_t output_idx = dep.first;
+    const std::vector<size_t>& input_indices = dep.second;
+
+    if (output_idx >= main1.getNumResults()) {
+      throw std::runtime_error("Invalid dependency: module1 output index " +
+                               std::to_string(output_idx) + " out of range");
+    }
+
+    auto output_type = main1.getResultTypes()[output_idx];
+
+    for (size_t input_idx : input_indices) {
+      if (input_idx >= main2.getNumArguments()) {
+        throw std::runtime_error("Invalid dependency: module2 input index " +
+                                 std::to_string(input_idx) + " out of range");
+      }
+
+      auto input_type = main2.getArgumentTypes()[input_idx];
+      auto outputTensor = llvm::dyn_cast<mlir::RankedTensorType>(output_type);
+      auto inputTensor = llvm::dyn_cast<mlir::RankedTensorType>(input_type);
+
+      if (outputTensor && inputTensor) {
+        // Check element type compatibility
+        if (outputTensor.getElementType() != inputTensor.getElementType()) {
+          throw std::runtime_error(
+              "Element type mismatch in dependency: module1 output " + std::to_string(output_idx) +
+              " (" + typeToString(output_type) + ") cannot connect to module2 input " +
+              std::to_string(input_idx) + " (expected " + typeToString(input_type) + ")");
+        }
+
+        // Check element count compatibility
+        int64_t numElements1 = getNumElements(outputTensor);
+        int64_t numElements2 = getNumElements(inputTensor);
+
+        if (numElements1 != numElements2 || numElements1 < 0) {
+          throw std::runtime_error(
+              "Element count mismatch in dependency: module1 output " + std::to_string(output_idx) +
+              " has " + std::to_string(numElements1) + " elements but module2 input " +
+              std::to_string(input_idx) + " expects " + std::to_string(numElements2) + " elements");
+        }
+
+        TORCH_NEURONX_DEBUG("Validated in-order dependency: module1_output[", output_idx,
+                            "] -> module2_input[", input_idx,
+                            "] (reshape-compatible: ", typeToString(output_type), " -> ",
+                            typeToString(input_type), ")");
+      } else if (output_type != input_type) {
+        throw std::runtime_error("Type mismatch in dependency: module1 output " +
+                                 std::to_string(output_idx) + " (" + typeToString(output_type) +
+                                 ") cannot connect to module2 input " + std::to_string(input_idx) +
+                                 " (expected " + typeToString(input_type) + ")");
+      }
+    }
+  }
+
+  // Validate common inputs have compatible types (allow trivial reshapes for in-order merges)
+  // Same safety reasoning as dependencies: StableHLO tensors are dense row-major, so reshapes
+  // between shapes with the same element count and element type are always valid.
+  for (const auto& common : analysis.commonInputs) {
+    size_t module1_idx = common.first;
+    size_t module2_idx = common.second;
+
+    if (module1_idx >= main1.getNumArguments() || module2_idx >= main2.getNumArguments()) {
+      throw std::runtime_error("Invalid common input indices");
+    }
+
+    auto type1 = main1.getArgumentTypes()[module1_idx];
+    auto type2 = main2.getArgumentTypes()[module2_idx];
+
+    if (type1 != type2) {
+      // Allow reshape-compatible common inputs (same element type and count)
+      auto tensor1 = llvm::dyn_cast<mlir::RankedTensorType>(type1);
+      auto tensor2 = llvm::dyn_cast<mlir::RankedTensorType>(type2);
+
+      if (tensor1 && tensor2 && tensor1.getElementType() == tensor2.getElementType() &&
+          getNumElements(tensor1) == getNumElements(tensor2) && getNumElements(tensor1) > 0) {
+        TORCH_NEURONX_DEBUG(
+            "validateDepCompatibilityInOrder: Common input reshape-compatible. module1[",
+            module1_idx, "] (", typeToString(type1), ") -> module2[", module2_idx, "] (",
+            typeToString(type2), ") - reshape will be inserted during merge");
+      } else {
+        TORCH_NEURONX_INFO(
+            "validateDepCompatibilityInOrder: Type mismatch in common input, "
+            "skipping concatenation. module1[",
+            module1_idx, "] (", typeToString(type1), ") != module2[", module2_idx, "] (",
+            typeToString(type2), ")");
+        return false;
+      }
+    }
+  }
+
+  TORCH_NEURONX_DEBUG("validateDepCompatibilityInOrder: All in-order compatibility checks passed");
+  return true;
+}
+
+/**
  * @brief Low-level in-order module merge implementation
  *
  * Core merge function that assumes module1 executes before module2.
  * Uses analyzeDependenciesInOrder for simplified dependency analysis,
- * then calls mergeModulesWithAnalysis to avoid re-analyzing dependencies.
+ * and validateDepCompatibilityInOrder which allows trivial reshapes.
  */
 mlir::OwningOpRef<mlir::ModuleOp> mergeModulesInOrder(
     mlir::ModuleOp module1, mlir::ModuleOp module2, mlir::MLIRContext* context,
@@ -2199,11 +2354,21 @@ mlir::OwningOpRef<mlir::ModuleOp> mergeModulesInOrder(
   auto analysis = analyzeDependenciesInOrder(module1_input_addrs, module1_output_addrs,
                                              module2_input_addrs, module2_output_addrs);
 
-  // Delegate to mergeModulesWithAnalysis to avoid re-analyzing dependencies
-  return mergeModulesWithAnalysis(module1, module2, context, module1_input_addrs,
-                                  module1_output_addrs, module2_input_addrs, module2_output_addrs,
-                                  analysis, mapping, verify_output, module1_outputs_to_skip,
-                                  module2_outputs_to_skip);
+  // Validate and get main functions
+  auto [main1, main2] =
+      validateAndGetMainFunctions(module1, module2, module1_input_addrs, module1_output_addrs,
+                                  module2_input_addrs, module2_output_addrs);
+
+  // Use in-order validation (allows trivial reshapes for module2 inputs)
+  if (!validateDepCompatibilityInOrder(main1, main2, analysis)) {
+    TORCH_NEURONX_DEBUG("mergeModulesInOrder: Skipping merge due to incompatible common inputs");
+    return nullptr;
+  }
+
+  // Delegate to core merge function
+  return mergeModulesCore(module1, module2, main1, main2, context, module1_input_addrs,
+                          module1_output_addrs, module2_input_addrs, module2_output_addrs, analysis,
+                          mapping, verify_output, module1_outputs_to_skip, module2_outputs_to_skip);
 }
 
 /**
@@ -2397,10 +2562,36 @@ std::unique_ptr<StableHloNode> mergeStableHLOModulesWithTensorsInOrder(StableHlo
 
   auto mapping = std::make_unique<MergeMapping>();
 
+  // Skip module1 outputs that module2 overwrites in-place (same address as both
+  // its input and output) to avoid duplicate addresses in the merged result.
+  std::unordered_set<size_t> module1_skip;
+  const char* aliasing_env = std::getenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
+  if (aliasing_env && std::string(aliasing_env) == "1") {
+    // Find module2 outputs that are in-place (output_addr == input_addr)
+    std::unordered_set<void*> module2_inplace_addrs;
+    for (void* out_addr : module2_output_addrs) {
+      if (!out_addr) continue;
+      for (void* in_addr : module2_input_addrs) {
+        if (in_addr == out_addr) {
+          module2_inplace_addrs.insert(out_addr);
+          break;
+        }
+      }
+    }
+
+    // Skip module1 outputs whose address matches a module2 in-place address
+    // (module1 produced it, module2 overwrites it in-place → intermediate)
+    for (size_t i = 0; i < module1_output_addrs.size(); i++) {
+      if (module1_output_addrs[i] && module2_inplace_addrs.count(module1_output_addrs[i])) {
+        module1_skip.insert(i);
+      }
+    }
+  }
+
   // Use in-order merge
-  auto merged =
-      mergeModulesInOrder(*mod1, *mod2, context, module1_input_addrs, module1_output_addrs,
-                          module2_input_addrs, module2_output_addrs, mapping.get());
+  auto merged = mergeModulesInOrder(*mod1, *mod2, context, module1_input_addrs,
+                                    module1_output_addrs, module2_input_addrs, module2_output_addrs,
+                                    mapping.get(), true, module1_skip);
 
   if (!merged) {
     TORCH_NEURONX_DEBUG("ERROR: mergeStableHLOModulesWithTensorsInOrder: Merge failed");

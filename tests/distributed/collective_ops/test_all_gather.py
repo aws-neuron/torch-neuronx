@@ -240,6 +240,12 @@ def run_all_gather_partial_group_test(rank, world_size, kwargs):
         # Ranks not in partial_group don't participate
         pass
 
+    # Barrier on the default group: participating ranks can finish at
+    # different times; the compilation service is single-owner by design,
+    # and the first rank to exit tears down its shared socket, starving
+    # any in-flight compiles on peers.
+    dist.barrier()
+
 
 class TestAllGather(BaseCollectiveOpTest):
     """Test cases for torch.distributed.all_reduce."""
@@ -290,7 +296,11 @@ class TestAllGather(BaseCollectiveOpTest):
         """Test all_gather with specific process groups."""
         self.distributed_tester.run_test(run_group_argument_test)
 
-    @assert_raises(RuntimeError, match=r".*Expected neuron device, got cpu.*")
+    @assert_raises(
+        RuntimeError,
+        match=r".*(Expected neuron device, got cpu"
+        r"|No backend type associated with device type cpu).*",
+    )
     def test_different_devices(self):
         """Test all_gather with tensors on different devices."""
         self.distributed_tester.run_test(run_different_device_test)

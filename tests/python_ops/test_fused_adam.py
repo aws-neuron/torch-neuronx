@@ -253,6 +253,41 @@ class TestFusedAdamW:
         for pc, pn in zip(params_cpu, params_neuron, strict=False):
             torch.testing.assert_close(pn.detach().cpu(), pc.detach(), rtol=1e-4, atol=1e-4)
 
+    def test_fused_adamw_flag_variants_in_one_process(self):
+        """Run both values of amsgrad, and of maximize, inside one test body.
+
+        The kernel cache is per process and keys on compute_fn's code object, which
+        every closure from one def shares. When the flags were captured rather than
+        passed, the first combination to run installed its kernel and later ones
+        lowered its graph: maximize=True kept the un-negated gradient, amsgrad=True
+        never updated max_exp_avg_sq. The per-flag tests below only catch that when
+        they happen to share a process in the right order; this asserts it directly.
+        False runs first because it is the value that installs the kernel.
+        """
+        for flag in ("amsgrad", "maximize"):
+            for value in (False, True):
+                torch.manual_seed(42)
+
+                param_cpu = torch.randn(16, requires_grad=True)
+                param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+                opt_cpu = torch.optim.AdamW([param_cpu], lr=0.01, fused=False, **{flag: value})
+                opt_neuron = torch.optim.AdamW([param_neuron], lr=0.01, fused=True, **{flag: value})
+
+                for _ in range(2):
+                    param_cpu.pow(2).sum().backward()
+                    opt_cpu.step()
+                    opt_cpu.zero_grad()
+
+                    param_neuron.pow(2).sum().backward()
+                    opt_neuron.step()
+                    opt_neuron.zero_grad()
+
+                self._compare_optimizer_states(opt_cpu, opt_neuron)
+                torch.testing.assert_close(
+                    param_neuron.detach().cpu(), param_cpu.detach(), rtol=1e-4, atol=1e-4
+                )
+
     def test_fused_adamw_amsgrad(self):
         """Test AdamW with AMSGrad enabled."""
         torch.manual_seed(42)
@@ -313,7 +348,9 @@ class TestFusedAdamW:
         param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
 
         optimizer_cpu = torch.optim.AdamW([param_cpu], lr=torch.tensor(0.01), fused=False)
-        optimizer_neuron = torch.optim.AdamW([param_neuron], lr=torch.tensor(0.01), fused=True)
+        optimizer_neuron = torch.optim.AdamW(
+            [param_neuron], lr=torch.tensor(0.01, device="neuron"), fused=True
+        )
 
         for _ in range(3):
             loss_cpu = param_cpu.pow(2).sum()
@@ -423,6 +460,43 @@ class TestFusedAdamW:
             state["max_exp_avg_sq"].data_ptr() == max_exp_avg_sq_ptr
         ), "max_exp_avg_sq should be updated in-place with AMSGrad"
 
+    def test_fused_adamw_scalar_params(self):
+        """Test AdamW with scalar (0-dim) params mixed with normal ones.
+
+        Reproduces the CLIP logit_scale failure where a scalar param caused
+        the NKI kernel to crash with: error: invalid shape: cannot be empty
+        """
+        torch.manual_seed(42)
+
+        params_cpu = [
+            torch.randn((), requires_grad=True),  # scalar — triggers the bug
+            torch.randn(49408, 768, requires_grad=True),
+            torch.randn(768, requires_grad=True),
+        ]
+        params_neuron = [p.detach().clone().to("neuron").requires_grad_(True) for p in params_cpu]
+
+        optimizer_cpu = torch.optim.AdamW(
+            params_cpu, lr=4e-4, betas=(0.9, 0.999), weight_decay=0.01, fused=False
+        )
+        optimizer_neuron = torch.optim.AdamW(
+            params_neuron, lr=4e-4, betas=(0.9, 0.999), weight_decay=0.01, fused=True
+        )
+
+        for _ in range(3):
+            loss_cpu = sum(p.sum() for p in params_cpu)
+            loss_cpu.backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            loss_neuron = sum(p.sum() for p in params_neuron)
+            loss_neuron.backward()
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adamw_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
     def test_fused_adamw_mixed_zero_size_params(self):
         """Test AdamW with zero-size parameters mixed with normal ones.
 
@@ -479,7 +553,7 @@ class TestFusedAdamWNKI:
         opt = torch.optim.AdamW(params, lr=0.001, fused=True)
 
         with patch(
-            "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+            "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
             wraps=convert_fx_to_stablehlo,
         ) as mock_compiler:
             for p in params:
@@ -518,7 +592,7 @@ class TestFusedAdamWNKI:
         scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=5)
 
         with patch(
-            "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+            "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
             wraps=convert_fx_to_stablehlo,
         ) as mock_compiler:
             # Step 1: compiles
@@ -555,7 +629,7 @@ class TestFusedAdamWNKI:
         opt = torch.optim.AdamW(params, lr=0.01, amsgrad=True, fused=True)
 
         with patch(
-            "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+            "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
             wraps=convert_fx_to_stablehlo,
         ) as mock_compiler:
             for p in params:
@@ -806,7 +880,7 @@ class TestFusedAdam:
         opt = torch.optim.Adam(params, lr=0.001, weight_decay=0.01, fused=True)
 
         with patch(
-            "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+            "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
             wraps=convert_fx_to_stablehlo,
         ) as mock_compiler:
             for p in params:

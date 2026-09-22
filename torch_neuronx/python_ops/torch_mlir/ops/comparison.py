@@ -3,7 +3,22 @@
 import torch
 
 from ..operation_registry import register_aten
+from ..validation import check_broadcast_shapes
 from .constants import INT_DTYPES
+from .unary import _validate_float_promoting_out
+
+
+def _validate_broadcast_and_out(x, other=None, *args, out=None, **kwargs):
+    """Reject a non-broadcastable pair, then check the out= dtype.
+
+    minimum/maximum and the clamp_min/clamp_max tensor overloads report a
+    broadcast failure from the lowering, with different wording than ATen. The
+    foreach list overloads dispatch here for each element, so this also gives
+    _foreach_clamp_max and its family the ATen message.
+    """
+    if isinstance(x, torch.Tensor) and isinstance(other, torch.Tensor):
+        check_broadcast_shapes(x, other)
+    _validate_float_promoting_out(x, other, *args, out=out, **kwargs)
 
 
 @register_aten(["aten::eq", "aten::eq.Scalar_out", "aten::eq.Tensor_out"])
@@ -38,6 +53,7 @@ def torch_le(x, y, out=None):
 
 @register_aten(
     ["aten::clamp", "aten::clamp.out", "aten::clamp.Tensor", "aten::clamp.Tensor_out"],
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_clamp(x, min=None, max=None, out=None):
     if min is None and max is None:
@@ -45,10 +61,13 @@ def torch_clamp(x, min=None, max=None, out=None):
 
     # Handle tensor bounds with torch.maximum/minimum to avoid StableHLO
     # broadcast_dimensions errors on rank mismatch.
+    # Promote to common dtype to match PyTorch's dtype promotion rules.
     if isinstance(min, torch.Tensor):
-        x, min = torch.maximum(x, min.to(x.dtype)), None
+        common_dtype = torch.result_type(x, min)
+        x, min = torch.maximum(x.to(common_dtype), min.to(common_dtype)), None
     if isinstance(max, torch.Tensor):
-        x, max = torch.minimum(x, max.to(x.dtype)), None
+        common_dtype = torch.result_type(x, max)
+        x, max = torch.minimum(x.to(common_dtype), max.to(common_dtype)), None
 
     return torch.clamp(x, min=min, max=max) if min is not None or max is not None else x
 
@@ -60,13 +79,15 @@ def torch_clamp(x, min=None, max=None, out=None):
         "aten::clamp_max.Tensor",
         "aten::clamp_max.Tensor_out",
     ],
+    validate_static_inputs=_validate_broadcast_and_out,
 )
 def torch_clamp_max(x, max, out=None):
     # Ensure tensor max has same dtype as input
     if isinstance(max, torch.Tensor):
         # Use torch.minimum instead of torch.clamp_max: it handles broadcasting
         # natively, avoiding StableHLO broadcast_dimensions errors on rank mismatch
-        return torch.minimum(x, max.to(x.dtype))
+        common_dtype = torch.result_type(x, max)
+        return torch.minimum(x.to(common_dtype), max.to(common_dtype))
     return torch.clamp_max(x, max)
 
 
@@ -77,23 +98,25 @@ def torch_clamp_max(x, max, out=None):
         "aten::clamp_min.Tensor",
         "aten::clamp_min.Tensor_out",
     ],
+    validate_static_inputs=_validate_broadcast_and_out,
 )
 def torch_clamp_min(x, min, out=None):
     # Ensure tensor min has same dtype as input
     if isinstance(min, torch.Tensor):
         # Use torch.maximum instead of torch.clamp_min: it handles broadcasting
         # natively, avoiding StableHLO broadcast_dimensions errors on rank mismatch
-        return torch.maximum(x, min.to(x.dtype))
+        common_dtype = torch.result_type(x, min)
+        return torch.maximum(x.to(common_dtype), min.to(common_dtype))
     return torch.clamp_min(x, min)
 
 
-@register_aten(["aten::isnan"])
-def torch_isnan(x):
+@register_aten(["aten::isnan", "aten::isnan.out"], output_params=("out",))
+def torch_isnan(x, out=None):
     return torch.isnan(x)
 
 
-@register_aten(["aten::isinf"])
-def torch_isinf(x):
+@register_aten(["aten::isinf", "aten::isinf.out"], output_params=("out",))
+def torch_isinf(x, out=None):
     """Integer dtype cannot be inf and should always return False.
 
     Bypassing the operation here to avoid running stablehlo.abs with unsupported dtypes.
@@ -121,3 +144,39 @@ def torch_isfinite(x):
     else:
         # For floating point: finite = not (nan or inf)
         return ~(torch.isnan(x) | torch.isinf(x))
+
+
+@register_aten(
+    [
+        "aten::isin.Tensor_Tensor_out",
+        "aten::isin.Tensor_Scalar_out",
+        "aten::isin.Scalar_Tensor_out",
+    ],
+    static_argnames=("assume_unique", "invert"),
+)
+def torch_isin_out(elements, test_elements, assume_unique=False, invert=False, out=None):
+    """out= variants for isin: delegate to functional ``torch.isin`` and let the
+    dispatcher write the result into the caller's ``out`` buffer.
+    """
+    return torch.isin(elements, test_elements, assume_unique=assume_unique, invert=invert)
+
+
+@register_aten(
+    ["aten::minimum", "aten::minimum.out"],
+    validate_static_inputs=_validate_broadcast_and_out,
+)
+def torch_minimum(self, other, out=None):
+    return torch.minimum(self, other)
+
+
+@register_aten(
+    ["aten::maximum", "aten::maximum.out"],
+    validate_static_inputs=_validate_broadcast_and_out,
+)
+def torch_maximum(self, other, out=None):
+    return torch.maximum(self, other)
+
+
+@register_aten(["aten::isposinf", "aten::isposinf.out"])
+def torch_isposinf(self, out=None):
+    return torch.ops.aten.isposinf(self)

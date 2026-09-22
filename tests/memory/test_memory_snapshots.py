@@ -223,7 +223,7 @@ class TestSnapshotAllocTracking:
 
         after_alloc = memory.memory_stats(0)
         assert after_alloc["allocation_requests"] > initial_stats["allocation_requests"]
-        assert after_alloc["active_bytes"]["current"] > initial_stats["active_bytes"]["current"]
+        assert after_alloc["active_bytes.all.current"] > initial_stats["active_bytes.all.current"]
 
         del t1
         sync()
@@ -298,41 +298,46 @@ class TestRecyclingStackTraces:
 
         recycled = addr1 == addr2
 
-        # Get snapshot and analyze traces
+        # Get snapshot and find the alpha/beta alloc traces by stack frames
+        # (independent of the trace addr, which is the NRT VA and may not
+        # match the Python-visible data_ptr() under lazy alloc).
         snapshot = memory._snapshot()
 
-        alloc_traces_at_addr = []
+        alpha_alloc_traces = []
+        beta_alloc_traces = []
         for traces in snapshot["device_traces"]:
             for t in traces:
-                if t.get("action") == "alloc" and t.get("addr") == addr2:
-                    alloc_traces_at_addr.append(t)
-
-        # Analyze stack traces
-        alpha_found = False
-        beta_found = False
-
-        for trace in alloc_traces_at_addr:
-            frames = trace.get("frames", [])
-            frame_names = [f.get("name", "") for f in frames]
-
-            if "allocate_from_function_alpha" in frame_names:
-                alpha_found = True
-            if "allocate_from_function_beta" in frame_names:
-                beta_found = True
+                if t.get("action") != "alloc":
+                    continue
+                frame_names = [f.get("name", "") for f in t.get("frames", [])]
+                if "allocate_from_function_alpha" in frame_names:
+                    alpha_alloc_traces.append(t)
+                if "allocate_from_function_beta" in frame_names:
+                    beta_alloc_traces.append(t)
 
         del t2
         sync()
 
+        # The two allocations must each appear in the trace with the
+        # call-site stack we recorded at allocation time. This is the
+        # invariant the test is really checking — that recycling does
+        # not overwrite the stack on the recycled trace entry.
+        assert (
+            len(alpha_alloc_traces) >= 1
+        ), "First alloc should have 'allocate_from_function_alpha'"
+        assert len(beta_alloc_traces) >= 1, "Second alloc should have 'allocate_from_function_beta'"
+
         if recycled:
-            # If recycled, we should have 2 alloc traces at the same address
-            assert (
-                len(alloc_traces_at_addr) >= 2
-            ), f"Expected >= 2 alloc traces at recycled addr, got {len(alloc_traces_at_addr)}"
-            assert alpha_found, "First alloc should have 'allocate_from_function_alpha'"
-            assert beta_found, "Second alloc should have 'allocate_from_function_beta'"
-        else:
-            # If not recycled, still verify we have traces
-            assert len(alloc_traces_at_addr) >= 1, "Should have at least one alloc trace"
+            # When recycled, both allocs should land on the same NRT VA in
+            # the trace. Verify the trace's address (NRT VA) is identical
+            # across the two events.
+            alpha_trace_addrs = {t["addr"] for t in alpha_alloc_traces}
+            beta_trace_addrs = {t["addr"] for t in beta_alloc_traces}
+            shared = alpha_trace_addrs & beta_trace_addrs
+            assert shared, (
+                "Recycled alloc should reuse the same trace addr; "
+                f"alpha addrs={alpha_trace_addrs}, beta addrs={beta_trace_addrs}"
+            )
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")

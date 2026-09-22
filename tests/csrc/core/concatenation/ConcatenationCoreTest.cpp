@@ -5,6 +5,11 @@
 #include <string>
 #include <vector>
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "stablehlo/dialect/ChloOps.h"
+#include "stablehlo/dialect/StablehloOps.h"
+#include "tests/csrc/mocks/MockNRT.h"
 #include "tests/csrc/mocks/MockStreamImpl.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
@@ -12,16 +17,37 @@
 #include "torch_neuronx/csrc/core/concatenation/ConcatenationCore.h"
 
 using namespace torch_neuronx;
+using ::testing::_;
+using ::testing::DoAll;
+using ::testing::Return;
+using ::testing::SetArgPointee;
 
 class ConcatenationCoreTest : public ::testing::Test {
  protected:
+  torch_neuronx::testing::MockNRTSession mock_session_;
+  torch_neuronx::testing::MockNRT* mock_nrt_ = torch_neuronx::testing::MockNRT::GetInstance();
+
   void SetUp() override {
+    // Mock NRT instance info for CompilationCacheKey construction
+    nrt_instance_info_t info{};
+    info.family = NRT_INSTANCE_TRN3;
+    EXPECT_CALL(*mock_nrt_, nrt_get_instance_info(_, _))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly(DoAll(SetArgPointee<0>(info), Return(NRT_SUCCESS)));
+
     core = ConcatenationCoreFactory::CreateInstance();
     stream_mock = std::make_unique<at::neuron::testing::MockStreamImpl>();
+
+    // Set up MLIR context for StableHloNode creation in tests
+    mlir_context_ = std::make_unique<mlir::MLIRContext>();
+    mlir_context_->getOrLoadDialect<mlir::func::FuncDialect>();
+    mlir_context_->getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
+    mlir_context_->getOrLoadDialect<mlir::chlo::ChloDialect>();
   }
 
   std::unique_ptr<ConcatenationCore> core;
   std::unique_ptr<at::neuron::testing::MockStreamImpl> stream_mock;
+  std::unique_ptr<mlir::MLIRContext> mlir_context_;
 
   std::shared_ptr<at::neuron::OperationContext> createDotOperation(
       std::string name = "dot_op", std::string cache = "dot_cache") {
@@ -524,7 +550,7 @@ TEST_F(ConcatenationCoreTest, CreateOpContextFromIrNode_ThrowsOnSizeMismatch) {
 
 // Test that verifies TensorDataRef validation passes when data refs are properly populated
 TEST_F(ConcatenationCoreTest, CreateOpContextFromIrNode_SucceedsWithProperDataRefs) {
-  // Create an IrNode with properly matched data refs
+  // Create a StableHloNode with properly matched data refs
   std::vector<void*> inputs = {reinterpret_cast<void*>(0x1000)};
   std::vector<void*> outputs = {reinterpret_cast<void*>(0x2000)};
 
@@ -538,8 +564,9 @@ module @test {
 )";
   std::vector<uint8_t> ir_data(mlir.begin(), mlir.end());
 
-  auto ir_node = std::make_unique<IrNode>("test_op", "test_cache", ir_data, IrNodeType::STABLEHLO,
-                                          std::move(inputs), std::move(outputs), false);
+  auto ir_node = std::make_unique<StableHloNode>("test_op", "test_cache", std::move(ir_data),
+                                                 std::move(inputs), std::move(outputs), false,
+                                                 mlir_context_.get());
 
   // Add properly matched data refs
   ir_node->input_data_refs.emplace_back(reinterpret_cast<void*>(0x1000));
@@ -551,7 +578,7 @@ module @test {
 
 // Test that verifies TensorDataRef validation with empty inputs/outputs succeeds
 TEST_F(ConcatenationCoreTest, CreateOpContextFromIrNode_SucceedsWithEmptyInputsOutputs) {
-  // Create an IrNode with no inputs or outputs (edge case)
+  // Create a StableHloNode with no inputs or outputs (edge case)
   std::vector<void*> inputs = {};
   std::vector<void*> outputs = {};
 
@@ -564,8 +591,9 @@ module @test {
 )";
   std::vector<uint8_t> ir_data(mlir.begin(), mlir.end());
 
-  auto ir_node = std::make_unique<IrNode>("test_op", "test_cache", ir_data, IrNodeType::STABLEHLO,
-                                          std::move(inputs), std::move(outputs), false);
+  auto ir_node = std::make_unique<StableHloNode>("test_op", "test_cache", std::move(ir_data),
+                                                 std::move(inputs), std::move(outputs), false,
+                                                 mlir_context_.get());
 
   // No data refs needed for empty inputs/outputs
 

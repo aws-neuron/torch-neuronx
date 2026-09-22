@@ -125,9 +125,10 @@ class NeuronStream {
   /// Submit an event wait primitive to this stream
   void SubmitEventWait(const NeuronEvent& event) const;
 
- private:
+  /// Underlying StreamImpl identity (for logical-stream comparison).
   StreamImpl* get_stream_impl() const;
 
+ private:
   c10::Stream stream_;
 };
 
@@ -145,6 +146,13 @@ c10::DeviceIndex current_device();
 
 /// Synchronize all streams on a device
 void synchronize(c10::DeviceIndex device_index = -1);
+
+/// Drain all streams on every visible device, swallowing any exceptions.
+/// Intended for teardown paths where there is no reasonable exception
+/// handler. This does NOT acquire the GIL. Callers that hold Python state
+/// that may need the GIL during tensor destruction must drain BEFORE
+/// releasing it.
+void drain_visible_device_streams(const char* phase) noexcept;
 
 /// Submit an operation context to the asynchronous execution.
 /// @param stream The stream to submit the operation to

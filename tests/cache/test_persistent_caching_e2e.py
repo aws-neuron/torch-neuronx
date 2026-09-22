@@ -113,6 +113,19 @@ class TestPersistentCachingE2E:
         neff_files_after = _list_neff_files(cache_dir)
         assert len(neff_files_after) > len(neff_files_before), "No new NEFF files created on disk"
 
+    def test_ensure_compilation_service_constructs_cache_without_compiling(self, cache_dir):
+        """ensure_compilation_service() forces the CompilationCache singleton to
+        exist without submitting a compile"""
+        import torch_neuronx
+
+        torch_neuronx._C._clear_compilation_cache()
+
+        torch_neuronx._C.ensure_compilation_service()
+
+        stats = torch_neuronx._C._get_compilation_cache_stats()
+        assert stats["persistent_hits"] == 0
+        assert stats["persistent_misses"] == 0
+
     def test_deterministic_cache_key(self, cache_dir):
         """Test that cache keys are deterministic.
 

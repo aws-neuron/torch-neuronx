@@ -14,7 +14,9 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+import torch_neuronx
 from tests.distributed.collective_ops.base_collective_op import BaseCollectiveOpTest
+from tests.distributed.utils import broadcast_object_from_rank0
 from torch_neuronx.neuron_dynamo_backend.compile import (
     ArtifactType,
     clear_compiled_cache_keys,
@@ -58,9 +60,8 @@ def run_in_memory_cache_key_test(rank, world_size, kwargs):
     assert len(cache_keys) == 1, f"Expected 1 cache key, got {len(cache_keys)}"
     local_key = next(iter(cache_keys))
 
-    # Broadcast rank 0's key and verify all ranks match
-    rank0_key = [local_key] if rank == 0 else [None]
-    dist.broadcast_object_list(rank0_key, src=0)
+    # Broadcast rank 0's key and verify all ranks match (host-side; see helper)
+    rank0_key = [broadcast_object_from_rank0(local_key, rank, world_size, tag="cache_key")]
 
     assert (
         local_key == rank0_key[0]
@@ -70,7 +71,10 @@ def run_in_memory_cache_key_test(rank, world_size, kwargs):
 def run_persistent_cache_test(rank, world_size, kwargs):
     """Test that all ranks share a single NEFF in persistent cache."""
     device = torch.device(f"neuron:{torch.neuron.current_device()}")
-    os.environ["TORCH_NEURONX_NEFF_CACHE_DIR"] = kwargs["cache_dir"]
+
+    # Compilation cache should be cleared from any previous NEFFs for this check
+    torch_neuronx._C._clear_compilation_cache()
+    dist.barrier()
 
     _compile_and_run(device)
 
@@ -93,4 +97,5 @@ class TestCacheKeySPMD(BaseCollectiveOpTest):
     def test_persistent_cache_single_neff(self):
         """Verify all ranks share one NEFF file in persistent cache."""
         with tempfile.TemporaryDirectory() as cache_dir:
+            os.environ["TORCH_NEURONX_NEFF_CACHE_DIR"] = cache_dir
             self.distributed_tester.run_test(run_persistent_cache_test, cache_dir=cache_dir)

@@ -125,6 +125,14 @@ class TestIndexRegistration:
         """Test boolean mask indexing"""
         x_cpu = torch.randn(shape)
         mask_cpu = torch.randint(0, 2, shape).bool()
+        # Guarantee at least one True element. Without this the random mask
+        # is all-False with probability (1/2)**numel(shape) — 3.125% for
+        # shape=(5,). In that case PyTorch short-circuits x[mask] to
+        # nonzero + empty and aten.index is never dispatched, making the
+        # assert_op_runs_on_neuron("index") assertion below fail.
+        # The all-False path is covered separately by
+        # test_boolean_mask_all_false.
+        mask_cpu.view(-1)[0] = True
         expected = x_cpu[mask_cpu]
 
         with track_neuron_ops():
@@ -160,7 +168,48 @@ class TestIndexRegistration:
             assert_op_did_not_run_on_neuron("index")
             assert_op_runs_on_neuron("nonzero")
 
-    @assert_raises(RuntimeError, match=r"index .* is out of bounds for dimension 0 with size 4")
+    @pytest.mark.xfail(
+        condition=os.environ.get("NEURON_LAUNCH_BLOCKING") == "1",
+        reason="Need to update the op logging for sync mode for short-circuited tests",
+    )
+    @pytest.mark.parametrize(
+        "shape,mask_shape",
+        [
+            ((8, 4), (8,)),
+            ((2, 3, 4), (2,)),
+            ((2, 3, 4), (2, 3)),
+        ],
+    )
+    def test_boolean_mask_all_false_partial_rank(self, shape, mask_shape):
+        """All-false mask over leading dims keeps the un-indexed trailing dims.
+
+        (8, 4) indexed by an all-false (8,) mask is (0, 4): the short-circuit that
+        skips the kernel must reproduce that shape rather than a flat (0,).
+        """
+        x_cpu = torch.randn(shape)
+        mask_cpu = torch.zeros(mask_shape, dtype=torch.bool)
+        expected = x_cpu[mask_cpu]
+
+        with track_neuron_ops():
+            x = x_cpu.to(device="neuron")
+            mask = mask_cpu.to(device="neuron")
+            result = x[mask]
+            assert result.shape == expected.shape
+            torch.testing.assert_close(result.cpu(), expected)
+            assert_op_did_not_run_on_neuron("index")
+            assert_op_runs_on_neuron("nonzero")
+
+    def test_boolean_mask_shape_mismatch_raises(self):
+        x = torch.empty(2, 3, 4, device="neuron")
+        mask = torch.zeros(5, dtype=torch.bool, device="neuron")
+
+        with pytest.raises(
+            IndexError,
+            match=r"The shape of the mask \[5\].*indexed tensor \[2, 3, 4\]",
+        ):
+            _ = x[mask]
+
+    @assert_raises(IndexError, match=r"index .* is out of bounds for dimension 0 with size 4")
     def test_out_of_bounds_indexing_raises_error(self):
         """Test that out-of-bounds indexing raises IndexError like PyTorch."""
         input_data = [
@@ -245,3 +294,35 @@ class TestIndexRegistration:
             torch.testing.assert_close(result.cpu(), result_cpu)
             assert result.device.type == "neuron"
             assert_op_runs_on_neuron("index")
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.int32])
+    def test_index_dtype_preserved(self, dtype):
+        """Verify indexing preserves tensor dtype."""
+        x = torch.arange(12, dtype=dtype).reshape(3, 4)
+        idx = torch.tensor([0, 2])
+
+        result = x.to("neuron")[idx.to("neuron")]
+        expected = x[idx]
+
+        assert (
+            result.dtype == expected.dtype
+        ), f"dtype mismatch: neuron={result.dtype}, cpu={expected.dtype}"
+        torch.testing.assert_close(result.cpu(), expected)
+
+    def test_index_tensor_out_variant(self):
+        """Test index.Tensor_out variant with pre-allocated output tensor."""
+        x_cpu = torch.randn(4, 8)
+        idx = torch.tensor([0, 2, 3])
+
+        expected = torch.ops.aten.index(x_cpu, [idx])
+
+        x_neuron = x_cpu.to("neuron")
+        idx_neuron = idx.to("neuron")
+        out = torch.empty(3, 8, device="neuron")
+
+        with track_neuron_ops():
+            torch.ops.aten.index.Tensor_out(x_neuron, [idx_neuron], out=out)
+            assert_op_runs_on_neuron("aten::index")
+
+        assert out.shape == (3, 8)
+        torch.testing.assert_close(out.cpu(), expected)

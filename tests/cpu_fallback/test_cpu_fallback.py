@@ -36,13 +36,45 @@ class TestCpuFallback:
         expected = torch.ops.aten._test_optional_intlist(x_cpu, None)
         assert torch.allclose(y.cpu(), expected)
 
+    @assert_raises(RuntimeError, match="Expected all tensors to be on the same device")
+    def test_cross_device_out_raises_same_device_error(self):
+        """A CPU-fallback op with an out= on a different device than the Neuron
+        inputs raises PyTorch's standard same-device error up front, rather than
+        failing later in the fallback's _copy_from_and_resize copy-back step
+        (which can't copy a CPU result into a CPU out via a PrivateUse1-only op).
+        cholesky is a CPU-fallback linalg op that exercises this path.
+        """
+        a = torch.eye(3, dtype=torch.float32, device="neuron")
+        cpu_out = torch.empty(0, dtype=torch.float32, device="cpu")
+        torch.linalg.cholesky(a, out=cpu_out)
+
+    def test_same_device_out_fills_correctly(self):
+        """Same-device out= for a CPU-fallback linalg op is still filled correctly."""
+        a = torch.eye(3, dtype=torch.float32, device="neuron")
+        out = torch.empty(0, dtype=torch.float32, device="neuron")
+        torch.linalg.cholesky(a, out=out)
+        torch.testing.assert_close(out.cpu(), torch.linalg.cholesky(a).cpu())
+
+    @pytest.mark.parametrize("use_out", [False, True])
+    @assert_raises(RuntimeError, match="Expected all tensors to be on the same device")
+    def test_householder_cross_device_tau_raises_same_device_error(self, use_out):
+        reflectors = torch.randn(5, 3, device="neuron")
+        tau = torch.randn(3)
+
+        if use_out:
+            out = torch.empty_like(reflectors)
+            torch.linalg.householder_product(reflectors, tau, out=out)
+        else:
+            torch.linalg.householder_product(reflectors, tau)
+
+    # Either layer can raise this check: ATen's TORCH_CHECK spells dtypes
+    # "float"/"int", histc's own validator spells them "torch.float32"/"torch.int32".
+    # Which one wins depends on the fallback mode and on --forked (this suite uses
+    # both), so accept either. \b keeps it exact, "int64" still fails.
     @assert_raises(
         RuntimeError,
-        match="torch.histogram: input tensor and hist tensor should have the same dtype, "
-        "but got input torch.float32 and hist torch.int32"
-        if use_mlir_aten_ops()
-        else "torch.histogram: input tensor and hist tensor should have the same dtype, "
-        "but got input float and hist int",
+        match=r"torch\.histogram: input tensor and hist tensor should have the same dtype, "
+        r"but got input (torch\.float32|float)\b and hist (torch\.int32|int)\b",
     )
     def test_histc_out_inconsistent_dtype_neuron(self):
         """Test histc with inconsistent dtype on Neuron device."""
@@ -146,6 +178,11 @@ class TestCpuFallback:
         row_idx = torch.tensor([1, 2], dtype=dtype, device="neuron")  # 15 is out of bounds
         x[row_idx, :]
 
+    @pytest.mark.skipif(
+        os.environ.get("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS") == "1",
+        reason="Complex dtype CPU fallback is disabled under "
+        "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1;",
+    )
     @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
     def test_complex_dtype_fallback(self, dtype):
         """Test that complex dtypes fall back to CPU"""
@@ -197,6 +234,12 @@ class TestCpuFallback:
 @pytest.mark.skipif(
     os.environ.get("NEURON_LAUNCH_BLOCKING") == "1",
     reason="Async CPU fallback is only relevant with aysnc execution mode",
+)
+@pytest.mark.skipif(
+    os.environ.get("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS") == "1",
+    reason="Runtime CPU fallback executor is disabled under "
+    "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1 (CPUFallbackExecutor "
+    "sets enabled_=false), so compilation-failure recovery cannot run.",
 )
 class TestCpuFallbackAsync:
     """Test CPU fallback for operations with static arguments.

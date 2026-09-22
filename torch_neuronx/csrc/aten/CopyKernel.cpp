@@ -13,15 +13,13 @@ at::Tensor _copy_from_and_resize_neuron(const at::Tensor& self, const at::Tensor
               "got src tensor device is ",
               self.device(), " and dst device is ", dst.device());
 
-  // If dst is empty (numel() == 0), resize it to match self
-  if (dst.numel() == 0) {
+  // Resize dst to match self if shapes differ. This implements PyTorch's
+  // out= contract: if the out tensor has a different shape than the result
+  // of the computation, it is resized.
+  if (self.sizes() != dst.sizes()) {
     // Cast away const to resize - this is safe as we're modifying dst which is the output
     const_cast<at::Tensor&>(dst).resize_as_(self);
   }
-
-  // After potential resize, check that sizes match
-  TORCH_CHECK(self.sizes() == dst.sizes(),
-              "_copy_from_and_resize now only support copy with same size, or dst.numel() == 0!");
 
   // Perform the copy using the existing copy_ operation
   const_cast<at::Tensor&>(dst).copy_(self);

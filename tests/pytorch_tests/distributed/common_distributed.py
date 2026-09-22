@@ -20,10 +20,27 @@ from tests.utils.neuron_test_utils import get_core_start_index, get_pytest_worke
 NEURON_RT_NUM_CORES = "8"
 
 
+class _CallableString(str):
+    """A str subclass that is callable and returns itself.
+
+    Makes `device_type` work as both a string self.device_type == "neuron"
+    and a callable self.device_type() to match upstream test conventions.
+    """
+
+    def __call__(self):
+        return str(self)
+
+
 class NeuronDistributedBase:
+    _world_size = 8
+
     @property
     def world_size(self):
-        return 8
+        return self._world_size
+
+    @world_size.setter
+    def world_size(self, value):
+        self._world_size = value
 
     @property
     def backend(self):
@@ -41,6 +58,8 @@ class NeuronDistributedBase:
         if set_rt_visible_cores:
             core_start_index = get_core_start_index()
             os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_start_index + rank)
+        # P2P requires SHM transfer disabled for intra-node EFA
+        os.environ.setdefault("FI_EFA_ENABLE_SHM_TRANSFER", "0")
 
     @classmethod
     def _apply_patches(cls, exclude: list[str] | None = None):
@@ -215,7 +234,7 @@ def create_test_classes(base_class, module_globals, spec_file="test_spec.json"):
 class NeuronMultiProcessTest(NeuronDistributedBase, MultiProcessTestCase):
     @property
     def device_type(self):
-        return "neuron"
+        return _CallableString("neuron")
 
     @classmethod
     def _run(cls, rank, test_name, file_name, parent_pipe, **kwargs):
@@ -227,7 +246,7 @@ class NeuronMultiProcessTest(NeuronDistributedBase, MultiProcessTestCase):
 class NeuronMultiProcessTestDDP(NeuronDistributedBase, MultiProcessTestCase):
     @property
     def device_type(self):
-        return "neuron"
+        return _CallableString("neuron")
 
     @classmethod
     def _run(cls, rank, test_name, file_name, parent_pipe, **kwargs):
@@ -239,7 +258,7 @@ class NeuronMultiProcessTestDDP(NeuronDistributedBase, MultiProcessTestCase):
 class NeuronCommonTest(NeuronDistributedBase):
     @property
     def device_type(self):
-        return "neuron"
+        return _CallableString("neuron")
 
     @classmethod
     def _run(cls, rank, test_name, file_name, parent_pipe, **kwargs):
@@ -262,16 +281,14 @@ class NeuronCommonTest(NeuronDistributedBase):
 
 
 class NeuronCommonContTest(NeuronDistributedBase):
+    device_type = _CallableString("neuron")
+
     @classmethod
     def _worker_loop(cls, rank, world_size, rdvz_file, task_queue, completion_queue):
         """Called inside MultiProcContinuousTest class to spawn process"""
         cls._setup_neuron_environment(rank, set_rt_visible_cores=True)
         cls._apply_patches()
         super()._worker_loop(rank, world_size, rdvz_file, task_queue, completion_queue)
-
-    @classmethod
-    def device_type(cls):
-        return "neuron"
 
     @classmethod
     def backend_str(cls):

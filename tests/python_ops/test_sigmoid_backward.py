@@ -208,3 +208,20 @@ class TestSigmoidRegistration:
 
         torch.testing.assert_close(neuron_grad.cpu(), cpu_grad, atol=atol, rtol=rtol)
         assert_op_runs_on_neuron("aten::sigmoid_backward")
+
+    @pytest.mark.parametrize("shape", [(32,), (8, 16)])
+    def test_sigmoid_backward_grad_input_variant(self, shape):
+        """Test aten::sigmoid_backward.grad_input dispatches to Neuron."""
+        torch.manual_seed(42)
+        grad_output = torch.randn(shape, device="neuron")
+        output = torch.sigmoid(torch.randn(shape)).to("neuron")
+        grad_input = torch.empty(shape, device="neuron")
+
+        with track_neuron_ops():
+            result = torch.ops.aten.sigmoid_backward.grad_input(
+                grad_output, output, grad_input=grad_input
+            )
+        assert_op_runs_on_neuron("aten::sigmoid_backward")
+        expected = torch.ops.aten.sigmoid_backward(grad_output, output)
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+        torch.testing.assert_close(grad_input.cpu(), expected.cpu())

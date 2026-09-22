@@ -141,7 +141,7 @@ StableHloNode::StableHloNode(const at::neuron::OperationContext& operation_conte
   TORCH_NEURONX_TRACE_FUNCTION_WITH_ARGS("op_name:", xla_kernel->GetOpName());
 
   this->op_name = xla_kernel->GetOpName();
-  this->cache_key = xla_kernel->GetCacheKey();
+  this->cache_key = xla_kernel->GetCompileKey();
   this->ir_type = IrNodeType::STABLEHLO;
   this->status = IrNodeStatus::CREATED;
   this->ir_serialized = xla_kernel->GetHloBytes();

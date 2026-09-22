@@ -5,6 +5,18 @@ from enum import Enum, auto
 import torch
 
 
+def match_layout(
+    source: torch.Tensor, reference: torch.Tensor, out: torch.Tensor = None
+) -> torch.Tensor:
+    """Return source with the same layout as reference, copying only if needed, in out tensor."""
+    if source.stride() == reference.stride():
+        return source
+    if out is None:
+        out = torch.empty_like(reference)
+    out.copy_(source)
+    return out
+
+
 class KernelType(Enum):
     """Enumeration of available contiguous copy kernel types"""
 

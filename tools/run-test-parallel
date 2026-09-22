@@ -7,9 +7,40 @@ set -e
 # Configuration
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-readonly DEFAULT_IGNORE_DIRS=("tests/tmp" "tests/huggingface" "tests/pytorch_tests" "tests/cpu_fallback" "tests/vertical")
-readonly SKIP_TESTS=("tests/distributed/" "tests/device/test_multi_device.py" "tests/device/test_device_lnc1_all_cores.py")
+# tests/cache is here because its conftest repoints TORCH_NEURONX_NEFF_CACHE_DIR at
+# import, which the C++ backend reads once per process, so collecting it in the main
+# group would redirect every worker's cache. It runs in its own group below.
+readonly DEFAULT_IGNORE_DIRS=("tests/tmp" "tests/huggingface" "tests/pytorch_tests" "tests/pytorch_tests_native" "tests/cpu_fallback" "tests/vertical" "tests/cache")
+# Tests that drive the cache directly rather than through a compile. They need a
+# private cache dir, because _clear_compilation_cache() deletes the on-disk NEFFs
+# and would wipe what the other workers are using, and HLO-derived keying off,
+# because put_neff_cache cannot derive a key without HLO bytes.
+readonly CACHE_OWNING_TESTS=(
+    "tests/neuron_dynamo_backend/component/caching/test_megacache.py"
+    "tests/neuron_dynamo_backend/unit/test_metrics.py"
+    "tests/neuron_dynamo_backend/e2e/test_execute_compiled_graph_e2e.py"
+)
+readonly CACHE_OWNING_NEFF_DIR="/tmp/neff_cache_owned_by_tests"
+readonly SKIP_TESTS=("tests/distributed/" "tests/device/test_multi_device.py" "tests/device/test_device_lnc1_all_cores.py" "tests/operations/test_launch_blocking_invariant.py")
 readonly REQUIRED_PACKAGES=("pytest-html" "xdist" "pytest_forked")
+
+# Retry configuration
+DEFAULT_NUM_WORKERS_RETRY=4
+DEFAULT_RETRY_TIMEOUT=1800
+
+# Persistent NEFF cache (--persistent-cache). The internal-compute fleet injects
+# these two vars into the pod when the job carries a
+# neuron.internal_compute.persistent-storage:{read,write} label, naming this repo's
+# S3 cache. The bucket is fleet-assigned, so suites are separated by prefix:
+# ATEN_NEFF_CACHE_S3_SUBDIR keeps ATen's NEFFs away from the upstream suite's.
+readonly PERSISTENT_STORAGE_BUCKET_ENV="PERSISTENT_STORAGE_BUCKET"
+readonly PERSISTENT_STORAGE_PREFIX_ENV="PERSISTENT_STORAGE_PREFIX"
+readonly ATEN_NEFF_CACHE_S3_SUBDIR="aten-unit-tests"
+# torch-neuronx's own default cache dir, on local NVMe. Set explicitly so the
+# download target and the compile path cannot drift apart. Overridable from the
+# environment to point a local run at a scratch cache.
+readonly ATEN_NEFF_CACHE_DIR="${ATEN_NEFF_CACHE_DIR:-/tmp/neff_cache}"
+readonly NEFF_CACHE_TRANSFER_TIMEOUT=600
 
 # Global state
 declare -g RUNNER=()
@@ -28,14 +59,35 @@ declare -g ENABLE_JSON_REPORT=false
 declare -g HAS_EXPLICIT_TEST_PATH=false
 declare -g SKIP_PT_TEST_DISTRIBUTED=false
 declare -g SANITY_PT_DISTRIBUTED_TESTS=""
+# Share one process per xdist worker instead of forking per test, so the Neuron
+# runtime init is paid once per worker. See "Process isolation" in
+# docs/AI-testing.md for the full contract.
+declare -g NO_FORKED=false
+# Per-test timeout, usable only because the shared run drops --forked
+# (pytest-timeout and pytest-forked can't be combined).
+declare -g NO_FORKED_TEST_TIMEOUT=1800
+# Wall-clock ceiling for the shared run, needed because the per-test timeout uses
+# the signal method and so cannot interrupt a hang inside a native call. -k
+# escalates to SIGKILL: SIGTERM alone leaves a wedged xdist controller waiting on
+# its workers, which burned 86 and then 120 min on a 30 min suite.
+declare -g NO_FORKED_GROUP_TIMEOUT=3600
+# Workers for the isolated pass. Low on purpose: the marked set is the
+# device-hostile tests (hard OOMs, a 17GB pre-alloc per parametrization), which
+# the full suite only survived because they were spread over an hour.
+declare -g NO_FORKED_ISOLATED_WORKERS=4
+declare -g PERSISTENT_CACHE=false
+declare -g PERSISTENT_CACHE_REFRESH=false
 
 
 # Initialize environment
 init_environment() {
     cd "$PROJECT_ROOT"
+    unset NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE
     export NEURON_LAUNCH_BLOCKING="${NEURON_LAUNCH_BLOCKING:-0}"
 
-    if command -v uv >/dev/null 2>&1; then
+    if [ -n "$VIRTUAL_ENV" ]; then
+        RUNNER=(python)
+    elif command -v uv >/dev/null 2>&1; then
         RUNNER=(uv run python)
     else
         RUNNER=(python)
@@ -111,6 +163,9 @@ parse_arguments() {
             "--coverage") ENABLE_COVERAGE=true ;;
             "--json-report") ENABLE_JSON_REPORT=true ;;
             "--skip_pt_test_distributed") SKIP_PT_TEST_DISTRIBUTED=true ;;
+            "--no-forked") NO_FORKED=true ;;
+            "--persistent-cache") PERSISTENT_CACHE=true ;;
+            "--refresh-persistent-cache") PERSISTENT_CACHE_REFRESH=true ;;
             "--sanity_pt_distributed_tests")
                 SANITY_PT_DISTRIBUTED_TESTS="--sanity_pt_distributed_tests"
                 ;;
@@ -159,15 +214,118 @@ build_ignore_args() {
         ignore_args+="--ignore=$dir "
     done
 
-    # Add multi-device and distributed test ignores for full suite runs
+    # Always ignore multistream host-cc tests (requires worldsize>8, run separately)
+    ignore_args+="--ignore=tests/distributed/collective_ops/test_multistream_collectives_with_host_cc.py "
+
+    # Add multi-device, distributed and cache-owning ignores for full suite runs
     if [[ "$HAS_EXPLICIT_TEST_PATH" == "false" ]]; then
-        for test in "${SKIP_TESTS[@]}"; do
+        for test in "${SKIP_TESTS[@]}" "${CACHE_OWNING_TESTS[@]}"; do
             ignore_args+="--ignore=$test "
         done
     fi
 
     echo "$ignore_args"
 }
+# S3 location of this suite's NEFF cache, or non-zero when no storage label is set.
+# Partitioned by compiler version so a bump starts from an empty prefix rather
+# than paying a lookup against entries that can never match.
+neff_cache_s3_uri() {
+    local bucket="${!PERSISTENT_STORAGE_BUCKET_ENV:-}"
+    [[ -n "$bucket" ]] || return 1
+
+    local prefix="${!PERSISTENT_STORAGE_PREFIX_ENV:-}"
+    prefix="${prefix#/}"
+    prefix="${prefix%/}"
+
+    local compiler_version
+    compiler_version=$("${RUNNER[@]}" -c \
+        "import neuronxcc; print(neuronxcc.__version__)" 2>/dev/null) || compiler_version=""
+    [[ -n "$compiler_version" ]] || compiler_version="unknown"
+
+    local base="s3://$bucket"
+    [[ -n "$prefix" ]] && base="$base/$prefix"
+    echo "$base/version=$compiler_version/$ATEN_NEFF_CACHE_S3_SUBDIR/neff_cache/"
+}
+
+neff_cache_file_count() {
+    find "$ATEN_NEFF_CACHE_DIR" -type f 2>/dev/null | wc -l | tr -d ' '
+}
+
+# Download the shared NEFF cache before the tests, so a compile that any previous
+# run already did is a cache hit here. Everything is fail-open: no label, no aws
+# CLI, or an S3 error just means a cold compile, never a failed run.
+neff_cache_download() {
+    [[ "$PERSISTENT_CACHE" == "true" ]] || return 0
+
+    if ! mkdir -p "$ATEN_NEFF_CACHE_DIR"; then
+        echo "=== NEFF cache: cannot create $ATEN_NEFF_CACHE_DIR; cold compile ==="
+        return 0
+    fi
+    export TORCH_NEURONX_NEFF_CACHE_DIR="$ATEN_NEFF_CACHE_DIR"
+    # Key each NEFF by its HLO, so a source edit that does not change the HLO still
+    # hits. Off by default in torch-neuronx.
+    export TORCH_NEURONX_NEFF_KEY_FROM_HLO=1
+
+    local s3_uri
+    if ! s3_uri=$(neff_cache_s3_uri); then
+        echo "=== NEFF cache: $PERSISTENT_STORAGE_BUCKET_ENV unset (no persistent-storage label?); cold compile ==="
+        return 0
+    fi
+
+    # Print without the s3:// scheme so the path is not redacted in CI logs.
+    echo "=== NEFF cache: downloading from ${s3_uri#s3://} ==="
+    local start=$SECONDS
+    if ! timeout "$NEFF_CACHE_TRANSFER_TIMEOUT" \
+            aws s3 cp --recursive --only-show-errors "$s3_uri" "$ATEN_NEFF_CACHE_DIR"; then
+        # A cold prefix exits non-zero too, which is normal on the first run of a
+        # compiler version.
+        echo "=== NEFF cache: nothing downloaded (cold prefix or transfer error) ==="
+    fi
+    echo "=== NEFF cache: $(neff_cache_file_count) entries local after $((SECONDS - start))s ==="
+}
+
+# Seed the shared cache with the compiled NEFFs. Three independent gates must pass.
+# A PR, Merge Queue run, or custom branch run cannot publish unmerged NEFFs:
+#   1. --refresh-persistent-cache, which main Nightly and main Dependency Guard pass
+#   2. the branch is main
+#   3. a storage bucket is present, i.e. the job carries persistent-storage:write
+neff_cache_upload() {
+    [[ "$PERSISTENT_CACHE" == "true" ]] || return 0
+    [[ "$PERSISTENT_CACHE_REFRESH" == "true" ]] || return 0
+
+    # Internal compute forwards only TEST_COMMAND into the workload, so a caller
+    # that wants to upload has to export GITHUB_REF_NAME itself. Empty means the
+    # export is missing, not that we are off main, so say so rather than implying
+    # the branch was checked.
+    if [[ -z "${GITHUB_REF_NAME:-}" ]]; then
+        echo "=== NEFF cache: skip upload (GITHUB_REF_NAME not forwarded into the workload) ==="
+        return 0
+    fi
+    if [[ "${GITHUB_REF_NAME}" != "main" ]]; then
+        echo "=== NEFF cache: skip upload (branch '${GITHUB_REF_NAME}' is not main) ==="
+        return 0
+    fi
+
+    local s3_uri
+    if ! s3_uri=$(neff_cache_s3_uri); then
+        echo "=== NEFF cache: $PERSISTENT_STORAGE_BUCKET_ENV unset (no :write label?); skip upload ==="
+        return 0
+    fi
+
+    echo "=== NEFF cache: uploading $(neff_cache_file_count) local entries to ${s3_uri#s3://} ==="
+    local start=$SECONDS
+    # AtomicWrite creates .tmp.XXXXXX inside the target shard directory, so a
+    # process killed before the rename leaves one behind. Excluded so partial
+    # writes are never published to the shared prefix.
+    if ! timeout "$NEFF_CACHE_TRANSFER_TIMEOUT" \
+            aws s3 cp --recursive --only-show-errors --exclude '.tmp.*' \
+            "$ATEN_NEFF_CACHE_DIR" "$s3_uri"; then
+        echo "=== NEFF cache: upload failed (non-fatal) ==="
+        return 0
+    fi
+    echo "=== NEFF cache: upload finished in $((SECONDS - start))s ==="
+}
+
 # Setup test reports directory and options
 setup_reports() {
     if [[ -z "$REPORTS_DIR" ]]; then
@@ -186,7 +344,9 @@ build_pytest_options() {
     local xdist_args=""
     local json_report_ops=""
 
-    if [[ "$ENABLE_COVERAGE" == "true" && "$report_name" == "report" ]]; then
+    # "isolated-report" is the --forked tail of the same logical group as "report",
+    # so it contributes to the same (appended) coverage data.
+    if [[ "$ENABLE_COVERAGE" == "true" && ( "$report_name" == "report" || "$report_name" == "isolated-report" ) ]]; then
         local cov_target="torch_neuronx"
         cov_opts="--cov=$cov_target --cov-report=html:$REPORTS_DIR/coverage --cov-report=term-missing --cov-append"
         if [[ "$ENABLE_JSON_REPORT" == "true" ]]; then
@@ -203,15 +363,60 @@ build_pytest_options() {
         xdist_args="-n $workers"
     fi
 
-    echo "$xdist_args $html_opts $cov_opts $json_report_ops"
+    local warn_opts="-W 'ignore:This process .* is multi-threaded, use of fork:DeprecationWarning'"
+
+    echo "$xdist_args $html_opts $cov_opts $json_report_ops $warn_opts"
 }
 
-# Run command and track exit code
+# Run command and track exit code, retrying only failed tests on exit code 1.
+# allow_empty=true treats exit 5 (nothing collected) as success. Needed by the
+# isolated pass: `--no-forked tests/streams` has no marked tests to select, and
+# without this the whole run would report failure with every test passing.
 run_and_record() {
     local test_name="$1"
     local cmd="$2"
+    local allow_empty="${3:-false}"
     echo "Running $test_name: $cmd"
-    if ! eval "$cmd"; then
+    local test_exit=0
+    eval "$cmd" || test_exit=$?
+
+    if [[ $test_exit -eq 5 && "$allow_empty" == "true" ]]; then
+        echo "=== $test_name: no tests selected, skipping ==="
+        return
+    fi
+
+    # Retry only on exit code 1 (test failures with complete cache).
+    # Skip timeouts (124/130/137) and internal errors where retry won't help.
+    if [[ $test_exit -eq 1 ]]; then
+        local num_workers_retry="${NUM_WORKERS_RETRY:-$DEFAULT_NUM_WORKERS_RETRY}"
+        local retry_timeout="${RETRY_TIMEOUT:-$DEFAULT_RETRY_TIMEOUT}"
+        echo ""
+        echo "=== Retrying failed tests for $test_name ($num_workers_retry workers, timeout ${retry_timeout}s) ==="
+
+        # Build retry command: replace worker count and append --last-failed flags.
+        # Redirect the retry's HTML/JSON reports to distinct "-retry" filenames —
+        # otherwise the retry run (which only collects the previously-failed
+        # tests) overwrites the full-suite reports and only the retried tests
+        # show up in the uploaded artifacts.
+        local retry_cmd
+        retry_cmd=$(echo "$cmd" | sed -E "s/-n [0-9]+/-n $num_workers_retry/")
+        retry_cmd=$(echo "$retry_cmd" | sed -E \
+            -e 's#--html=([^ ]+)\.html#--html=\1-retry.html#' \
+            -e 's#--json-report-file=([^ ]+)\.json#--json-report-file=\1-retry.json#')
+        retry_cmd="$retry_cmd --last-failed --last-failed-no-failures=none"
+
+        local retry_exit=0
+        timeout "$retry_timeout" bash -c "$retry_cmd" || retry_exit=$?
+
+        if [[ $retry_exit -eq 0 || $retry_exit -eq 5 ]]; then
+            echo "=== Retry SUCCESS: all previously-failing tests passed on retry ==="
+            test_exit=0
+        else
+            echo "=== Retry incomplete: some tests still failing (retry exit: $retry_exit) ==="
+        fi
+    fi
+
+    if [[ $test_exit -ne 0 ]]; then
         exit_code=1
     fi
 }
@@ -246,8 +451,28 @@ run_main_tests() {
 	fi
 	pytest_opts=$(build_pytest_options "report" "$workers")
 
-    local cmd="${RUNNER[*]} -m pytest --forked $pytest_opts $test_args $ignore_args"
+    if [[ "$NO_FORKED" != "true" ]]; then
+        local cmd="${RUNNER[*]} -m pytest --forked $pytest_opts $test_args $ignore_args"
+        run_and_record "main_tests" "$cmd"
+        return
+    fi
+
+    # --no-forked: share one process per xdist worker, so runtime init is paid once
+    # per worker instead of once per test. Tests that cannot share a process carry
+    # @pytest.mark.needs_process_isolation and run in the second pass below.
+    #
+    # Two passes, not a per-test @pytest.mark.forked: forking a worker that has
+    # already touched the device is fatal. Why, and when to mark a test:
+    # "Process isolation" in docs/AI-testing.md.
+    local cmd="timeout -k 120 $NO_FORKED_GROUP_TIMEOUT ${RUNNER[*]} -m pytest --timeout=$NO_FORKED_TEST_TIMEOUT $pytest_opts"
+    cmd="$cmd -m 'not needs_process_isolation' $test_args $ignore_args"
     run_and_record "main_tests" "$cmd"
+
+    local isolated_opts
+    isolated_opts=$(build_pytest_options "isolated-report" "$NO_FORKED_ISOLATED_WORKERS")
+    local isolated_cmd="${RUNNER[*]} -m pytest --forked $isolated_opts"
+    isolated_cmd="$isolated_cmd -m needs_process_isolation $test_args $ignore_args"
+    run_and_record "isolated_tests" "$isolated_cmd" "true"
 }
 
 # Run additional tests
@@ -262,7 +487,12 @@ run_additional_tests() {
 
         local pytest_opts
         pytest_opts=$(build_pytest_options "distributed-report" "$distributed_workers")
-        run_and_record "distributed_tests" "${RUNNER[*]} -m pytest --forked $pytest_opts tests/distributed"
+        run_and_record "distributed_tests" "${RUNNER[*]} -m pytest --forked $pytest_opts tests/distributed --ignore=tests/distributed/collective_ops/test_multistream_collectives_with_host_cc.py --ignore=tests/distributed/collective_ops/test_launch_blocking_collective_invariant.py"
+
+        # Launch blocking collective invariant test (requires CPP_DISPATCH=0)
+        local pytest_opts
+        pytest_opts=$(build_pytest_options "launch-blocking-collective-invariant-report" "1")
+        run_and_record "launch_blocking_collective_invariant" "TORCH_NEURONX_CPP_DISPATCH=0 NEURON_LAUNCH_BLOCKING=1 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/distributed/collective_ops/test_launch_blocking_collective_invariant.py"
     fi
 
     local pytest_opts
@@ -274,22 +504,46 @@ run_additional_tests() {
     pytest_opts=$(build_pytest_options "lnc1-all-cores-report" "1")
     run_and_record "lnc1_all_cores_tests" "NEURON_LOGICAL_NC_CONFIG=1 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/device/test_device_lnc1_all_cores.py"
 
+    # Launch blocking invariant test (requires CPP_DISPATCH=0 to exercise Python kernel path)
+    local pytest_opts
+    pytest_opts=$(build_pytest_options "launch-blocking-invariant-report" "1")
+    run_and_record "launch_blocking_invariant" "TORCH_NEURONX_CPP_DISPATCH=0 NEURON_LAUNCH_BLOCKING=1 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/operations/test_launch_blocking_invariant.py"
+
     local pytest_opts
     pytest_opts=$(build_pytest_options "cpu-fallback-report" "$NUM_WORKERS")
     run_and_record "cpu_fallback_tests" "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=0 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/cpu_fallback/test_cpu_fallback.py"
+
+    # Cache-owning tests: private cache dir and HLO-derived keying off.
+    local pytest_opts
+    pytest_opts=$(build_pytest_options "cache-owning-report" "$NUM_WORKERS")
+    run_and_record "cache_owning_tests" \
+        "env -u TORCH_NEURONX_NEFF_KEY_FROM_HLO TORCH_NEURONX_NEFF_CACHE_DIR=$CACHE_OWNING_NEFF_DIR ${RUNNER[*]} -m pytest --forked $pytest_opts ${CACHE_OWNING_TESTS[*]}"
+
+    # tests/cache: no cache environment at all, which is how these ran before this
+    # feature. Their own conftest picks a per-worker dir and the HLO cache uses its
+    # default. Fork mode follows the caller, as the main group does.
+    local pytest_opts fork_arg=""
+    [[ "$NO_FORKED" == "true" ]] || fork_arg="--forked"
+    pytest_opts=$(build_pytest_options "cache-report" "$NUM_WORKERS")
+    run_and_record "cache_tests" \
+        "env -u TORCH_NEURONX_NEFF_KEY_FROM_HLO -u TORCH_NEURONX_NEFF_CACHE_DIR -u TORCH_NEURONX_HLO_CACHE_DIR ${RUNNER[*]} -m pytest $fork_arg $pytest_opts tests/cache"
 
     local pytest_opts
     local saved_custom_n="$CUSTOM_N"
     CUSTOM_N=true
     pytest_opts=$(build_pytest_options "host-cc-multi-stream")
     CUSTOM_N="$saved_custom_n"
-    run_and_record "$test_name" "export DISTRIBUTED_TESTS_DEFAULT_TIMEOUT=1200 && TORCH_NEURONX_ENABLE_HOST_CC=1 NEURON_RT_DISABLE_EXECUTION_BARRIER=1 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/distributed/collective_ops/test_multistream_collectives_with_host_cc.py"
+    run_and_record "host_cc_multi_stream" "export DISTRIBUTED_TESTS_DEFAULT_TIMEOUT=1200 && TORCH_NEURONX_ENABLE_STREAMS=1 TORCH_NEURONX_ENABLE_HOST_CC=1 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/distributed/collective_ops/test_multistream_collectives_with_host_cc.py"
 
     if [[ "$SKIP_VERTICAL" == "false" ]]; then
         local pytest_opts
         pytest_opts=$(build_pytest_options "vertical-report" "$NUM_WORKERS")
         run_and_record "vertical_tests" "${RUNNER[*]} -m pytest --forked $pytest_opts tests/vertical"
     fi
+
+    local pytest_opts
+    pytest_opts=$(build_pytest_options "pinned-malloc-report" "1")
+    run_and_record "pinned_malloc_tests" "TORCH_NEURONX_USE_PINNED_MALLOC=1 ${RUNNER[*]} -m pytest --forked $pytest_opts tests/operations/test_copy_cpu_to_neuron.py tests/operations/test_copy_neuron_to_cpu.py"
 
     local pytest_opts
     pytest_opts=$(build_pytest_options "streams-report" "$NUM_WORKERS")
@@ -307,7 +561,7 @@ run_additional_tests() {
 
         # Fallback if detection fails
         if [[ -z "$torch_version" ]]; then
-            torch_version="2.10.0"
+            torch_version="2.11.0"
             echo "Warning: Could not detect torch version, using fallback: $torch_version"
         else
             echo "Detected torch version: $torch_version"
@@ -331,6 +585,7 @@ run_additional_tests() {
 
             local base_name="${test_file#test_}"  # Remove "test_" prefix
             base_name="${base_name%.py}"          # Remove ".py" suffix
+            base_name="${base_name%/}"            # Remove trailing slash
             local test_name="pytorch_${base_name}_tests"
             local report_name="pytorch-${base_name//_/-}-report"
 
@@ -349,6 +604,10 @@ display_results() {
     echo "Test Reports Generated:"
     echo "========================================="
     echo "Main Report: $REPORTS_DIR/report.html"
+
+    if [[ "$NO_FORKED" == "true" ]]; then
+        echo "Isolated Tests: $REPORTS_DIR/isolated-report.html"
+    fi
 
     if [[ "$ENABLE_COVERAGE" == "true" ]]; then
         echo "Coverage Report: $REPORTS_DIR/coverage/index.html"
@@ -388,8 +647,37 @@ main() {
     # Clear previous coverage data
     coverage erase
 
+    neff_cache_download
+
     run_main_tests
+
+    # Seed straight after the main group, not at the end of the run. The main group
+    # compiles the NEFFs that matter, and the later groups are long enough that the
+    # internal-compute workload timeout can kill the job before the upload runs.
+    # Whether the suite passed has no bearing on whether its NEFFs are reusable.
+    neff_cache_upload
+
     run_additional_tests
+
+    # Generate HUD benchmark NDJSON from JSON reports
+    if [[ "$ENABLE_JSON_REPORT" == "true" ]]; then
+        echo ""
+        echo "=== Generating HUD benchmark results ==="
+        PYTHONPATH="$PROJECT_ROOT/tests:${PYTHONPATH:-}" python3 \
+            "$PROJECT_ROOT/tests/utils/generate_hud.py" \
+            --multi --reports-dir "$REPORTS_DIR" --output-dir "$REPORTS_DIR" \
+            || echo "WARNING: HUD generation failed (non-fatal)"
+
+        # Write the GitHub step summary from the same JSON reports. Non-fatal:
+        # a summary failure must not mask the test exit code.
+        echo ""
+        echo "=== Generating GitHub step summary ==="
+        PYTHONPATH="$PROJECT_ROOT/tests:${PYTHONPATH:-}" python3 \
+            "$PROJECT_ROOT/tests/utils/generate_unit_step_summary.py" \
+            --reports-dir "$REPORTS_DIR" \
+            || echo "WARNING: step summary generation failed (non-fatal)"
+    fi
+
     display_results
 
     exit $exit_code

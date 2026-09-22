@@ -2,6 +2,7 @@
 
 import logging
 import traceback
+from collections.abc import Callable
 
 import torch
 
@@ -29,6 +30,7 @@ class TorchMlirOpImpl(CompilableOpImpl):
         output_params: tuple[str, ...] | None = None,
         static_argnums: tuple[int, ...] | None = None,
         static_argnames: tuple[str, ...] | None = None,
+        validate_static_inputs_func: Callable | None = None,
     ):
         super().__init__()
 
@@ -37,12 +39,15 @@ class TorchMlirOpImpl(CompilableOpImpl):
         self.output_params = output_params
         self.static_argnums = static_argnums or ()
         self.static_argnames = static_argnames or ()
+        # Stored on the impl (not the kernel) because for preprocessing ops
+        # the kernel is lazily created in execute(), after registration.
+        self.validate_static_inputs_func = validate_static_inputs_func
 
         # Initialize handlers
         self.output_handler = BaseOutputHandler()
 
         # Check for preprocessing
-        self._uses_preprocessing = getattr(self.torch_fn, "uses_preprocessing", False)
+        self._uses_preprocessing = getattr(self.torch_fn, "preprocessing", None) is not None
         self._postprocess_fn = None
         if not self._uses_preprocessing:
             self.kernel = TorchMlirKernel(
@@ -65,6 +70,11 @@ class TorchMlirOpImpl(CompilableOpImpl):
         Returns:
             ExecutionResult with output tensor(s)
         """
+        # Run validator on raw args before preprocessing. Mirrors what the C++
+        # dispatch path does in kernel.lower
+        if self.validate_static_inputs_func is not None:
+            self.validate_static_inputs_func(*args, **kwargs)
+
         if self._uses_preprocessing:
             preprocess_result = self.torch_fn(*args, **kwargs)
 
@@ -86,14 +96,60 @@ class TorchMlirOpImpl(CompilableOpImpl):
 
         exec_context = ExecutionContext(original_inputs=args, original_kwargs=kwargs.copy())
 
+        # CPU fallback for int64 when policy demands it.
+        # Covers UNSUPPORTED ops (matmul/conv) plus native_strict, which
+        # routes any non-native int64 op away from Neuron. See
+        # torch_neuronx.int64_policy.Int64Mode.
+        #
+        # Routes through PyTorch's at::native::cpu_fallback via the C++
+        # _cpu_fallback helper, mirroring what the C++ dispatcher's
+        # neuron_cpu_fallback does. This preserves Tensor(a!) write
+        # aliasing (out= and inplace), multi-return device placement, and
+        # schema-based kwarg filtering — none of which can be done
+        # correctly from a hand-rolled tensor.cpu() / .to("neuron") loop.
+        from torch_neuronx.int64_policy import Int64Policy
+
+        policy = Int64Policy.get()
+        if policy.should_cpu_fallback(self.aten_op_name):
+            has_int64 = any(isinstance(a, torch.Tensor) and a.dtype == torch.int64 for a in args)
+            if has_int64:
+                # auto_registration.py wraps inplace ops by injecting a
+                # synthetic ``out=self`` kwarg so downstream Neuron-side
+                # bookkeeping has a uniform handle for the write target.
+                # Schema-strict ATen ops (e.g. ``aten::zero_(Tensor(a!) self)``)
+                # don't declare ``out``; ``createStackForSchema`` would
+                # reject the call. Strip the synthetic kwarg before the
+                # fallback — ``self`` is already the first positional arg
+                # and the Tensor(a!) alias is enough for cpu_fallback to
+                # mutate it in place. Mirrors the equivalent strip in
+                # python_ops/base.py for the non-int64 CPU fallback.
+                fallback_kwargs = kwargs
+                # Inplace detection mirrors Operation.is_inplace in base.py:
+                # an op is inplace if its name contains ``_.`` (overloaded
+                # inplace, e.g. ``aten::add_.Tensor``) or ends in ``_`` with
+                # no overload (e.g. ``aten::zero_``).
+                op_name = self.aten_op_name
+                is_inplace = "_." in op_name or (op_name.endswith("_") and "." not in op_name)
+                if (
+                    is_inplace
+                    and "out" in fallback_kwargs
+                    and len(args) > 0
+                    and fallback_kwargs["out"] is args[0]
+                ):
+                    fallback_kwargs = {k: v for k, v in fallback_kwargs.items() if k != "out"}
+
+                from torch_neuronx import _C
+
+                result = _C._cpu_fallback(self.aten_op_name, *args, **fallback_kwargs)
+                return ExecutionResult(success=True, output=result)
+
         # Apply dtype autocast only if not disabled
         if not self.DISABLE_DTYPE_AUTOCAST:
-            # Use dtype autocast context
-            from torch_neuronx.utils import is_native_int64_enabled
-
-            # When native int64 enabled: compiler handles S64 HLO natively, no bounce through int32
+            # When native int64 is enabled, don't cast int64 — S64 passes through to compiler.
+            # When disabled, cast int64→int32 (old behavior).
             with autocast_neuron(
-                cast_dtype_params=True, cast_int64=not is_native_int64_enabled()
+                cast_dtype_params=True,
+                cast_int64=not policy.native_int64_enabled,
             ) as context:
                 # Process arguments, excluding output parameters from casting
                 original_kwargs = kwargs

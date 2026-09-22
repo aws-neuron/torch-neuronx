@@ -2,6 +2,7 @@
 
 import torch
 
+from ...auto_registration import neuron_op
 from ..op_impl import TorchMlirOpImpl
 
 
@@ -11,6 +12,7 @@ def _gather_mlir(input, dim, index, sparse_grad=False, out=None):
     return torch.ops.aten.gather(input, dim, index, sparse_grad=sparse_grad)
 
 
+@neuron_op("aten::gather", priority=40)
 class GatherMLIRImpl(TorchMlirOpImpl):
     """Register gather and gather.out"""
 

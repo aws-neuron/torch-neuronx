@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -10,6 +11,7 @@ from torch_neuronx.neuron_dynamo_backend._nki.ast import (
 from torch_neuronx.neuron_dynamo_backend._nki.fx_to_nki import lowerings
 
 TargetType = Callable[..., Any] | str
+logger = logging.getLogger(__name__)
 
 
 # FX -> nki.isa lowering for point-wise operations
@@ -41,3 +43,8 @@ class NISAPointwiseSubgraphLowering(torch.fx.Interpreter):
     def output(self, target: str, args: tuple[Any], kwargs: dict[str, Any]) -> None:  # type: ignore[override]
         assert len(args) == 1
         self.graph_outputs = args[0]
+
+        # TODO: joint_graph may return multiple extra outputs as a list with other buffer gradients.
+        # We need to handle them to support score_mod with free variables.
+        if isinstance(args[0], list):
+            self.graph_outputs = args[0][0]

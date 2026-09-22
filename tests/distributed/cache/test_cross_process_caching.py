@@ -59,6 +59,72 @@ def _cross_process_cache_test(rank, world_size, func_args):
         )
 
 
+def _cross_version_cache_test(rank, world_size, func_args):
+    """Test function run by each rank.
+
+    Rank 0 populates the cache. Rank 1 then runs with a different
+    global_version_hash(), which simulates an edit to a lowering source file, and must
+    still hit the persistent cache.
+
+    The persistent NEFF key is content-addressed on the lowered IR, so a source or
+    version change must not orphan the cache. The legacy key folded
+    global_version_hash() into base_key and therefore failed this test.
+    """
+
+    from unittest.mock import patch
+
+    import torch_neuronx
+
+    torch_neuronx._C._clear_compilation_cache()
+
+    # Patch every module that binds global_version_hash at import time. A plain patch of
+    # torch_neuronx.utils.global_version_hash does NOT reach these: `from ... import x`
+    # copies the reference, so the module keeps the original function.
+    edited = [
+        patch(f"{m}.global_version_hash", return_value="0" * 64)
+        for m in (
+            "torch_neuronx.utils",
+            "torch_neuronx.python_ops.torch_mlir.kernel",
+            "torch_neuronx.python_ops.torch_mlir.nki_op_impl",
+        )
+    ]
+
+    if rank == 1:
+        dist.barrier()
+        for p in edited:
+            p.start()
+
+    try:
+        a = torch.randn(64, 128, device="neuron")
+        b = torch.randn(128, 32, device="neuron")
+        torch.matmul(a, b)
+        torch.neuron.synchronize()
+    finally:
+        if rank == 1:
+            for p in edited:
+                p.stop()
+
+    if rank == 0:
+        dist.barrier()
+
+    stats = torch_neuronx._C._get_compilation_cache_stats()
+
+    if rank == 0:
+        assert stats["persistent_misses"] >= 1, (
+            f"Rank 0 expected cache misses (compilation), "
+            f"got {stats['persistent_misses']} misses"
+        )
+    elif rank == 1:
+        # Strict: the version change must cost NOTHING. Any miss means an entry was
+        # orphaned, which is the bug. ">= 1 hit" would pass even with most keys orphaned.
+        assert stats["persistent_hits"] >= 1 and stats["persistent_misses"] == 0, (
+            f"A version change orphaned the persistent cache. Rank 1 expected only "
+            f"persistent hits but got {stats['persistent_hits']} hits and "
+            f"{stats['persistent_misses']} misses. The persistent NEFF key must not "
+            f"depend on global_version_hash()."
+        )
+
+
 @pytest.mark.skipif(
     os.environ.get("NEURON_LAUNCH_BLOCKING") == "1",
     reason="Async pipeline persistent caching tests",
@@ -82,3 +148,17 @@ class TestCrossProcessCaching:
 
             tester = DistributedTester(world_size=2)
             tester.run_test(_cross_process_cache_test, cache_dir=cache_dir)
+
+    def test_cache_survives_a_version_change(self):
+        """A source or version change must not orphan the persistent NEFF cache.
+
+        Rank 0 compiles. Rank 1 runs with a different global_version_hash() and must
+        still hit the cache, because the persistent key comes from the lowered IR.
+        """
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            os.environ["TORCH_NEURONX_NEFF_CACHE_DIR"] = cache_dir
+            os.environ["TORCH_NEURONX_METRICS_ENABLED"] = "1"
+
+            tester = DistributedTester(world_size=2)
+            tester.run_test(_cross_version_cache_test, cache_dir=cache_dir)

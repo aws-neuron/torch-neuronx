@@ -2,29 +2,43 @@
 
 import torch
 
-from ..operation_registry import register_aten
+from ..operation_registry import Preprocessing, register_aten
+from ..validation import check_lerp_dtype, validate_inplace_broadcast
+from .unary import _validate_float_promoting_out
 
 
 @register_aten(["aten::embedding"], static_argnums=(2, 3, 4))
 def torch_embedding(weights, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False):
+    if indices.dtype not in (torch.long, torch.int):
+        raise RuntimeError(
+            f"Expected tensor for argument #1 'indices' to have one of the following "
+            f"scalar types: Long, Int; but got {indices.dtype} instead"
+        )
     return torch.embedding(
         weights, indices, padding_idx=padding_idx, scale_grad_by_freq=False, sparse=sparse
     )
 
 
-@register_aten(
-    ["aten::embedding_dense_backward", "aten::embedding_dense_backward.out"],
-    static_argnums=(2, 3, 4),
-)
-def torch_embedding_dense_backward(
+def _validate_embedding_dense_backward(
     grad_output, indices, num_weights, padding_idx, scale_grad_by_freq, out=None
 ):
+    """Validate embedding_dense_backward dtypes on raw args."""
     if indices.dtype not in (torch.int32, torch.int64):
         raise RuntimeError(
             "Expected tensor for argument #2 'indices' to have one of the following "
             "scalar types: Long, Int; but got torch.FloatTensor instead "
             "(while checking arguments for embedding_backward)"
         )
+
+
+@register_aten(
+    ["aten::embedding_dense_backward", "aten::embedding_dense_backward.out"],
+    static_argnums=(2, 3, 4),
+    validate_static_inputs=_validate_embedding_dense_backward,
+)
+def torch_embedding_dense_backward(
+    grad_output, indices, num_weights, padding_idx, scale_grad_by_freq, out=None
+):
     return torch.ops.aten.embedding_dense_backward(
         grad_output, indices, num_weights, padding_idx, scale_grad_by_freq
     )
@@ -55,15 +69,18 @@ def torch_log_softmax(x, dim, dtype=None):
 
 
 @register_aten(
-    ["aten::_softmax_backward_data", "aten::_softmax_backward_data.out"], static_argnums=(2, 3)
+    ["aten::_softmax_backward_data", "aten::_softmax_backward_data.out"],
+    static_argnums=(2, 3),
+    output_params=("grad_input",),
 )
-def torch_softmax_backward_data(grad_output, output, dim, input_dtype, out=None):
+def torch_softmax_backward_data(grad_output, output, dim, input_dtype, grad_input=None):
     return torch.ops.aten._softmax_backward_data(grad_output, output, dim, input_dtype)
 
 
 @register_aten(
     ["aten::_log_softmax_backward_data", "aten::_log_softmax_backward_data.out"],
     static_argnums=(2, 3),
+    output_params=("out",),
 )
 def torch_log_softmax_backward_data(grad_output, output, dim, input_dtype, out=None):
     return torch.ops.aten._log_softmax_backward_data(grad_output, output, dim, input_dtype)
@@ -75,12 +92,27 @@ def torch_log_softmax_backward_data(grad_output, output, dim, input_dtype, out=N
         "aten::lerp.Scalar_out",
         "aten::lerp.Tensor",
         "aten::lerp.Tensor_out",
-        "aten::lerp_.Scalar",
-        "aten::lerp_.Tensor",
-    ]
+    ],
+    validate_static_inputs=_validate_float_promoting_out,
+)
+@register_aten(
+    ["aten::lerp_.Scalar", "aten::lerp_.Tensor"],
+    validate_static_inputs=validate_inplace_broadcast,
 )
 def torch_lerp(start, end, weight, out=None):
+    check_lerp_dtype(start, weight)
     return torch.ops.aten.lerp(start, end, weight)
+
+
+def _validate_histc(
+    input: torch.Tensor, bins: int = 100, min: float = 0.0, max: float = 0.0, out=None
+):
+    """Validate histc dtypes on raw args."""
+    if out is not None and input.dtype != out.dtype:
+        raise RuntimeError(
+            "torch.histogram: input tensor and hist tensor should have the same dtype, "
+            f"but got input {input.dtype} and hist {out.dtype}"
+        )
 
 
 @register_aten(
@@ -88,21 +120,27 @@ def torch_lerp(start, end, weight, out=None):
         "aten::histc",
         "aten::histc.out",
     ],
+    # Both lists are needed because they index different signatures: argnums the
+    # ATen schema histc(self, bins, min, max), argnames the compute fn's kwargs
+    # (range_min/range_max are the adjusted values, hence the different spelling).
+    # Without argnums, C++ PreprocessArgs tensorizes the positional min/max into
+    # runtime inputs the traced graph never declared, and the launch is rejected
+    # ("Unable to find input tensor input1 in input set").
+    static_argnums=(1, 2, 3),
     static_argnames=("bins", "range_min", "range_max"),
-    uses_preprocessing=True,
+    preprocessing=Preprocessing.VALUE_DEPENDENT,
+    validate_static_inputs=_validate_histc,
+    # Auto-range (min == max == 0) derives bin edges from min()/max(), so re-lower
+    # every call.
+    relower_every_call=True,
 )
 def torch_histc(
     input: torch.Tensor, bins: int = 100, min: float = 0.0, max: float = 0.0, out=None
 ) -> torch.Tensor:
     """Fast histogram using linear interpolation like PyTorch."""
-    if out is not None and input.dtype != out.dtype:
-        raise RuntimeError(
-            "torch.histogram: input tensor and hist tensor should have the same dtype, "
-            f"but got input {input.dtype} and hist {out.dtype}"
-        )
 
-    # Handle auto range
-    if min == 0.0 and max == 0.0 and input.numel() > 0:
+    # Handle auto range — CPU auto-ranges whenever min == max (not just 0==0)
+    if min == max and input.numel() > 0:
         min = input.min().item()
         max = input.max().item()
 
@@ -133,12 +171,14 @@ def torch_histc(
 
 
 @register_aten(["aten::threshold", "aten::threshold.out"], static_argnums=(1, 2))
-def torch_threshold(self, threshold, value):
+def torch_threshold(self, threshold, value, out=None):
     return torch.nn.functional.threshold(self, threshold, value)
 
 
 @register_aten(
-    ["aten::threshold_backward", "aten::threshold_backward.grad_input"], static_argnums=(2,)
+    ["aten::threshold_backward", "aten::threshold_backward.grad_input"],
+    static_argnums=(2,),
+    output_params=("grad_input",),
 )
-def torch_threshold_backward(grad_output, self, threshold):
+def torch_threshold_backward(grad_output, self, threshold, grad_input=None):
     return torch.ops.aten.threshold_backward(grad_output, self, threshold)

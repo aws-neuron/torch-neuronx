@@ -35,8 +35,8 @@ def compute_permutation_for_contiguous(
         current view. Returns None if not a pure permutation.
 
     Convention:
-        The returned `perm` follows JAX/NumPy semantics used by
-        `jnp.transpose(x, axes=perm)`, i.e., the result's axis `i` comes from
+        The returned `perm` follows NumPy semantics used by
+        `np.transpose(x, axes=perm)`, i.e., the result's axis `i` comes from
         input axis `perm[i]` (new_axis_i = old_axis_perm[i]).
     """
     n = len(shape)
@@ -177,7 +177,6 @@ class ContiguousTransposeImpl(OperationImplementation):
 
     def _execute_impl_internal(self, self_tensor, memory_format=None) -> ExecutionResult:
         """Execute contiguous operation using transpose kernel."""
-        # Compute permutation and base contiguous view over same storage
         permutation, base_view = _prepare_transpose_inputs(self_tensor)
 
         if permutation is None:
@@ -185,7 +184,6 @@ class ContiguousTransposeImpl(OperationImplementation):
                 success=False, error_msg="Failed to compute permutation for transpose"
             )
 
-        # Get the kernel
         kernel = self._get_kernel()
 
         from .shared.context import ExecutionContext
@@ -198,7 +196,7 @@ class ContiguousTransposeImpl(OperationImplementation):
 
     def _execute_impl(self, self_tensor, memory_format=None) -> ExecutionResult:
         """Execute contiguous operation using transpose kernel.
-        This uses compiled JAX transpose kernels to efficiently make
+        This uses compiled transpose kernels to efficiently make
         the tensor contiguous without element-wise copying.
         """
         try:
@@ -265,11 +263,33 @@ class ContiguousTransposeMLIRImpl(ContiguousTransposeImpl):
     def _get_kernel(self):
         return ContiguousTransposeMLIRImpl._kernel
 
+    def get_lower_func(self):
+        """Return a lower function that transforms aten args to kernel args."""
+        kernel = self._get_kernel()
+
+        def contiguous_transpose_lower(*args, **kwargs):
+            self_tensor = args[0]
+            permutation, base_view = _prepare_transpose_inputs(self_tensor)
+            return kernel.lower(base_view, permutation)
+
+        return contiguous_transpose_lower
+
+    def get_infer_func(self):
+        """Return an infer function that transforms aten args to kernel args."""
+        kernel = self._get_kernel()
+
+        def contiguous_transpose_infer(*args, **kwargs):
+            self_tensor = args[0]
+            permutation, base_view = _prepare_transpose_inputs(self_tensor)
+            return kernel.infer_output_dtypes(base_view, permutation)
+
+        return contiguous_transpose_infer
+
 
 class ContiguousTransposeFunction(torch.autograd.Function):
     """Autograd function for transpose-based contiguous implementation.
 
-    Forward uses the JAX transpose kernel on a base contiguous view over the
+    Forward uses the transpose kernel on a base contiguous view over the
     underlying storage. Backward is identity (since contiguous is a layout-only
     change and mathematically y == x).
     """
@@ -277,6 +297,10 @@ class ContiguousTransposeFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, self_tensor: torch.Tensor, memory_format, impl: ContiguousTransposeImpl):
         return impl._execute_impl_internal(self_tensor, memory_format)
+
+    @staticmethod
+    def jvp(ctx, grad_self, grad_memory_format, grad_impl):
+        return grad_self
 
     @staticmethod
     def backward(ctx, grad_output):

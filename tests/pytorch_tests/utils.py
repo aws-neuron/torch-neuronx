@@ -735,6 +735,9 @@ def setup_pytorch_tests(
     if not test_dir.exists() or not any(test_dir.iterdir()):
         clone_pytorch_tests(args.torch_version)
 
+    # refresh cached directories to ensure cloned tests are visible
+    importlib.invalidate_caches()
+
     # Add pytorch tests to path
     sys.path.insert(0, str(pytorch_tests_dir))
 

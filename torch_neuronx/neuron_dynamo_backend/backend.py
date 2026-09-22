@@ -2,42 +2,68 @@
 Neuron backend implementation for torch.compile
 """
 
+import contextlib
+import hashlib
+import io
 import logging
 import os
 from collections.abc import Callable
+from dataclasses import dataclass, field
 
 import torch
 from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
 from torch._dynamo.utils import dynamo_timed
 from torch._functorch._aot_autograd.logging_utils import get_aot_graph_name
+from torch._functorch._aot_autograd.schemas import SerializableAOTDispatchCompiler
+from torch._guards import TracingContext
+from torch.utils._filelock import FileLock
 
-# Import process group variable tracking (needed for registration side effect)
-from torch_neuronx.kernels.cache_utils import CompilationJob, compilation_job
-from torch_neuronx.neuron_dynamo_backend import process_group_variable
+from torch_neuronx.kernels.cache_utils import CompilationJob, compilation_job, get_lock_timeout
 from torch_neuronx.neuron_dynamo_backend.compile import CompileGraph
+from torch_neuronx.neuron_dynamo_backend.compile_only import build_compile_only_handle
+
+# Do not call get_model_name() directly in this file; use _resolve_model_name(options) instead.
 from torch_neuronx.neuron_dynamo_backend.config import (
     get_model_name,
 )
 from torch_neuronx.neuron_dynamo_backend.decompositions import get_compile_decomposition_table
-from torch_neuronx.neuron_dynamo_backend.executor import Executor
-from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
+from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import (
+    convert_fx_to_stablehlo,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+    IOMutation,
+    MutationKind,
+    PassMutations,
+    apply_input_mutations,
+    apply_output_mutations,
+    get_alias_output_buffer_map,
+    translate_input_indices_to_neff,
+)
 from torch_neuronx.neuron_dynamo_backend.fx.pipelines.post_aot_processing_pipeline import (
     post_aot_processing,
 )
 from torch_neuronx.neuron_dynamo_backend.fx.pipelines.preprocessing_pipeline import preprocess_graph
+from torch_neuronx.neuron_dynamo_backend.hilo_infergoldens_executor import HiloInferGoldensExecutor
 from torch_neuronx.neuron_dynamo_backend.metrics import (
     NeuronCompilationMetrics,
     record_compilation,
 )
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool
-from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
-from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import RandomInputInfo
+from torch_neuronx.neuron_dynamo_backend.stablehlo_executor import StableHLOInterpreterExecutor
 
 logger = logging.getLogger(__name__)
 
-# Ensure process group registration happens
-_ = process_group_variable
+
+def _resolve_model_name(options):
+    """Resolve the model name from options dict, falling back to get_model_name().
+
+    Priority: options["model_name"] > get_model_name() <-- returns global/default
+    """
+    model_name = options.get("model_name") if options else None
+    if not model_name:
+        model_name = get_model_name()
+    return model_name
 
 
 def _compile_fx_to_stablehlo(
@@ -46,8 +72,8 @@ def _compile_fx_to_stablehlo(
     model_name: str,
     segment_id: str,
     job: CompilationJob,
-    aliasing_info: AliasingInfo = None,
-    random_input_info: RandomInputInfo = None,
+    alias_buffer_map: dict[int, int] | None = None,
+    static_input_indices: list[int] | None = None,
 ):
     """Convert an FX GraphModule to StableHLO MLIR.
 
@@ -57,8 +83,9 @@ def _compile_fx_to_stablehlo(
         model_name (str): Model name for logging and artifact naming.
         segment_id (str): Segment ID for statistics tracking.
         job (CompilationJob): Compilation job for artifact management.
-        aliasing_info (AliasingInfo): Input-output aliasing information.
-        random_input_info: Optional metadata about random inputs added to the graph
+        alias_buffer_map (dict[int, int] | None): NEFF output→input aliasing hints.
+        static_input_indices (list[int] | None): WLO — indices of static weights the
+            compiler may transpose (stamped as transposable_weight_idx). None disables WLO.
 
     Returns:
         tuple: (stablehlo_mlir, artifacts_stablehlo, io_spec, cast_spec)
@@ -72,9 +99,9 @@ def _compile_fx_to_stablehlo(
     stablehlo_mlir, io_spec, cast_spec = convert_fx_to_stablehlo(
         gm,
         example_inputs,
-        aliasing_info,
+        alias_buffer_map,
         job=job,
-        random_input_info=random_input_info,
+        static_input_indices=static_input_indices,
     )
     logger.debug("FX Graph to StableHLO conversion completed")
 
@@ -87,7 +114,8 @@ def _compile_fx_to_stablehlo(
 def _has_collectives_in_graph(gm: torch.fx.GraphModule) -> bool:
     """Detect if an FX graph contains collective operations.
 
-    Scans the FX graph for torch._c10d_functional collective operations.
+    Detects torch._c10d_functional collectives and NKI HOPs whose specialized
+    frontend config reports embedded collective communication.
 
     Args:
         gm (torch.fx.GraphModule): FX GraphModule to analyze.
@@ -95,10 +123,16 @@ def _has_collectives_in_graph(gm: torch.fx.GraphModule) -> bool:
     Returns:
         bool: True if graph contains any collective operations.
     """
+    from torch_neuronx.nki_hop import nki_kernel_wrapper
+
     collective_ops = {"all_reduce", "all_gather", "reduce_scatter", "all_to_all"}
 
     for node in gm.graph.nodes:
         if node.op == "call_function":
+            if node.target is nki_kernel_wrapper and node.kwargs.get("has_collectives", False):
+                logger.info("Detected collective NKI kernel")
+                return True
+
             func_name = (
                 node.target.__name__ if hasattr(node.target, "__name__") else str(node.target)
             )
@@ -116,6 +150,480 @@ def _is_trivial_graph(gm: torch.fx.GraphModule) -> bool:
     passthrough subgraphs that don't need NEFF compilation.
     """
     return all(node.op in ("placeholder", "output", "get_attr") for node in gm.graph.nodes)
+
+
+def _is_compile_only() -> bool:
+    """Compile-only mode: generate the NEFF but do not execute it on device.
+
+    Used to compile (incl. backward graphs) on a host with no usable Neuron
+    device — e.g. compiler CI sweeps. The NEFF is still produced by
+    CompileGraph.compile(); only the device execution is skipped.
+
+    Reads the single C++ flag (set by `torch_neuronx.compiler.compile_only()` /
+    `TORCH_NEURONX_COMPILE_ONLY`) so allocation (empty_strided_neuron), the
+    device guard, and this execution skip all agree.
+    """
+    import torch_neuronx
+
+    return torch_neuronx._C._is_compile_only()
+
+
+class _StableHLOError(Exception):
+    """Raised by _lower_fx_to_neff when FX -> StableHLO conversion fails, so the
+    caller (the dynamo backend) can fall back to running the original graph. The
+    standalone compile API lets it propagate."""
+
+    def __init__(self, original, lowering):
+        super().__init__(str(original))
+        self.original = original
+        self.lowering = lowering  # _Lowering with the analysis info gathered so far
+
+
+@dataclass
+class _Lowering:
+    """Result of the shared FX -> StableHLO -> NEFF core (`_lower_fx_to_neff`).
+
+    This is the single lowering path used by BOTH `torch.compile(backend="neuron")`
+    (via `neuron_backend_fx_compiler`) and the public compile API
+    (`torch_neuronx.compiler.fx_to_neff`), so the two cannot drift: same FX passes,
+    same trace, same compile, same cache key.
+    """
+
+    gm: torch.fx.GraphModule  # post-FX-pass graph
+    # A live MLIR module from a fresh lowering, or serialized MLIR bytes when
+    # resumed from the StableHLO cache.
+    stablehlo_mlir: object
+    io_spec: object
+    cast_spec: object
+    cache_key: str
+    graph_name: str
+    segment_id: str
+    has_collectives: bool
+    # post-AOT analysis (needed to build the executor / fallback)
+    # Ordered per-pass IO mutations; alias_buffer_map derived from these.
+    pass_mutations: list[PassMutations] = field(default_factory=list)
+    alias_buffer_map: dict[int, int] = field(default_factory=dict)
+
+
+def _make_graph_name(model_name: str) -> str:
+    """Per-run graph name: `{model_name}_{compile_id}` from the AOT graph name."""
+    aot_name = get_aot_graph_name()  # e.g., "model__0_inference_0"
+    compile_id = aot_name.split("__", 1)[-1] if "__" in aot_name else aot_name
+    return f"{model_name}_{compile_id}"
+
+
+def _lower_fx_to_stablehlo(
+    gm: torch.fx.GraphModule,
+    example_inputs,
+    job,
+    *,
+    model_name: str,
+    pre_processing_analysis_info=None,
+    run_fx_passes: bool = True,
+    options=None,
+) -> _Lowering:
+    """Front half of the shared lowering core: FX passes -> FX→StableHLO.
+
+    Runs `post_aot_processing` (the FX passes) and `_compile_fx_to_stablehlo`,
+    returning a `_Lowering` with `stablehlo_mlir`/`io_spec` populated and
+    `cache_key=""` (the NEFF stage has not run yet). This is the ONE place the FX
+    passes run, so every consumer — `backend="neuron"`, `fx_to_neff`, and
+    `fx_to_stablehlo` — sees the identical transformed graph. Raises
+    `_StableHLOError` if FX→StableHLO conversion fails.
+
+    With `run_fx_passes=False` the graph is taken as already post-pass; the
+    alias/None bookkeeping is read from `pre_processing_analysis_info` instead
+    of being recomputed (absent keys mean none).
+    """
+    analysis_info = pre_processing_analysis_info or {}
+    pre_aot_pass_mutations = analysis_info.get("pre_aot_pass_mutations")
+    if run_fx_passes:
+        logger.debug("Applying FX graph transformations...")
+        with dynamo_timed("torch_neuronx_fx_passes"):
+            post_aot_processing_result = post_aot_processing(
+                gm,
+                job=job,
+                model_name=model_name,
+                pre_aot_pass_mutations=pre_aot_pass_mutations,
+            )
+        gm = post_aot_processing_result.graph_module
+        pass_analysis = post_aot_processing_result.analysis
+    else:
+        logger.debug("Skipping FX graph transformations (run_fx_passes=False)")
+        # Caller-supplied analysis stands in for the pass outputs.
+        pass_analysis = dict(analysis_info)
+        # Public contract: client backends supply aliasing as "mutation_info"
+        # (an AliasingInfo). Translate it into the unified pass_mutations form
+        # so it reaches alias_buffer_map / io_spec.aliases.
+        supplied = pass_analysis.get("mutation_info")
+        if supplied is not None and supplied.aliases and not pass_analysis.get("pass_mutations"):
+            pass_analysis["pass_mutations"] = [
+                PassMutations(
+                    pass_name="caller_supplied_mutation_info",
+                    output_mutations=[
+                        IOMutation(
+                            kind=MutationKind.ALIAS,
+                            indices=[a.output_index for a in supplied.aliases],
+                            alias_input_indices=[a.parameter_number for a in supplied.aliases],
+                            is_mutation=True,
+                            pass_name="caller_supplied_mutation_info",
+                        )
+                    ],
+                )
+            ]
+
+    # Per-pass IO mutations; alias_buffer_map is the NEFF output->input hint.
+    pass_mutations = pass_analysis.get("pass_mutations", [])
+    alias_buffer_map = get_alias_output_buffer_map(pass_mutations)
+
+    graph_name = _make_graph_name(model_name)
+    segment_id = job.timestamp
+
+    has_collectives = _has_collectives_in_graph(gm)
+    logger.debug(f"Graph contains collectives: {has_collectives}")
+
+    analysis = _Lowering(
+        gm=gm,
+        stablehlo_mlir=None,
+        io_spec=None,
+        cast_spec=None,
+        cache_key="",
+        graph_name=graph_name,
+        segment_id=segment_id,
+        has_collectives=has_collectives,
+        pass_mutations=pass_mutations,
+        alias_buffer_map=alias_buffer_map,
+    )
+
+    # WLO: when weight_layout_optimization is enabled, mark the static weight
+    # inputs the compiler may transpose.
+    static_input_indices = _wlo_static_input_indices(
+        options, example_inputs, get_aot_graph_name(), pass_mutations
+    )
+
+    try:
+        stablehlo_mlir, _, io_spec, cast_spec = _compile_fx_to_stablehlo(
+            gm,
+            example_inputs,
+            model_name,
+            segment_id,
+            job,
+            alias_buffer_map,
+            static_input_indices=static_input_indices,
+        )
+    except Exception as stablehlo_err:
+        raise _StableHLOError(stablehlo_err, analysis) from stablehlo_err
+
+    analysis.stablehlo_mlir = stablehlo_mlir
+    analysis.io_spec = io_spec
+    analysis.cast_spec = cast_spec
+    return analysis
+
+
+def _lower_stablehlo_to_neff(analysis: _Lowering, *, model_name: str, options=None) -> _Lowering:
+    """Back half of the shared lowering core: StableHLO -> NEFF.
+
+    Consumes the `_Lowering` produced by `_lower_fx_to_stablehlo` (with
+    `stablehlo_mlir` populated), runs `CompileGraph.compile()`, and sets
+    `cache_key` in place. Shared by `backend="neuron"`, `fx_to_neff`, and
+    `stablehlo_to_neff` so they submit the identical StableHLO to neuronx-cc.
+
+    `stablehlo_mlir` may be a live module or the serialized bytes a cache hit
+    carries; `CompileGraph` accepts either.
+    """
+    use_tensorizer_backend = options.get("use_tensorizer_backend", False) if options else False
+    compile_graph = CompileGraph(
+        analysis.stablehlo_mlir,
+        model_name,
+        analysis.segment_id,
+        analysis.graph_name,
+        analysis.has_collectives,
+        use_tensorizer=use_tensorizer_backend,
+    )
+    analysis.cache_key = compile_graph.compile()
+    # WLO weight transforms are not recovered here: for a WLO graph compile() submits async and
+    # returns a "|wlo" cache_key; the wrapped_neff.hlo sidecar is fetched + parsed lazily when the
+    # executor is first built (cache_artifact.NeuronOutputCode._get_executor).
+    return analysis
+
+
+def _lower_fx_to_neff(
+    gm: torch.fx.GraphModule,
+    example_inputs,
+    job,
+    *,
+    model_name: str,
+    pre_processing_analysis_info=None,
+    options=None,
+    run_fx_passes: bool = True,
+) -> _Lowering:
+    """Shared lowering core: FX passes -> FX→StableHLO -> StableHLO→NEFF.
+
+    The ONE path both consumers go through. `neuron_backend_fx_compiler` calls
+    this and then wraps the result in an executor; `fx_to_neff` calls it and
+    returns the artifact. Composed from `_lower_fx_to_stablehlo` +
+    `_lower_stablehlo_to_neff`, the same two halves `fx_to_stablehlo` /
+    `stablehlo_to_neff` use — so all entry points share one implementation and
+    produce the same NEFF (same passes, same cache key). Raises `_StableHLOError`
+    if FX→StableHLO conversion fails.
+
+    The front half goes through `_lower_fx_to_stablehlo_cached`: with
+    `TORCH_NEURONX_HLO_COMPILE_CACHE=1` a cache hit skips FX→StableHLO and resumes
+    directly at `_lower_stablehlo_to_neff`.
+    """
+    analysis = _lower_fx_to_stablehlo_cached(
+        gm,
+        example_inputs,
+        job,
+        model_name=model_name,
+        pre_processing_analysis_info=pre_processing_analysis_info,
+        run_fx_passes=run_fx_passes,
+        use_tensorizer=(options or {}).get("use_tensorizer_backend", False),
+    )
+    return _lower_stablehlo_to_neff(analysis, model_name=model_name, options=options)
+
+
+def _pass_mutations_fingerprint(pass_mutations) -> str:
+    """Stable text for a caller-supplied `pass_mutations` list.
+
+    Order is preserved rather than sorted: `get_alias_output_buffer_map` translates
+    each alias through the mutations that follow it, so the same entries in a
+    different order can yield a different alias map. ADD/REMOVE entries are included
+    for the same reason -- they shift the indices an alias resolves to.
+    """
+    entries = []
+    for pm in pass_mutations or ():
+        for direction, mutations in (
+            ("in", getattr(pm, "input_mutations", None) or ()),
+            ("out", getattr(pm, "output_mutations", None) or ()),
+        ):
+            for m in mutations:
+                kind = getattr(getattr(m, "kind", None), "value", None)
+                entries.append(
+                    (
+                        direction,
+                        kind,
+                        tuple(getattr(m, "indices", None) or ()),
+                        tuple(getattr(m, "alias_input_indices", None) or ()),
+                        getattr(m, "is_mutation", None),
+                        getattr(m, "transform_key", None),
+                    )
+                )
+    return repr(entries)
+
+
+def _alias_fingerprint(pre_processing_analysis_info) -> str:
+    """Stable text for the aliasing a caller supplies via analysis info.
+
+    Each key is serialized by its declared shape; an unrecognized value contributes
+    only its type name.
+    """
+    # pre_aot_pass_mutations is omitted: it is derived from gm by AliasingAnalysis,
+    # so the graph hash already discriminates it.
+    info = pre_processing_analysis_info or {}
+    parts = []
+    for name in (
+        "aliasing_analysis",
+        "mutation_info",
+        "pass_mutations",
+    ):
+        value = info.get(name)
+        if value is None:
+            continue
+        if name == "pass_mutations":
+            parts.append(f"{name}={_pass_mutations_fingerprint(value)}")
+        elif (aliases := getattr(value, "aliases", None)) is not None:
+            pairs = sorted(
+                (getattr(a, "parameter_number", None), getattr(a, "output_index", None))
+                for a in aliases
+            )
+            parts.append(f"{name}={pairs}")
+        else:
+            # Unknown shape: contribute the type, not repr's memory address.
+            parts.append(f"{name}=<{type(value).__name__}>")
+    return "|".join(parts)
+
+
+def _lower_fx_to_stablehlo_cached(
+    gm: torch.fx.GraphModule,
+    example_inputs,
+    job,
+    *,
+    model_name: str,
+    pre_processing_analysis_info=None,
+    run_fx_passes: bool = True,
+    use_tensorizer: bool = False,
+) -> _Lowering:
+    """`_lower_fx_to_stablehlo` with the FX-keyed StableHLO cache in front.
+
+    Returns an uncached lowering when the cache is off, the tensorizer is in use, or
+    the key cannot be computed.
+    On a cache hit the result's `stablehlo_mlir` holds serialized bytes rather than a live module.
+    On a miss, a per-key file lock lets one rank lower and store while the others wait
+    and resume from the stored entry, so co-launched ranks do not all repeat the work.
+    """
+    from torch_neuronx.python_ops.compilation import hlo_cache
+
+    def lower():
+        return _lower_fx_to_stablehlo(
+            gm,
+            example_inputs,
+            job,
+            model_name=model_name,
+            pre_processing_analysis_info=pre_processing_analysis_info,
+            run_fx_passes=run_fx_passes,
+        )
+
+    # Caching disabled
+    if not hlo_cache.cache_enabled(compile_mode=True):
+        return lower()
+
+    # TODO: support caching the tensorizer path.
+    if use_tensorizer:
+        return lower()
+
+    try:
+        key = hlo_cache.compute_fx_cache_key(
+            gm,
+            run_fx_passes=run_fx_passes,
+            alias_fingerprint=_alias_fingerprint(pre_processing_analysis_info),
+            use_tensorizer=use_tensorizer,
+        )
+    except Exception as exc:
+        logger.warning("StableHLO cache key failed (%s); lowering uncached", exc)
+        return lower()
+
+    def resume(cached: hlo_cache.CachedHLO) -> _Lowering:
+        return _Lowering(
+            gm=None,
+            stablehlo_mlir=cached.hlo_bytes,
+            io_spec=cached.io_spec,
+            cast_spec=cached.cast_spec,
+            cache_key="",
+            graph_name=_make_graph_name(model_name),
+            segment_id=job.timestamp,
+            has_collectives=cached.has_collectives,
+            alias_buffer_map=cached.alias_buffer_map,
+            pass_mutations=cached.pass_mutations,
+        )
+
+    def lower_and_store() -> _Lowering:
+        analysis = lower()
+        try:
+            hlo_bytes = CompileGraph(
+                analysis.stablehlo_mlir,
+                model_name,
+                analysis.segment_id,
+                analysis.graph_name,
+                analysis.has_collectives,
+            ).serialize()
+            hlo_cache.put(
+                key,
+                hlo_cache.CachedHLO(
+                    hlo_bytes=hlo_bytes,
+                    io_spec=analysis.io_spec,
+                    cast_spec=analysis.cast_spec,
+                    has_collectives=analysis.has_collectives,
+                    alias_buffer_map=analysis.alias_buffer_map,
+                    pass_mutations=analysis.pass_mutations,
+                ),
+                compile_mode=True,
+            )
+        except Exception as exc:
+            logger.warning("StableHLO cache store failed (%s)", exc)
+        return analysis
+
+    cached = hlo_cache.get(key, compile_mode=True)
+    if cached is not None:
+        logger.info("StableHLO cache HIT (key=%s); skipping FX->StableHLO", key[:12])
+        return resume(cached)
+
+    # Miss. Serialize lowering across ranks so only one does the FX->StableHLO work
+    # for a given key; the rest wait on the lock and resume from the stored entry.
+    # Mirrors the eager path (torch_mlir/kernel.py) and nki_kernel.py.
+    lock_path = os.path.join(
+        hlo_cache.CACHE_DIR, hashlib.sha256(key.encode()).hexdigest() + ".fx.lock"
+    )
+    with FileLock(lock_path, timeout=get_lock_timeout()):
+        # Another rank may have stored the entry while we waited for the lock.
+        cached = hlo_cache.get(key, compile_mode=True)
+        if cached is not None:
+            logger.info("StableHLO cache HIT after lock (key=%s)", key[:12])
+            return resume(cached)
+        return lower_and_store()
+
+
+def _make_fallback_fn(
+    gm,
+    pass_mutations: list[PassMutations],
+):
+    """Create a boxed fallback function that runs the original GraphModule."""
+
+    def fallback_fn(inputs):
+        mutated_inputs = apply_input_mutations(list(inputs), pass_mutations, "cpu")
+        result = gm.forward(*mutated_inputs)
+        outputs = list(result) if isinstance(result, tuple) else [result]
+        outputs = apply_output_mutations(outputs, pass_mutations, "cpu", list(inputs))
+        return tuple(outputs)
+
+    fallback_fn._boxed_call = True
+    return fallback_fn
+
+
+def _filter_wlo_indices(static_input_indices, example_inputs):
+    """Keep only the floating-point weight inputs (the ones the compiler transposes)."""
+    if not static_input_indices:
+        return None
+
+    filtered = [
+        i
+        for i in static_input_indices
+        if isinstance(example_inputs[i], torch.Tensor) and example_inputs[i].dtype.is_floating_point
+    ]
+    dropped = set(static_input_indices) - set(filtered)
+    if dropped:
+        logger.debug(
+            f"WLO: excluding non-floating-point inputs {sorted(dropped)} from weight "
+            "layout optimization (only floating-point weights are transposed)."
+        )
+    return filtered or None
+
+
+def _wlo_static_input_indices(options, example_inputs, aot_name, pass_mutations):
+    """Compute the NEFF-space static-weight indices eligible for WLO, or None if disabled.
+
+    WLO is opt-in (options["weight_layout_optimization"]) and applies to inference and
+    forward graphs (not backward/joint).
+    """
+    wlo_enabled = options is not None and options.get("weight_layout_optimization", False)
+    if not wlo_enabled:
+        return None
+
+    graph_type = aot_name.rsplit("_", 1)[0].rsplit("_", 1)[-1] if "__" in aot_name else ""
+    if graph_type not in ("inference", "forward"):
+        logger.warning(
+            f"WLO: weight_layout_optimization=True but graph_type='{graph_type}' "
+            f"(name={aot_name}); WLO applies to inference and forward graphs only and is "
+            "being SKIPPED (it does not apply to backward/joint graphs)."
+        )
+        return None
+
+    ctx = TracingContext.try_get()
+    fw_metadata = ctx.fw_metadata if ctx else None
+    static_input_indices = (
+        list(fw_metadata.static_input_indices)
+        if fw_metadata and fw_metadata.static_input_indices
+        else None
+    )
+    caller_indices = _filter_wlo_indices(static_input_indices, example_inputs)
+    if not caller_indices:
+        return None
+
+    neff_indices = translate_input_indices_to_neff(caller_indices, pass_mutations)
+    removed = len(caller_indices) - len(neff_indices)
+    if removed:
+        logger.debug(f"WLO: {removed} weight(s) were removed by FX passes and dropped from WLO.")
+    return neff_indices or None
 
 
 def neuron_backend_fx_compiler(
@@ -148,112 +656,135 @@ def neuron_backend_fx_compiler(
         logger.debug("Trivial graph detected (graph break artifact), using passthrough")
         return make_boxed_func(gm.forward)
 
-    logger.debug("Applying FX graph transformations...")
-    with dynamo_timed("torch_neuronx_fx_passes"):
-        post_aot_processing_result = post_aot_processing(gm)
-    gm = post_aot_processing_result.graph_module
-    mutation_info = post_aot_processing_result.analysis.get("mutation_info", None)
-    none_output_info = post_aot_processing_result.analysis.get("none_output_info", None)
-    random_input_info = post_aot_processing_result.analysis.get("random_input_info", None)
-    aliasing_info = (
-        None
-        if pre_processing_analysis_info is None
-        else pre_processing_analysis_info.get("aliasing_analysis", None)
+    from torch_neuronx.neuron_dynamo_backend.fx.passes.complex_decomposition import (
+        maybe_decompose_complex,
     )
 
-    logger.debug(f"Graph nodes: {len(gm.graph.nodes)}")
-    logger.debug(
-        f"Example inputs: {[inp.shape if hasattr(inp, 'shape') else inp for inp in example_inputs]}"
+    gm = maybe_decompose_complex(gm, example_inputs)
+
+    model_name = _resolve_model_name(options)
+    pre_processing_analysis_info = (
+        pre_processing_analysis_info if pre_processing_analysis_info else {}
     )
 
-    # Get model name from global variable
-    model_name = get_model_name() if options is None else options.get("model_name", "model_default")
-
-    # Set retain device mode
     retain_device = os.environ.get("TORCH_NEURONX_RETAIN_DEVICE_MODE", "0") == "1"
-
-    # Construct human-readable graph name from model_name and AOT compile ID
-    # get_aot_graph_name() returns: model__{aot_id}_{graph_type}_{nth}
-    # We replace generic "model" prefix with user's model_name
-    aot_name = get_aot_graph_name()  # e.g., "model__0_inference_0"
-    compile_id = aot_name.split("__", 1)[-1] if "__" in aot_name else aot_name
-    graph_name = f"{model_name}_{compile_id}"  # e.g., "LlamaForCausalLM_0_inference_0"
 
     # Create a CompilationJob for this compilation using context manager for automatic cleanup
     with compilation_job(op_name=model_name) as job:
-        segment_id = job.timestamp  # Use job timestamp as segment ID
+        # Save the FX graph before any transformations
+        job.save_fx_graph(model_name, gm)
 
-        logger.debug(f"Model name: {model_name}")
-        logger.debug(f"Segment ID: {segment_id}")
+        # Shared two-stage core (_lower_fx_to_stablehlo / _lower_stablehlo_to_neff).
+        logger.debug(
+            f"Example inputs: "
+            f"{[inp.shape if hasattr(inp, 'shape') else inp for inp in example_inputs]}"
+        )
 
         try:
-            # Detect collectives early in the pipeline
-            has_collectives = _has_collectives_in_graph(gm)
-            logger.debug(f"Graph contains collectives: {has_collectives}")
+            # Two-stage lowering; debug paths exit between stages.
+            # WLO (weight_layout_optimization) is handled inside
+            # _lower_fx_to_stablehlo, which is why options is threaded through.
+            try:
+                low = _lower_fx_to_stablehlo(
+                    gm,
+                    example_inputs,
+                    job,
+                    model_name=model_name,
+                    pre_processing_analysis_info=pre_processing_analysis_info,
+                    options=options,
+                )
+            except _StableHLOError as err:
+                if _getenv_bool("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", False):
+                    raise err.original from err
+                logger.error(f"StableHLO conversion failed: {err.original}")
+                logger.warning("Falling back to original GraphModule execution")
+                a = err.lowering
+                return _make_fallback_fn(a.gm, a.pass_mutations)
 
-            # Save the FX graph we received
-            job.save_fx_graph(model_name, gm)
+            # Compile-only: return CompilationArtifact handle (no execution).
+            if os.environ.get("TORCH_NEURONX_DYNAMO_STABLEHLO_EXECUTOR") == "1":
+                logger.debug("Bypassing compilation -> returning stablehlo executor")
+                executor = StableHLOInterpreterExecutor(
+                    low.stablehlo_mlir, low.io_spec, low.cast_spec
+                )
 
-            stablehlo_mlir, _, io_spec, cast_spec = _compile_fx_to_stablehlo(
-                gm,
-                example_inputs,
-                model_name,
-                segment_id,
-                job,
-                aliasing_info,
-                random_input_info,
-            )
+                def interp_wrapper(inputs):
+                    return executor(inputs)
 
-            use_tensorizer_backend = (
-                options.get("use_tensorizer_backend", False) if options else False
-            )
-            compile_graph = CompileGraph(
-                stablehlo_mlir,
-                model_name,
-                segment_id,
-                graph_name,
-                has_collectives,
-                use_tensorizer=use_tensorizer_backend,
-            )
-            final_cache_key = compile_graph.compile()
+                interp_wrapper._boxed_call = True
+                return interp_wrapper
+
+            if os.environ.get("TORCH_NEURONX_DYNAMO_HILO_INFERGOLDENS") == "1":
+                logger.debug("Bypassing compilation -> returning hilo infergoldens executor")
+                executor = HiloInferGoldensExecutor(low.stablehlo_mlir, low.io_spec, low.cast_spec)
+
+                def hilo_ig_wrapper(inputs):
+                    return executor(inputs)
+
+                hilo_ig_wrapper._boxed_call = True
+                return hilo_ig_wrapper
+
+            # Stage 2: StableHLO -> NEFF (async submit; sets low.cache_key. For WLO the cache_key
+            # carries a "|wlo" suffix and the sidecar/weight-transforms are fetched lazily in the
+            # executor — see NeuronOutputCode._get_executor).
+            low = _lower_stablehlo_to_neff(low, model_name=model_name, options=options)
+
+            # Compile-only: return CompilationArtifact handle (no execution).
+            if _is_compile_only():
+                from torch_neuronx.compiler.api import _make_artifact
+
+                artifact = _make_artifact(low, target=None, neff=None)
+                return build_compile_only_handle(gm, low, artifact)
+
+            # Serialize HLO bytes for embedding in NeuronOutputCode.
+            # The embedded bytes make the Dynamo cache self-contained —
+            # no dependency on the ephemeral /tmp/hlo_cache/ directory.
+            bytecode_buf = io.BytesIO()
+            low.stablehlo_mlir.operation.write_bytecode(bytecode_buf)
+            hlo_bytes_raw = bytecode_buf.getvalue()
 
             # Record compilation metrics (stablehlo_to_neff timing populated lazily at sync)
             record_compilation(
                 NeuronCompilationMetrics(
-                    graph_id=final_cache_key,
-                    graph_name=graph_name,
+                    graph_id=low.cache_key,
+                    graph_name=low.graph_name,
                     model_name=model_name,
-                    has_collectives=has_collectives,
-                    graph_node_count=len(gm.graph.nodes),
-                    timestamp=segment_id,
+                    has_collectives=low.has_collectives,
+                    graph_node_count=len(low.gm.graph.nodes),
+                    timestamp=low.segment_id,
                 )
             )
 
-            executor = Executor(
-                model_name,
-                final_cache_key,
-                io_spec,
-                cast_spec,
-                has_collectives,
+            from torch_neuronx.neuron_dynamo_backend.cache_artifact import NeuronOutputCode
+
+            output_code = NeuronOutputCode(
+                graph_name=model_name,
+                cache_key=low.cache_key,
+                hlo_bytes=hlo_bytes_raw,
+                io_spec=low.io_spec,
+                cast_spec=low.cast_spec,
+                has_collectives=low.has_collectives,
                 retain_device=retain_device,
-                mutation_info=mutation_info,
-                none_output_info=none_output_info,
+                pass_mutations=low.pass_mutations,
+                alias_buffer_map=low.alias_buffer_map,
             )
 
-            # Create wrapper function that matches torch.compile expectations
-            def execution_wrapper(*inputs):
-                """Wrapper function for execution"""
+            # Wrap with CPU fallback for cold path debugging.
+            # __wrapped__ lets AOTAutograd's unwrap_output_code find the
+            # OutputCode for serialization.
+            def fallback_wrapper(inputs):
                 try:
-                    return executor(*inputs)
+                    return output_code(inputs)
                 except Exception as e:
                     if _getenv_bool("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", False):
-                        raise e from e
+                        raise
                     logger.error(f"Execution failed: {e}")
-                    # Fallback to original execution for debugging
                     logger.warning("Falling back to original GraphModule execution")
-                    return gm.forward(*inputs)
+                    return _make_fallback_fn(low.gm, low.pass_mutations)(inputs)
 
-            return make_boxed_func(execution_wrapper)
+            fallback_wrapper._boxed_call = True
+            fallback_wrapper.__wrapped__ = output_code
+            return fallback_wrapper
 
         except Exception as e:
             raise RuntimeError(
@@ -279,6 +810,62 @@ def make_compiler(
         return neuron_backend_fx_compiler(gm, example_inputs, analysis_info, options)
 
     return wrapper
+
+
+@contextlib.contextmanager
+def _preserve_act_input_grad():
+    """Preserve requires_grad through the eager->compile boundary for
+    grad-requiring top-level AsyncCollectiveTensor inputs.
+
+    AOTAutograd's process_inputs resolves an ACT input via trigger_wait(), which
+    returns the grad-less inner .elem; the fake built from it reads
+    requires_grad=False, so AOTAutograd builds a non-differentiable graph and
+    silently drops the gradient to the upstream eager producer (e.g. a
+    RowwiseParallel nn.Embedding feeding a torch.compile'd TP block). Record
+    grad-requiring top-level ACT inputs before the unwrap and re-sync
+    requires_grad onto their fakes afterward. Scoped to one Neuron compile;
+    process_inputs is restored on exit. Fail-open on any AOTAutograd/collectives
+    API drift so a torch version change can never break the compile path.
+
+    This is a temporary bridge. Remove it once the fix lands upstream
+    (pytorch AsyncCollectiveTensor.trigger_wait, tracked in pytorch#191113) and
+    the pinned torch version includes it.
+    """
+    import torch._functorch.aot_autograd as _aot_autograd
+
+    if not hasattr(_aot_autograd, "process_inputs"):
+        yield
+        return
+
+    _original = _aot_autograd.process_inputs
+
+    def _wrapped(flat_args, *args, **kwargs):
+        try:
+            from torch.distributed._functional_collectives import AsyncCollectiveTensor
+
+            grad_act_indices = [
+                i
+                for i, a in enumerate(flat_args)
+                if isinstance(a, AsyncCollectiveTensor) and a.requires_grad
+            ]
+        except Exception:
+            grad_act_indices = []
+        result = _original(flat_args, *args, **kwargs)
+        try:
+            fake_flat_args = result[0] if isinstance(result, tuple) else result
+            for i in grad_act_indices:
+                fi = fake_flat_args[i]
+                if isinstance(fi, torch.Tensor) and not fi.requires_grad:
+                    fi.requires_grad_(True)
+        except Exception:
+            return result  # fail-open on any shape/API drift
+        return result
+
+    _aot_autograd.process_inputs = _wrapped
+    try:
+        yield
+    finally:
+        _aot_autograd.process_inputs = _original
 
 
 def create_neuron_backend():
@@ -310,16 +897,32 @@ def create_neuron_backend():
         if options is None:
             options = {}
         options.setdefault("dynamic", False)
+
         gm, analysis_results = preprocess_graph(gm)
+
+        # Wrap in SerializableAOTDispatchCompiler so AOTAutograd's bundled
+        # cache can serialize the NeuronOutputCode alongside its own metadata
+        # (ViewAndMutationMeta, subclass info, etc.).  This enables
+        # caching_precompile to skip both Dynamo and AOTAutograd on warm starts.
+        from torch_neuronx.neuron_dynamo_backend.cache_artifact import NeuronOutputCode
+
+        fw_compiler = SerializableAOTDispatchCompiler(
+            NeuronOutputCode, make_compiler(analysis_results, options=options)
+        )
+        bw_compiler = SerializableAOTDispatchCompiler(
+            NeuronOutputCode, make_compiler({}, options=options)
+        )
+
         aot_backend = aot_autograd(
             # pass pre-AOT aliasing info to functionalized post-AOT FWD FX graph
-            fw_compiler=make_compiler(analysis_results, options=options),
+            fw_compiler=fw_compiler,
             # functionalized post-AOT BWD FX graph does not contain aliasing hints
-            bw_compiler=make_compiler({}, options=options),
+            bw_compiler=bw_compiler,
             keep_inference_input_mutations=True,  # Prevent Copy-back.
             decompositions=decomposition_table,
         )
-        return aot_backend(gm, example_inputs)
+        with _preserve_act_input_grad():
+            return aot_backend(gm, example_inputs)
 
     return neuron_backend_wrapper
 

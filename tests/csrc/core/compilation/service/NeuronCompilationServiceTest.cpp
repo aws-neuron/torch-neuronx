@@ -4,14 +4,28 @@
 #include <chrono>
 #include <thread>
 
+#include "tests/csrc/mocks/MockNRT.h"
 #include "torch_neuronx/csrc/core/compilation/service/CompilationServiceClient.h"
 #include "torch_neuronx/csrc/core/compilation/service/NeuronCompilationService.h"
 
 using namespace at::neuron;
+using ::testing::_;
+using ::testing::DoAll;
+using ::testing::Return;
+using ::testing::SetArgPointee;
 
 class NeuronCompilationServiceTest : public ::testing::Test {
  protected:
+  torch_neuronx::testing::MockNRTSession mock_session_;
+  torch_neuronx::testing::MockNRT* mock_nrt_ = torch_neuronx::testing::MockNRT::GetInstance();
+
   void SetUp() override {
+    nrt_instance_info_t info{};
+    info.family = NRT_INSTANCE_TRN3;
+    EXPECT_CALL(*mock_nrt_, nrt_get_instance_info(_, _))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly(DoAll(SetArgPointee<0>(info), Return(NRT_SUCCESS)));
+
     socket_path_ = "/tmp/neuron_test_" + std::to_string(getpid()) + "_" +
                    std::to_string(test_counter_++) + ".sock";
     setenv("TORCH_NEURONX_NEFF_DISABLE_CACHE", "true", 1);
@@ -52,16 +66,19 @@ TEST_F(NeuronCompilationServiceTest, PropagatesCompilerError) {
 
   // Send garbage HLO — neuronx-cc will fail with a real error message
   std::string error;
-  auto result = client.CompileSync({0x01, 0x02, 0x03}, "XLA", "-O1", "", &error);
+  auto result =
+      client.CompileSync({0x01, 0x02, 0x03}, "XLA", "op_name", "cache_key", "-O1", "", &error);
   EXPECT_TRUE(result.empty());
   EXPECT_FALSE(error.empty()) << "Service should propagate the neuronx-cc error message";
-  EXPECT_NE(error.find("Command failed"), std::string::npos) << "Got: " << error;
+  EXPECT_TRUE(error.find("Command failed") != std::string::npos ||
+              error.find("Failed to read file") != std::string::npos)
+      << "Got: " << error;
 }
 
 TEST_F(NeuronCompilationServiceTest, CompileSyncBeforeServiceReturnsEmpty) {
   CompilationServiceClient client;
   // service_ready_ is false
-  auto result = client.CompileSync({0x01}, "XLA", "-O1", "");
+  auto result = client.CompileSync({0x01}, "XLA", "op_name", "cache_key", "-O1", "");
   EXPECT_TRUE(result.empty());
 }
 
@@ -80,7 +97,7 @@ TEST_F(NeuronCompilationServiceTest, ConcurrentCompileSync) {
   std::vector<std::thread> threads;
   for (int i = 0; i < kNumThreads; ++i) {
     threads.emplace_back([&]() {
-      auto result = client.CompileSync({0xDE, 0xAD}, "XLA", "-O1", "");
+      auto result = client.CompileSync({0xDE, 0xAD}, "XLA", "op_name", "cache_key", "-O1", "");
       // Compilation fails (garbage HLO) but no crash or hang
       completed++;
     });

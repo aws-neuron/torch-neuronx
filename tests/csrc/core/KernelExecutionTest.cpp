@@ -2,6 +2,7 @@
 
 #include <vector>
 
+#include "tests/csrc/mocks/MockNRT.h"
 #include "tests/csrc/utils/TestUtils.h"
 #include "torch_neuronx/csrc/c10/neuron/NeuronEvent.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
@@ -10,10 +11,26 @@
 
 using namespace at::neuron;
 using namespace at::neuron::testing;
+using ::testing::_;
+using ::testing::DoAll;
+using ::testing::Return;
+using ::testing::SetArgPointee;
 
 class KernelExecutionTest : public ::testing::Test {
  protected:
+  torch_neuronx::testing::MockNRTSession mock_session_;
+  torch_neuronx::testing::MockNRT* mock_nrt_ = torch_neuronx::testing::MockNRT::GetInstance();
+
   void SetUp() override {
+    c10_neuron::set_compile_only(false);
+
+    // Mock NRT instance info for CompilationCacheKey construction
+    nrt_instance_info_t info{};
+    info.family = NRT_INSTANCE_TRN3;
+    EXPECT_CALL(*mock_nrt_, nrt_get_instance_info(_, _))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly(DoAll(SetArgPointee<0>(info), Return(NRT_SUCCESS)));
+
     // Set up world size for collective kernel tests
     c10_neuron::set_world_size(2);
     c10_neuron::set_rank(0);
@@ -28,6 +45,8 @@ class KernelExecutionTest : public ::testing::Test {
   }
 
   void TearDown() override {
+    c10_neuron::set_compile_only(false);
+
     // Reset distributed state so next test can set it again
     c10_neuron::reset_distributed_state();
   }
@@ -48,9 +67,33 @@ TEST_F(KernelExecutionTest, CompilableKernelConstruction) {
 
   EXPECT_EQ(kernel.GetOpName(), "compilable_op");
   EXPECT_TRUE(kernel.RequiresCompilation());
-  EXPECT_TRUE(kernel.GetCacheKey().find("cache_key_123") == 0);
+  EXPECT_TRUE(kernel.GetCompileKey().find("cache_key_123") == 0);
   EXPECT_FALSE(kernel.HasCachedNeff());
   EXPECT_FALSE(kernel.HasCollectives());
+  EXPECT_TRUE(kernel.IsValid());
+}
+
+TEST_F(KernelExecutionTest, ExecutionRequirementCapturedAtConstruction) {
+  CopyDirectKernelExecution normal_kernel("normal_copy", TensorDataRef(input_ptrs_[0]),
+                                          TensorDataRef(output_ptrs_[0]), 0, 0, sizeof(float), 0);
+  EXPECT_TRUE(normal_kernel.RequiresExecution());
+
+  c10_neuron::set_compile_only(true);
+  CopyDirectKernelExecution compile_only_kernel("compile_only_copy", TensorDataRef(input_ptrs_[0]),
+                                                TensorDataRef(output_ptrs_[0]), 0, 0, sizeof(float),
+                                                0);
+  EXPECT_FALSE(compile_only_kernel.RequiresExecution());
+
+  c10_neuron::set_compile_only(false);
+  EXPECT_FALSE(compile_only_kernel.RequiresExecution());
+}
+
+TEST_F(KernelExecutionTest, CastKernelConstruction) {
+  CastDirectKernelExecution kernel("cast", TensorDataRef(input_ptrs_[0]),
+                                   TensorDataRef(output_ptrs_[0]), 3, 7, c10::ScalarType::Float,
+                                   c10::ScalarType::BFloat16, 6, 0);
+
+  EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kCast);
   EXPECT_TRUE(kernel.IsValid());
 }
 
@@ -101,7 +144,7 @@ TEST_F(KernelExecutionTest, XLAKernelConstruction) {
 
   EXPECT_EQ(kernel.GetOpName(), "xla_op");
   EXPECT_TRUE(kernel.RequiresCompilation());
-  EXPECT_TRUE(kernel.GetCacheKey().find("xla_cache_key") == 0);
+  EXPECT_TRUE(kernel.GetCompileKey().find("xla_cache_key") == 0);
   EXPECT_EQ(kernel.GetHloBytes(), hlo_bytes);
   EXPECT_FALSE(kernel.HasCollectives());
   EXPECT_TRUE(kernel.IsValid());
@@ -268,7 +311,7 @@ TEST_F(KernelExecutionTest, CacheKeyIsBaseKey) {
                                       hlo_bytes, false, 0);
 
   // In-memory cache key is just the base key (compiler config is only in persistent key)
-  EXPECT_EQ(kernel.GetCacheKey(), "base_key");
+  EXPECT_EQ(kernel.GetCompileKey(), "base_key");
 }
 
 TEST_F(KernelExecutionTest, CompilableKernelAccessors) {
@@ -306,7 +349,7 @@ TEST_F(KernelExecutionTest, XLAEnvironmentVariableSupport) {
   EXPECT_EQ(kernel.GetOptimizationLevel(), "-O2");
 
   // Cache key is just the base key (compiler config is in persistent key only)
-  EXPECT_EQ(kernel.GetCacheKey(), "key");
+  EXPECT_EQ(kernel.GetCompileKey(), "key");
 
   // Clean up
   unsetenv("NEURON_CC_FLAGS");
@@ -327,8 +370,8 @@ TEST_F(KernelExecutionTest, SameBaseKeyDifferentArgsEqualInMemoryKey) {
                                        hlo_bytes, false, 0);
 
   // In-memory keys are equal (both just "same_base")
-  EXPECT_EQ(kernel1.GetCacheKey(), kernel2.GetCacheKey());
-  EXPECT_EQ(kernel1.GetCacheKey(), "same_base");
+  EXPECT_EQ(kernel1.GetCompileKey(), kernel2.GetCompileKey());
+  EXPECT_EQ(kernel1.GetCompileKey(), "same_base");
 
   unsetenv("NEURON_COMPILER_OPT_LEVEL");
 }
@@ -354,6 +397,50 @@ TEST_F(KernelExecutionTest, CachedNeffManagement) {
   // Now should have cached NEFF
   EXPECT_TRUE(kernel.HasCachedNeff());
   EXPECT_EQ(kernel.GetCachedNeff(), expected_data);
+}
+
+TEST_F(KernelExecutionTest, IoNamesDefaultEmpty) {
+  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
+  XLACompilableKernelExecution kernel("op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "key",
+                                      hlo_bytes, false, 0);
+
+  // By default a compilable kernel carries no I/O names — NRTHandler will
+  // fall back to ``input{i}`` / ``output{i}`` when scheduling.
+  EXPECT_TRUE(kernel.GetInputNames().empty());
+  EXPECT_TRUE(kernel.GetOutputNames().empty());
+}
+
+TEST_F(KernelExecutionTest, IoNamesSetAndGet) {
+  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
+  XLACompilableKernelExecution kernel("op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "key",
+                                      hlo_bytes, false, 0);
+
+  std::vector<std::string> in_names = {"q", "k", "v"};
+  std::vector<std::string> out_names = {"attn_out"};
+  kernel.SetInputNames(in_names);
+  kernel.SetOutputNames(out_names);
+
+  EXPECT_EQ(kernel.GetInputNames(), in_names);
+  EXPECT_EQ(kernel.GetOutputNames(), out_names);
+}
+
+TEST_F(KernelExecutionTest, IoNamesAcceptAliasSlots) {
+  // NKI kernel-builder produces aliased input ports named
+  // ``<output>.must_alias_input`` — verify those round-trip without any
+  // special handling in the base class.
+  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
+  XLACompilableKernelExecution kernel("op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "key",
+                                      hlo_bytes, false, 0);
+
+  kernel.SetInputNames({"a", "b", "out.must_alias_input"});
+  kernel.SetOutputNames({"out"});
+
+  const auto& ins = kernel.GetInputNames();
+  ASSERT_EQ(ins.size(), 3u);
+  EXPECT_EQ(ins[2], "out.must_alias_input");
 }
 
 TEST_F(KernelExecutionTest, XLACompilationConfigPropagation) {
@@ -509,9 +596,10 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelConstruction) {
 
   EXPECT_TRUE(kernel.IsValid());
   EXPECT_TRUE(kernel.RequiresCompilation());
+  EXPECT_FALSE(kernel.RequiresExecution());
   EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kHLO);
   EXPECT_FALSE(kernel.HasCollectives());
-  EXPECT_TRUE(kernel.GetCacheKey().find("base_cache_key") == 0);
+  EXPECT_TRUE(kernel.GetCompileKey().find("base_cache_key") == 0);
 }
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelWithCollectives) {
@@ -535,7 +623,7 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelCacheKey) {
   CompileOnlyKernelExecution kernel("base_key", stablehlo_bytes, false);
 
   // In-memory cache key is just the base key
-  EXPECT_EQ(kernel.GetCacheKey(), "base_key");
+  EXPECT_EQ(kernel.GetCompileKey(), "base_key");
 }
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelEnvironmentVariables) {
@@ -551,6 +639,57 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelEnvironmentVariables) {
 
   unsetenv("NEURON_CC_FLAGS");
   unsetenv("NEURON_COMPILER_OPT_LEVEL");
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelExplicitConfigOverridesEnv) {
+  std::vector<uint8_t> stablehlo_bytes = {0x53, 0x48, 0x4C, 0x4F};
+
+  setenv("NEURON_CC_FLAGS", "--env-should-be-ignored", 1);
+  setenv("NEURON_COMPILER_OPT_LEVEL", "-O3", 1);
+
+  CompileOnlyKernelExecution kernel("key", stablehlo_bytes, /*has_collectives=*/true,
+                                    /*additional_args=*/"--foo", /*optimization_level=*/"-O1");
+
+  // Explicit args win; the environment is not consulted.
+  EXPECT_NE(kernel.GetAdditionalArgs().find("--foo"), std::string::npos);
+  EXPECT_EQ(kernel.GetAdditionalArgs().find("--env-should-be-ignored"), std::string::npos);
+  EXPECT_EQ(kernel.GetOptimizationLevel(), "-O1");
+  EXPECT_TRUE(kernel.IsValid());
+  EXPECT_TRUE(kernel.HasCollectives());
+
+  unsetenv("NEURON_CC_FLAGS");
+  unsetenv("NEURON_COMPILER_OPT_LEVEL");
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelDoesNotForceFmaFlag) {
+  std::vector<uint8_t> bytes = {0x53, 0x48, 0x4C, 0x4F};
+  CompileOnlyKernelExecution compile_only_kernel("key", bytes, false);
+
+  EXPECT_EQ(compile_only_kernel.GetAdditionalArgs().find("--internal-disable-fma-on-ios"),
+            std::string::npos);
+  EXPECT_NE(compile_only_kernel.GetAdditionalArgs().find("--model-type transformer"),
+            std::string::npos);
+
+  setenv("NEURON_CC_FLAGS", "--internal-disable-fma-on-ios", 1);
+  CompileOnlyKernelExecution optin_kernel("key2", bytes, false);
+  EXPECT_NE(optin_kernel.GetAdditionalArgs().find("--internal-disable-fma-on-ios"),
+            std::string::npos);
+  unsetenv("NEURON_CC_FLAGS");
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelCapturesTargetAtConstruction) {
+  // Verify target is captured at construction, not read live by the worker.
+  std::vector<uint8_t> bytes = {0x53, 0x48, 0x4C, 0x4F};
+
+  setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2", 1);
+  CompileOnlyKernelExecution kernel("key", bytes, false);
+  EXPECT_EQ(kernel.GetCapturedPlatformTarget(), "trn2");
+
+  setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn3", 1);
+  EXPECT_EQ(kernel.GetCapturedPlatformTarget(), "trn2");
+
+  unsetenv("NEURON_PLATFORM_TARGET_OVERRIDE");
+  EXPECT_EQ(kernel.GetCapturedPlatformTarget(), "trn2");
 }
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelDefaultOptLevel) {
@@ -578,7 +717,7 @@ TEST_F(KernelExecutionTest, NeffDirectKernelConstruction) {
                                    create_fake_tensor_refs(output_ptrs_), {}, {}, 0, false);
 
   EXPECT_EQ(kernel.GetOpName(), "graph_name");
-  EXPECT_EQ(kernel.GetCacheKey(), "cache_key");
+  EXPECT_EQ(kernel.GetCompileKey(), "cache_key");
   EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kHLO);
   EXPECT_FALSE(kernel.HasCollectives());
 }
@@ -656,15 +795,14 @@ TEST_F(KernelExecutionTest, WriteKernelBufferConstruction) {
   EXPECT_TRUE(kernel.IsValid());
 }
 
-TEST_F(KernelExecutionTest, CollectiveKernelRequiresPrepare) {
+TEST_F(KernelExecutionTest, CollectiveKernelDoesNotRequirePrepare) {
   std::vector<std::vector<int>> replica_groups = {{0, 1}};
   CollectiveDirectKernelExecution kernel(
       "allreduce_op", CollectiveDirectKernelExecution::CollectiveType::kAllReduce,
       create_fake_tensor_refs(input_ptrs_), create_fake_tensor_refs(output_ptrs_), {}, {},
       c10::ScalarType::Float, c10d::ReduceOp::SUM, replica_groups, 0);
 
-  // Collectives require preparation before scheduling
-  EXPECT_TRUE(kernel.RequiresPrepare());
+  EXPECT_FALSE(kernel.RequiresPrepare());
 }
 
 TEST_F(KernelExecutionTest, NonCollectiveKernelsDoNotRequirePrepare) {
@@ -695,6 +833,7 @@ TEST_F(KernelExecutionTest, IsDeviceKernelTypeReturnsTrue) {
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kHLO));
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kCollective));
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kCopy));
+  EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kCast));
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kWrite));
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kRead));
 }
@@ -702,7 +841,6 @@ TEST_F(KernelExecutionTest, IsDeviceKernelTypeReturnsTrue) {
 TEST_F(KernelExecutionTest, IsDeviceKernelTypeReturnsFalse) {
   // Host-side kernel types should return false
   EXPECT_FALSE(IsDeviceKernelType(KernelTypeEnum::kEvent));
-  EXPECT_FALSE(IsDeviceKernelType(KernelTypeEnum::kHint));
 }
 
 TEST_F(KernelExecutionTest, GetXUIndexMapping) {
@@ -710,14 +848,14 @@ TEST_F(KernelExecutionTest, GetXUIndexMapping) {
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kHLO), NRTA_XU_COMPUTE);
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kCollective), NRTA_XU_COLLECTIVES);
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kCopy), NRTA_XU_TENSOR_OP);
+  EXPECT_EQ(GetXUIndex(KernelTypeEnum::kCast), NRTA_XU_TENSOR_OP);
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kWrite), NRTA_XU_TENSOR_OP);
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kRead), NRTA_XU_TENSOR_OP);
 }
 
 TEST_F(KernelExecutionTest, GetXUIndexThrowsForNonDevice) {
   // Non-device kernel types should throw
-  EXPECT_THROW(GetXUIndex(KernelTypeEnum::kEvent), c10::Error);
-  EXPECT_THROW(GetXUIndex(KernelTypeEnum::kHint), c10::Error);
+  EXPECT_THROW(GetXUIndex(KernelTypeEnum::kEvent), torch_neuronx::ExecutionRuntimeException);
 }
 
 TEST_F(KernelExecutionTest, BaseKernelPrepareDoesNotThrow) {
@@ -827,7 +965,7 @@ TEST_F(KernelExecutionTest, NRTReduceOpEnumValues) {
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelWithTensorizer) {
   std::vector<uint8_t> mlir_bytes = {0x4D, 0x4C, 0x49, 0x52};
-  CompileOnlyKernelExecution kernel("cache_key", mlir_bytes, false, true);
+  CompileOnlyKernelExecution kernel("cache_key", mlir_bytes, false, CompileMode::kTensorizer);
 
   EXPECT_TRUE(kernel.IsValid());
   EXPECT_TRUE(kernel.RequiresCompilation());
@@ -836,7 +974,7 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelWithTensorizer) {
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelTensorizerCompilationThrows) {
   std::vector<uint8_t> mlir_bytes = {0x4D, 0x4C, 0x49, 0x52};
-  CompileOnlyKernelExecution kernel("key", mlir_bytes, false, true);
+  CompileOnlyKernelExecution kernel("key", mlir_bytes, false, CompileMode::kTensorizer);
 
   // CompileToNeff should throw since we don't have real compiler
   try {
@@ -850,7 +988,7 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelTensorizerCompilationThrows) {
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelTensorizerWithEmptyBytes) {
   std::vector<uint8_t> empty_bytes;
-  CompileOnlyKernelExecution kernel("cache_key", empty_bytes, false, true);
+  CompileOnlyKernelExecution kernel("cache_key", empty_bytes, false, CompileMode::kTensorizer);
 
   EXPECT_FALSE(kernel.IsValid());
 }
@@ -876,6 +1014,42 @@ TEST_F(KernelExecutionTest, SetAndGetCompilationError) {
   EXPECT_TRUE(kernel.IsFailedCompilation());
   EXPECT_EQ(kernel.GetCompilationError(), "neuronx-cc: invalid HLO format");
   EXPECT_FALSE(kernel.HasCachedNeff());
+}
+
+// =============================================================================
+// Lazy Allocation Kernel Tests
+// =============================================================================
+
+TEST_F(KernelExecutionTest, AllocDirectKernelExecutionIsTyped) {
+  void* va = output_ptrs_[0];
+  TensorDataRef dst_ref(va);
+  AllocDirectKernelExecution kernel("alloc_op", std::move(dst_ref), 1024, 0);
+
+  EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kAlloc);
+  EXPECT_FALSE(kernel.RequiresCompilation());
+  EXPECT_EQ(kernel.GetSizeBytes(), 1024u);
+  EXPECT_TRUE(kernel.IsValid());
+
+  // dst_ptrs should contain the VA
+  auto dst_ptrs = kernel.GetDstPtrs();
+  EXPECT_EQ(dst_ptrs.size(), 1u);
+  EXPECT_EQ(dst_ptrs[0], va);
+}
+
+TEST_F(KernelExecutionTest, DeallocDirectKernelExecutionIsTyped) {
+  void* va = input_ptrs_[0];
+  TensorDataRef src_ref(va);
+  DeallocDirectKernelExecution kernel("dealloc_op", std::move(src_ref), 1024, 0);
+
+  EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kDealloc);
+  EXPECT_FALSE(kernel.RequiresCompilation());
+  EXPECT_EQ(kernel.GetSizeBytes(), 1024u);
+  EXPECT_TRUE(kernel.IsValid());
+
+  // src_ptrs should contain the VA
+  auto src_ptrs = kernel.GetSrcPtrs();
+  EXPECT_EQ(src_ptrs.size(), 1u);
+  EXPECT_EQ(src_ptrs[0], va);
 }
 
 int main(int argc, char** argv) {

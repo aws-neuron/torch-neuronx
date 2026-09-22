@@ -3,6 +3,42 @@
 import torch
 
 from ..operation_registry import register_aten
+from ..output_layout import channels_last_strides, suggest_output_memory_format
+from ..validation import aten_scalar_type_name
+from .unary import _validate_float_promoting_out
+
+
+def _preserve_channels_last(input_index=0):
+    """Mirror a channels-last input layout, which the eager kernel would drop.
+
+    The kernel returns a contiguous output, but aten keeps the input layout. Take
+    the format from the input, not the traced output. Skip a user out=/grad_input.
+    """
+
+    def transform(lowering_result, logical_args, logical_kwargs):
+        if not lowering_result.output_specs:
+            return
+        if any(
+            isinstance(value, torch.Tensor) and name in ("out", "grad_input")
+            for name, value in logical_kwargs.items()
+        ):
+            return
+        if len(logical_args) <= input_index:
+            return
+        inp = logical_args[input_index]
+        if not isinstance(inp, torch.Tensor):
+            return
+        memory_format = suggest_output_memory_format(inp)
+        spec = lowering_result.output_specs[0]
+        if not isinstance(spec, tuple) or len(spec) < 2:
+            return
+        shape = spec[0]
+        target_strides = channels_last_strides(shape, memory_format)
+        if target_strides is None:
+            return
+        lowering_result.output_specs[0] = (shape, spec[1], target_strides)
+
+    return transform
 
 
 @register_aten(["aten::relu", "aten::relu.out", "aten::relu_"])
@@ -11,7 +47,7 @@ def torch_relu(x, out=None):
     return torch.relu(x)
 
 
-@register_aten(["aten::gelu", "aten::gelu_", "aten::gelu.out"])
+@register_aten(["aten::gelu", "aten::gelu_", "aten::gelu.out"], static_argnames=("approximate",))
 def torch_gelu(x, approximate="none", out=None):
     return torch.nn.functional.gelu(x, approximate=approximate)
 
@@ -21,43 +57,300 @@ def torch_silu(x, out=None):
     return torch.nn.functional.silu(x)
 
 
-@register_aten(["aten::sigmoid", "aten::sigmoid.out"])
+@register_aten(
+    ["aten::sigmoid", "aten::sigmoid.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_sigmoid(x, out=None):
     return torch.sigmoid(x)
 
 
-@register_aten(["aten::tanh", "aten::tanh.out"])
+@register_aten(
+    ["aten::tanh", "aten::tanh.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_tanh(self, out=None):
     return torch.tanh(self)
 
 
 @register_aten(["aten::softplus", "aten::softplus.out"], static_argnums=(1, 2))
-def torch_softplus(self, beta=1, threshold=20):
+def torch_softplus(self, beta=1, threshold=20, out=None):
     return torch.nn.functional.softplus(self, beta=beta, threshold=threshold)
 
 
-@register_aten(["aten::sigmoid_backward", "aten::sigmoid_backward.grad_input"])
-def torch_sigmoid_backward(grad_output, output):
+@register_aten(
+    ["aten::sigmoid_backward", "aten::sigmoid_backward.grad_input"], output_params=("grad_input",)
+)
+def torch_sigmoid_backward(grad_output, output, grad_input=None):
     return torch.ops.aten.sigmoid_backward.default(grad_output, output)
 
 
-@register_aten(["aten::silu_backward"])
-def torch_silu_backward(grad_output, x):
+@register_aten(
+    ["aten::silu_backward", "aten::silu_backward.grad_input"], output_params=("grad_input",)
+)
+def torch_silu_backward(grad_output, x, grad_input=None):
     return torch.ops.aten.silu_backward.default(grad_output, x)
 
 
-@register_aten(["aten::tanh_backward"])
-def torch_tanh_backward(grad_output, output):
+@register_aten(
+    ["aten::tanh_backward", "aten::tanh_backward.grad_input"], output_params=("grad_input",)
+)
+def torch_tanh_backward(grad_output, output, grad_input=None):
     return torch.ops.aten.tanh_backward(grad_output, output)
 
 
-@register_aten(["aten::gelu_backward", "aten::gelu_backward.grad_input"])
-def torch_gelu_backward(grad_output, self, approximate="none"):
+@register_aten(
+    ["aten::gelu_backward", "aten::gelu_backward.grad_input"],
+    static_argnames=("approximate",),
+    output_params=("grad_input",),
+)
+def torch_gelu_backward(grad_output, self, approximate="none", grad_input=None):
     return torch.ops.aten.gelu_backward(grad_output, self, approximate=approximate)
 
 
 @register_aten(
-    ["aten::softplus_backward", "aten::softplus_backward.grad_input"], static_argnums=(2, 3)
+    ["aten::softplus_backward", "aten::softplus_backward.grad_input"],
+    static_argnums=(2, 3),
+    output_params=("grad_input",),
 )
-def torch_softplus_backward(out_grad, x, beta, threshold):
+def torch_softplus_backward(out_grad, x, beta, threshold, grad_input=None):
     return torch.ops.aten.softplus_backward(out_grad, x, beta=beta, threshold=threshold)
+
+
+@register_aten(
+    ["aten::log_sigmoid_forward", "aten::log_sigmoid_forward.output"],
+    output_params=("output", "buffer"),
+)
+def torch_log_sigmoid_forward(self, output=None, buffer=None):
+    return torch.ops.aten.log_sigmoid_forward(self)
+
+
+@register_aten(
+    ["aten::log_sigmoid_backward", "aten::log_sigmoid_backward.grad_input"],
+    output_params=("grad_input",),
+)
+def torch_log_sigmoid_backward(grad_output, self, buffer, grad_input=None):
+    return torch.ops.aten.log_sigmoid_backward(grad_output, self, buffer)
+
+
+@register_aten(
+    ["aten::elu", "aten::elu.out"],
+    static_argnums=(1, 2, 3),
+    lowering_result_transform=_preserve_channels_last(0),
+)
+@register_aten(["aten::elu_"], static_argnums=(1, 2, 3))
+def torch_elu(self, alpha=1, scale=1, input_scale=1, out=None):
+    return torch.ops.aten.elu(self, alpha, scale, input_scale)
+
+
+def _validate_elu_backward(
+    grad_output, alpha, scale, input_scale, is_result, self_or_result, grad_input=None
+):
+    # A negative alpha with is_result cannot recover the gradient from the output.
+    if is_result and alpha < 0:
+        raise RuntimeError(
+            "In-place elu backward calculation is triggered with a negative slope which is not "
+            "supported. This is caused by calling in-place forward function with a negative "
+            "slope, please call out-of-place version instead."
+        )
+
+
+@register_aten(
+    ["aten::elu_backward", "aten::elu_backward.grad_input"],
+    static_argnums=(1, 2, 3, 4),
+    output_params=("grad_input",),
+    validate_static_inputs=_validate_elu_backward,
+    lowering_result_transform=_preserve_channels_last(0),
+)
+def torch_elu_backward(
+    grad_output, alpha, scale, input_scale, is_result, self_or_result, grad_input=None
+):
+    return torch.ops.aten.elu_backward.default(
+        grad_output, alpha, scale, input_scale, is_result, self_or_result
+    )
+
+
+# selu and selu_ are CompositeImplicitAutograd and decompose to elu, so they run
+# on Neuron with no dedicated kernel.
+
+
+def _validate_hardshrink_out(self, lambd=0.5, out=None):
+    """Reject a non-float input, which aten rejects but the decomposition runs."""
+    if isinstance(self, torch.Tensor) and not self.is_floating_point():
+        raise RuntimeError(
+            f"\"hardshrink\" not implemented for '{aten_scalar_type_name(self.dtype)}'"
+        )
+    _validate_float_promoting_out(self, out=out)
+
+
+@register_aten(
+    ["aten::hardshrink", "aten::hardshrink.out"],
+    static_argnums=(1,),
+    static_argnames=("lambd",),
+    validate_static_inputs=_validate_hardshrink_out,
+    lowering_result_transform=_preserve_channels_last(0),
+)
+def torch_hardshrink(self, lambd=0.5, out=None):
+    return torch.ops.aten.hardshrink(self, lambd)
+
+
+@register_aten(
+    ["aten::hardshrink_backward", "aten::hardshrink_backward.grad_input"],
+    static_argnums=(2,),
+    static_argnames=("lambd",),
+    output_params=("grad_input",),
+    lowering_result_transform=_preserve_channels_last(1),
+)
+def torch_hardshrink_backward(grad_out, self, lambd, grad_input=None):
+    return torch.ops.aten.hardshrink_backward.default(grad_out, self, lambd)
+
+
+# relu6 is CompositeImplicitAutograd and decomposes to hardtanh(0, 6), so it runs
+# on Neuron with no dedicated kernel.
+@register_aten(
+    ["aten::hardtanh", "aten::hardtanh.out"],
+    static_argnums=(1, 2),
+    lowering_result_transform=_preserve_channels_last(0),
+)
+@register_aten(["aten::hardtanh_"], static_argnums=(1, 2))
+def torch_hardtanh(self, min_val=-1, max_val=1, out=None):
+    return torch.ops.aten.hardtanh(self, min_val, max_val)
+
+
+@register_aten(
+    ["aten::hardtanh_backward", "aten::hardtanh_backward.grad_input"],
+    static_argnums=(2, 3),
+    output_params=("grad_input",),
+    lowering_result_transform=_preserve_channels_last(0),
+)
+def torch_hardtanh_backward(grad_output, self, min_val, max_val, grad_input=None):
+    return torch.ops.aten.hardtanh_backward(grad_output, self, min_val, max_val)
+
+
+def _validate_mish_float_dtype(self, *_operands, **_kwargs):
+    """Reject non-floating inputs; ATen implements mish for float dtypes only."""
+    if isinstance(self, torch.Tensor) and not self.is_floating_point():
+        raise RuntimeError(f"\"mish\" not implemented for '{aten_scalar_type_name(self.dtype)}'")
+
+
+@register_aten(
+    ["aten::mish", "aten::mish.out"],
+    validate_static_inputs=_validate_mish_float_dtype,
+    lowering_result_transform=_preserve_channels_last(0),
+)
+@register_aten(["aten::mish_"], validate_static_inputs=_validate_mish_float_dtype)
+def torch_mish(self, out=None):
+    return torch.nn.functional.mish(self)
+
+
+@register_aten(["aten::mish_backward"], validate_static_inputs=_validate_mish_float_dtype)
+def torch_mish_backward(grad_output, self):
+    return torch.ops.aten.mish_backward.default(grad_output, self)
+
+
+def _validate_hardswish_float(self, *_args, **_kwargs):
+    """Reject a non-float input, which hardswish does not support."""
+    if isinstance(self, torch.Tensor) and not self.is_floating_point():
+        raise RuntimeError(
+            f"\"hardswish\" not implemented for '{aten_scalar_type_name(self.dtype)}'"
+        )
+
+
+@register_aten(
+    ["aten::hardswish", "aten::hardswish.out"],
+    validate_static_inputs=_validate_hardswish_float,
+    lowering_result_transform=_preserve_channels_last(0),
+)
+@register_aten(
+    ["aten::hardswish_"],
+    validate_static_inputs=_validate_hardswish_float,
+    lowering_result_transform=_preserve_channels_last(0),
+)
+def torch_hardswish(self, out=None):
+    return torch.ops.aten.hardswish(self)
+
+
+@register_aten(
+    ["aten::hardswish_backward", "aten::hardswish_backward.out"],
+    lowering_result_transform=_preserve_channels_last(0),
+)
+def torch_hardswish_backward(grad_output, self, out=None):
+    return torch.ops.aten.hardswish_backward(grad_output, self)
+
+
+def _validate_glu(self, dim=-1, out=None):
+    """Guard glu like aten: float input, no 0-d tensor, even split dimension."""
+    if not self.is_floating_point():
+        raise RuntimeError(f"\"glu\" not implemented for '{aten_scalar_type_name(self.dtype)}'")
+    if self.dim() == 0:
+        raise RuntimeError("glu does not support 0-dimensional tensors")
+    wrap_dim = dim if dim >= 0 else dim + self.dim()
+    size = self.size(wrap_dim)
+    if size % 2 != 0:
+        raise RuntimeError(
+            f"Halving dimension must be even, but dimension {wrap_dim} is size {size}"
+        )
+    _validate_float_promoting_out(self, out=out)
+
+
+@register_aten(
+    ["aten::glu", "aten::glu.out"],
+    static_argnums=(1,),
+    validate_static_inputs=_validate_glu,
+    lowering_result_transform=_preserve_channels_last(0),
+)
+def torch_glu(self, dim=-1, out=None):
+    return torch.ops.aten.glu(self, dim)
+
+
+def _validate_glu_backward(grad_output, self, dim, grad_input=None):
+    # The glu_backward decomposition skips aten's even-dimension check; re-raise it.
+    wrap_dim = dim if dim >= 0 else dim + self.dim()
+    size = self.size(wrap_dim)
+    if size % 2 != 0:
+        raise RuntimeError(
+            f"Halving dimension must be even, but dimension {wrap_dim} is size {size}"
+        )
+
+
+@register_aten(
+    ["aten::glu_backward", "aten::glu_backward.grad_input"],
+    static_argnums=(2,),
+    output_params=("grad_input",),
+    validate_static_inputs=_validate_glu_backward,
+)
+def torch_glu_backward(grad_output, self, dim, grad_input=None):
+    return torch.ops.aten.glu_backward.default(grad_output, self, dim)
+
+
+@register_aten(["aten::celu", "aten::celu.out"], static_argnames=("alpha",))
+def torch_celu(self, alpha=1.0, out=None):
+    return torch.ops.aten.celu(self, alpha)
+
+
+@register_aten(["aten::leaky_relu", "aten::leaky_relu.out"], static_argnames=("negative_slope",))
+def torch_leaky_relu(self, negative_slope=0.01, out=None):
+    return torch.ops.aten.leaky_relu(self, negative_slope)
+
+
+@register_aten(["aten::leaky_relu_"], static_argnames=("negative_slope",))
+def torch_leaky_relu_(self, negative_slope=0.01):
+    return torch.ops.aten.leaky_relu(self, negative_slope)
+
+
+@register_aten(["aten::hardsigmoid", "aten::hardsigmoid.out"])
+def torch_hardsigmoid(self, out=None):
+    return torch.ops.aten.hardsigmoid(self)
+
+
+@register_aten(["aten::hardsigmoid_"])
+def torch_hardsigmoid_(self):
+    return torch.ops.aten.hardsigmoid(self)
+
+
+@register_aten(
+    ["aten::hardsigmoid_backward", "aten::hardsigmoid_backward.grad_input"],
+    output_params=("grad_input",),
+)
+def torch_hardsigmoid_backward(grad_output, self, grad_input=None):
+    return torch.ops.aten.hardsigmoid_backward.default(grad_output, self)

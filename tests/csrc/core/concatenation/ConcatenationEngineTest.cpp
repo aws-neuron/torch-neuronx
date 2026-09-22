@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "tests/csrc/mocks/MockKernelExecution.h"
+#include "tests/csrc/mocks/MockNRT.h"
 #include "tests/csrc/mocks/MockOperationExecutionEngine.h"
 #include "torch_neuronx/csrc/core/OperationContext.h"
 #include "torch_neuronx/csrc/core/concatenation/ConcatenationEngine.h"
@@ -13,11 +14,24 @@
 
 using namespace at::neuron;
 using namespace at::neuron::testing;
+using ::testing::_;
+using ::testing::DoAll;
+using ::testing::Return;
+using ::testing::SetArgPointee;
 
 // Simple test fixture for ConcatenationEngine tests
 class ConcatenationEngineTest : public ::testing::Test {
  protected:
+  torch_neuronx::testing::MockNRTSession mock_session_;
+  torch_neuronx::testing::MockNRT* mock_nrt_ = torch_neuronx::testing::MockNRT::GetInstance();
+
   void SetUp() override {
+    nrt_instance_info_t info{};
+    info.family = NRT_INSTANCE_TRN3;
+    EXPECT_CALL(*mock_nrt_, nrt_get_instance_info(_, _))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly(DoAll(SetArgPointee<0>(info), Return(NRT_SUCCESS)));
+
     // Create mock execution engine
     mock_engine_wrapper_ = std::make_unique<MockOperationExecutionEngineWrapper>();
 
@@ -93,10 +107,25 @@ class ConcatenationEngineTest : public ::testing::Test {
     return op;
   }
 
-  // Helper to create a Hint operation (allocation/deallocation hints - not boundaries)
-  OperationContext* CreateMockHintOperation() {
-    auto mock_kernel = std::make_unique<::testing::NiceMock<MockNeuronKernelExecution>>("hint_op");
-    ON_CALL(*mock_kernel, GetKernelType()).WillByDefault(::testing::Return(KernelTypeEnum::kHint));
+  // sentinel_tensors_ keeps the data_ptr() backing alive for the TensorDataRef.
+  OperationContext* CreateMockAllocOperation(const std::string& name = "alloc") {
+    sentinel_tensors_.push_back(torch::zeros({1}));
+    auto mock_kernel = std::make_unique<::testing::NiceMock<MockNeuronKernelExecution>>(
+        name, std::vector<torch::Tensor>{}, std::vector<torch::Tensor>{sentinel_tensors_.back()},
+        0);
+    ON_CALL(*mock_kernel, GetKernelType()).WillByDefault(::testing::Return(KernelTypeEnum::kAlloc));
+    auto* op = new OperationContext(std::move(mock_kernel));
+    op->stream = test_stream_;
+    return op;
+  }
+
+  OperationContext* CreateMockDeallocOperation(const std::string& name = "dealloc") {
+    sentinel_tensors_.push_back(torch::zeros({1}));
+    auto mock_kernel = std::make_unique<::testing::NiceMock<MockNeuronKernelExecution>>(
+        name, std::vector<torch::Tensor>{sentinel_tensors_.back()}, std::vector<torch::Tensor>{},
+        0);
+    ON_CALL(*mock_kernel, GetKernelType())
+        .WillByDefault(::testing::Return(KernelTypeEnum::kDealloc));
     auto* op = new OperationContext(std::move(mock_kernel));
     op->stream = test_stream_;
     return op;
@@ -122,6 +151,7 @@ class ConcatenationEngineTest : public ::testing::Test {
   StreamImpl* test_stream_;
   StreamImpl* test_stream2_;
   std::unique_ptr<MockOperationExecutionEngineWrapper> mock_engine_wrapper_;
+  std::vector<torch::Tensor> sentinel_tensors_;
 };
 
 // =============================================================================
@@ -203,32 +233,6 @@ TEST_F(ConcatenationEngineTest, BoundaryOperationEnablesAccumulation) {
 
   delete boundary_op;
   delete hlo_op;
-}
-
-TEST_F(ConcatenationEngineTest, HintOperationIsNotBoundary) {
-  ConcatenationEngine engine;
-
-  // Enable accumulation first with a matmul
-  OperationContext* matmul_op = CreateMockMatmulOperation();
-  engine.ProcessConcatenationTask(matmul_op);
-
-  // Buffer some HLO operations
-  OperationContext* op1 = CreateMockHLOOperation("aten::add");
-  engine.ProcessConcatenationTask(op1);
-
-  size_t buffered_before = engine.GetBufferedOperationsCount();
-  EXPECT_GT(buffered_before, 0);
-
-  // Hint operation should NOT trigger flush (not a boundary)
-  OperationContext* hint_op = CreateMockHintOperation();
-  auto result = engine.ProcessConcatenationTask(hint_op);
-
-  // Hint should be processed but not trigger flush
-  // Buffer count may or may not change depending on implementation
-
-  delete matmul_op;
-  delete op1;
-  delete hint_op;
 }
 
 TEST_F(ConcatenationEngineTest, HLOWithCollectivesIsBoundary) {
@@ -1126,6 +1130,190 @@ TEST_F(ConcatenationEngineTest, MaybeTryConcatenate_SingleOperation) {
   EXPECT_GE(result.size(), 0);
 
   delete op;
+}
+
+// ============================================================================
+// Reorder-on-flush — partition into allocs → compute → deallocs (lazy alloc).
+// ============================================================================
+
+TEST_F(ConcatenationEngineTest, FlushReordersAllocsBeforeComputeBeforeDeallocs) {
+  ConcatenationEngine engine;
+
+  // matmul flips accumulation on and is emitted on its own.
+  OperationContext* matmul = CreateMockMatmulOperation();
+  engine.ProcessConcatenationTask(matmul);
+
+  OperationContext* d1 = CreateMockDeallocOperation("dealloc1");
+  OperationContext* hlo_a = CreateMockHLOOperation("aten::add");
+  OperationContext* a1 = CreateMockAllocOperation("alloc1");
+  OperationContext* hlo_b = CreateMockHLOOperation("aten::mul");
+  OperationContext* a2 = CreateMockAllocOperation("alloc2");
+  OperationContext* d2 = CreateMockDeallocOperation("dealloc2");
+  OperationContext* hlo_c = CreateMockHLOOperation("aten::sub");
+
+  engine.ProcessConcatenationTask(d1);
+  engine.ProcessConcatenationTask(hlo_a);
+  engine.ProcessConcatenationTask(a1);
+  engine.ProcessConcatenationTask(hlo_b);
+  engine.ProcessConcatenationTask(a2);
+  engine.ProcessConcatenationTask(d2);
+  engine.ProcessConcatenationTask(hlo_c);
+
+  // Non-fusible boundary triggers the flush; boundary is appended after.
+  OperationContext* boundary = CreateMockBoundaryOperation();
+  auto result = engine.ProcessConcatenationTask(boundary);
+
+  ASSERT_EQ(result.size(), 8u);
+  auto it = result.begin();
+  EXPECT_EQ(*it++, a1);
+  EXPECT_EQ(*it++, a2);
+  EXPECT_EQ(*it++, hlo_a);
+  EXPECT_EQ(*it++, hlo_b);
+  EXPECT_EQ(*it++, hlo_c);
+  EXPECT_EQ(*it++, d1);
+  EXPECT_EQ(*it++, d2);
+  EXPECT_EQ(*it++, boundary);
+
+  delete matmul;
+  delete d1;
+  delete hlo_a;
+  delete a1;
+  delete hlo_b;
+  delete a2;
+  delete d2;
+  delete hlo_c;
+  delete boundary;
+}
+
+// All-compute buffer: partition is a no-op, ops emit in submission order.
+TEST_F(ConcatenationEngineTest, FlushReorderDegenerateOnlyCompute) {
+  ConcatenationEngine engine;
+
+  OperationContext* matmul = CreateMockMatmulOperation();
+  engine.ProcessConcatenationTask(matmul);
+
+  OperationContext* a = CreateMockHLOOperation("aten::add");
+  OperationContext* b = CreateMockHLOOperation("aten::mul");
+  OperationContext* c = CreateMockHLOOperation("aten::sub");
+  engine.ProcessConcatenationTask(a);
+  engine.ProcessConcatenationTask(b);
+  engine.ProcessConcatenationTask(c);
+
+  OperationContext* boundary = CreateMockBoundaryOperation();
+  auto result = engine.ProcessConcatenationTask(boundary);
+
+  ASSERT_EQ(result.size(), 4u);
+  auto it = result.begin();
+  EXPECT_EQ(*it++, a);
+  EXPECT_EQ(*it++, b);
+  EXPECT_EQ(*it++, c);
+  EXPECT_EQ(*it++, boundary);
+
+  delete matmul;
+  delete a;
+  delete b;
+  delete c;
+  delete boundary;
+}
+
+// Alloc-only buffer: all allocs come before any computes/deallocs (which are
+// absent here). Verifies the alloc partition keeps submission order.
+TEST_F(ConcatenationEngineTest, FlushReorderAllocsOnly) {
+  ConcatenationEngine engine;
+
+  OperationContext* matmul = CreateMockMatmulOperation();
+  engine.ProcessConcatenationTask(matmul);
+
+  OperationContext* a1 = CreateMockAllocOperation("alloc1");
+  OperationContext* a2 = CreateMockAllocOperation("alloc2");
+  OperationContext* a3 = CreateMockAllocOperation("alloc3");
+  engine.ProcessConcatenationTask(a1);
+  engine.ProcessConcatenationTask(a2);
+  engine.ProcessConcatenationTask(a3);
+
+  OperationContext* boundary = CreateMockBoundaryOperation();
+  auto result = engine.ProcessConcatenationTask(boundary);
+
+  ASSERT_EQ(result.size(), 4u);
+  auto it = result.begin();
+  EXPECT_EQ(*it++, a1);
+  EXPECT_EQ(*it++, a2);
+  EXPECT_EQ(*it++, a3);
+  EXPECT_EQ(*it++, boundary);
+
+  delete matmul;
+  delete a1;
+  delete a2;
+  delete a3;
+  delete boundary;
+}
+
+// Dealloc-only buffer: all deallocs come after computes (which are absent).
+// Verifies the dealloc partition keeps submission order.
+TEST_F(ConcatenationEngineTest, FlushReorderDeallocsOnly) {
+  ConcatenationEngine engine;
+
+  OperationContext* matmul = CreateMockMatmulOperation();
+  engine.ProcessConcatenationTask(matmul);
+
+  OperationContext* d1 = CreateMockDeallocOperation("dealloc1");
+  OperationContext* d2 = CreateMockDeallocOperation("dealloc2");
+  OperationContext* d3 = CreateMockDeallocOperation("dealloc3");
+  engine.ProcessConcatenationTask(d1);
+  engine.ProcessConcatenationTask(d2);
+  engine.ProcessConcatenationTask(d3);
+
+  OperationContext* boundary = CreateMockBoundaryOperation();
+  auto result = engine.ProcessConcatenationTask(boundary);
+
+  ASSERT_EQ(result.size(), 4u);
+  auto it = result.begin();
+  EXPECT_EQ(*it++, d1);
+  EXPECT_EQ(*it++, d2);
+  EXPECT_EQ(*it++, d3);
+  EXPECT_EQ(*it++, boundary);
+
+  delete matmul;
+  delete d1;
+  delete d2;
+  delete d3;
+  delete boundary;
+}
+
+// Allocs and deallocs only (no compute): partition emits all allocs first,
+// then all deallocs, each preserving submission order.
+TEST_F(ConcatenationEngineTest, FlushReorderAllocsThenDeallocs) {
+  ConcatenationEngine engine;
+
+  OperationContext* matmul = CreateMockMatmulOperation();
+  engine.ProcessConcatenationTask(matmul);
+
+  OperationContext* d1 = CreateMockDeallocOperation("dealloc1");
+  OperationContext* a1 = CreateMockAllocOperation("alloc1");
+  OperationContext* d2 = CreateMockDeallocOperation("dealloc2");
+  OperationContext* a2 = CreateMockAllocOperation("alloc2");
+  engine.ProcessConcatenationTask(d1);
+  engine.ProcessConcatenationTask(a1);
+  engine.ProcessConcatenationTask(d2);
+  engine.ProcessConcatenationTask(a2);
+
+  OperationContext* boundary = CreateMockBoundaryOperation();
+  auto result = engine.ProcessConcatenationTask(boundary);
+
+  ASSERT_EQ(result.size(), 5u);
+  auto it = result.begin();
+  EXPECT_EQ(*it++, a1);
+  EXPECT_EQ(*it++, a2);
+  EXPECT_EQ(*it++, d1);
+  EXPECT_EQ(*it++, d2);
+  EXPECT_EQ(*it++, boundary);
+
+  delete matmul;
+  delete d1;
+  delete a1;
+  delete d2;
+  delete a2;
+  delete boundary;
 }
 
 int main(int argc, char** argv) {

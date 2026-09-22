@@ -8,11 +8,9 @@ namespace torch_neuronx {
 
 namespace ops {
 
-// Mock contiguous operation - only this one is missing from aten_neuron
-at::Tensor call_python_contiguous_op(const at::Tensor& tensor, c10::MemoryFormat memory_format) {
-  // Simple mock - just return contiguous tensor
-  return tensor.contiguous(memory_format);
-}
+// Mock stubs for the Python contiguous op mechanism (InternalOps.h)
+void SetPythonContiguousOp(PyObject* /*op*/) {}
+PyObject* GetPythonContiguousOp() { return nullptr; }
 
 }  // namespace ops
 

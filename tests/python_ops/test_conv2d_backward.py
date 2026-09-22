@@ -232,6 +232,56 @@ class TestConv2dBackwardRegistration:
 
         assert_op_runs_on_neuron(op_name)
 
+    @pytest.mark.xfail(
+        raises=RuntimeError,
+        match="NCC_IBIR243|Access pattern out of bounds",
+        reason="neuronx-cc NCC_IBIR243: conv2d_dw kernel access pattern out of bounds "
+        "with batch>1, stride=2, 7x7 kernel, 224x224 input",
+    )
+    def test_conv2d_backward_7x7_stride2_compile(self):
+        """Verify 7x7 stride=2 batch>1 grad_weight compiles and executes correctly."""
+        torch.manual_seed(0)
+        grad_output = torch.randn(8, 64, 56, 56)
+        input_t = torch.randn(8, 3, 224, 224)
+        weight = torch.randn(64, 3, 7, 7)
+
+        # Run on CPU for reference
+        cpu_result = torch.ops.aten.convolution_backward(
+            grad_output,
+            input_t,
+            weight,
+            [64],
+            [2, 2],
+            [3, 3],
+            [1, 1],
+            False,
+            [0, 0],
+            1,
+            [False, True, False],
+        )
+
+        # Run on Neuron — the compilation error is asynchronous and only
+        # surfaces at synchronize() or when results are read back to CPU.
+        with track_neuron_ops():
+            neuron_result = torch.ops.aten.convolution_backward(
+                grad_output.to("neuron"),
+                input_t.to("neuron"),
+                weight.to("neuron"),
+                [64],
+                [2, 2],
+                [3, 3],
+                [1, 1],
+                False,
+                [0, 0],
+                1,
+                [False, True, False],
+            )
+            torch_neuronx.synchronize()
+
+        assert_op_runs_on_neuron("convolution_backward")
+        assert neuron_result[1] is not None
+        torch.testing.assert_close(neuron_result[1].cpu(), cpu_result[1])
+
     def test_conv2d_fwd_bwd_basic(self):
         """Test forward-backward pass using loss.backward()"""
 

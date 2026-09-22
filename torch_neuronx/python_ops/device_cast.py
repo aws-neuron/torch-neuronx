@@ -39,7 +39,7 @@ def device_cast_neuron_to_neuron(src: torch.Tensor, dst: torch.Tensor) -> None:
     """Cast `src` into `dst` on Neuron device without CPU bounce for <=32-bit dtypes.
 
     - If dtypes match, performs a direct device-to-device copy.
-    - Otherwise, uses a tiny JAX/MLIR kernel to cast on device and write into `dst`.
+    - Otherwise, uses a tiny MLIR kernel to cast on device and write into `dst`.
 
     Args:
         src: Source Neuron tensor

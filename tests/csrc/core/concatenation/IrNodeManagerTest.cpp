@@ -12,18 +12,9 @@ using namespace torch_neuronx;
 
 class IrNodeManagerTest : public ::testing::Test {
  protected:
-  void SetUp() override {
-    manager = std::make_unique<IrNodeManager>();
+  void SetUp() override { manager = std::make_unique<IrNodeManager>(); }
 
-    // Clear environment variable for consistent testing
-    unsetenv("TORCH_NEURONX_SKIP_INTERMEDIATES");
-  }
-
-  void TearDown() override {
-    // Clean up environment
-    unsetenv("TORCH_NEURONX_SKIP_INTERMEDIATES");
-    unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
-  }
+  void TearDown() override { unsetenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING"); }
 
   std::unique_ptr<IrNodeManager> manager;
 
@@ -94,56 +85,6 @@ TEST_F(IrNodeManagerTest, CreateConcatNodeCacheHit) {
     // Verify combined input/output counts
     EXPECT_EQ(result1->inputs.size(), node1->inputs.size() + node2->inputs.size());
     EXPECT_EQ(result1->outputs.size(), node1->outputs.size() + node2->outputs.size());
-  }
-}
-
-TEST_F(IrNodeManagerTest, CreateConcatNodeSkipIntermediatesDisabled) {
-  // Ensure environment variable is not set
-  unsetenv("TORCH_NEURONX_SKIP_INTERMEDIATES");
-
-  auto node1 = createStableHloNode("op1", "key1");
-  auto node2 = createStableHloNode("op2", "key2");
-
-  // This should use the conservative merge function
-  auto result = manager->CreateConcatNode(node1.get(), node2.get());
-
-  if (result) {
-    // Create union sets for inputs and outputs
-    std::set<void*> expected_inputs(node1->inputs.begin(), node1->inputs.end());
-    expected_inputs.insert(node2->inputs.begin(), node2->inputs.end());
-
-    std::set<void*> expected_outputs(node1->outputs.begin(), node1->outputs.end());
-    expected_outputs.insert(node2->outputs.begin(), node2->outputs.end());
-
-    std::set<void*> actual_inputs(result->inputs.begin(), result->inputs.end());
-    std::set<void*> actual_outputs(result->outputs.begin(), result->outputs.end());
-
-    EXPECT_EQ(actual_inputs, expected_inputs);
-    EXPECT_EQ(actual_outputs, expected_outputs);
-  }
-}
-
-TEST_F(IrNodeManagerTest, CreateConcatNodeSkipIntermediatesEnabled) {
-  // Set environment variable to enable skip intermediates
-  setenv("TORCH_NEURONX_SKIP_INTERMEDIATES", "1", 1);
-
-  auto node1 = createStableHloNode("op1", "key1");
-  auto node2 = createStableHloNode("op2", "key2");
-
-  // This should use the unsafe merge function
-  auto result = manager->CreateConcatNode(node1.get(), node2.get());
-
-  if (result) {
-    // Verify optimized module has only 1 main function (submains are inlined)
-    std::string ir_string(result->ir_serialized.begin(), result->ir_serialized.end());
-    EXPECT_TRUE(ir_string.find("main") != std::string::npos);
-    // After optimization/inlining, submain functions should be removed
-    EXPECT_TRUE(ir_string.find("submain1") == std::string::npos);
-    EXPECT_TRUE(ir_string.find("submain2") == std::string::npos);
-
-    // Verify combined input/output counts
-    EXPECT_EQ(result->inputs.size(), node1->inputs.size() + node2->inputs.size());
-    EXPECT_EQ(result->outputs.size(), node1->outputs.size() + node2->outputs.size());
   }
 }
 

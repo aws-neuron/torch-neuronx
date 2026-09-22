@@ -187,9 +187,10 @@ class TestSDPAForward:
                 )
 
         assert output_neuron.cpu().shape == output_cpu.shape
-        torch.testing.assert_close(
-            output_neuron.cpu(), output_cpu, rtol=config.rtol, atol=config.atol
-        )
+        if config.dropout_p == 0.0 or config.dropout_p == 1.0:
+            torch.testing.assert_close(
+                output_neuron.cpu(), output_cpu, rtol=config.rtol, atol=config.atol
+            )
 
     def test_sdpa_forward_cross_attention(self):
         """Test SDPA forward for cross-attention (different seq lengths - special case)."""
@@ -221,6 +222,40 @@ class TestSDPAForward:
 
 class TestSDPABackward:
     """Forward+backward tests for SDPA decomposition (gradient computation)"""
+
+    def test_bf16_reported_shape_matches_eager(self):
+        """Compile and eager Math2 must match for the reported training shape."""
+        torch.manual_seed(1234)
+        shape = (25, 32, 51, 48)
+        query = torch.randn(shape, dtype=torch.bfloat16)
+        key = torch.randn(shape, dtype=torch.bfloat16)
+        value = torch.randn(shape, dtype=torch.bfloat16)
+        grad_out = torch.randn(shape, dtype=torch.bfloat16)
+
+        def run(operation):
+            query_neuron = query.to("neuron").requires_grad_(True)
+            key_neuron = key.to("neuron").requires_grad_(True)
+            value_neuron = value.to("neuron").requires_grad_(True)
+            output = operation(query_neuron, key_neuron, value_neuron)
+            output.backward(grad_out.to("neuron"))
+            return (
+                output.cpu(),
+                query_neuron.grad.cpu(),
+                key_neuron.grad.cpu(),
+                value_neuron.grad.cpu(),
+            )
+
+        eager = run(F.scaled_dot_product_attention)
+        compiled = run(torch.compile(F.scaled_dot_product_attention, backend="neuron"))
+
+        names = ("output", "query gradient", "key gradient", "value gradient")
+        for name, eager_tensor, compiled_tensor in zip(
+            names,
+            eager,
+            compiled,
+            strict=True,
+        ):
+            torch.testing.assert_close(compiled_tensor, eager_tensor, rtol=0, atol=0, msg=name)
 
     @pytest.mark.parametrize("config", SDPA_TEST_CONFIGS)
     def test_sdpa_backward(self, config: SDPAConfig):
@@ -286,21 +321,20 @@ class TestSDPABackward:
 
         output_neuron.backward(grad_out.clone().to("neuron"))
 
-        # Verify forward output
-        torch.testing.assert_close(
-            output_neuron.cpu(), output_cpu, rtol=config.rtol, atol=config.atol
-        )
-
-        # Verify gradients
-        torch.testing.assert_close(
-            query_neuron.grad.cpu(), query_cpu.grad, rtol=config.rtol, atol=config.atol
-        )
-        torch.testing.assert_close(
-            key_neuron.grad.cpu(), key_cpu.grad, rtol=config.rtol, atol=config.atol
-        )
-        torch.testing.assert_close(
-            value_neuron.grad.cpu(), value_cpu.grad, rtol=config.rtol, atol=config.atol
-        )
+        # Verify forward output and gradients (skip for stochastic dropout)
+        if config.dropout_p == 0.0 or config.dropout_p == 1.0:
+            torch.testing.assert_close(
+                output_neuron.cpu(), output_cpu, rtol=config.rtol, atol=config.atol
+            )
+            torch.testing.assert_close(
+                query_neuron.grad.cpu(), query_cpu.grad, rtol=config.rtol, atol=config.atol
+            )
+            torch.testing.assert_close(
+                key_neuron.grad.cpu(), key_cpu.grad, rtol=config.rtol, atol=config.atol
+            )
+            torch.testing.assert_close(
+                value_neuron.grad.cpu(), value_cpu.grad, rtol=config.rtol, atol=config.atol
+            )
 
     def test_sdpa_backward_cross_attention(self):
         """Test SDPA backward for cross-attention (different seq lengths - special case)."""

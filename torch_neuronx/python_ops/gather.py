@@ -2,15 +2,37 @@
 
 import torch
 
-from .base import ExecutionResult, Operation, OperationImplementation
+from .auto_registration import neuron_op
+from .base import ExecutionResult, Operation
+from .torch_mlir.op_impl import TorchMlirOpImpl
 from .torch_mlir.ops.gather import GatherMLIRImpl, GatherOutMLIRImpl
 
 
-class GatherNKIImpl(OperationImplementation):
-    """NKI implementation of gather"""
+def _gather_nki_traceable(
+    input: torch.Tensor, dim: int, index: torch.Tensor, sparse_grad: bool = False
+) -> torch.Tensor:
+    """Traceable version of NKI gather for make_fx tracing."""
+    if index.dtype == torch.int64:
+        index = index.to(torch.int32)
+    index_1d = index[:, 0]
+    from .nki_kernels.gather import gather_kernel
+
+    return gather_kernel(input, dim, index_1d)
+
+
+@neuron_op("aten::gather", priority=60)
+class GatherNKIImpl(TorchMlirOpImpl):
+    """NKI implementation of gather — dispatched via C++ DispatchImpl."""
+
+    def __init__(self):
+        super().__init__(
+            aten_op_name="aten::gather",
+            torch_fn=_gather_nki_traceable,
+            static_argnums=(1,),
+            static_argnames=("sparse_grad",),
+        )
 
     def can_handle(self, input, dim, index, sparse_grad=False) -> bool:
-        """Check if NKI can handle these inputs"""
         if input.ndim != 2:
             return False
         if dim != 0:
@@ -21,13 +43,11 @@ class GatherNKIImpl(OperationImplementation):
             return False
         if sparse_grad:
             return False
-        # Only handle 2D index with repeated values
         if index.ndim != 2:
             return False
         return index.stride(1) == 0
 
-    def _execute_impl(self, input, dim, index, sparse_grad=False) -> ExecutionResult:
-        """Execute NKI gather"""
+    def execute(self, *args, **kwargs) -> ExecutionResult:
         try:
             from torch_neuronx.python_ops.cast_policy import (
                 bounce_64bit,
@@ -38,12 +58,12 @@ class GatherNKIImpl(OperationImplementation):
 
             from .nki_kernels.gather import gather_kernel
 
+            input, dim, index = args[0], args[1], args[2]
             original_input_dtype = input.dtype
 
             index = convert_for_neuron(index)
             index_1d = index[:, 0]
             result = gather_kernel(input, dim, index_1d)
-            # Cast back to 64-bit if needed
             if bounce_64bit(original_input_dtype):
                 cpu_cast = copy_neuron_to_cpu(result, target_dtype=original_input_dtype)
                 result = copy_cpu_to_neuron(cpu_cast, result.device, original_input_dtype)
@@ -52,16 +72,11 @@ class GatherNKIImpl(OperationImplementation):
         except Exception as e:
             return ExecutionResult(success=False, error_msg=str(e))
 
-    @property
-    def priority(self) -> int:
-        return super().priority + 10
-
 
 class GatherOp(Operation):
     """Gather operation with NKI + XLA fallback"""
 
     def _setup_implementations(self):
-        self._implementations.append(GatherNKIImpl())
         self._implementations.append(GatherMLIRImpl())
 
     @property

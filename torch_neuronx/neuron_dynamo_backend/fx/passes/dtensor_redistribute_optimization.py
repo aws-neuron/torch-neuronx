@@ -1,18 +1,24 @@
-"""Eliminate redundant index_select ops from DTensor redistribution.
+"""Eliminate redundant index_select / slice ops from collective reassembly.
 
 DTensor's redistribute() traces to flatten → index_select → reshape patterns that
-torch-mlir lowers to element-wise stablehlo.gather. This pass replaces them with
-view/permute/reshape (or slice for standalone shards).
+torch-mlir lowers to element-wise stablehlo.gather. funcol.all_gather_tensor with
+gather_dim > 0 produces a chunk + cat chain that lowers to N slices and a
+concatenate on a different dim than the gather dim, forcing real data movement.
+This pass replaces both with view/permute/reshape (or slice for standalone shards).
 
-Three patterns are handled:
-  1. Shard-to-Replicate cat:   wait_tensor → flatten → index_select x N → cat(dim>0)
-  2. Replicate-to-Shard cat:   tensor → flatten → index_select x N → cat(dim=0)
-  3. Replicate-to-Shard clone: tensor → flatten → index_select → view → clone
+Four patterns are handled:
+  1. Shard-to-Replicate cat:        wait_tensor → flatten → index_select x N → cat(dim>0)
+  2. Replicate-to-Shard cat:        tensor → flatten → index_select x N → cat(dim=0)
+  3. Replicate-to-Shard clone:      tensor → flatten → index_select → view → clone
+  4. funcol all_gather slice+cat:   wait_tensor → slice x N (dim=0) → cat(dim=1)
 
 Shard-to-Replicate occurs after all_gather reassembles shards into the full replicated tensor.
 Replicate-to-Shard cat occurs before reduce_scatter chunks a replicated tensor for distribution.
 Replicate-to-Shard clone occurs when a single rank's shard is needed
 (i.e. not immediately passed to reduce_scatter).
+funcol all_gather slice+cat occurs in sequence-parallel transformer code that calls
+funcol.all_gather_tensor(x, gather_dim=1) — the chunk-and-cat reassembly is equivalent
+to a single reshape since N is the slowest-varying dim of the all_gather output.
 """
 
 import copy
@@ -22,12 +28,14 @@ import operator
 
 import torch
 from torch.fx import Graph, GraphModule, Node
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
+
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import NeuronFXPass
 
 logger = logging.getLogger(__name__)
 
 
-class DTensorRedistributeOptimization(PassBase):
+class DTensorRedistributeOptimization(NeuronFXPass):
     """Optimize DTensor redistribution patterns to eliminate stablehlo.gather ops."""
 
     def call(self, graph_module: GraphModule) -> PassResult:
@@ -67,6 +75,8 @@ def _optimize_cat_patterns(gm: GraphModule) -> bool:
         result = _try_shard_to_replicate_cat(node, cat_inputs, cat_dim, graph)
         if result is None:
             result = _try_replicate_to_shard_cat(node, cat_inputs, cat_dim, graph)
+        if result is None:
+            result = _try_funcol_all_gather_slice_cat(node, cat_inputs, cat_dim, graph)
         if result is None:
             continue
 
@@ -163,6 +173,83 @@ def _try_replicate_to_shard_cat(
         unsqueeze_leading=[src_shape[0], num_chunks],
         n_dim_idx=1,
     )
+    return replacement, source
+
+
+def _try_funcol_all_gather_slice_cat(
+    cat_node: Node, cat_inputs: list, cat_dim: int, graph: Graph
+) -> tuple[Node, Node] | None:
+    """Try to optimize funcol slice+cat: wait_tensor -> slice x N (dim=0) -> cat(cat_dim>0).
+
+    Pattern (from funcol.all_gather_tensor with gather_dim > 0):
+        all_gather_into_tensor → wait_tensor : [N, *rest]
+        slice(dim=0, 0:1), slice(dim=0, 1:2), ..., slice(dim=0, N-1:N)
+        cat([s_0, ..., s_{N-1}], dim=cat_dim)
+
+    Since the slice dim (0) is the slowest-varying dim of the all_gather output,
+    chunk-and-cat reassembly is layout-equivalent to a single reshape that merges
+    the leading N into the cat_dim. Replace the chain with one aten.view.
+
+    Returns:
+        (replacement_node, source_node) if the pattern matches, None otherwise.
+    """
+    if cat_dim == 0:
+        return None
+
+    num_chunks = len(cat_inputs)
+    sources = []
+    for i, inp in enumerate(cat_inputs):
+        if not _is_op(inp, torch.ops.aten.slice.Tensor):
+            return None
+        # slice.Tensor signature: (input, dim, start, end[, step])
+        if len(inp.args) < 4:
+            return None
+        slice_dim = inp.args[1]
+        slice_start = inp.args[2]
+        slice_end = inp.args[3]
+        slice_step = inp.args[4] if len(inp.args) > 4 else 1
+        if slice_dim != 0 or slice_step != 1:
+            return None
+        if slice_start != i or slice_end != i + 1:
+            return None
+        sources.append(inp.args[0])
+
+    if len({id(s) for s in sources}) != 1:
+        return None
+    source = sources[0]
+    if not isinstance(source, Node):
+        return None
+    if source.target != torch.ops._c10d_functional.wait_tensor.default:
+        return None
+    if not hasattr(source, "meta") or "tensor_meta" not in source.meta:
+        return None
+
+    src_shape = list(source.meta["tensor_meta"].shape)
+    if len(src_shape) < 2 or src_shape[0] != num_chunks:
+        return None
+    if cat_dim >= len(src_shape):
+        return None
+
+    # Each slice has shape [1, src_shape[1], ..., src_shape[-1]]. cat(dim=cat_dim) of
+    # num_chunks such tensors gives [1, ..., src_shape[cat_dim]*N, ..., src_shape[-1]].
+    # This is layout-equivalent to a reshape only when cat_dim == 1, because then the
+    # gathered N (slowest-varying dim 0 of the source) merges contiguously with
+    # src_shape[1] in the destination's cat_dim. For cat_dim > 1, an interior dim
+    # would have to absorb N, which requires an actual transpose.
+    if cat_dim != 1:
+        return None
+
+    output_shape = list(src_shape)
+    output_shape[0] = 1
+    output_shape[cat_dim] = src_shape[cat_dim] * num_chunks
+
+    if _product(output_shape) != _product(src_shape):
+        return None
+
+    with graph.inserting_before(cat_node):
+        replacement = graph.call_function(torch.ops.aten.view.default, args=(source, output_shape))
+        replacement.meta = _copy_meta(cat_node)
+
     return replacement, source
 
 

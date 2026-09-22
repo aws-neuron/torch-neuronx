@@ -190,6 +190,50 @@ void log_variadic(LogLevel level, LogCategory category, const char* file, int li
   TORCH_NEURONX_LOG(torch_neuronx::LogLevel::DEBUG, torch_neuronx::LogCategory::GENERAL, \
                     "[STREAM]", __VA_ARGS__)
 
+// Allocator-specific logging. Routes to the MEMORY category and prepends
+// "[SEGMENT_POOL]" so call sites can drop the boilerplate.
+#define TORCH_NEURONX_ALLOCATOR_LOG(level, ...) \
+  TORCH_NEURONX_LOG(level, torch_neuronx::LogCategory::MEMORY, "[SEGMENT_POOL] ", __VA_ARGS__)
+#define TORCH_NEURONX_ALLOCATOR_DEBUG(...) \
+  TORCH_NEURONX_ALLOCATOR_LOG(torch_neuronx::LogLevel::DEBUG, __VA_ARGS__)
+#define TORCH_NEURONX_ALLOCATOR_WARN(...) \
+  TORCH_NEURONX_ALLOCATOR_LOG(torch_neuronx::LogLevel::WARNING, __VA_ARGS__)
+
+// Dispatch-specific debug logging.
+// Enabled by TORCH_NEURONX_DISPATCH_DEBUG=1 (independent of TORCH_NEURONX_LOG_LEVEL).
+// When the global log level is already >= DEBUG, dispatch logs are emitted regardless.
+#define TORCH_NEURONX_DISPATCH_DEBUG(...)                                                  \
+  do {                                                                                     \
+    if (torch_neuronx::NeuronLogger::shouldLog(torch_neuronx::LogLevel::DEBUG) ||          \
+        torch_neuronx::dispatch_debug_enabled()) {                                         \
+      torch_neuronx::log_variadic(torch_neuronx::LogLevel::DEBUG,                          \
+                                  torch_neuronx::LogCategory::GENERAL, __FILE__, __LINE__, \
+                                  "[DISPATCH]", __VA_ARGS__);                              \
+    }                                                                                      \
+  } while (0)
+
+inline bool dispatch_debug_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("TORCH_NEURONX_DISPATCH_DEBUG");
+    return env != nullptr && std::string(env) == "1";
+  }();
+  return enabled;
+}
+
+// RDMA-specific logging (libfabric/EFA transport layer)
+#define TORCH_NEURONX_RDMA_ERROR(...)                                                              \
+  TORCH_NEURONX_LOG(torch_neuronx::LogLevel::ERROR, torch_neuronx::LogCategory::GENERAL, "[RDMA]", \
+                    __VA_ARGS__)
+#define TORCH_NEURONX_RDMA_WARN(...)                                                       \
+  TORCH_NEURONX_LOG(torch_neuronx::LogLevel::WARNING, torch_neuronx::LogCategory::GENERAL, \
+                    "[RDMA]", __VA_ARGS__)
+#define TORCH_NEURONX_RDMA_INFO(...)                                                              \
+  TORCH_NEURONX_LOG(torch_neuronx::LogLevel::INFO, torch_neuronx::LogCategory::GENERAL, "[RDMA]", \
+                    __VA_ARGS__)
+#define TORCH_NEURONX_RDMA_DEBUG(...)                                                              \
+  TORCH_NEURONX_LOG(torch_neuronx::LogLevel::DEBUG, torch_neuronx::LogCategory::GENERAL, "[RDMA]", \
+                    __VA_ARGS__)
+
 // Function tracing macros
 #define TORCH_NEURONX_TRACE_FUNCTION() TORCH_NEURONX_DEBUG("TRACE:", __FUNCTION__)
 

@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cstdlib>
 
+#include "NeuronLogging.h"
+
 namespace torch_neuronx {
 
 // OpTrackerBase implementation
@@ -44,6 +46,9 @@ bool shouldLogFallback(const std::string& op_name) {
 }
 
 void markFallbackLogged(const std::string& op_name) {
+  if (!FallbackOpTracker::getInstance().has_been_tracked(op_name)) {
+    TORCH_NEURONX_FALLBACK_WARN(op_name);
+  }
   FallbackOpTracker::getInstance().mark_as_tracked(op_name);
 }
 

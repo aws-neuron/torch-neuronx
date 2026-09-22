@@ -112,6 +112,12 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "CacheKeyGeneratorTest",
+    srcs = ["core/cache/CacheKeyGeneratorTest.cpp"],
+    deps = ["//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
     name = "ModelHandleCacheTest",
     srcs = ["core/runtime/ModelHandleCacheTest.cpp"],
     deps = ["//:runtime"],
@@ -161,9 +167,69 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "HostKernelExecutionTest",
+    srcs = ["core/HostKernelExecutionTest.cpp"],
+    deps = ["//:device", "//:torch_neuronx_core", "//:runtime", "//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
+    name = "HostWorkerPoolTest",
+    srcs = ["core/HostWorkerPoolTest.cpp"],
+    deps = ["//:device", "//:torch_neuronx_core", "//:runtime", "//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
+    name = "HostCCSchedulingTest",
+    srcs = ["core/HostCCSchedulingTest.cpp"],
+    deps = ["//:device", "//:torch_neuronx_core", "//:runtime", "//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
     name = "NeuronBindingsTest",
     srcs = ["core/NeuronBindingsTest.cpp"],
     deps = ["//:runtime"],
+)
+
+torch_neuronx_cc_test(
+    name = "NeuronDispatcherTest",
+    srcs = ["core/dispatch/NeuronDispatcherTest.cpp"],
+    deps = ["//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
+    name = "DispatchUtilsTest",
+    srcs = ["core/dispatch/DispatchUtilsTest.cpp"],
+    deps = ["//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
+    name = "DtypeUtilsTest",
+    srcs = ["core/dispatch/DtypeUtilsTest.cpp"],
+    deps = ["//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
+    name = "OutputProcessingTest",
+    srcs = ["core/dispatch/OutputProcessingTest.cpp"],
+    deps = ["//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
+    name = "PreprocessArgsTest",
+    srcs = ["core/dispatch/PreprocessArgsTest.cpp"],
+    deps = ["//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
+    name = "Int64PolicyTest",
+    srcs = ["core/dispatch/Int64PolicyTest.cpp"],
+    deps = ["//:neuron_bindings"],
+)
+
+torch_neuronx_cc_test(
+    name = "CpuFallbackTest",
+    srcs = ["core/dispatch/CpuFallbackTest.cpp"],
+    deps = ["//:neuron_bindings"],
 )
 
 torch_neuronx_cc_test(
@@ -203,8 +269,20 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "PlatformUtilsTest",
+    srcs = ["core/utils/PlatformUtilsTest.cpp"],
+    deps = ["//:compilation"],
+)
+
+torch_neuronx_cc_test(
     name = "ErrorRecoveryTest",
     srcs = ["core/utils/ErrorRecoveryTest.cpp"],
+    deps = ["//:runtime"],
+)
+
+torch_neuronx_cc_test(
+    name = "OpErrorHandlerTest",
+    srcs = ["core/utils/OpErrorHandlerTest.cpp"],
     deps = ["//:runtime"],
 )
 
@@ -293,6 +371,24 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "OpConcatUtilsViewInsertionTest",
+    srcs = ["core/concatenation/OpConcatUtilsViewInsertionTest.cpp"],
+    deps = [
+        "//:concatenation",
+        "//:opbuilder",
+    ],
+)
+
+torch_neuronx_cc_test(
+    name = "OpConcatUtilsSharedInputReshapeTest",
+    srcs = ["core/concatenation/OpConcatUtilsSharedInputReshapeTest.cpp"],
+    deps = [
+        "//:concatenation",
+        "//:opbuilder",
+    ],
+)
+
+torch_neuronx_cc_test(
     name = "OpConcatUtilsOptimizationTest",
     srcs = ["core/concatenation/OpConcatUtilsOptimizationTest.cpp"],
     deps = [
@@ -364,6 +460,33 @@ torch_neuronx_cc_test(
     ],
 )
 
+torch_neuronx_cc_test(
+    name = "ConcatPruneExplorationTest",
+    srcs = ["core/concatenation/ConcatPruneExplorationTest.cpp"],
+    deps = [
+        "//:concatenation",
+        "//:opbuilder",
+    ],
+)
+
+torch_neuronx_cc_test(
+    name = "ConcatPreservationTest",
+    srcs = ["core/concatenation/ConcatPreservationTest.cpp"],
+    deps = [
+        "//:concatenation",
+        "//:opbuilder",
+    ],
+)
+
+torch_neuronx_cc_test(
+    name = "ConcatPruneIntegrationTest",
+    srcs = ["core/concatenation/ConcatPruneIntegrationTest.cpp"],
+    deps = [
+        "//:concatenation",
+        "//:opbuilder",
+    ],
+)
+
 # Use raw cc_test to avoid automatic test_mocks dependency which pulls in
 # //:runtime and references maybe_lazy_init() - not needed for this simple unit test
 cc_test(
@@ -404,6 +527,25 @@ cc_test(
     copts = ["-I."],
     deps = [
         "//:profiler_test_lib",
+        "@torch//:headers",
+        "@torch//:libc10",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "ContinuousExporterTest",
+    srcs = [
+        "profiler/ContinuousExporterTest.cpp",
+        "mocks/MockNRT.cpp",
+        "mocks/MockNRT.h",
+    ],
+    size = "small",
+    timeout = "short",
+    copts = ["-I.", "-fvisibility=default"],
+    deps = [
+        "//:profiler_test_lib",
+        "@nrt//:nrt",
         "@torch//:headers",
         "@torch//:libc10",
         "@googletest//:gtest_main",
@@ -476,8 +618,22 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "OutputDeduplicationTest",
+    srcs = ["core/concatenation/OutputDeduplicationTest.cpp"],
+    deps = [
+        "//:concatenation",
+    ],
+)
+
+torch_neuronx_cc_test(
     name = "NeuronWorkTest",
     srcs = ["core/distributed/NeuronWorkTest.cpp"],
+    deps = ["//:distributed"],
+)
+
+torch_neuronx_cc_test(
+    name = "NeuronBackendTest",
+    srcs = ["core/distributed/NeuronBackendTest.cpp"],
     deps = ["//:distributed"],
 )
 
@@ -488,8 +644,30 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "DynamicCollectiveTilingTest",
+    srcs = ["core/distributed/DynamicCollectiveTilingTest.cpp"],
+    deps = ["//:distributed"],
+)
+
+torch_neuronx_cc_test(
+    name = "RdmaManagerTest",
+    srcs = ["core/rdma/RdmaManagerTest.cpp"],
+    copts = ["-Wno-deprecated-declarations"],
+    deps = [
+        "//:rdma",
+        "//:transfer_descriptor_cc_proto",
+    ],
+)
+
+torch_neuronx_cc_test(
     name = "ShelvesCleanupTest",
     srcs = ["core/allocator/ShelvesCleanupTest.cpp"],
+    deps = ["//:runtime"],
+)
+
+torch_neuronx_cc_test(
+    name = "NeuronSegmentAllocatorTest",
+    srcs = ["core/allocator/NeuronSegmentAllocatorTest.cpp"],
     deps = ["//:runtime"],
 )
 
@@ -521,6 +699,12 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "WloCompileResultTest",
+    srcs = ["core/compilation/WloCompileResultTest.cpp"],
+    deps = ["//:compilation"],
+)
+
+torch_neuronx_cc_test(
     name = "CompilationThreadPoolTest",
     srcs = ["core/compilation/CompilationThreadPoolTest.cpp"],
     deps = ["//:compilation"],
@@ -536,4 +720,10 @@ torch_neuronx_cc_test(
     name = "NeuronMemorySnapshotTest",
     srcs = ["core/metrics/NeuronMemorySnapshotTest.cpp"],
     deps = ["//:runtime"],
+)
+
+torch_neuronx_cc_test(
+    name = "PackedInt64UtilsTest",
+    srcs = ["core/utils/PackedInt64UtilsTest.cpp"],
+    deps = ["//:neuron_bindings"],
 )

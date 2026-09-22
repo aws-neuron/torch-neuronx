@@ -6,7 +6,7 @@ common --enable_workspace
 common --registry=https://raw.githubusercontent.com/bazelbuild/bazel-central-registry/main/
 
 # Python version - set via --@rules_python//python/config_settings:python_version=X.Y
-# Supported: 3.10, 3.11, 3.12, 3.13 (setup.py and tools/run-cpp-test pass this automatically)
+# Supported: 3.10, 3.11, 3.12, 3.13, 3.14 (setup.py and tools/run-cpp-test pass this automatically)
 
 # Make Bazel print out all options from rc files
 build --announce_rc
@@ -38,13 +38,14 @@ build --copt=-DNDEBUG
 build:posix --copt=-Wno-sign-compare
 build:posix --copt=-Wall
 build:posix --copt=-Wno-error=attributes
-build:posix --cxxopt=-std=c++17
-build:posix --host_cxxopt=-std=c++17
+build:posix --cxxopt=-std=c++20
+build:posix --host_cxxopt=-std=c++20
+build:generic_gcc --cxxopt=-std=c++20 --host_cxxopt=-std=c++20
 build:linux --config=posix
 
 ## Pytorch variables.
 # Pytorch version, when local is not available.
-build --action_env=PYTORCH_VERSION="2.10.0"
+build --action_env=PYTORCH_VERSION="2.14.0"
 
 # Default to use local Pytorch installation.
 # Set to "1" to download from source.
@@ -59,5 +60,10 @@ build --action_env=NRT_LOCAL_PATH=/opt/aws/neuron
 
 test --test_env=LD_LIBRARY_PATH
 
-# avoid hitting CPU related alarms
+# cap CPU usage to avoid hitting CPU-related alarms on shared EKS workload
 build --local_cpu_resources=HOST_CPUS*0.8
+
+# Disk cache — avoids recompiling LLVM/MLIR on every build.
+# First build is slow (~20 min); subsequent builds ~2-3 min.
+# Cache auto-invalidates when WORKSPACE or compiler flags change.
+build --disk_cache=~/.cache/bazel-torch-neuronx

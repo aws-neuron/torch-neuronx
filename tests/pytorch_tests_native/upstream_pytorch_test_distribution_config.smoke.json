@@ -1,0 +1,10 @@
+{
+  "description": "Smoke-test distribution config \u2014 minimal subset for verifying the test pipeline (matrix \u2192 run \u2192 upload \u2192 aggregate \u2192 summary) without paying for a full upstream run. Pick this via DIST_CONFIG=upstream_pytorch_test_distribution_config.smoke.json before running emit_upstream_matrix.py. The full config lives next to this file at upstream_pytorch_test_distribution_config.json.",
+  "nodes": [
+    {
+      "items": [
+        "dynamo"
+      ]
+    }
+  ]
+}

@@ -103,9 +103,9 @@ if [ ${#CLASS_NAMES[@]} -eq 0 ]; then
 fi
 
 # Calculate CLASS_TIMEOUT from total timeout if provided
-# Reserve 5 minutes (300s) for post-processing
+# Reserve 20 minutes (1200s) for post-processing
 if [ -n "$TOTAL_TIMEOUT" ]; then
-    POST_PROCESSING_BUFFER=300
+    POST_PROCESSING_BUFFER=1200
     AVAILABLE_TIME=$((TOTAL_TIMEOUT - POST_PROCESSING_BUFFER))
     NUM_CLASSES=${#CLASS_NAMES[@]}
     CLASS_TIMEOUT=$((AVAILABLE_TIME / NUM_CLASSES))
@@ -113,7 +113,7 @@ if [ -n "$TOTAL_TIMEOUT" ]; then
 fi
 
 # Setup
-mkdir -p "$OUTPUT_DIR"
+mkdir -p "$OUTPUT_DIR" "$OUTPUT_DIR/json_reports" "$OUTPUT_DIR/html_reports" "$OUTPUT_DIR/csv_reports"
 export TEST_RUN_TIMESTAMP=${TEST_RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 export ATEN_SPEC_FILE="$SPEC_FILE"
 cd "$BASE_PATH"
@@ -137,12 +137,14 @@ for CLASS_NAME in "${CLASS_NAMES[@]}"; do
     echo ""
     echo "=== Running class: $CLASS_NAME ==="
 
-    REPORT_FILE="$OUTPUT_DIR/test_results_${CLASS_NAME}.json"
+    REPORT_FILE="$OUTPUT_DIR/json_reports/test_results_${CLASS_NAME}.json"
+    HTML_FILE="$OUTPUT_DIR/html_reports/${CLASS_NAME}.html"
     LOG_FILE="$OUTPUT_DIR/${CLASS_NAME}.log"
 
-    # Add shard suffix to report file if sharding
+    # Add shard suffix if sharding
     if [[ -n "$SHARD_ID" && -n "$NUM_SHARDS" ]]; then
-        REPORT_FILE="$OUTPUT_DIR/test_results_${CLASS_NAME}_shard${SHARD_ID}.json"
+        REPORT_FILE="$OUTPUT_DIR/json_reports/test_results_${CLASS_NAME}_shard${SHARD_ID}.json"
+        HTML_FILE="$OUTPUT_DIR/html_reports/${CLASS_NAME}_shard${SHARD_ID}.html"
         LOG_FILE="$OUTPUT_DIR/${CLASS_NAME}_shard${SHARD_ID}.log"
     fi
 
@@ -157,20 +159,27 @@ for CLASS_NAME in "${CLASS_NAMES[@]}"; do
     fi
 
     # Run pytest with per-test timeout and class-level safety timeout
+    # --kill-after=300: give pytest 5 minutes to gracefully shutdown and write reports after SIGINT
     set +e
-    timeout --signal=SIGINT --kill-after=30 $CLASS_TIMEOUT pytest -n "$NUM_WORKERS" \
+    timeout --signal=SIGINT --kill-after=300 $CLASS_TIMEOUT pytest -n "$NUM_WORKERS" \
+        --isolate \
         $SHARD_ARGS \
+        -W "ignore:This process .* is multi-threaded, use of fork:DeprecationWarning" \
         --json-report \
         --json-report-file="$REPORT_FILE" \
+        --html="$HTML_FILE" --self-contained-html \
         --timeout=$TEST_TIMEOUT \
         --timeout-method=signal \
         --tb=short \
         --maxfail=0 \
         --continue-on-collection-errors \
         -v \
-        "$SCRIPT_DIR/test_aten.py" 2>&1 | tee "$LOG_FILE"
-    EXIT_CODE=${PIPESTATUS[0]}
+        "$SCRIPT_DIR/test_aten.py" > >(tee "$LOG_FILE") 2>&1
+    EXIT_CODE=$?
     set -e
+
+    pkill -9 -f "pytest.*test_aten.py" 2>/dev/null || true
+    sleep 2
 
     # Log warning if class timeout was hit (124=timeout, 130=SIGINT, 137=SIGKILL)
     if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 130 ] || [ $EXIT_CODE -eq 137 ]; then
@@ -196,5 +205,13 @@ if [ $FAILED_CLASSES -eq 0 ]; then
 else
     echo "Status: $FAILED_CLASSES/$TOTAL_CLASSES classes had failures"
 fi
+
+# Generate HUD benchmark NDJSON from JSON reports
+echo ""
+echo "=== Generating HUD benchmark results ==="
+PYTHONPATH="$BASE_PATH/tests:${PYTHONPATH:-}" python3 \
+    "$BASE_PATH/tests/utils/generate_hud.py" \
+    "Neuron ATen upstream tests" "$OUTPUT_DIR/json_reports/test_results_*.json" "$OUTPUT_DIR" \
+    || echo "WARNING: HUD generation failed (non-fatal)"
 
 exit 0

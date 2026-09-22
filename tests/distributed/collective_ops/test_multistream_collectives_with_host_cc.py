@@ -1,9 +1,4 @@
-"""
-Multi-Stream Collective Operations Tests for Host-CC Feature.
-
-Tests collective operations on non-default streams using NRT host collectives API.
-Environment variable: TORCH_NEURONX_ENABLE_HOST_CC=1 (enabled by tests)
-"""
+"""Multi-stream collective tests for HostCC."""
 
 import os
 
@@ -11,26 +6,16 @@ import pytest
 import torch
 import torch.distributed as dist
 
+import torch_neuronx
 from tests.utils.neuron_test_utils import assert_raises
 
 from .base_collective_op import BaseCollectiveOpTest
 
-# TODO - remove this line once host-cc feature is stable to run the tests
-pytestmark = pytest.mark.skip(reason="Host-CC feature is under development")
 
-
-# Module-level setup: enable host-cc for all tests in this file
 @pytest.fixture(scope="module", autouse=True)
-def enable_host_cc():
-    """Enable host-cc for all tests in this module."""
-    old_value = os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC")
+def require_host_cc():
+    os.environ["TORCH_NEURONX_ENABLE_STREAMS"] = "1"
     os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = "1"
-    yield
-    # Restore original value
-    if old_value is None:
-        os.environ.pop("TORCH_NEURONX_ENABLE_HOST_CC", None)
-    else:
-        os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = old_value
 
 
 _DEFAULT_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 2))
@@ -69,8 +54,10 @@ def run_baseline_default_stream(rank, world_size, kwargs):
 
 
 def run_allreduce(rank, world_size, kwargs):
+    default_stream = torch_neuronx.default_stream()
     stream = torch.neuron.Stream()
     tensor = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
+    stream.wait_stream(default_stream)
     with torch.neuron.stream(stream):
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     stream.synchronize()
@@ -79,12 +66,14 @@ def run_allreduce(rank, world_size, kwargs):
 
 
 def run_allgather(rank, world_size, kwargs):
+    default_stream = torch_neuronx.default_stream()
     stream = torch.neuron.Stream()
     local = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
     outputs = [
         torch.zeros(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron")
         for _ in range(world_size)
     ]
+    stream.wait_stream(default_stream)
     with torch.neuron.stream(stream):
         dist.all_gather(outputs, local)
     stream.synchronize()
@@ -94,12 +83,14 @@ def run_allgather(rank, world_size, kwargs):
 
 
 def run_reduce_scatter(rank, world_size, kwargs):
+    default_stream = torch_neuronx.default_stream()
     stream = torch.neuron.Stream()
     inputs = [
         torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (i + rank)
         for i in range(world_size)
     ]
     output = torch.zeros(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron")
+    stream.wait_stream(default_stream)
     with torch.neuron.stream(stream):
         dist.reduce_scatter(output, inputs, op=dist.ReduceOp.SUM)
     stream.synchronize()
@@ -110,10 +101,12 @@ def run_reduce_scatter(rank, world_size, kwargs):
 
 def run_all_gather_into_tensor_1d_and_2d(rank, world_size, kwargs):
     """Combined: all_gather_into_tensor with 1D and 2D tensors."""
+    default_stream = torch_neuronx.default_stream()
     stream = torch.neuron.Stream()
     # 1D test
     input_1d = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
     output_1d = torch.zeros(_SMALL_TENSOR_SIZE * world_size, dtype=torch.float32, device="neuron")
+    stream.wait_stream(default_stream)
     with torch.neuron.stream(stream):
         dist.all_gather_into_tensor(output_1d, input_1d)
     stream.synchronize()
@@ -125,6 +118,7 @@ def run_all_gather_into_tensor_1d_and_2d(rank, world_size, kwargs):
     rows, cols = 32, 64
     input_2d = torch.ones(rows, cols, dtype=torch.float32, device="neuron") * (rank + 1)
     output_2d = torch.zeros(rows * world_size, cols, dtype=torch.float32, device="neuron")
+    stream.wait_stream(default_stream)
     with torch.neuron.stream(stream):
         dist.all_gather_into_tensor(output_2d, input_2d)
     stream.synchronize()
@@ -136,6 +130,7 @@ def run_all_gather_into_tensor_1d_and_2d(rank, world_size, kwargs):
 
 def run_reduce_scatter_tensor_1d_and_2d(rank, world_size, kwargs):
     """Combined: reduce_scatter_tensor with 1D and 2D tensors."""
+    default_stream = torch_neuronx.default_stream()
     stream = torch.neuron.Stream()
     expected_val = sum(i + 1 for i in range(world_size))
     # 1D test
@@ -143,6 +138,7 @@ def run_reduce_scatter_tensor_1d_and_2d(rank, world_size, kwargs):
         rank + 1
     )
     output_1d = torch.zeros(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron")
+    stream.wait_stream(default_stream)
     with torch.neuron.stream(stream):
         dist.reduce_scatter_tensor(output_1d, input_1d, op=dist.ReduceOp.SUM)
     stream.synchronize()
@@ -154,6 +150,7 @@ def run_reduce_scatter_tensor_1d_and_2d(rank, world_size, kwargs):
         rank + 1
     )
     output_2d = torch.zeros(rows, cols, dtype=torch.float32, device="neuron")
+    stream.wait_stream(default_stream)
     with torch.neuron.stream(stream):
         dist.reduce_scatter_tensor(output_2d, input_2d, op=dist.ReduceOp.SUM)
     stream.synchronize()
@@ -168,10 +165,13 @@ def run_reduce_scatter_tensor_1d_and_2d(rank, world_size, kwargs):
 
 def run_two_streams_sequential_and_interleaved(rank, world_size, kwargs):
     """Combined: Sequential and interleaved collectives on two streams."""
+    default_stream = torch_neuronx.default_stream()
     s0, s1 = torch.neuron.Stream(), torch.neuron.Stream()
     # Sequential part
     t0 = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
     t1 = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 10)
+    s0.wait_stream(default_stream)
+    s1.wait_stream(default_stream)
     with torch.neuron.stream(s0):
         dist.all_reduce(t0, op=dist.ReduceOp.SUM)
     with torch.neuron.stream(s1):
@@ -192,7 +192,9 @@ def run_two_streams_sequential_and_interleaved(rank, world_size, kwargs):
     results = []
     for i in range(6):
         t = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + i)
-        with torch.neuron.stream(s0 if i % 2 == 0 else s1):
+        stream = s0 if i % 2 == 0 else s1
+        stream.wait_stream(default_stream)
+        with torch.neuron.stream(stream):
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
         results.append((t, i))
     s0.synchronize()
@@ -205,10 +207,12 @@ def run_two_streams_sequential_and_interleaved(rank, world_size, kwargs):
 
 
 def run_three_streams_parallel(rank, world_size, kwargs):
+    default_stream = torch_neuronx.default_stream()
     streams = [torch.neuron.Stream() for _ in range(3)]
     tensors = []
     for i, s in enumerate(streams):
         t = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + i * 10)
+        s.wait_stream(default_stream)
         with torch.neuron.stream(s):
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
         tensors.append((t, i))
@@ -222,14 +226,17 @@ def run_three_streams_parallel(rank, world_size, kwargs):
 
 
 def run_stream_sync_between_collectives(rank, world_size, kwargs):
+    default_stream = torch_neuronx.default_stream()
     stream = torch.neuron.Stream()
     t1 = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * rank
+    stream.wait_stream(default_stream)
     with torch.neuron.stream(stream):
         dist.all_reduce(t1, op=dist.ReduceOp.SUM)
     stream.synchronize()
     expected1 = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32) * sum(range(world_size))
     assert torch.allclose(t1.cpu(), expected1, rtol=1e-5)
     t2 = t1.clone()
+    stream.wait_stream(default_stream)
     with torch.neuron.stream(stream):
         dist.all_reduce(t2, op=dist.ReduceOp.SUM)
     stream.synchronize()
@@ -244,12 +251,14 @@ def run_stream_sync_between_collectives(rank, world_size, kwargs):
 def run_two_pgs_same_stream(rank, world_size, kwargs):
     if world_size < 4:
         pytest.skip("Requires world_size >= 4")
+    default_stream = torch_neuronx.default_stream()
     half = world_size // 2
     pg1 = dist.new_group(ranks=list(range(half)))
     pg2 = dist.new_group(ranks=list(range(half, world_size)))
     my_pg = pg1 if rank < half else pg2
     stream = torch.neuron.Stream()
     t = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
+    stream.wait_stream(default_stream)
     with torch.neuron.stream(stream):
         dist.all_reduce(t, op=dist.ReduceOp.SUM, group=my_pg)
     stream.synchronize()
@@ -262,12 +271,14 @@ def run_two_pgs_same_stream(rank, world_size, kwargs):
 def run_two_pgs_different_streams(rank, world_size, kwargs):
     if world_size < 4:
         pytest.skip("Requires world_size >= 4")
+    default_stream = torch_neuronx.default_stream()
     half = world_size // 2
     pg1 = dist.new_group(ranks=list(range(half)))
     pg2 = dist.new_group(ranks=list(range(half, world_size)))
     my_pg = pg1 if rank < half else pg2
     my_stream = torch.neuron.Stream()
     t = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
+    my_stream.wait_stream(default_stream)
     with torch.neuron.stream(my_stream):
         dist.all_reduce(t, op=dist.ReduceOp.SUM, group=my_pg)
     my_stream.synchronize()
@@ -283,9 +294,11 @@ def run_two_pgs_different_streams(rank, world_size, kwargs):
 
 
 def run_event_record_and_wait(rank, world_size, kwargs):
+    default_stream = torch_neuronx.default_stream()
     s_a, s_b = torch.neuron.Stream(), torch.neuron.Stream()
     event = torch.neuron.Event()
     t = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
+    s_a.wait_stream(default_stream)
     with torch.neuron.stream(s_a):
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
         event.record(s_a)
@@ -297,13 +310,12 @@ def run_event_record_and_wait(rank, world_size, kwargs):
 
 
 def run_cross_stream_sync_with_collective(rank, world_size, kwargs):
-    import torch_neuronx
-
     default_stream = torch_neuronx.default_stream()
     fsdp_stream = torch.neuron.Stream()
     event = torch.neuron.Event()
     shard = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
     gathered = [torch.zeros_like(shard) for _ in range(world_size)]
+    fsdp_stream.wait_stream(default_stream)
     with torch.neuron.stream(fsdp_stream):
         dist.all_gather(gathered, shard)
         event.record(fsdp_stream)
@@ -314,8 +326,6 @@ def run_cross_stream_sync_with_collective(rank, world_size, kwargs):
 
 
 def run_multiple_events_pipeline(rank, world_size, kwargs):
-    import torch_neuronx
-
     default_stream = torch_neuronx.default_stream()
     fsdp_stream = torch.neuron.Stream()
     e1, e2 = torch.neuron.Event(), torch.neuron.Event()
@@ -323,6 +333,7 @@ def run_multiple_events_pipeline(rank, world_size, kwargs):
     w2 = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 10)
     g1 = [torch.zeros_like(w1) for _ in range(world_size)]
     g2 = [torch.zeros_like(w2) for _ in range(world_size)]
+    fsdp_stream.wait_stream(default_stream)
     with torch.neuron.stream(fsdp_stream):
         dist.all_gather(g1, w1)
         e1.record(fsdp_stream)
@@ -340,9 +351,11 @@ def run_multiple_events_pipeline(rank, world_size, kwargs):
 
 
 def run_event_timing(rank, world_size, kwargs):
+    default_stream = torch_neuronx.default_stream()
     stream = torch.neuron.Stream()
     start, end = torch.neuron.Event(enable_timing=True), torch.neuron.Event(enable_timing=True)
     t = torch.ones(_MEDIUM_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
+    stream.wait_stream(default_stream)
     with torch.neuron.stream(stream):
         start.record(stream)
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -358,12 +371,15 @@ def run_event_timing(rank, world_size, kwargs):
 
 
 def run_compute_collective_overlap(rank, world_size, kwargs):
+    default_stream = torch_neuronx.default_stream()
     compute_stream = torch.neuron.Stream()
     collective_stream = torch.neuron.Stream()
     compute_in = torch.randn(_MEDIUM_TENSOR_SIZE, dtype=torch.float32, device="neuron")
     collective_t = torch.ones(_MEDIUM_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (
         rank + 1
     )
+    compute_stream.wait_stream(default_stream)
+    collective_stream.wait_stream(default_stream)
     with torch.neuron.stream(compute_stream):
         _ = compute_in * 2.0 + 1.0
     with torch.neuron.stream(collective_stream):
@@ -375,14 +391,13 @@ def run_compute_collective_overlap(rank, world_size, kwargs):
 
 
 def run_fsdp_allgather_compute_overlap(rank, world_size, kwargs):
-    import torch_neuronx
-
     default_stream = torch_neuronx.default_stream()
     fsdp_stream = torch.neuron.Stream()
     event = torch.neuron.Event()
     shard = torch.randn(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron")
     gathered = [torch.zeros_like(shard) for _ in range(world_size)]
     activation = torch.randn(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron")
+    fsdp_stream.wait_stream(default_stream)
     with torch.neuron.stream(fsdp_stream):
         dist.all_gather(gathered, shard)
         event.record(fsdp_stream)
@@ -397,8 +412,6 @@ def run_fsdp_allgather_compute_overlap(rank, world_size, kwargs):
 def run_tp_fsdp_overlap(rank, world_size, kwargs):
     if world_size < 4:
         pytest.skip("Requires world_size >= 4")
-    import torch_neuronx
-
     half = world_size // 2
     tp_ranks = list(range(half)) if rank < half else list(range(half, world_size))
     fsdp_ranks = [rank % half, rank % half + half]
@@ -411,6 +424,7 @@ def run_tp_fsdp_overlap(rank, world_size, kwargs):
     fsdp_t = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 10)
     fsdp_gathered = [torch.zeros_like(fsdp_t) for _ in range(2)]
     dist.all_gather(tp_gathered, tp_t, group=tp_group)
+    fsdp_stream.wait_stream(default_stream)
     with torch.neuron.stream(fsdp_stream):
         dist.all_gather(fsdp_gathered, fsdp_t, group=fsdp_group)
     default_stream.synchronize()
@@ -424,8 +438,6 @@ def run_tp_fsdp_overlap(rank, world_size, kwargs):
 
 
 def run_pipelined_layers(rank, world_size, kwargs):
-    import torch_neuronx
-
     default_stream = torch_neuronx.default_stream()
     fsdp_stream = torch.neuron.Stream()
     num_layers = 2
@@ -436,6 +448,7 @@ def run_pipelined_layers(rank, world_size, kwargs):
     ]
     gathered = [[torch.zeros_like(shards[i]) for _ in range(world_size)] for i in range(num_layers)]
     activation = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron")
+    fsdp_stream.wait_stream(default_stream)
     for i in range(num_layers):
         with torch.neuron.stream(fsdp_stream):
             dist.all_gather(gathered[i], shards[i])
@@ -456,12 +469,14 @@ def run_pipelined_layers(rank, world_size, kwargs):
 
 def run_many_streams_and_rapid_creation(rank, world_size, kwargs):
     """Combined: many_streams and rapid_stream_creation."""
+    default_stream = torch_neuronx.default_stream()
     # Many streams part
     num_streams = 8
     streams = [torch.neuron.Stream() for _ in range(num_streams)]
     tensors = []
     for i, s in enumerate(streams):
         t = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + i)
+        s.wait_stream(default_stream)
         with torch.neuron.stream(s):
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
         tensors.append((t, i))
@@ -476,6 +491,7 @@ def run_many_streams_and_rapid_creation(rank, world_size, kwargs):
     for _ in range(10):
         s = torch.neuron.Stream()
         t = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
+        s.wait_stream(default_stream)
         with torch.neuron.stream(s):
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
         s.synchronize()
@@ -486,8 +502,10 @@ def run_many_streams_and_rapid_creation(rank, world_size, kwargs):
 
 
 def run_large_tensor(rank, world_size, kwargs):
+    default_stream = torch_neuronx.default_stream()
     s = torch.neuron.Stream()
     t = torch.ones(_LARGE_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
+    s.wait_stream(default_stream)
     with torch.neuron.stream(s):
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
     s.synchronize()
@@ -496,6 +514,7 @@ def run_large_tensor(rank, world_size, kwargs):
 
 
 def run_mixed_collective_types(rank, world_size, kwargs):
+    default_stream = torch_neuronx.default_stream()
     s_ar, s_ag, s_rs = torch.neuron.Stream(), torch.neuron.Stream(), torch.neuron.Stream()
     ar_t = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
     ag_local = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
@@ -503,6 +522,9 @@ def run_mixed_collective_types(rank, world_size, kwargs):
     rs_in = torch.ones(_SMALL_TENSOR_SIZE * world_size, dtype=torch.float32, device="neuron")
     rs_chunks = list(rs_in.chunk(world_size))
     rs_out = torch.zeros(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron")
+    s_ar.wait_stream(default_stream)
+    s_ag.wait_stream(default_stream)
+    s_rs.wait_stream(default_stream)
     with torch.neuron.stream(s_ar):
         dist.all_reduce(ar_t, op=dist.ReduceOp.SUM)
     with torch.neuron.stream(s_ag):
@@ -532,9 +554,11 @@ def run_mixed_collective_types(rank, world_size, kwargs):
 
 
 def run_empty_tensor(rank, world_size, kwargs):
+    default_stream = torch_neuronx.default_stream()
     s = torch.neuron.Stream()
     t = torch.ones(0, dtype=torch.float32, device="neuron")
     try:
+        s.wait_stream(default_stream)
         with torch.neuron.stream(s):
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
         s.synchronize()
@@ -544,8 +568,10 @@ def run_empty_tensor(rank, world_size, kwargs):
 
 
 def run_single_element(rank, world_size, kwargs):
+    default_stream = torch_neuronx.default_stream()
     s = torch.neuron.Stream()
     t = torch.tensor([float(rank + 1)], dtype=torch.float32, device="neuron")
+    s.wait_stream(default_stream)
     with torch.neuron.stream(s):
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
     s.synchronize()
@@ -555,12 +581,14 @@ def run_single_element(rank, world_size, kwargs):
 
 def run_stream_behavior_combined(rank, world_size, kwargs):
     """Combined: stream_reuse, multiple_syncs, sync_without_ops."""
+    default_stream = torch_neuronx.default_stream()
     s = torch.neuron.Stream()
     expected = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32) * sum(range(1, world_size + 1))
     # sync_without_ops: sync before any ops
     s.synchronize()
     # First collective
     t1 = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
+    s.wait_stream(default_stream)
     with torch.neuron.stream(s):
         dist.all_reduce(t1, op=dist.ReduceOp.SUM)
     # multiple_syncs
@@ -570,6 +598,7 @@ def run_stream_behavior_combined(rank, world_size, kwargs):
     assert torch.allclose(t1.cpu(), expected, rtol=1e-5)
     # stream_reuse: reuse stream after sync
     t2 = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 10)
+    s.wait_stream(default_stream)
     with torch.neuron.stream(s):
         dist.all_reduce(t2, op=dist.ReduceOp.SUM)
     s.synchronize()
@@ -581,9 +610,11 @@ def run_stream_behavior_combined(rank, world_size, kwargs):
 
 def run_decomposed_ops_combined(rank, world_size, kwargs):
     """Combined: broadcast, reduce, scatter, gather (all decomposed)."""
+    default_stream = torch_neuronx.default_stream()
     s = torch.neuron.Stream()
     # Broadcast
     t_bcast = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
+    s.wait_stream(default_stream)
     with torch.neuron.stream(s):
         dist.broadcast(t_bcast, src=0)
     s.synchronize()
@@ -592,6 +623,7 @@ def run_decomposed_ops_combined(rank, world_size, kwargs):
     )
     # Reduce
     t_reduce = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
+    s.wait_stream(default_stream)
     with torch.neuron.stream(s):
         dist.reduce(t_reduce, dst=0, op=dist.ReduceOp.SUM)
     s.synchronize()
@@ -610,6 +642,7 @@ def run_decomposed_ops_combined(rank, world_size, kwargs):
         if rank == 0
         else None
     )
+    s.wait_stream(default_stream)
     with torch.neuron.stream(s):
         dist.scatter(out_scatter, scatter_list, src=0)
     s.synchronize()
@@ -628,6 +661,7 @@ def run_decomposed_ops_combined(rank, world_size, kwargs):
         if rank == 0
         else None
     )
+    s.wait_stream(default_stream)
     with torch.neuron.stream(s):
         dist.gather(inp_gather, gather_list, dst=0)
     s.synchronize()
@@ -645,6 +679,7 @@ def run_decomposed_ops_combined(rank, world_size, kwargs):
 
 def run_alltoall_ops_fail(rank, world_size, kwargs):
     """Combined: all_to_all and all_to_all_single both fail."""
+    default_stream = torch_neuronx.default_stream()
     s = torch.neuron.Stream()
     # all_to_all
     inputs = [
@@ -656,6 +691,7 @@ def run_alltoall_ops_fail(rank, world_size, kwargs):
         torch.zeros(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron")
         for _ in range(world_size)
     ]
+    s.wait_stream(default_stream)
     with torch.neuron.stream(s):
         dist.all_to_all(outputs, inputs)
 
@@ -668,8 +704,6 @@ def run_alltoall_ops_fail(rank, world_size, kwargs):
 def run_tp_fsdp_groups(rank, world_size, kwargs):
     if world_size != 16:
         pytest.skip("Requires 16 ranks")
-    import torch_neuronx
-
     tp_size = 4
     tp_group, fsdp_group = create_tp_fsdp_groups(rank, world_size, tp_size)
     default_stream = torch_neuronx.default_stream()
@@ -677,6 +711,7 @@ def run_tp_fsdp_groups(rank, world_size, kwargs):
     tp_t = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
     dist.all_reduce(tp_t, op=dist.ReduceOp.SUM, group=tp_group)
     fsdp_t = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
+    fsdp_stream.wait_stream(default_stream)
     with torch.neuron.stream(fsdp_stream):
         dist.all_reduce(fsdp_t, op=dist.ReduceOp.SUM, group=fsdp_group)
     default_stream.synchronize()
@@ -696,8 +731,6 @@ def run_tp_fsdp_groups(rank, world_size, kwargs):
 def run_full_pattern(rank, world_size, kwargs):
     if world_size != 16:
         pytest.skip("Requires 16 ranks")
-    import torch_neuronx
-
     tp_size, fsdp_size = 4, 4
     tp_group, fsdp_group = create_tp_fsdp_groups(rank, world_size, tp_size)
     default_stream = torch_neuronx.default_stream()
@@ -707,6 +740,7 @@ def run_full_pattern(rank, world_size, kwargs):
     gathered_weights = [torch.zeros_like(weight_shard) for _ in range(fsdp_size)]
     activation = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
     tp_gathered = [torch.zeros_like(activation) for _ in range(tp_size)]
+    fsdp_stream.wait_stream(default_stream)
     with torch.neuron.stream(fsdp_stream):
         dist.all_gather(gathered_weights, weight_shard, group=fsdp_group)
         event.record(fsdp_stream)
@@ -741,14 +775,13 @@ def run_full_pattern(rank, world_size, kwargs):
 def run_tp1_fsdp64(rank, world_size, kwargs):
     if world_size != 64:
         pytest.skip("Requires 64 ranks")
-    import torch_neuronx
-
-    fsdp_group = dist.new_group(ranks=list(range(world_size)))
     default_stream = torch_neuronx.default_stream()
+    fsdp_group = dist.new_group(ranks=list(range(world_size)))
     fsdp_stream = torch.neuron.Stream()
     event = torch.neuron.Event()
     shard = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
     gathered = [torch.zeros_like(shard) for _ in range(64)]
+    fsdp_stream.wait_stream(default_stream)
     with torch.neuron.stream(fsdp_stream):
         dist.all_gather(gathered, shard, group=fsdp_group)
         event.record(fsdp_stream)
@@ -763,8 +796,6 @@ def run_tp1_fsdp64(rank, world_size, kwargs):
 def run_tp4_fsdp16(rank, world_size, kwargs):
     if world_size != 64:
         pytest.skip("Requires 64 ranks")
-    import torch_neuronx
-
     tp_size, fsdp_size = 4, 16
     tp_group, fsdp_group = create_tp_fsdp_groups(rank, world_size, tp_size)
     default_stream = torch_neuronx.default_stream()
@@ -774,6 +805,7 @@ def run_tp4_fsdp16(rank, world_size, kwargs):
     gathered_weights = [torch.zeros_like(weight_shard) for _ in range(fsdp_size)]
     activation = torch.ones(_SMALL_TENSOR_SIZE, dtype=torch.float32, device="neuron") * (rank + 1)
     tp_gathered = [torch.zeros_like(activation) for _ in range(tp_size)]
+    fsdp_stream.wait_stream(default_stream)
     with torch.neuron.stream(fsdp_stream):
         dist.all_gather(gathered_weights, weight_shard, group=fsdp_group)
         event.record(fsdp_stream)
@@ -800,11 +832,13 @@ def run_tp4_fsdp16(rank, world_size, kwargs):
 
 def run_coalesced_all_reduce(rank, world_size, kwargs):
     """all_reduce_coalesced on non-default stream."""
+    default_stream = torch_neuronx.default_stream()
     s = torch.neuron.Stream()
     ar_tensors = [
         torch.ones(64, dtype=torch.float32, device="neuron") * (rank + 1),
         torch.ones(128, dtype=torch.float32, device="neuron") * (rank + 2),
     ]
+    s.wait_stream(default_stream)
     with torch.neuron.stream(s):
         dist.all_reduce_coalesced(ar_tensors, op=dist.ReduceOp.SUM)
     s.synchronize()
@@ -816,6 +850,7 @@ def run_coalesced_all_reduce(rank, world_size, kwargs):
 
 def run_coalesced_all_gather(rank, world_size, kwargs):
     """all_gather_coalesced on non-default stream."""
+    default_stream = torch_neuronx.default_stream()
     s = torch.neuron.Stream()
     ag_inputs = [
         torch.ones(64, dtype=torch.float32, device="neuron") * (rank + 1),
@@ -825,6 +860,7 @@ def run_coalesced_all_gather(rank, world_size, kwargs):
         [torch.zeros(64, dtype=torch.float32, device="neuron") for _ in range(world_size)],
         [torch.zeros(128, dtype=torch.float32, device="neuron") for _ in range(world_size)],
     ]
+    s.wait_stream(default_stream)
     with torch.neuron.stream(s):
         dist.all_gather_coalesced(ag_outputs, ag_inputs)
     s.synchronize()
@@ -839,6 +875,7 @@ def run_coalesced_all_gather(rank, world_size, kwargs):
 
 def run_coalesced_tensor_variants(rank, world_size, kwargs):
     """Combined: all_gather_into_tensor_coalesced and reduce_scatter_tensor_coalesced."""
+    default_stream = torch_neuronx.default_stream()
     _c10d_functional = torch.ops._c10d_functional
     s = torch.neuron.Stream()
     default_group = dist.group.WORLD
@@ -847,6 +884,7 @@ def run_coalesced_tensor_variants(rank, world_size, kwargs):
         torch.ones(64, dtype=torch.float32, device="neuron") * (rank + 1),
         torch.ones(128, dtype=torch.float32, device="neuron") * (rank + 10),
     ]
+    s.wait_stream(default_stream)
     with torch.neuron.stream(s):
         ag_outputs = _c10d_functional.all_gather_into_tensor_coalesced(
             ag_inputs, world_size, default_group.group_name
@@ -870,6 +908,7 @@ def run_coalesced_tensor_variants(rank, world_size, kwargs):
         torch.ones(64 * world_size, dtype=torch.float32, device="neuron") * (rank + 1),
         torch.ones(128 * world_size, dtype=torch.float32, device="neuron") * (rank + 10),
     ]
+    s.wait_stream(default_stream)
     with torch.neuron.stream(s):
         rs_outputs = _c10d_functional.reduce_scatter_tensor_coalesced(
             rs_inputs, "sum", world_size, default_group.group_name

@@ -15,6 +15,16 @@ def pytest_configure(config):
         "markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')"
     )
     config.addinivalue_line("markers", "multi_device: marks tests as distributed tests")
+    config.addinivalue_line(
+        "markers",
+        "needs_process_isolation(reason): test cannot share a process with other tests. "
+        "run-test-parallel --no-forked deselects these from the shared run and re-runs "
+        "them in a second, --forked invocation. See docs/testing.md.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "nrt_stream_config(host_cc_enabled): seed the stream flags before Neuron initialization.",
+    )
 
     global SANITY_PT_DISTRIBUTED_TESTS
     # Read the option from the distributed configuration object
@@ -333,13 +343,54 @@ if hasattr(pytest, "hookimpl"):
         pass
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
     """Set environment variables from worker input before each test."""
+    stream_config = item.get_closest_marker("nrt_stream_config")
+    if stream_config is not None:
+        host_cc_enabled = stream_config.kwargs["host_cc_enabled"]
+        test_func = getattr(item.obj, "__func__", item.obj)
+        item._nrt_stream_config_test_func = test_func
+        item._original_nrt_stream_config = {
+            "TORCH_NEURONX_ENABLE_STREAMS": os.environ.get("TORCH_NEURONX_ENABLE_STREAMS"),
+            "TORCH_NEURONX_ENABLE_HOST_CC": os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC"),
+            "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE": os.environ.get(
+                "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE"
+            ),
+            "NEURON_RT_EXEC_TIMEOUT": os.environ.get("NEURON_RT_EXEC_TIMEOUT"),
+        }
+        os.environ["TORCH_NEURONX_ENABLE_STREAMS"] = "1"
+        os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = "1" if host_cc_enabled else "0"
+        if host_cc_enabled:
+            # Package initialization applies these when HostCC is on, but it already
+            # ran with the launch flags, so seed what a HostCC process would have.
+            os.environ["NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE"] = "true"
+            os.environ.setdefault("NEURON_RT_EXEC_TIMEOUT", "300")
+        else:
+            # A true value with HostCC off is rejected at import.
+            os.environ.pop("NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE", None)
+        test_func._nrt_stream_config_seeded = True
+
     # Check if we have worker input (running under xdist)
     if hasattr(item.config, "workerinput"):
         worker_input = item.config.workerinput
         if "TOTAL_DEVICE_COUNT" in worker_input:
             os.environ["TOTAL_DEVICE_COUNT"] = worker_input["TOTAL_DEVICE_COUNT"]
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    """Restore process-level stream flags changed before fixture initialization."""
+    original = getattr(item, "_original_nrt_stream_config", None)
+    if original is None:
+        return
+
+    item._nrt_stream_config_test_func._nrt_stream_config_seeded = False
+    for name, value in original.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 @pytest.fixture(scope="class")

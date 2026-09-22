@@ -15,6 +15,13 @@ import torch
 from neuronxcc.starfish.support import dtype as _ndt
 from packaging.version import Version
 
+from torch_neuronx.packed_storage import (
+    packed_int64_execution_view,
+    packed_int64_high_word_alias,
+    packed_logical_view,
+    packed_physical_view,
+)
+
 
 def deterministic_hash(obj) -> str:
     """Generate a deterministic hash string from an object.
@@ -24,42 +31,70 @@ def deterministic_hash(obj) -> str:
     return hashlib.sha256(repr(obj).encode()).hexdigest()[:16]
 
 
+_LOWERING_SOURCE_SUFFIXES = frozenset({".py", ".cpp", ".h", ".hpp", ".cc", ".td", ".mlir"})
+
+
+def _hash_source_tree(hasher, directory: Path, base: Path) -> None:
+    """Fold every lowering source file under directory into hasher.
+
+    A missing directory contributes nothing. An installed wheel ships no csrc/ and no
+    vendored torch-mlir sources, so those trees are absent there and cost no time.
+    """
+    if not directory.exists():
+        return
+    for path in sorted(directory.rglob("*")):
+        if path.suffix not in _LOWERING_SOURCE_SUFFIXES or not path.is_file():
+            continue
+        hasher.update(str(path.relative_to(base)).encode())
+        hasher.update(path.read_bytes())
+
+
 @functools.lru_cache(maxsize=1)
 def global_version_hash() -> str:
     """Version hash combining source code + package versions.
 
-    Hashes all .py files in torch_neuronx lowering directories plus
-    package versions into a single SHA-256 digest. Used to invalidate
-    persistent caches when code or package versions change.
-
+    Hashes every lowering source file plus the package versions into one SHA-256 digest.
+    This salts the in-memory cache key and the persistent HLO cache key, so a lowering
+    change cannot give a stale HLO hit. The persistent NEFF key does not use it: that key
+    is content-addressed on the lowered IR (see CompilationCacheKey).
     """
     import torch_neuronx
 
     hasher = hashlib.sha256()
 
-    # Hash source files
     root = Path(torch_neuronx.__file__).parent
-    for d in [root / "python_ops", root / "neuron_dynamo_backend"]:
-        if d.exists():
-            for py_file in sorted(d.rglob("*.py")):
-                hasher.update(str(py_file.relative_to(root)).encode())
-                hasher.update(py_file.read_bytes())
+    for path in sorted(root.glob("*.py")):
+        hasher.update(path.name.encode())
+        hasher.update(path.read_bytes())
+    for d in [
+        root / "python_ops",
+        root / "neuron_dynamo_backend",
+        root / "distributed",
+        root / "kernels",
+        root / "csrc",
+    ]:
+        _hash_source_tree(hasher, d, root)
+
+    # torch-mlir is vendored, so its version string never moves. Hash the sources instead.
+    _hash_source_tree(hasher, root.parent / "third_party" / "torch-mlir", root.parent)
 
     # Hash package versions
     hasher.update(torch.__version__.encode())
     hasher.update(getattr(torch_neuronx, "__version__", "unknown").encode())
-    try:
-        import torch_mlir
-
-        hasher.update(getattr(torch_mlir, "__version__", "unknown").encode())
-    except Exception:
-        pass
     try:
         import neuronxcc
 
         hasher.update(neuronxcc.__version__.encode())
     except Exception:
         pass
+    try:
+        import nki
+
+        hasher.update(getattr(nki, "__version__", "unknown").encode())
+    except Exception:
+        pass
+
+    hasher.update(os.environ.get("TORCH_NEURONX_INT64_MODE", "native").encode())
 
     return hasher.hexdigest()
 
@@ -150,13 +185,18 @@ def use_mlir_aten_ops():
     return os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS", "0") == "1"
 
 
-def is_stablehlo_enabled() -> bool:
-    """Check if StableHLO lowering is enabled via environment variable.
+def use_dynamic_nki_kernels():
+    """Check if dynamic-shape NKI kernels are preferred over MLIR lowerings.
+
+    When True, ops registered in
+    ``torch_neuronx/python_ops/torch_mlir/ops/dynamic_kernels`` are used in
+    place of their default MLIR/PyTorch lowering when the input shape meets
+    the kernel's compile-time constraints.
 
     Returns:
-        True by default. False if TORCH_NEURONX_ENABLE_STABLEHLO is set to "0" or "false".
+        bool: True if TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS is set to "1"
     """
-    return os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") not in ("0", "false")
+    return os.environ.get("TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS", "0") == "1"
 
 
 def is_sync_mode_enabled():
@@ -172,13 +212,20 @@ def is_sync_mode_enabled():
 def is_host_cc_enabled():
     """Check if host-side collective communication is enabled.
 
-    Host-cc enables collective operations on non-default streams using NRT host collectives API.
+    Host-cc enables collective operations on non-default streams using the NRT
+    host collectives API.
     Result is cached after first call since the env var is set once at process start.
 
     Returns:
-        bool: True if TORCH_NEURONX_ENABLE_HOST_CC is "1"
+        bool: True when TORCH_NEURONX_ENABLE_HOST_CC is ``1``.
     """
-    return os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC", "0") == "1"
+    return os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] == "1"
+
+
+@functools.lru_cache(maxsize=1)
+def is_streams_enabled():
+    """Check whether distinct Neuron streams are enabled."""
+    return os.environ["TORCH_NEURONX_ENABLE_STREAMS"] == "1"
 
 
 def get_gmm_align() -> int:
@@ -200,16 +247,20 @@ def skip_op_preconditions() -> bool:
 
 
 def is_native_int64_enabled() -> bool:
-    """Check if native int64 passthrough to compiler is enabled.
+    """Check if int64 tensors flow through to the compiler as S64.
 
-    When enabled, int64 tensors pass through to the compiler natively
-    via S64 HLO instead of being casted to int32. Disable with
-    TORCH_NEURONX_NATIVE_INT64=0 to fall back to int32 conversion.
+    Back-compat shim for "int64 reaches the compiler as S64".
+
+    True when ``TORCH_NEURONX_INT64_MODE`` is ``native`` or ``native_strict``.
+    False for ``packed`` and ``cpu_bounce``. Equivalent to
+    ``torch_neuronx.int64_policy.is_s64_passthrough()``.
 
     Returns:
-        bool: False by default (TORCH_NEURONX_NATIVE_INT64 is "0")
+        bool: True when the compiler sees int64 directly.
     """
-    return os.environ.get("TORCH_NEURONX_NATIVE_INT64", "0") == "1"
+    from torch_neuronx.int64_policy import is_s64_passthrough
+
+    return is_s64_passthrough()
 
 
 def get_logical_neuron_cores():
@@ -392,10 +443,17 @@ def cast_dtype_if_needed(tensor: torch.Tensor, target_dtype: torch.dtype | None)
 
 
 def is_float8_e4m3_supported():
-    return get_platform_target() == "trn2"
+    # NKI casts torch.float8_e4m3fn to nl.float8_e4m3 at the input boundary when
+    # UNSAFE_FP8FNCAST is set; allow the same cast on the output boundary so a
+    # kernel returning nl.float8_e4m3 maps back to torch.float8_e4m3fn.
+    return os.environ.get("UNSAFE_FP8FNCAST", "").lower() in ("1", "true", "yes", "on")
 
 
 def is_float8_e4m3fn_supported():
+    return get_platform_target() != "trn2"
+
+
+def is_float8_e8m0fnu_supported():
     return get_platform_target() != "trn2"
 
 
@@ -492,18 +550,22 @@ def map_external_dtype_to_torch(nki_or_numpy_dtype: _t.Any) -> torch.dtype:
     # NeuronXCC starfish dtype: explicitly handle bf16 and float8 which lack a NumPy dtype
     if _ndt is not None:
         target = get_platform_target()
-        if nki_or_numpy_dtype is getattr(_ndt, "bfloat16", object()):
+        if nki_or_numpy_dtype == getattr(_ndt, "bfloat16", object()):
             return torch.bfloat16
-        if nki_or_numpy_dtype is getattr(_ndt, "float8_e5m2", object()):
+        if nki_or_numpy_dtype == getattr(_ndt, "float8_e5m2", object()):
             return torch.float8_e5m2
-        if nki_or_numpy_dtype is getattr(_ndt, "float8_e4m3", object()):
+        if nki_or_numpy_dtype == getattr(_ndt, "float8_e4m3", object()):
             if is_float8_e4m3_supported():
                 return torch.float8_e4m3fn
             raise RuntimeError(f"Unexpected dtype {nki_or_numpy_dtype} for platform {target}")
-        if nki_or_numpy_dtype is getattr(_ndt, "float8_e4m3fn", object()):
+        if nki_or_numpy_dtype == getattr(_ndt, "float8_e4m3fn", object()):
             if not is_float8_e4m3fn_supported():
                 raise RuntimeError(f"Unsupported dtype {nki_or_numpy_dtype} for platform {target}")
             return torch.float8_e4m3fn
+        if nki_or_numpy_dtype == getattr(_ndt, "float8_e8m0fnu", object()):
+            if not is_float8_e8m0fnu_supported():
+                raise RuntimeError(f"Unsupported dtype {nki_or_numpy_dtype} for platform {target}")
+            return torch.float8_e8m0fnu
 
     # NumPy direct matches
     if np is not None:
@@ -602,6 +664,47 @@ def convert_for_neuron(
     """
     # Determine if conversion is needed
     if tensor.dtype == torch.int64 and convert_int64:
+        # Packed mode: extract low words on-device (no CPU bounce)
+        from torch_neuronx.int64_policy import is_packed_int64_mode
+
+        if is_packed_int64_mode() and tensor.device.type == "neuron":
+            # Leave it *logical int64*. kernel.py reinterprets to the int32[..., 2]
+            # physical view at the graph boundary, gathers the low words in-graph,
+            # and binds the physical view at execution — so packed int64 is handled
+            # in one place and dispatch args keep their logical shape (avoids the
+            # shape-leak that broke shape-reading ops like nonzero / cross_entropy).
+            if os.environ.get("TORCH_NEURONX_PACKED_INT64_CHECK_OVERFLOW", "0") == "1":
+                low = packed_int64_execution_view(tensor, contiguous=True)
+                high_alias = packed_int64_high_word_alias(tensor)
+                high = torch.empty_like(low)
+                if tensor.is_contiguous():
+                    torch.ops.neuron.nki_strided_copy_(high_alias, high)
+                else:
+                    high.copy_(high_alias)
+                expected_high = low >> 31
+                if not torch.eq(high, expected_high).all().item():
+                    raise OverflowError(
+                        "int64 tensor contains values outside int32 range "
+                        "[-2147483648, 2147483647]. Packed int64 mode only "
+                        "supports values representable in 32 bits. Set "
+                        "TORCH_NEURONX_INT64_MODE=cpu_bounce for full range."
+                    )
+
+            if not tensor.is_contiguous():
+                # Mirror the C++ NeuronSafeCast fix for non-contiguous packed
+                # int64. The graph boundary binds the int32[..., 2] physical
+                # view; a non-contiguous int64 otherwise binds only the low-word
+                # half (e.g. NRT "input0 too small: 100 vs 200"). Contiguify the
+                # int32 *physical view* (not the int64 tensor — that redispatches
+                # through convert_for_neuron and recurses; on int32 it doesn't).
+                # The [low, high] pairs are value-preserving, so logical_view of
+                # the contiguous result equals tensor.contiguous().
+                phys_contig = packed_physical_view(tensor).contiguous()
+                return packed_logical_view(
+                    phys_contig, tensor.dtype, tuple(int(d) for d in tensor.shape)
+                )
+
+            return tensor
         target_dtype = torch.int32
     elif tensor.dtype == torch.float64:
         target_dtype = torch.float32
