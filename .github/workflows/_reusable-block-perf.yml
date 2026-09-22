@@ -1,4 +1,4 @@
-name: Block Perf Tests (reusable)
+name: Block Perf Tests
 
 # =============================================================================
 # Reusable workflow for block performance + collective performance tests.
@@ -6,8 +6,6 @@ name: Block Perf Tests (reusable)
 # Invoked by:
 #   - pull.yml            (PR checks, TRN2, enforce=true, multiplier=1.0)
 #   - dependency-guard.yml (dependency validation, TRN2 + TRN3PDS B1)
-#   - nightly.yml          (wheel validation, TRN2 + TRN3PDS B1)
-#   - nightly-cp313.yml    (wheel validation, TRN2)
 #
 # Tests are grouped by model and run sequentially on a single node per
 # group via run_group.py. This reduces each platform's node usage from 8 to 3.
