@@ -9,7 +9,48 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from torch_neuronx.kernels.cache_utils import CompilationJob, compilation_job
+import pytest
+
+from torch_neuronx.kernels.cache_utils import (
+    CompilationJob,
+    compilation_job,
+    is_caching_disabled,
+    is_preserve_artifacts_enabled,
+)
+
+
+class TestBooleanEnvironmentVariables:
+    """Test the shared environment flag parser."""
+
+    @pytest.mark.parametrize(
+        "function,name",
+        [
+            (is_caching_disabled, "TORCH_NEURONX_NEFF_DISABLE_CACHE"),
+            (
+                is_preserve_artifacts_enabled,
+                "TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "YES"])
+    def test_true_values(self, monkeypatch, function, name, value):
+        monkeypatch.setenv(name, value)
+        assert function() is True
+
+    @pytest.mark.parametrize(
+        "function,name",
+        [
+            (is_caching_disabled, "TORCH_NEURONX_NEFF_DISABLE_CACHE"),
+            (
+                is_preserve_artifacts_enabled,
+                "TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("value", ["", "0", "false", "no", "on"])
+    def test_false_values(self, monkeypatch, function, name, value):
+        monkeypatch.setenv(name, value)
+        assert function() is False
 
 
 class TestCleanupCompilationArtifacts:

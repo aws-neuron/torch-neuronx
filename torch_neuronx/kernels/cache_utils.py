@@ -12,6 +12,13 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes"})
+
+
+def _is_env_enabled(name: str) -> bool:
+    """Return true when an environment variable contains a supported true value."""
+    return os.getenv(name, "").lower() in _TRUE_ENV_VALUES
+
 
 def get_artifacts_directory() -> Path:
     """Get the artifacts directory from environment variable or default.
@@ -35,7 +42,7 @@ def get_local_cache_dir() -> str:
 
 def is_caching_disabled() -> bool:
     """Check if caching is disabled via environment variable."""
-    return os.getenv("TORCH_NEURONX_NEFF_DISABLE_CACHE", "").lower() in ("true", "1", "yes")
+    return _is_env_enabled("TORCH_NEURONX_NEFF_DISABLE_CACHE")
 
 
 def get_lock_timeout() -> int:
@@ -45,11 +52,7 @@ def get_lock_timeout() -> int:
 
 def is_preserve_artifacts_enabled() -> bool:
     """Get whether artifact preservation enabled"""
-    return os.getenv("TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS", "").lower() in (
-        "true",
-        "1",
-        "yes",
-    )
+    return _is_env_enabled("TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS")
 
 
 def atomic_write_bytes(file_path: Path, data: bytes) -> None:
