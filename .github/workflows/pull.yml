@@ -1,20 +1,16 @@
 name: PR Checks
 
-# pr-test-dispatcher.yml starts this workflow. You can also start it manually
-# with workflow_dispatch. The self-hosted runner builds a Docker image. The jobs
-# run in that container.
+# Runs the internal test suites on a pull request.
+#
+# pr-test-dispatcher.yml starts this workflow. You can also start it manually.
+#
+# This workflow defines no test suites. _reusable-internal-tests.yml holds the
+# single suite matrix, and each suite declares the sets it belongs to. Add a new
+# suite there, not here.
 #
 # The commit status context stays "Smoke Test". pr-gate.yml posts the pending
-# status under the same name, and branch protection refers to it. Rename both
-# files together, or the pending status never clears. One aggregate status is
-# posted for the whole run, not one per lane, so the contract holds while the
-# matrix grows.
-#
-# Lanes mirror the trn2-checks matrix in private-torch-neuronx. The trigger
-# model differs on purpose: private runs on pull_request and gates on an
-# approving review, while this repo is dispatch-only and pr-test-dispatcher.yml
-# decides when to fire. Launch-plan row 8 (maintainer approval + label) will
-# replace that gate; don't graft private's check-approval job on before it lands.
+# status under the same name. Branch protection refers to it. Rename both files
+# together, or the pending status does not clear.
 
 on:
   workflow_dispatch:
@@ -27,19 +23,26 @@ on:
         description: 'HEAD SHA of the PR branch'
         required: true
         type: string
-      test_scope:
-        description: 'smoke runs one device test file on the ATen lane. full runs every lane.'
+      test_set:
+        description: 'Which suite set to run. See _reusable-internal-tests.yml.'
         required: false
-        default: smoke
+        default: pr
         type: choice
         options:
-          - smoke
+          - pr
+          - ci
           - full
       image_uri:
-        description: 'Optional pre-built ECR image. Empty builds the image from NeuronGithubCIConfig.'
+        description: 'Pre-built ECR image. Empty builds the image from NeuronGithubCIConfig.'
         required: false
         default: ''
         type: string
+  # A required check must also report on the merge-group commit. If it does not,
+  # the queue hangs. The suites ran for real on the PR head, so they pass here
+  # as a no-op.
+  merge_group:
+    types: [checks_requested]
+    branches: [main]
 
 permissions:
   contents: read
@@ -47,7 +50,7 @@ permissions:
   statuses: write
 
 concurrency:
-  group: ${{ github.workflow }}-pr-${{ github.event.inputs.pr_number }}
+  group: ${{ github.workflow }}-pr-${{ github.event.inputs.pr_number || github.sha }}
   cancel-in-progress: true
 
 env:
@@ -56,12 +59,13 @@ env:
 jobs:
   set-pending:
     name: Report pending
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/github-script@v7
         env:
           HEAD_SHA: ${{ github.event.inputs.head_sha }}
-          TEST_SCOPE: ${{ github.event.inputs.test_scope }}
+          TEST_SET: ${{ github.event.inputs.test_set }}
         with:
           script: |
             await github.rest.repos.createCommitStatus({
@@ -70,169 +74,56 @@ jobs:
               sha: process.env.HEAD_SHA,
               state: 'pending',
               context: 'Smoke Test',
-              description: `Running PR checks (${process.env.TEST_SCOPE} scope)...`,
+              description: `Running PR checks (${process.env.TEST_SET} set)...`,
               target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });
 
-  # The matrix is emitted rather than written inline so `test_scope` can select
-  # lanes. A static matrix cannot be filtered by an input, and this mirrors the
-  # emitter pattern already used by _upstream-tests.yml.
-  compute-matrix:
-    name: Compute lane matrix
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.emit.outputs.matrix }}
-    steps:
-      - id: emit
-        env:
-          TEST_SCOPE: ${{ github.event.inputs.test_scope }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          # soft_fail lanes run and upload results but do not fail the run.
-          # Three lanes are soft on this repo today, each for a known reason:
-          #   dynamic-nki   - the dynamic NKI kernels have not mirrored to public
-          #                   (private #1541), so public runs older kernel code.
-          #   accuracy-op   - needs the qwen3_235b_ep64_tp4 traced model, which
-          #                   comes from team S3 (launch-plan row 13, open).
-          #   block-perf    - MFU goldens have no baseline captured on this fleet.
-          # Flip these to soft_fail:false once each cause is cleared; that is the
-          # only edit needed to make them gate.
-          if [ "${TEST_SCOPE}" = "full" ]; then
-            cat > /tmp/matrix.json <<'JSON'
-          {"include":[
-            {"id":"aten-unit-tests","name":"ATen Unit Tests (trn2)","soft_fail":false,
-             "test-command":"./tools/run-test-parallel --no-forked --persistent-cache --skip-distributed --skip_pt_test_distributed --json-report --report-dir=outputs/test-reports",
-             "artifact-name":"aten-test-results",
-             "summary-path":"test-results/outputs/test-reports/step_summary.md"},
-
-            {"id":"dist-unit-tests","name":"Distributed Unit Tests-Async (trn2)","soft_fail":false,
-             "test-command":"./tools/run-test-parallel tests/distributed --num_workers=8 --json-report --report-dir=outputs/test-reports --ignore=tests/distributed/collective_ops/test_multistream_collectives_with_host_cc.py",
-             "artifact-name":"dist-test-results",
-             "summary-path":"test-results/outputs/test-reports/step_summary.md"},
-
-            {"id":"cpp-unit-tests","name":"C++ Unit Tests (trn2)","soft_fail":false,
-             "test-command":"./tools/run-cpp-test --verbose",
-             "artifact-name":"cpp-test-results","summary-path":""},
-
-            {"id":"concat-unit-tests","name":"Concatenation Unit Tests (trn2)","soft_fail":false,
-             "test-command":"TORCH_NEURONX_ENABLE_CONCATENATION=1 ./tools/run-test-parallel tests/python_ops/test_concatenation_ops.py --num_workers=1 --json-report --report-dir=outputs/test-reports",
-             "artifact-name":"concat-test-results",
-             "summary-path":"test-results/outputs/test-reports/step_summary.md"},
-
-            {"id":"dynamic-nki-unit-tests","name":"Dynamic NKI Kernel Tests (trn2)","soft_fail":true,
-             "test-command":"TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS=1 TORCH_NEURONX_INT64_MODE=packed NEURON_CC_FLAGS=--disable-internal-gather-scatter-bound-check ./tools/run-test-parallel tests/python_ops/test_dynamic_nki_kernels.py --num_workers=8 --json-report --report-dir=outputs/test-reports",
-             "artifact-name":"dynamic-nki-test-results",
-             "summary-path":"test-results/outputs/test-reports/step_summary.md"},
-
-            {"id":"torch-mlir-lit","name":"Torch-MLIR LIT Tests (trn2)","soft_fail":false,
-             "test-command":"./tools/run-torch-mlir-lit-tests",
-             "artifact-name":"torch-mlir-lit-results","summary-path":""},
-
-            {"id":"accuracy-op-tests","name":"Op-Accuracy Tests (trn2)","soft_fail":true,
-             "test-command":"mkdir -p outputs/test-reports/json_reports && NEURON_ACCURACY_OUTPUT_DIR=outputs/accuracy python -m pytest tests/vertical/accuracy/test_accuracy.py --traced-model qwen3_235b_ep64_tp4 --max-shapes-per-op 0 -n 16 --dist load --json-report --json-report-file=outputs/test-reports/json_reports/report.json --tb=short -q",
-             "artifact-name":"accuracy-op-results",
-             "summary-path":"test-results/outputs/accuracy/step_summary.md"}
-          ]}
-          JSON
-          else
-            # smoke: one file on the ATen lane. Proves the container finds a
-            # Neuron device, pytest runs, and artifacts reach the runner host.
-            cat > /tmp/matrix.json <<'JSON'
-          {"include":[
-            {"id":"aten-unit-tests","name":"ATen Unit Tests (trn2)","soft_fail":false,
-             "test-command":"./tools/run-test-parallel --persistent-cache --json-report --report-dir=outputs/test-reports tests/device/test_device.py",
-             "artifact-name":"aten-test-results",
-             "summary-path":"test-results/outputs/test-reports/step_summary.md"}
-          ]}
-          JSON
-          fi
-          python3 -c "import json,sys; json.load(open('/tmp/matrix.json'))"
-          echo "matrix=$(tr -d '\n' < /tmp/matrix.json)" >> "$GITHUB_OUTPUT"
-          echo "Lanes: $(python3 -c "import json; print(', '.join(e['id'] for e in json.load(open('/tmp/matrix.json'))['include']))")"
-
-  trn2-checks:
-    name: ${{ matrix.name }}
-    needs: [compute-matrix]
-    env:
-      MATRIX_LABEL: ${{ matrix.id }}
-    # Built as JSON so the image label can switch between a pre-built image and
-    # a config-driven build. `image_uri` set gives `neuron.image:<uri>`, which
-    # skips the build. Empty gives `neuron.build-image`, which builds the
-    # Dockerfile that NeuronGithubCIConfig holds for this repo and branch.
-    #
-    # The fleet does not yet give this repository read access to the NEFF cache
-    # bucket. Add "neuron.internal_compute.persistent-storage:read" on the ATen
-    # lane after that access lands, so the fleet injects the cache bucket
-    # variables. A runner label the fleet does not advertise leaves the job
-    # queued, so it cannot be added early. Until then every lane compiles cold,
-    # which run-test-parallel handles without an error.
-    runs-on: ${{ fromJSON(format(
-      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","{0}","neuron.run-{1}-{2}","neuron.pr:{3}","neuron.timeout:{4}"]',
-      github.event.inputs.image_uri != '' && format('neuron.image:{0}', github.event.inputs.image_uri) || 'neuron.build-image',
-      github.run_id,
-      matrix.id,
-      github.event.inputs.pr_number,
-      github.event.inputs.test_scope == 'full' && '32400' || '3600')) }}
-    timeout-minutes: ${{ github.event.inputs.test_scope == 'full' && 600 || 60 }}
-    continue-on-error: ${{ matrix.soft_fail }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.compute-matrix.outputs.matrix) }}
-    steps:
-      - name: Checkout PR code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.head_sha }}
-
-      - uses: ./.github/actions/run-test-suite
-        with:
-          test-command: ${{ matrix.test-command }}
-          artifact-name: ${{ matrix.artifact-name }}
-          summary-path: ${{ matrix.summary-path }}
-
-  # Block / collective perf. Separate reusable workflow because its matrix axis
-  # is per-model groups and MFU gating is caller-driven. Full scope only: the
-  # smoke scope exists to be cheap.
-  block-perf:
-    name: Block Perf
-    needs: [compute-matrix]
-    if: github.event.inputs.test_scope == 'full'
-    uses: ./.github/workflows/_block-perf.yml
+  internal-tests:
+    name: Internal tests
+    uses: ./.github/workflows/_reusable-internal-tests.yml
     with:
-      runner-labels: ${{ format('["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","{0}","neuron.run-{1}-block-perf","neuron.pr:{2}","neuron.timeout:32400"]',
-        github.event.inputs.image_uri != '' && format('neuron.image:{0}', github.event.inputs.image_uri) || 'neuron.build-image',
-        github.run_id,
-        github.event.inputs.pr_number) }}
+      test_set: ${{ github.event.inputs.test_set || 'pr' }}
+      # An empty image_uri builds the image from NeuronGithubCIConfig. A set
+      # image_uri skips the build and runs the given image.
+      build_image: ${{ github.event.inputs.image_uri == '' }}
+      image: ${{ github.event.inputs.image_uri || '' }}
+      pr_number: ${{ github.event.inputs.pr_number || '' }}
+      checkout_ref: ${{ github.event.inputs.head_sha || github.sha }}
+      noop: ${{ github.event_name == 'merge_group' }}
+
+  block-perf:
+    name: Block perf
+    uses: ./.github/workflows/_reusable-block-perf.yml
+    with:
+      runner-labels: ${{ github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.build-image","neuron.run-{0}-block-perf","neuron.pr:{1}","neuron.timeout:32400"]', github.run_id, github.event.inputs.pr_number) }}
       artifact-prefix: block-perf
-      # No MFU baseline has been captured on the public fleet yet, so measure
-      # and report without gating. Flip to true once goldens exist.
+      # This fleet has no MFU baseline yet. Measure and report, but do not gate.
+      # Set this to true after the goldens exist.
       enforce-mfu-threshold: false
-      checkout-ref: ${{ github.event.inputs.head_sha }}
+      checkout-ref: ${{ github.event.inputs.head_sha || github.sha }}
+      noop: ${{ github.event_name == 'merge_group' }}
 
   report-status:
     name: Report status
-    needs: [trn2-checks, block-perf]
-    if: always()
+    needs: [internal-tests, block-perf]
+    if: always() && github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     steps:
-      - name: Post aggregate commit status
-        uses: actions/github-script@v7
+      - uses: actions/github-script@v7
         env:
           HEAD_SHA: ${{ github.event.inputs.head_sha }}
-          TEST_SCOPE: ${{ github.event.inputs.test_scope }}
-          LANES_RESULT: ${{ needs.trn2-checks.result }}
+          TEST_SET: ${{ github.event.inputs.test_set }}
+          TESTS_RESULT: ${{ needs.internal-tests.result }}
           PERF_RESULT: ${{ needs.block-perf.result }}
         with:
           script: |
-            // Lanes marked soft_fail carry continue-on-error, so a soft failure
-            // leaves the rollup at success and does not gate. Only a gating lane
-            // flips this to failure.
-            const lanes = process.env.LANES_RESULT;
-            const perf  = process.env.PERF_RESULT;
-            const bad   = ['failure', 'cancelled', 'timed_out'];
-            const ok    = !bad.includes(lanes) && !bad.includes(perf);
-            const scope = process.env.TEST_SCOPE;
+            // One status covers the whole run. Per-suite statuses would not match
+            // the single "Smoke Test" context that pr-gate.yml posts.
+            const bad = ['failure', 'cancelled', 'timed_out'];
+            const tests = process.env.TESTS_RESULT;
+            const perf = process.env.PERF_RESULT;
+            const ok = !bad.includes(tests) && !bad.includes(perf);
+            const set = process.env.TEST_SET;
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -240,7 +131,7 @@ jobs:
               state: ok ? 'success' : 'failure',
               context: 'Smoke Test',
               description: ok
-                ? `PR checks passed (${scope} scope)`
-                : `PR checks failed (${scope} scope): lanes=${lanes} block-perf=${perf}`,
+                ? `PR checks passed (${set} set)`
+                : `PR checks failed (${set} set): tests=${tests} block-perf=${perf}`,
               target_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });
