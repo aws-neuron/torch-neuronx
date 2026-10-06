@@ -1,0 +1,255 @@
+name: PyTorch Upstream Test Suite
+
+# Reusable workflow for running the PyTorch upstream test suite:
+# distribution_config.py + runner/run_upstream_tests.py.
+# Called by merge-queue.yml and nightly.yml.
+#
+# Job graph (3 jobs — GitHub Actions constraint: dynamic matrix cannot run in
+# the same job as the matrix generator):
+#   compute-pytorch-upstream-matrix (ubuntu-latest)
+#     ↓ outputs matrix
+#   pytorch-upstream-test-suite (26 parallel trn2 nodes)
+#     ↓ uploads per-node artifacts
+#   aggregate-pytorch-upstream (ubuntu-latest)
+#     ↓ downloads all artifacts, prints summary, writes GH job summary
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "Docker image URI to run tests against"
+        required: true
+        type: string
+      timeout-minutes:
+        description: "Per-matrix-node timeout"
+        required: false
+        type: number
+        default: 600
+      dist-config:
+        description: >
+          Distribution config filename (basename, resolved against
+          tests/pytorch_tests_native/). Default = full upstream suite.
+          Use upstream_pytorch_test_distribution_config.smoke.json to run
+          a 2-node smoke subset (dynamo + profiler) for pipeline
+          verification without paying for a full run.
+        required: false
+        type: string
+        default: upstream_pytorch_test_distribution_config.json
+      # Label-driven subset selection is OPT-IN at the caller level.
+      # Only the merge-queue gate (``merge-queue.yml``) passes ``labels``;
+      # nightly and any other caller leaves it empty, which makes the emitter
+      # run the full suite. See ``runner/label_selection.py`` for the
+      # selection precedence applied when labels ARE provided.
+      labels:
+        description: >
+          PR labels (CSV). When non-empty, ``emit_upstream_matrix.py``
+          filters the dist config to only the nodes implied by
+          ``module:*`` labels. Empty (the default) disables filtering —
+          full suite runs. ONLY pass this from the merge-queue gate.
+        required: false
+        type: string
+        default: ""
+      run-full-suite:
+        description: >
+          Override that forces the full dist config even when ``labels``
+          is set. Used by the merge-queue gate to honor the
+          ``ciflow:full-suite`` manual PR label. Other callers
+          leave it as default ``false`` and just pass empty ``labels``.
+        required: false
+        type: boolean
+        default: false
+      # Merge-gate threshold; empty (default) = don't gate on failure count.
+      max-failures:
+        description: >
+          Failure-count merge gate. If set, the aggregate job exits non-zero
+          when failing tests (failed/error) exceed this threshold. Empty
+          (default) disables gating, preserving nightly/main behavior.
+        required: false
+        type: string
+        default: ""
+      # Runner priority. Omit for normal; only merge-queue.yml sets "high".
+      priority:
+        description: 'Internal-compute priority. Omit for normal; "high" jumps queue.'
+        required: false
+        type: string
+      # Persistent NEFF cache. On by default: each node hydrates the shared
+      # S3 cache to local NVMe before the run (and enables HLO-derived NEFF
+      # keying). Fail-open: an S3 error degrades to a cold local compile, never
+      # blocks the run. Callers that shouldn't read the cache pass false.
+      download-neff-cache:
+        description: >
+          Hydrate the persistent NEFF cache from the shared S3 store before the
+          run. Default true.
+        required: false
+        type: boolean
+        default: true
+      # Upload the local cache to S3 after the run. Main Nightly and main
+      # Dependency Guard set this. The runner permits uploads only from main.
+      refresh-neff-cache:
+        description: >
+          Upload the local NEFF cache back to the shared store after the run.
+          Default false. Set true for main Nightly or main Dependency Guard.
+          The runner permits uploads only from main.
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      failure_count:
+        description: >
+          Number of failing tests (failed/error) the aggregator counted.
+          Empty if the run broke before producing any test data.
+        value: ${{ jobs.aggregate-pytorch-upstream.outputs.failure_count }}
+      gate_passed:
+        description: >
+          "true"/"false" verdict of the aggregator's max-failures gate when
+          a threshold was supplied; empty for non-gating callers.
+        value: ${{ jobs.aggregate-pytorch-upstream.outputs.gate_passed }}
+      max_failures:
+        description: >
+          The max-failures threshold this run was gated against (echoes the
+          ``max-failures`` input). Empty for non-gating callers.
+        value: ${{ inputs.max-failures }}
+
+
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  # Per-shard pytest WORKLOAD budget, in seconds. This is NOT the same as the
+  # `neuron.timeout:<seconds>` runs-on label below (which is the outer ceiling
+  # for how long the internal-compute fleet keeps the runner alive — 9h, set
+  # to sit just under the 10h GitHub `timeout-minutes`). This value is the
+  # inner pytest budget and is intentionally smaller than the runner ceiling.
+  #
+  # run_upstream_tests.py subtracts its own POST_PROCESSING_BUFFER (1200s)
+  # from --total-timeout to compute pytest's wall-clock budget, so we pass
+  # this value directly without any further subtraction here. Subtracting
+  # again would double-count and shrink the pytest budget unnecessarily.
+  INTERNAL_COMPUTE_WORKLOAD_TIMEOUT: 5400
+
+jobs:
+  compute-pytorch-upstream-matrix:
+    name: Compute PyTorch Upstream Test Suite Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.expand.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: expand
+        env:
+          DIST_CONFIG: ${{ inputs.dist-config }}
+          PR_LABELS: ${{ inputs.labels }}
+          RUN_FULL_SUITE: ${{ inputs.run-full-suite }}
+        run: python3 tests/pytorch_tests_native/runner/emit_upstream_matrix.py
+
+  pytorch-upstream-test-suite:
+    name: "${{ matrix.label }}"
+    needs: [compute-pytorch-upstream-matrix]
+    env:
+      MATRIX_LABEL: ${{ matrix.label }}
+    # Append the neuron.priority label only when inputs.priority is set, and the
+    # persistent-storage label only when the persistent cache is enabled:
+    # :write when this run uploads (nightly / bring-up), else :read. That label is
+    # what makes the fleet inject the storage bucket/prefix env vars into the pod.
+    runs-on: >-
+      ${{ fromJSON(format(
+      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.run-{0}-upstream-pytorch-{1}","neuron.image:{2}","neuron.timeout:32400"{3}{4}]',
+      github.run_id,
+      matrix.node,
+      inputs.image,
+      inputs.priority != '' && format(',"neuron.priority:{0}"', inputs.priority) || '',
+      inputs.download-neff-cache && format(',"neuron.internal_compute.persistent-storage:{0}"', inputs.refresh-neff-cache && 'write' || 'read') || ''
+      )) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    # Soft-fail suites run and upload raw results. The aggregator excludes them.
+    # A soft-fail suite cannot fail the workflow or block CI.
+    continue-on-error: ${{ matrix.soft_fail }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.compute-pytorch-upstream-matrix.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - uses: ./.github/actions/run-test-suite
+        with:
+          test-command: |
+            pip uninstall -y ec2-metadata 2>/dev/null
+            export NUM_WORKERS=${{ matrix.num_workers }}
+            # Internal compute does not propagate GitHub context env vars into the
+            # workload (only TEST_COMMAND is forwarded), so forward the ones the
+            # runner needs explicitly: the branch gate in the persistent cache
+            # upload() reads GITHUB_REF_NAME, and the cache_metrics sidecar records
+            # run id / sha. Without these the upload silently skips (branch reads '').
+            export GITHUB_REF_NAME='${{ github.ref_name }}'
+            export GITHUB_RUN_ID='${{ github.run_id }}'
+            export GITHUB_SHA='${{ github.sha }}'
+            python3 tests/pytorch_tests_native/runner/run_upstream_tests.py \
+              --output-dir outputs/upstream_pytorch_artifacts \
+              --total-timeout ${{ env.INTERNAL_COMPUTE_WORKLOAD_TIMEOUT }} \
+              ${{ matrix.shard_args }} \
+              ${{ matrix.ignore_args }} \
+              ${{ matrix.soft_fail && '--soft-fail' || '' }} \
+              ${{ inputs.download-neff-cache && '--download-neff-cache' || '' }} \
+              ${{ inputs.download-neff-cache && inputs.refresh-neff-cache && '--refresh-neff-cache' || '' }} \
+              ${{ matrix.items }}
+          artifact-name: upstream-pytorch-${{ matrix.label }}
+          # run_upstream_tests.py writes the panel under --output-dir; pass its
+          # extracted path so append-step-summary posts it (no built-in default).
+          summary-path: test-results/outputs/upstream_pytorch_artifacts/step_summary.md
+          # artifact-path defaults to `test-results/` — the path internal
+          # compute extracts each per-node tar into. The aggregator's
+          # recursive glob handles the nested layout.
+
+  aggregate-pytorch-upstream:
+    name: Aggregate PyTorch Upstream Test Results
+    needs: [pytorch-upstream-test-suite]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      failure_count: ${{ steps.summarize.outputs.failure_count }}
+      gate_passed: ${{ steps.summarize.outputs.gate_passed }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all upstream artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/upstream-results
+          pattern: upstream-pytorch-*
+      - name: Install aggregator dependencies
+        # ubuntu-latest doesn't have the test image's `[dev]` extras
+        # installed, so the aggregator's pyarrow import fails without
+        # this. Pin to a version that has prebuilt wheels for python 3.12.
+        run: pip install "pyarrow>=15,<20"
+      - name: Summarize results
+        id: summarize
+        env:
+          DIST_CONFIG: tests/pytorch_tests_native/${{ inputs.dist-config }}
+          MAX_FAILURES: ${{ inputs.max-failures }}
+        run: |
+          python3 tests/pytorch_tests_native/runner/aggregate_upstream_results.py \
+            /tmp/upstream-results --dist-config "$DIST_CONFIG" \
+            ${MAX_FAILURES:+--max-failures $MAX_FAILURES}
+      - name: Bundle all node artifacts into single archive
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # NB: must NOT match the ``upstream-pytorch-*`` download pattern above.
+          # This is a convenience re-bundle of the whole results dir; if it were
+          # named ``upstream-pytorch-*`` a workflow re-run would download it back
+          # into results_dir and the aggregator would double-count every test
+          # under the "all" label (bypassing the soft_fail gate exclusion).
+          name: upstream-results-bundle
+          path: /tmp/upstream-results/
+          retention-days: 30
+      # Artifact name ``custom-test-artifacts`` triggers the DevOps mirror
+      # to copy contents to S3 verbatim. The directory tree inside becomes
+      # the S3 key suffix the Athena tables read from.
+      - name: Upload parquet to dashboard S3 prefix
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: custom-test-artifacts
+          path: /tmp/upstream-results/custom-test-artifacts/
+          retention-days: 30

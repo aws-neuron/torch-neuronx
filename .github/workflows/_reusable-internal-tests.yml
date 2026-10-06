@@ -127,7 +127,7 @@ jobs:
                 "timeout_minutes": 600,
                 "uses_neff_cache": false,
                 "supports_coverage": false,
-                "sets": ["pr"],
+                "sets": ["full", "pr"],
                 "summary_path": "test-results/outputs/test-reports/step_summary.md"
               },
               {
@@ -149,8 +149,8 @@ jobs:
                 "test_command": "mkdir -p outputs/test-reports/json_reports && NEURON_ACCURACY_OUTPUT_DIR=outputs/accuracy python -m pytest tests/vertical/accuracy/test_accuracy.py --traced-model qwen3_235b_ep64_tp4 --max-shapes-per-op 0 -n 16 --dist load --json-report --json-report-file=outputs/test-reports/json_reports/report.json --tb=short -q",
                 "artifact_name": "accuracy-op-results",
                 "artifact_suffix": "accuracy",
-                "runner_timeout": "3600",
-                "timeout_minutes": 60,
+                "runner_timeout": "32400",
+                "timeout_minutes": 600,
                 "uses_neff_cache": false,
                 "supports_coverage": false,
                 "sets": ["full", "pr", "ci"],

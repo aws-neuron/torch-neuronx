@@ -4,30 +4,29 @@ name: Block Perf Tests
 # Reusable workflow for block performance + collective performance tests.
 #
 # Invoked by:
-#   - pull.yml            (PR checks, TRN2, enforce=true, multiplier=1.0)
-#   - dependency-guard.yml (dependency validation, TRN2 + TRN3PDS B1)
+#   - pull.yml (PR checks, TRN2)
+#   - _reusable-full-wheel-tests.yml (Nightly and Dependency Guard, both platforms)
 #
 # Tests are grouped by model and run sequentially on a single node per
 # group via run_group.py. This reduces each platform's node usage from 8 to 3.
 #
-# Platform-specific MFU goldens live in the JSON config files under
-# tests/blocks/block_perf/group_configs/. Each test entry has an mfu object
-# keyed by platform; every platform entry records its measured baseline,
-# capture date, and threshold. New captures use threshold = baseline × 0.90.
+# Platform-specific MFU goldens in the JSON configs are the reconstructible
+# seed. Every MFU-bearing group automatically hydrates a higher high-water
+# baseline from the repo-scoped, 7-day-TTL cache. Only main's canonical
+# nightly can refresh it.
 #
-# Thresholds are enforced when enforce-mfu-threshold is true. The
-# mfu-threshold-multiplier input scales every per-test threshold:
-#   PR:       enforce=true,  multiplier=1.0   (full strictness)
-#   nightly:  enforce=true,  multiplier=0.95  (~5% looser to absorb fleet noise)
-# Set enforce=false to disable gates entirely (legacy escape hatch).
+# Each golden threshold contains a per-test, per-platform tolerance band.
+# A failed MFU gate runs once more before the group verdict.
+# Every workflow uses a 1.0 multiplier. Set enforce=false to disable gates
+# entirely (legacy escape hatch).
 #
-# How to update a golden (when perf legitimately improves):
-#   1. Measure the new MFU from a CI run.
-#   2. In the relevant JSON config:
-#      - Set mfu.<platform>.threshold to new_mfu × 0.90.
-#      - Set mfu.<platform>.baseline to the new measured MFU.
-#      - Set mfu.<platform>.baseline_date to today's date.
-#   3. Call out the change in the PR description and torch-neuron-eager-committers channel
+# Persistent golden policy:
+#   - PR and dependency-guard jobs read but never write.
+#   - Only the canonical nightly on main gets write access.
+#   - Each passing test updates a median-of-5 history under a monotone baseline
+#     floor, and retained values are rewritten to refresh their TTL.
+#   - A failed test keeps its cached entry; passing siblings still update.
+#   - If no MFU test passes, the group does not write.
 #
 # See tests/blocks/block_perf/group_configs/README.md for full details.
 # =============================================================================
@@ -65,10 +64,15 @@ on:
         type: boolean
         default: false
       mfu-threshold-multiplier:
-        description: 'Multiplier on the selected platform threshold (<1.0 loosens). PR uses 1.0; nightly uses 0.95.'
+        description: 'Multiplier on the selected platform threshold (<1.0 loosens); defaults to the canonical 1.0 policy.'
         required: false
         type: string
         default: '1.0'
+      refresh-persistent-goldens:
+        description: 'Refresh passing MFU tests only from the canonical nightly on main'
+        required: false
+        type: boolean
+        default: false
       checkout-ref:
         description: 'Git ref/SHA to checkout. PR-review-triggered callers pass the PR head SHA; empty string falls back to default checkout (e.g. nightly).'
         required: false
@@ -90,15 +94,22 @@ jobs:
     env:
       MATRIX_LABEL: ${{ format('{0}{1}', matrix.group.id, matrix.platform != 'trn2' && format('-{0}', matrix.platform) || '') }}
     # Pull checks provide a complete label override. Image-based callers use
-    # this template, selecting the instance and unique run suffix by platform.
+    # this template, selecting the instance, storage access, and run suffix.
+    # The neuron.run label must identify one matrix leg. It includes the
+    # platform and the group ID. The legs do not use the same label set.
+    # The infra group omits the persistent-storage label. A shared label
+    # can assign a runner to the wrong leg. The runner then uses the wrong
+    # persistent-storage setting. The other leg stays in the queue.
     runs-on: >-
       ${{ fromJSON(inputs.runner-labels || format(
-      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:{0}","neuron.run-{1}-{2}{3}","neuron.image:{4}","neuron.timeout:32400"]',
+      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:{0}","neuron.run-{1}-{2}-{3}-{6}","neuron.image:{4}","neuron.timeout:32400"{5}]',
       matrix.platform == 'trn2' && 'trn2.48xlarge' || 'trn3-dev1.48xlarge',
       github.run_id,
       inputs.runner-label-prefix || inputs.artifact-prefix,
-      matrix.platform != 'trn2' && format('-{0}', matrix.platform) || '',
-      inputs.image
+      matrix.platform,
+      inputs.image,
+      matrix.group.id != 'infra-group' && format(',"neuron.internal_compute.persistent-storage:{0}"', inputs.refresh-persistent-goldens && github.ref == 'refs/heads/main' && endsWith(github.workflow_ref, '/.github/workflows/nightly.yml@refs/heads/main') && 'write' || 'read') || '',
+      matrix.group.id
       )) }}
     timeout-minutes: 600
     strategy:
@@ -118,6 +129,12 @@ jobs:
             display_name: Block Perf Infra
             config: tests/blocks/block_perf/group_configs/infra.json
 
+    # Serialize the only writers for a platform/group. Read-only runs retain
+    # run-scoped groups and do not block one another.
+    concurrency:
+      group: ${{ inputs.refresh-persistent-goldens && github.ref == 'refs/heads/main' && endsWith(github.workflow_ref, '/.github/workflows/nightly.yml@refs/heads/main') && matrix.group.id != 'infra-group' && format('block-perf-goldens-{0}-{1}', matrix.platform, matrix.group.id) || format('block-perf-{0}-{1}-{2}', github.run_id, matrix.platform, matrix.group.id) }}
+      cancel-in-progress: false
+
     steps:
       - uses: actions/checkout@v4
         if: ${{ !inputs.noop }}
@@ -135,8 +152,12 @@ jobs:
         if: ${{ !inputs.noop }}
         with:
           test-command: >-
+            GITHUB_REF_NAME=${{ github.ref_name }}
+            GITHUB_RUN_ID=${{ github.run_id }}
+            GITHUB_SHA=${{ github.sha }}
             python tests/blocks/block_perf/run_group.py
             --config ${{ matrix.group.config }}
             --platform ${{ matrix.platform }}
+            ${{ inputs.refresh-persistent-goldens && github.ref == 'refs/heads/main' && endsWith(github.workflow_ref, '/.github/workflows/nightly.yml@refs/heads/main') && matrix.group.id != 'infra-group' && '--refresh-persistent-goldens' || '' }}
             ${{ !inputs.enforce-mfu-threshold && '--skip-mfu-threshold' || format('--mfu-threshold-multiplier {0}', inputs.mfu-threshold-multiplier) }}
           artifact-name: ${{ format('{0}-{1}{2}-results', inputs.artifact-prefix, matrix.platform != 'trn2' && format('{0}-', matrix.platform) || '', matrix.group.id) }}
