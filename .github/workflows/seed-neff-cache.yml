@@ -1,8 +1,9 @@
 name: Seed NEFF Cache
 
-# Public repository only. Seeds the persistent NEFF cache that the PR checks
-# (ATen) and the merge queue (upstream) read. In the private repository,
-# nightly.yml on main seeds the cache, so every job here is skipped.
+# Public repository only. Runs the Nightly test suite (_reusable-full-wheel-tests.yml)
+# with the NEFF cache refresh on, so the PR checks and the merge queue read a warm
+# cache. In the private repository, nightly.yml on main seeds the cache, so every
+# job here is skipped.
 #
 # The cache prefix keys on the neuronx-cc version, so a new Neuron SDK release
 # starts with an empty prefix. Run this workflow by hand after each release. The
@@ -56,22 +57,14 @@ jobs:
           echo "Tests image ready: $IMAGE_URI"
           echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
 
-  aten:
-    name: ATen cache
+  tests:
+    name: Nightly tests
     needs: [build-tests-image]
-    uses: ./.github/workflows/_reusable-internal-tests.yml
+    uses: ./.github/workflows/_reusable-full-wheel-tests.yml
     with:
-      test_set: aten
       suite_id: seed
       image: ${{ needs.build-tests-image.outputs.image }}
       refresh_neff_cache: true
-
-  upstream:
-    name: Upstream cache
-    needs: [build-tests-image]
-    uses: ./.github/workflows/_reusable-upstream-tests.yml
-    with:
-      image: ${{ needs.build-tests-image.outputs.image }}
-      refresh-neff-cache: true
+      dkms: ''
       # TEST-ONLY on contribute-9.9: one upstream node instead of 20.
-      dist-config: upstream_pytorch_test_distribution_config.smoke.json
+      upstream_smoke_only: true

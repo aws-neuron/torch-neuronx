@@ -75,7 +75,7 @@ jobs:
                 "timeout_minutes": 600,
                 "uses_neff_cache": true,
                 "supports_coverage": true,
-                "sets": ["full", "pr", "aten"],
+                "sets": ["full", "pr"],
                 "summary_path": "test-results/outputs/test-reports/step_summary.md"
               },
               {
@@ -158,7 +158,7 @@ jobs:
               }
             ]
           }'
-          if [[ "$TEST_SET" != "full" && "$TEST_SET" != "pr" && "$TEST_SET" != "ci" && "$TEST_SET" != "aten" ]]; then
+          if [[ "$TEST_SET" != "full" && "$TEST_SET" != "pr" && "$TEST_SET" != "ci" ]]; then
             echo "The test set '$TEST_SET' is not valid. Use full, pr, or ci."
             exit 1
           fi

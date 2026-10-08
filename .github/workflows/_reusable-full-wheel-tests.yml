@@ -1,0 +1,95 @@
+name: Full Wheel Test Suite
+
+on:
+  workflow_call:
+    inputs:
+      suite_id:
+        description: Test suite identifier.
+        required: true
+        type: string
+      image:
+        description: Complete image URI.
+        required: true
+        type: string
+      refresh_neff_cache:
+        description: Refresh the shared NEFF cache for tests that use it.
+        required: false
+        type: boolean
+        default: false
+      refresh_persistent_goldens:
+        description: Refresh MFU goldens from the canonical nightly on main.
+        required: false
+        type: boolean
+        default: false
+      enforce_mfu_threshold:
+        description: Enforce the block performance MFU threshold.
+        required: false
+        type: boolean
+        default: false
+      mfu_threshold_multiplier:
+        description: Scale the block performance MFU threshold.
+        required: false
+        type: string
+        default: '1.0'
+      upstream_smoke_only:
+        description: Run the upstream smoke set instead of the full upstream set.
+        required: false
+        type: boolean
+        default: false
+      run_vertical:
+        description: Run the vertical ATen op-coverage gate.
+        required: false
+        type: boolean
+        default: true
+      dkms:
+        description: Value of the neuron.dkms runner label.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+# TEST-ONLY on contribute-9.9: the reusables here predate the dkms input, so the
+# dkms pass-through is removed. Otherwise the same as private kunind/seed-neff-cache.
+jobs:
+  test-internal:
+    name: Internal tests
+    uses: ./.github/workflows/_reusable-internal-tests.yml
+    with:
+      suite_id: ${{ inputs.suite_id }}
+      image: ${{ inputs.image }}
+      refresh_neff_cache: ${{ inputs.refresh_neff_cache }}
+
+  test-block-perf:
+    name: Block performance
+    uses: ./.github/workflows/_reusable-block-perf.yml
+    with:
+      image: ${{ inputs.image }}
+      artifact-prefix: ${{ inputs.suite_id }}-block-perf-full
+      runner-label-prefix: ${{ inputs.suite_id }}-block-perf-full
+      # The public repository has no TRN3PDS B1 instances.
+      include-trn3pds-b1: ${{ github.repository != 'aws-neuron/torch-neuronx' }}
+      refresh-persistent-goldens: ${{ inputs.refresh_persistent_goldens }}
+      enforce-mfu-threshold: ${{ inputs.enforce_mfu_threshold }}
+      mfu-threshold-multiplier: ${{ inputs.mfu_threshold_multiplier }}
+
+  test-pytorch-upstream:
+    name: PyTorch upstream
+    uses: ./.github/workflows/_reusable-upstream-tests.yml
+    with:
+      image: ${{ inputs.image }}
+      refresh-neff-cache: ${{ inputs.refresh_neff_cache }}
+      dist-config: ${{ inputs.upstream_smoke_only && 'upstream_pytorch_test_distribution_config.smoke.json' || 'upstream_pytorch_test_distribution_config.json' }}
+
+  # Vertical ATen op-coverage gate. nightly and the dependency guard both pull
+  # this suite, so a gate failure blocks their promote jobs with no per-workflow
+  # job. Kill switch: set run_vertical false or VERTICAL_GATE_ENABLED to "false".
+  test-vertical:
+    name: Vertical op gate
+    if: ${{ inputs.run_vertical && vars.VERTICAL_GATE_ENABLED != 'false' }}
+    uses: ./.github/workflows/_reusable-vertical-tests.yml
+    with:
+      mode: gate
+      image: ${{ inputs.image }}
+      refresh-neff-cache: ${{ inputs.refresh_neff_cache }}
