@@ -301,8 +301,8 @@ neff_cache_upload() {
         echo "=== NEFF cache: skip upload (GITHUB_REF_NAME not forwarded into the workload) ==="
         return 0
     fi
-    if [[ "${GITHUB_REF_NAME}" != "main" ]]; then
-        echo "=== NEFF cache: skip upload (branch '${GITHUB_REF_NAME}' is not main) ==="
+    if [[ ! "${GITHUB_REF_NAME}" =~ ^(main|release-[0-9]+\.[0-9]+(\.[0-9]+)?|contribute-[0-9]+\.[0-9]+)$ ]]; then
+        echo "=== NEFF cache: skip upload (branch '${GITHUB_REF_NAME}' is not main, a release, or a contribute branch) ==="
         return 0
     fi
 

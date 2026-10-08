@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -183,8 +184,9 @@ class PersistentNeffCache:
         only when a storage bucket is present (the persistent-storage:write label).
         """
         branch = os.environ.get("GITHUB_REF_NAME", "")
-        if branch != "main":
-            print(f"=== Persistent cache: skip upload (branch '{branch}' != main) ===")
+        # TEST-ONLY on contribute-9.9: same branch rule as private kunind/seed-neff-cache.
+        if not re.fullmatch(r"(?:main|release-[0-9]+\.[0-9]+(?:\.[0-9]+)?|contribute-[0-9]+\.[0-9]+)", branch):
+            print(f"=== Persistent cache: skip upload (branch '{branch}' cannot seed) ===")
             return
         base = self._s3_base()
         if base is None:

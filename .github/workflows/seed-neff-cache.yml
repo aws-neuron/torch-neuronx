@@ -1,0 +1,73 @@
+name: Seed NEFF Cache
+
+# Public repository only. Seeds the persistent NEFF cache that the PR checks
+# (ATen) and the merge queue (upstream) read. In the private repository,
+# nightly.yml on main seeds the cache, so every job here is skipped.
+#
+# The cache prefix keys on the neuronx-cc version, so a new Neuron SDK release
+# starts with an empty prefix. Run this workflow by hand after each release. The
+# weekly run rewrites the entries before the storage tier expires them. GitHub
+# runs the schedule only on the default branch.
+#
+# Nothing else writes the public cache. PR checks and the merge queue only read.
+on:
+  schedule:
+    - cron: '0 6 * * 6'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # Same image as the merge queue, so the upstream shards compile the same NEFFs.
+  # The PR check image starts from the same base and compiler, so ATen shares the
+  # prefix too.
+  build-tests-image:
+    name: Build the tests image
+    if: github.repository == 'aws-neuron/torch-neuronx'
+    runs-on: [
+      self-hosted,
+      linux,
+      neuron.build-nightly-image,
+      "neuron.run-${{ github.run_id }}-build-tests-image",
+      "neuron.dockerfile:Dockerfile.nightly-test",
+      "neuron.base-image:684844594039.dkr.ecr.us-west-2.amazonaws.com/neuron-image-builder-public:torch-neuronx-main-nightly-base-stable",
+      "neuron.build-arg:PYTORCH_CHANNEL:stable"
+    ]
+    timeout-minutes: 60
+    outputs:
+      image: ${{ steps.wait.outputs.image_uri }}
+    steps:
+      - name: Wait for the tests image
+        id: wait
+        run: |
+          set -eo pipefail
+          /opt/neuron-ci/wait-for-nightly-image.sh | tee /tmp/image-output.log
+          IMAGE_URI=$(grep "Nightly base image ready:" /tmp/image-output.log | sed 's/.*ready: //')
+          echo "Tests image ready: $IMAGE_URI"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+  aten:
+    name: ATen cache
+    needs: [build-tests-image]
+    uses: ./.github/workflows/_reusable-internal-tests.yml
+    with:
+      test_set: aten
+      suite_id: seed
+      image: ${{ needs.build-tests-image.outputs.image }}
+      refresh_neff_cache: true
+
+  upstream:
+    name: Upstream cache
+    needs: [build-tests-image]
+    uses: ./.github/workflows/_reusable-upstream-tests.yml
+    with:
+      image: ${{ needs.build-tests-image.outputs.image }}
+      refresh-neff-cache: true
+      # TEST-ONLY on contribute-9.9: one upstream node instead of 20.
+      dist-config: upstream_pytorch_test_distribution_config.smoke.json
