@@ -14,6 +14,10 @@ on:
   schedule:
     - cron: '0 6 * * 6'
   workflow_dispatch:
+  # TEST-ONLY on contribute-9.9: workflow_dispatch needs the file on the default
+  # branch, which is still develop. A push to this branch starts the run instead.
+  push:
+    branches: [contribute-9.9]
 
 permissions:
   contents: read
