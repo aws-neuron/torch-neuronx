@@ -68,8 +68,7 @@ jobs:
       image: ${{ inputs.image }}
       artifact-prefix: ${{ inputs.suite_id }}-block-perf-full
       runner-label-prefix: ${{ inputs.suite_id }}-block-perf-full
-      # The public repository has no TRN3PDS B1 instances.
-      include-trn3pds-b1: ${{ github.repository != 'aws-neuron/torch-neuronx' }}
+      include-trn3pds-b1: ${{ vars.TRN3PDS_B1_ENABLED != 'false' }}
       refresh-persistent-goldens: ${{ inputs.refresh_persistent_goldens }}
       enforce-mfu-threshold: ${{ inputs.enforce_mfu_threshold }}
       mfu-threshold-multiplier: ${{ inputs.mfu_threshold_multiplier }}

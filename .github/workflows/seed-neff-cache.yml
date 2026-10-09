@@ -1,22 +1,10 @@
 name: Seed NEFF Cache
 
-# Public repository only. Runs the Nightly test suite (_reusable-full-wheel-tests.yml)
-# with the NEFF cache refresh on, so the PR checks and the merge queue read a warm
-# cache. In the private repository, nightly.yml on main seeds the cache, so every
-# job here is skipped.
-#
-# The cache prefix keys on the neuronx-cc version, so a new Neuron SDK release
-# starts with an empty prefix. Run this workflow by hand after each release. The
-# weekly run rewrites the entries before the storage tier expires them. GitHub
-# runs the schedule only on the default branch.
-#
-# Nothing else writes the public cache. PR checks and the merge queue only read.
 on:
   schedule:
     - cron: '0 6 * * 6'
   workflow_dispatch:
-  # TEST-ONLY on contribute-9.9: workflow_dispatch needs the file on the default
-  # branch, which is still develop. A push to this branch starts the run instead.
+  # TEST-ONLY on contribute-9.9: manual runs need the file on the default branch.
   push:
     branches: [contribute-9.9]
 
@@ -29,12 +17,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Same image as the merge queue, so the upstream shards compile the same NEFFs.
-  # The PR check image starts from the same base and compiler, so ATen shares the
-  # prefix too.
   build-tests-image:
     name: Build the tests image
-    if: github.repository == 'aws-neuron/torch-neuronx'
+    if: vars.NEFF_CACHE_SEED_ENABLED == 'true'
     runs-on: [
       self-hosted,
       linux,
