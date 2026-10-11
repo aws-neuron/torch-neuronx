@@ -22,7 +22,7 @@ jobs:
       "neuron.run-${{ github.run_id }}-dkms-check",
       "neuron.image:684844594039.dkr.ecr.us-west-2.amazonaws.com/neuron-image-builder-public:torch-neuronx-main-nightly-base-stable",
       "neuron.timeout:1800",
-      "neuron.dkms:${{ vars.NEURON_DKMS || private-torch-neuronx-main-stable }}"
+      "neuron.dkms:${{ vars.NEURON_DKMS || 'private-torch-neuronx-main-stable' }}"
     ]
     timeout-minutes: 45
     steps:
