@@ -1,0 +1,32 @@
+name: DKMS Check
+
+# TEST-ONLY on contribute-9.9: checks which Neuron driver the host loads when
+# the neuron.dkms label comes from the NEURON_DKMS repository variable.
+on:
+  push:
+    branches: [contribute-9.9]
+    paths: [.github/workflows/dkms-check.yml]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  driver:
+    runs-on: [
+      self-hosted,
+      linux,
+      neuron,
+      neuron.internal_compute,
+      "neuron.internal_compute:trn2.48xlarge",
+      "neuron.run-${{ github.run_id }}-dkms-check",
+      "neuron.image:684844594039.dkr.ecr.us-west-2.amazonaws.com/neuron-image-builder-public:torch-neuronx-main-nightly-base-stable",
+      "neuron.timeout:1800",
+      "neuron.dkms:${{ vars.NEURON_DKMS || private-torch-neuronx-main-stable }}"
+    ]
+    timeout-minutes: 45
+    steps:
+      - name: Show the loaded Neuron driver
+        run: |
+          echo "driver=$(cat /sys/module/neuron/version 2>/dev/null || echo unknown)"
+          dpkg -l | grep -E "aws-neuronx-(runtime-lib|dkms|collectives)" || true
