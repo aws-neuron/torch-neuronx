@@ -1,4 +1,4 @@
-name: Seed NEFF Cache
+name: Refresh CI Caches
 
 on:
   schedule:
@@ -19,7 +19,7 @@ concurrency:
 jobs:
   build-tests-image:
     name: Build the tests image
-    if: vars.NEFF_CACHE_SEED_ENABLED == 'true'
+    if: vars.CI_CACHE_REFRESH_ENABLED == 'true'
     runs-on: [
       self-hosted,
       linux,
@@ -50,6 +50,8 @@ jobs:
       suite_id: seed
       image: ${{ needs.build-tests-image.outputs.image }}
       refresh_neff_cache: true
+      refresh_persistent_goldens: true
+      enforce_mfu_threshold: true
       dkms: ''
       # TEST-ONLY on contribute-9.9: one upstream node instead of 20.
       upstream_smoke_only: true
