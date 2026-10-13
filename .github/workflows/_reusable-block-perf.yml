@@ -108,7 +108,7 @@ jobs:
       inputs.runner-label-prefix || inputs.artifact-prefix,
       matrix.platform,
       inputs.image,
-      matrix.group.id != 'infra-group' && format(',"neuron.internal_compute.persistent-storage:{0}"', inputs.refresh-persistent-goldens && ((github.ref == 'refs/heads/main' && endsWith(github.workflow_ref, '/.github/workflows/nightly.yml@refs/heads/main')) || (startsWith(github.ref, 'refs/heads/contribute-') && endsWith(github.workflow_ref, format('/.github/workflows/refresh-ci-caches.yml@{0}', github.ref)))) && 'write' || 'read') || '',
+      matrix.group.id != 'infra-group' && format(',"neuron.internal_compute.persistent-storage:{0}"', inputs.refresh-persistent-goldens && ((github.ref == 'refs/heads/main' && endsWith(github.workflow_ref, '/.github/workflows/nightly.yml@refs/heads/main')) || (vars.CI_CACHE_REFRESH_ENABLED == 'true' && startsWith(github.ref, 'refs/heads/contribute-') && endsWith(github.workflow_ref, format('/.github/workflows/refresh-ci-caches.yml@{0}', github.ref)))) && 'write' || 'read') || '',
       matrix.group.id
       )) }}
     timeout-minutes: 600
@@ -132,7 +132,7 @@ jobs:
     # Serialize the only writers for a platform/group. Read-only runs retain
     # run-scoped groups and do not block one another.
     concurrency:
-      group: ${{ inputs.refresh-persistent-goldens && ((github.ref == 'refs/heads/main' && endsWith(github.workflow_ref, '/.github/workflows/nightly.yml@refs/heads/main')) || (startsWith(github.ref, 'refs/heads/contribute-') && endsWith(github.workflow_ref, format('/.github/workflows/refresh-ci-caches.yml@{0}', github.ref)))) && matrix.group.id != 'infra-group' && format('block-perf-goldens-{0}-{1}', matrix.platform, matrix.group.id) || format('block-perf-{0}-{1}-{2}', github.run_id, matrix.platform, matrix.group.id) }}
+      group: ${{ inputs.refresh-persistent-goldens && ((github.ref == 'refs/heads/main' && endsWith(github.workflow_ref, '/.github/workflows/nightly.yml@refs/heads/main')) || (vars.CI_CACHE_REFRESH_ENABLED == 'true' && startsWith(github.ref, 'refs/heads/contribute-') && endsWith(github.workflow_ref, format('/.github/workflows/refresh-ci-caches.yml@{0}', github.ref)))) && matrix.group.id != 'infra-group' && format('block-perf-goldens-{0}-{1}', matrix.platform, matrix.group.id) || format('block-perf-{0}-{1}-{2}', github.run_id, matrix.platform, matrix.group.id) }}
       cancel-in-progress: false
 
     steps:
@@ -158,6 +158,6 @@ jobs:
             python tests/blocks/block_perf/run_group.py
             --config ${{ matrix.group.config }}
             --platform ${{ matrix.platform }}
-            ${{ inputs.refresh-persistent-goldens && ((github.ref == 'refs/heads/main' && endsWith(github.workflow_ref, '/.github/workflows/nightly.yml@refs/heads/main')) || (startsWith(github.ref, 'refs/heads/contribute-') && endsWith(github.workflow_ref, format('/.github/workflows/refresh-ci-caches.yml@{0}', github.ref)))) && matrix.group.id != 'infra-group' && '--refresh-persistent-goldens' || '' }}
+            ${{ inputs.refresh-persistent-goldens && ((github.ref == 'refs/heads/main' && endsWith(github.workflow_ref, '/.github/workflows/nightly.yml@refs/heads/main')) || (vars.CI_CACHE_REFRESH_ENABLED == 'true' && startsWith(github.ref, 'refs/heads/contribute-') && endsWith(github.workflow_ref, format('/.github/workflows/refresh-ci-caches.yml@{0}', github.ref)))) && matrix.group.id != 'infra-group' && '--refresh-persistent-goldens' || '' }}
             ${{ !inputs.enforce-mfu-threshold && '--skip-mfu-threshold' || format('--mfu-threshold-multiplier {0}', inputs.mfu-threshold-multiplier) }}
           artifact-name: ${{ format('{0}-{1}{2}-results', inputs.artifact-prefix, matrix.platform != 'trn2' && format('{0}-', matrix.platform) || '', matrix.group.id) }}

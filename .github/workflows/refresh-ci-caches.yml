@@ -1,8 +1,8 @@
-name: Refresh CI Caches
+name: Nightly Workflow for torch-neuronx (refresh NEFF cache and block perf goldens)
 
 on:
   schedule:
-    - cron: '0 6 * * 6'
+    - cron: '0 6 * * *'
   workflow_dispatch:
   # TEST-ONLY on contribute-9.9: manual runs need the file on the default branch.
   push:
@@ -50,7 +50,9 @@ jobs:
       suite_id: seed
       image: ${{ needs.build-tests-image.outputs.image }}
       refresh_neff_cache: true
-      refresh_persistent_goldens: true
+      # TEST-ONLY on contribute-9.9: this tree's run_group.py has no
+      # --refresh-persistent-goldens, so refresh only the NEFF cache here.
+      refresh_persistent_goldens: false
       enforce_mfu_threshold: true
       dkms: ''
       # TEST-ONLY on contribute-9.9: one upstream node instead of 20.
