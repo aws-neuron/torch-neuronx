@@ -128,13 +128,14 @@ jobs:
       # runner then uses our .github/ actions. The code under test is in the image.
       checkout_ref: ${{ github.event.pull_request.head.sha || github.sha }}
       noop: ${{ github.event_name == 'merge_group' }}
+      dkms: ${{ vars.NEURON_DKMS || 'private-torch-neuronx-main-stable' }}
 
   block-perf:
     needs: [check-approval]
     if: needs.check-approval.outputs.run == 'true'
     uses: ./.github/workflows/_reusable-block-perf.yml
     with:
-      runner-labels: ${{ github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.internal_compute.persistent-storage:read","neuron.build-image","neuron.run-{0}-block-perf","neuron.pr:{1}","neuron.timeout:32400"]', github.run_id, github.event.pull_request.number || needs.check-approval.outputs.pr_number) }}
+      runner-labels: ${{ github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.internal_compute.persistent-storage:read","neuron.build-image","neuron.run-{0}-block-perf","neuron.pr:{1}","neuron.timeout:32400","neuron.dkms:{2}"]', github.run_id, github.event.pull_request.number || needs.check-approval.outputs.pr_number, vars.NEURON_DKMS || 'private-torch-neuronx-main-stable') }}
       artifact-prefix: block-perf
       enforce-mfu-threshold: true
       # Empty on a fork run, so it checks out the base branch. See internal-tests.

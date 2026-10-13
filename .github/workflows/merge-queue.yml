@@ -88,6 +88,7 @@ jobs:
       # max-failures: "0" blocks the merge on any failure/flake — calibrate first.
       max-failures: "0"
       priority: high
+      dkms: ${{ vars.NEURON_DKMS || 'private-torch-neuronx-main-stable' }}
       # download-neff-cache defaults true, so the merge gate reads the nightly's
       # seeded cache automatically. It never sets refresh-neff-cache, so a queued
       # PR can't write to the shared cache.
@@ -117,6 +118,7 @@ jobs:
       mode: gate
       image: ${{ needs.build-tests-image.outputs.main_image }}
       priority: high
+      dkms: ${{ vars.NEURON_DKMS || 'private-torch-neuronx-main-stable' }}
 
   merge-queue-gate:
     # This is the REQUIRED status check. It always runs (both events) so it can

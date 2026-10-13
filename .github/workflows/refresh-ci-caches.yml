@@ -55,6 +55,6 @@ jobs:
       # --refresh-persistent-goldens, so refresh only the NEFF cache here.
       refresh_persistent_goldens: false
       enforce_mfu_threshold: true
-      dkms: ''
+      dkms: ${{ vars.NEURON_DKMS || 'private-torch-neuronx-main-stable' }}
       # TEST-ONLY on contribute-9.9: one upstream node instead of 20.
       upstream_smoke_only: true

@@ -83,6 +83,11 @@ on:
         required: false
         type: boolean
         default: false
+      dkms:
+        description: Value of the neuron.dkms runner label. Empty uses the branch config pin.
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -102,14 +107,15 @@ jobs:
     # persistent-storage setting. The other leg stays in the queue.
     runs-on: >-
       ${{ fromJSON(inputs.runner-labels || format(
-      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:{0}","neuron.run-{1}-{2}-{3}-{6}","neuron.image:{4}","neuron.timeout:32400"{5}]',
+      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:{0}","neuron.run-{1}-{2}-{3}-{6}","neuron.image:{4}","neuron.timeout:32400"{5}{7}]',
       matrix.platform == 'trn2' && 'trn2.48xlarge' || 'trn3-dev1.48xlarge',
       github.run_id,
       inputs.runner-label-prefix || inputs.artifact-prefix,
       matrix.platform,
       inputs.image,
       matrix.group.id != 'infra-group' && format(',"neuron.internal_compute.persistent-storage:{0}"', inputs.refresh-persistent-goldens && ((github.ref == 'refs/heads/main' && endsWith(github.workflow_ref, '/.github/workflows/nightly.yml@refs/heads/main')) || (vars.CI_CACHE_REFRESH_ENABLED == 'true' && startsWith(github.ref, 'refs/heads/contribute-') && endsWith(github.workflow_ref, format('/.github/workflows/refresh-ci-caches.yml@{0}', github.ref)))) && 'write' || 'read') || '',
-      matrix.group.id
+      matrix.group.id,
+      inputs.dkms != '' && format(',"neuron.dkms:{0}"', inputs.dkms) || ''
       )) }}
     timeout-minutes: 600
     strategy:

@@ -93,6 +93,11 @@ on:
         required: false
         type: boolean
         default: false
+      dkms:
+        description: Value of the neuron.dkms runner label. Empty uses the branch config pin.
+        required: false
+        type: string
+        default: ''
     outputs:
       failure_count:
         description: >
@@ -155,12 +160,13 @@ jobs:
     # what makes the fleet inject the storage bucket/prefix env vars into the pod.
     runs-on: >-
       ${{ fromJSON(format(
-      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.run-{0}-upstream-pytorch-{1}","neuron.image:{2}","neuron.timeout:32400"{3}{4}]',
+      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.run-{0}-upstream-pytorch-{1}","neuron.image:{2}","neuron.timeout:32400"{3}{4}{5}]',
       github.run_id,
       matrix.node,
       inputs.image,
       inputs.priority != '' && format(',"neuron.priority:{0}"', inputs.priority) || '',
-      inputs.download-neff-cache && format(',"neuron.internal_compute.persistent-storage:{0}"', inputs.refresh-neff-cache && 'write' || 'read') || ''
+      inputs.download-neff-cache && format(',"neuron.internal_compute.persistent-storage:{0}"', inputs.refresh-neff-cache && 'write' || 'read') || '',
+      inputs.dkms != '' && format(',"neuron.dkms:{0}"', inputs.dkms) || ''
       )) }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     # Soft-fail suites run and upload raw results. The aggregator excludes them.

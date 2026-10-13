@@ -60,6 +60,7 @@ jobs:
       suite_id: ${{ inputs.suite_id }}
       image: ${{ inputs.image }}
       refresh_neff_cache: ${{ inputs.refresh_neff_cache }}
+      dkms: ${{ inputs.dkms }}
 
   test-block-perf:
     name: Block performance
@@ -72,6 +73,7 @@ jobs:
       refresh-persistent-goldens: ${{ inputs.refresh_persistent_goldens }}
       enforce-mfu-threshold: ${{ inputs.enforce_mfu_threshold }}
       mfu-threshold-multiplier: ${{ inputs.mfu_threshold_multiplier }}
+      dkms: ${{ inputs.dkms }}
 
   test-pytorch-upstream:
     name: PyTorch upstream
@@ -80,6 +82,7 @@ jobs:
       image: ${{ inputs.image }}
       refresh-neff-cache: ${{ inputs.refresh_neff_cache }}
       dist-config: ${{ inputs.upstream_smoke_only && 'upstream_pytorch_test_distribution_config.smoke.json' || 'upstream_pytorch_test_distribution_config.json' }}
+      dkms: ${{ inputs.dkms }}
 
   # Vertical ATen op-coverage gate. nightly and the dependency guard both pull
   # this suite, so a gate failure blocks their promote jobs with no per-workflow
@@ -92,3 +95,4 @@ jobs:
       mode: gate
       image: ${{ inputs.image }}
       refresh-neff-cache: ${{ inputs.refresh_neff_cache }}
+      dkms: ${{ inputs.dkms }}
