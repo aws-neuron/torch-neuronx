@@ -137,17 +137,33 @@ env:
 jobs:
   compute-pytorch-upstream-matrix:
     name: Compute PyTorch Upstream Test Suite Matrix
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, "neuron.image:neuron-gate-tools", "neuron.run-${{ github.run_id }}-upstream-compute-matrix"]
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.expand.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
-      - id: expand
+      # Step env does not reach run steps on this runner. Pass the inputs in a file,
+      # because the labels and the dispatch config are free text.
+      - uses: actions/github-script@v7
         env:
-          DIST_CONFIG: ${{ inputs.dist-config }}
           PR_LABELS: ${{ inputs.labels }}
+          DIST_CONFIG: ${{ inputs.dist-config }}
           RUN_FULL_SUITE: ${{ inputs.run-full-suite }}
-        run: python3 tests/pytorch_tests_native/runner/emit_upstream_matrix.py
+        with:
+          script: |
+            const {PR_LABELS, DIST_CONFIG, RUN_FULL_SUITE} = process.env;
+            require('fs').writeFileSync(
+              `${process.env.RUNNER_TEMP}/upstream-matrix-env.json`,
+              JSON.stringify({PR_LABELS, DIST_CONFIG, RUN_FULL_SUITE}),
+            );
+      - id: expand
+        run: |
+          f="${RUNNER_TEMP}/upstream-matrix-env.json"
+          PR_LABELS="$(jq -r '.PR_LABELS // ""' "$f")" \
+          DIST_CONFIG="$(jq -r '.DIST_CONFIG // ""' "$f")" \
+          RUN_FULL_SUITE="$(jq -r '.RUN_FULL_SUITE // ""' "$f")" \
+            python3 tests/pytorch_tests_native/runner/emit_upstream_matrix.py
 
   pytorch-upstream-test-suite:
     name: "${{ matrix.label }}"
