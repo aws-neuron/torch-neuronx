@@ -74,6 +74,11 @@ on:
         required: false
         type: boolean
         default: false
+      dkms:
+        description: Value of the neuron.dkms runner label. Empty uses the branch config pin.
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -95,13 +100,14 @@ jobs:
     # pod. Both mirror _upstream-tests.yml.
     runs-on: >-
       ${{ fromJSON(format(
-      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.run-{0}-vertical-{1}","neuron.image:{2}","neuron.timeout:{3}"{4}{5}]',
+      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.run-{0}-vertical-{1}","neuron.image:{2}","neuron.timeout:{3}"{4}{5}{6}]',
       github.run_id,
       inputs.mode,
       inputs.image,
       inputs.runner-timeout,
       inputs.priority != '' && format(',"neuron.priority:{0}"', inputs.priority) || '',
-      inputs.download-neff-cache && format(',"neuron.internal_compute.persistent-storage:{0}"', inputs.refresh-neff-cache && 'write' || 'read') || ''
+      inputs.download-neff-cache && format(',"neuron.internal_compute.persistent-storage:{0}"', inputs.refresh-neff-cache && 'write' || 'read') || '',
+      inputs.dkms != '' && format(',"neuron.dkms:{0}"', inputs.dkms) || ''
       )) }}
     timeout-minutes: ${{ inputs.job-timeout-minutes }}
     env:

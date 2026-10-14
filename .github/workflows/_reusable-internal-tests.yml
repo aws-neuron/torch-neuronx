@@ -48,6 +48,11 @@ on:
         required: false
         type: boolean
         default: false
+      dkms:
+        description: Value of the neuron.dkms runner label. Empty uses the branch config pin.
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -177,14 +182,15 @@ jobs:
     runs-on: >-
       ${{ inputs.noop && fromJSON('["ubuntu-latest"]') || inputs.build_image &&
       fromJSON(format(
-      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.build-image","neuron.run-{0}-{1}","neuron.pr:{2}","neuron.timeout:{3}"{4}]',
+      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.build-image","neuron.run-{0}-{1}","neuron.pr:{2}","neuron.timeout:{3}"{4}{5}]',
       github.run_id,
       matrix.id,
       inputs.pr_number,
       matrix.runner_timeout,
-      matrix.uses_neff_cache && ',"neuron.internal_compute.persistent-storage:read"' || ''
+      matrix.uses_neff_cache && ',"neuron.internal_compute.persistent-storage:read"' || '',
+      inputs.dkms != '' && format(',"neuron.dkms:{0}"', inputs.dkms) || ''
       )) || fromJSON(format(
-      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.run-{0}-{1}-{2}","neuron.image:{3}","neuron.timeout:{4}"{5}]',
+      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.run-{0}-{1}-{2}","neuron.image:{3}","neuron.timeout:{4}"{5}{6}]',
       github.run_id,
       inputs.suite_id,
       matrix.id,
@@ -193,7 +199,8 @@ jobs:
       matrix.uses_neff_cache && format(
       ',"neuron.internal_compute.persistent-storage:{0}"',
       inputs.refresh_neff_cache && 'write' || 'read'
-      ) || ''
+      ) || '',
+      inputs.dkms != '' && format(',"neuron.dkms:{0}"', inputs.dkms) || ''
       )) }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:

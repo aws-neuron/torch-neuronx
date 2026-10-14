@@ -6,7 +6,21 @@ on:
   # synchronize re-runs the suite on the new SHA (gate checks approval via API).
   pull_request:
     types: [synchronize]
+  # A fork pull request gets no automatic run. A maintainer comments /test
+  # (pr-commands.yml), which starts this workflow with the two inputs below.
+  # Leave both empty for a normal manual run.
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Fork pull request number. Leave empty for a normal manual run.
+        required: false
+        type: string
+        default: ''
+      head_sha:
+        description: Full head commit of the fork pull request that you reviewed.
+        required: false
+        type: string
+        default: ''
   # Required checks must report on the merge-group commit too, else the queue
   # hangs. They ran for real on the PR head; here they no-op pass (see jobs).
   merge_group:
@@ -16,8 +30,10 @@ permissions:
   contents: read
   id-token: write
   pull-requests: read  # gate reads PR reviews
+# Fork pull request runs get their own group. They start on the base branch,
+# so github.sha is the same for every fork pull request on that branch.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (inputs.pr_number && format('manual-{0}', inputs.pr_number)) || github.sha }}
   cancel-in-progress: true
 env:
   AWS_DEFAULT_REGION: us-west-2
@@ -26,26 +42,63 @@ jobs:
   # so we don't need the ciflow:approved label or a separate labeler workflow.
   check-approval:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write  # pending status on a fork pull request
     outputs:
       run: ${{ steps.check.outputs.run }}
+      pr_number: ${{ steps.check.outputs.pr_number }}
+      head_sha: ${{ steps.check.outputs.head_sha }}
     steps:
       - id: check
         uses: actions/github-script@v7
         with:
           script: |
-            // merge_group and workflow_dispatch always run.
-            if (context.eventName === 'merge_group' || context.eventName === 'workflow_dispatch') {
+            // merge_group and a manual run without a pull request always run.
+            const prInput = (context.payload.inputs || {}).pr_number || '';
+            if (context.eventName === 'merge_group' || (context.eventName === 'workflow_dispatch' && !prInput)) {
               core.setOutput('run', 'true');
               return;
             }
+            // A manual run for a fork pull request. Run only the commit that a
+            // maintainer reviewed and labelled.
+            if (context.eventName === 'workflow_dispatch') {
+              const headSha = context.payload.inputs.head_sha || '';
+              if (!/^[1-9][0-9]*$/.test(prInput) || !/^[0-9a-f]{40}$/.test(headSha)) {
+                core.setFailed('Give the pull request number and its full 40-character head commit.');
+                return;
+              }
+              const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: Number(prInput) });
+              const branch = context.ref.replace('refs/heads/', '');
+              if (pr.state !== 'open') {
+                core.setFailed(`PR #${prInput} is not open.`);
+              } else if (pr.base.ref !== branch) {
+                core.setFailed(`PR #${prInput} targets ${pr.base.ref}. Start the run on that branch.`);
+              } else if (!pr.labels.some(l => l.name === 'safe-to-test')) {
+                core.setFailed(`PR #${prInput} does not have the safe-to-test label.`);
+              } else if (pr.head.sha !== headSha) {
+                core.setFailed(`PR #${prInput} changed after the review. Review ${pr.head.sha} and comment /test again.`);
+              } else {
+                await github.rest.repos.createCommitStatus({
+                  ...context.repo, sha: headSha, state: 'pending', context: 'PR Checks',
+                  target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+                });
+                core.setOutput('run', 'true');
+                core.setOutput('pr_number', prInput);
+                core.setOutput('head_sha', headSha);
+              }
+              return;
+            }
             const draft = context.payload.pull_request.draft;
+            const release = context.payload.pull_request.base.ref.startsWith('release-');
             const skip = (context.payload.pull_request.labels || []).some(l => l.name === 'ciflow:skip-pr-checks');
             // pull_request_review: only run on actual approval.
             // Comments will cancel the in-flight suite (unavoidable with
             // cancel-in-progress) but will NOT restart — same as before.
             if (context.eventName === 'pull_request_review') {
               const approved = context.payload.review.state === 'approved';
-              core.setOutput('run', String(approved && !draft && !skip));
+              core.setOutput('run', String(approved && !draft && !release && !skip));
               return;
             }
             // pull_request [synchronize]: rebase/merge-from-main.
@@ -61,7 +114,7 @@ jobs:
             // TEST-ONLY on contribute-9.9: approval check skipped. TODO: restore the line below.
             // const approved = [...latestByUser.values()].includes('APPROVED');
             const approved = true;
-            core.setOutput('run', String(approved && !draft && !skip));
+            core.setOutput('run', String(approved && !draft && !release && !skip));
   internal-tests:
     needs: [check-approval]
     if: needs.check-approval.outputs.run == 'true'
@@ -70,20 +123,44 @@ jobs:
     with:
       test_set: pr
       build_image: true
-      pr_number: ${{ github.event.pull_request.number || '' }}
+      pr_number: ${{ github.event.pull_request.number || needs.check-approval.outputs.pr_number || '' }}
+      # A fork run checks out the base branch (github.sha), not the fork. The
+      # runner then uses our .github/ actions. The code under test is in the image.
       checkout_ref: ${{ github.event.pull_request.head.sha || github.sha }}
       noop: ${{ github.event_name == 'merge_group' }}
+      dkms: ${{ vars.NEURON_DKMS || 'private-torch-neuronx-main-stable' }}
 
   block-perf:
     needs: [check-approval]
     if: needs.check-approval.outputs.run == 'true'
     uses: ./.github/workflows/_reusable-block-perf.yml
     with:
-      runner-labels: ${{ github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.internal_compute.persistent-storage:read","neuron.build-image","neuron.run-{0}-block-perf","neuron.pr:{1}","neuron.timeout:32400"]', github.run_id, github.event.pull_request.number) }}
+      runner-labels: ${{ github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.internal_compute.persistent-storage:read","neuron.build-image","neuron.run-{0}-block-perf","neuron.pr:{1}","neuron.timeout:32400","neuron.dkms:{2}"]', github.run_id, github.event.pull_request.number || needs.check-approval.outputs.pr_number, vars.NEURON_DKMS || 'private-torch-neuronx-main-stable') }}
       artifact-prefix: block-perf
       enforce-mfu-threshold: true
+      # Empty on a fork run, so it checks out the base branch. See internal-tests.
       checkout-ref: ${{ github.event.pull_request.head.sha }}
       noop: ${{ github.event_name == 'merge_group' }}
+
+  # Fork pull request runs only. A manual run reports on the base branch, so
+  # post the result on the pull request head commit.
+  report-to-pr:
+    needs: [check-approval, internal-tests, block-perf]
+    if: always() && needs.check-approval.outputs.pr_number != ''
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ needs.check-approval.outputs.head_sha }}
+          STATE: ${{ needs.internal-tests.result == 'success' && needs.block-perf.result == 'success' && 'success' || 'failure' }}
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              ...context.repo, sha: process.env.HEAD_SHA, state: process.env.STATE, context: 'PR Checks',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
 
   # ── Torch-MLIR E2E (currently disabled) ─────────────────────
   # Kept as its own job (rather than a matrix entry) because it's
