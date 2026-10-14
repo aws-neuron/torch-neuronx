@@ -41,7 +41,8 @@ jobs:
   # Determines whether the suite should run. Checks approval state via API
   # so we don't need the ciflow:approved label or a separate labeler workflow.
   check-approval:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, "neuron.image:neuron-gate-tools", "neuron.run-${{ github.run_id }}-check-approval"]
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: read
@@ -135,7 +136,7 @@ jobs:
     if: needs.check-approval.outputs.run == 'true'
     uses: ./.github/workflows/_reusable-block-perf.yml
     with:
-      runner-labels: ${{ github.event_name == 'merge_group' && '["ubuntu-latest"]' || format('["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.internal_compute.persistent-storage:read","neuron.build-image","neuron.run-{0}-block-perf","neuron.pr:{1}","neuron.timeout:32400","neuron.dkms:{2}"]', github.run_id, github.event.pull_request.number || needs.check-approval.outputs.pr_number, vars.NEURON_DKMS || 'private-torch-neuronx-main-stable') }}
+      runner-labels: ${{ format('["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.internal_compute.persistent-storage:read","neuron.build-image","neuron.run-{0}-block-perf","neuron.pr:{1}","neuron.timeout:32400","neuron.dkms:{2}"]', github.run_id, github.event.pull_request.number || needs.check-approval.outputs.pr_number, vars.NEURON_DKMS || 'private-torch-neuronx-main-stable') }}
       artifact-prefix: block-perf
       enforce-mfu-threshold: true
       # Empty on a fork run, so it checks out the base branch. See internal-tests.
@@ -147,7 +148,8 @@ jobs:
   report-to-pr:
     needs: [check-approval, internal-tests, block-perf]
     if: always() && needs.check-approval.outputs.pr_number != ''
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, "neuron.image:neuron-gate-tools", "neuron.run-${{ github.run_id }}-report-to-pr"]
+    timeout-minutes: 10
     permissions:
       statuses: write
     steps:

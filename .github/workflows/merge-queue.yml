@@ -128,19 +128,20 @@ jobs:
     name: Merge Queue Gate Status
     needs: [pytorch-upstream-tests, resolve-labels, vertical-gate]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, "neuron.image:neuron-gate-tools", "neuron.run-${{ github.run_id }}-merge-queue-gate"]
+    timeout-minutes: 10
     steps:
       - name: Link batched PRs
         # Reverse hop: link each PR gated by this (possibly batched) run so an
         # ejected/failed run points back to its PR(s). Informational only.
         if: github.event_name == 'merge_group'
         continue-on-error: true
-        env:
-          MG_HEAD_REF: ${{ github.event.merge_group.head_ref }}
-          # Commit message of the queued commit (== PR title for squash merges).
-          MG_COMMIT_MSG: ${{ github.event.merge_group.head_commit.message }}
-          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        # Step env does not reach run steps on this runner. Read PR text from the event file.
         run: |
+          MG_HEAD_REF=$(jq -r '.merge_group.head_ref // ""' "$GITHUB_EVENT_PATH")
+          # Commit message of the queued commit (== PR title for squash merges).
+          MG_COMMIT_MSG=$(jq -r '.merge_group.head_commit.message // ""' "$GITHUB_EVENT_PATH")
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
           # Lead with the pr-<N>-<sha> token(s) carried in the queue ref.
           tokens=$(echo "$MG_HEAD_REF" | grep -oE 'pr-[0-9]+-[0-9a-f]+' | sort -u | paste -sd' ' -)
           # First line only -- commit messages can be multi-line.

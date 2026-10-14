@@ -60,14 +60,15 @@ permissions:
 
 jobs:
   define-matrix:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, "neuron.image:neuron-gate-tools", "neuron.run-${{ github.run_id }}-${{ inputs.suite_id }}-define-matrix"]
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
+      # Step env does not reach run steps on this runner, so set the variable inline.
       - id: matrix
-        env:
-          TEST_SET: ${{ inputs.test_set }}
         run: |
+          TEST_SET='${{ inputs.test_set }}'
           matrix='{
             "include": [
               {
@@ -180,7 +181,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.define-matrix.outputs.matrix) }}
     runs-on: >-
-      ${{ inputs.noop && fromJSON('["ubuntu-latest"]') || inputs.build_image &&
+      ${{ inputs.noop && fromJSON(format(
+      '["self-hosted","linux","neuron.image:neuron-gate-tools","neuron.run-{0}-{1}-noop-{2}"]',
+      github.run_id, inputs.suite_id, matrix.id)) || inputs.build_image &&
       fromJSON(format(
       '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.build-image","neuron.run-{0}-{1}","neuron.pr:{2}","neuron.timeout:{3}"{4}{5}]',
       github.run_id,

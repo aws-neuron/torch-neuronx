@@ -32,7 +32,8 @@ permissions:
 jobs:
   resolve:
     name: Resolve PR Labels
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, "neuron.image:neuron-gate-tools", "neuron.run-${{ github.run_id }}-resolve-labels"]
+    timeout-minutes: 10
     outputs:
       labels: ${{ steps.lookup.outputs.labels }}
       skip_upstream: ${{ steps.lookup.outputs.skip_upstream }}
