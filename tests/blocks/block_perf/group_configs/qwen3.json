@@ -3,30 +3,17 @@
     {
       "benchmark_runs": 20,
       "block": "qwen3_torchtitan",
-      "host_cc": true,
       "id": "qwen3-tp4-fsdp16",
       "mfu": {
         "trn2": {
           "baseline": 9.96,
           "baseline_date": "2026-04-29",
-          "threshold": 9.06
+          "threshold": 8.97
         },
         "trn3pds-b1": {
           "baseline": 14.3,
           "baseline_date": "2026-08-27",
-          "threshold": 13.73
-        }
-      },
-      "mfu_hostcc": {
-        "trn2": {
-          "baseline": 10.91,
-          "baseline_date": "2026-10-05",
-          "threshold": 9.93
-        },
-        "trn3pds-b1": {
-          "baseline": 12.97,
-          "baseline_date": "2026-10-05",
-          "threshold": 12.45
+          "threshold": 12.87
         }
       },
       "n_layers": 4,
@@ -39,30 +26,17 @@
     {
       "benchmark_runs": 20,
       "block": "qwen3_torchtitan",
-      "host_cc": true,
       "id": "qwen3-tp1-fsdp64",
       "mfu": {
         "trn2": {
           "baseline": 24.14,
           "baseline_date": "2026-04-28",
-          "threshold": 23.17
+          "threshold": 21.73
         },
         "trn3pds-b1": {
-          "baseline": 31.89,
-          "baseline_date": "2026-09-23",
-          "threshold": 30.61
-        }
-      },
-      "mfu_hostcc": {
-        "trn2": {
-          "baseline": 21.83,
-          "baseline_date": "2026-10-05",
-          "threshold": 20.96
-        },
-        "trn3pds-b1": {
-          "baseline": 24.92,
-          "baseline_date": "2026-10-05",
-          "threshold": 23.92
+          "baseline": 32.76,
+          "baseline_date": "2026-08-27",
+          "threshold": 29.48
         }
       },
       "n_layers": 4,
@@ -80,12 +54,12 @@
         "trn2": {
           "baseline": 23.92,
           "baseline_date": "2026-04-25",
-          "threshold": 22.96
+          "threshold": 21.53
         },
         "trn3pds-b1": {
           "baseline": 32.72,
           "baseline_date": "2026-08-27",
-          "threshold": 29.78
+          "threshold": 29.45
         }
       },
       "n_layers": 4,
@@ -99,30 +73,17 @@
       "benchmark_runs": 20,
       "block": "qwen3_torchtitan",
       "exec_mode": "compile",
-      "host_cc": true,
       "id": "qwen3-tp4-fsdp16-compile",
       "mfu": {
         "trn2": {
           "baseline": 24.6,
           "baseline_date": "2026-07-10",
-          "threshold": 23.62
+          "threshold": 22.14
         },
         "trn3pds-b1": {
           "baseline": 32.93,
           "baseline_date": "2026-08-27",
-          "threshold": 30.95
-        }
-      },
-      "mfu_hostcc": {
-        "trn2": {
-          "baseline": 17.79,
-          "baseline_date": "2026-10-05",
-          "threshold": 17.08
-        },
-        "trn3pds-b1": {
-          "baseline": 21.38,
-          "baseline_date": "2026-10-05",
-          "threshold": 20.1
+          "threshold": 29.64
         }
       },
       "n_layers": 4,
@@ -136,30 +97,17 @@
       "benchmark_runs": 20,
       "block": "qwen3_torchtitan",
       "exec_mode": "compile",
-      "host_cc": true,
       "id": "qwen3-tp1-fsdp64-compile",
       "mfu": {
         "trn2": {
-          "baseline": 29.47,
-          "baseline_date": "2026-09-23",
-          "threshold": 27.7
+          "baseline": 30.99,
+          "baseline_date": "2026-05-29",
+          "threshold": 27.89
         },
         "trn3pds-b1": {
-          "baseline": 36.04,
-          "baseline_date": "2026-09-23",
-          "threshold": 34.6
-        }
-      },
-      "mfu_hostcc": {
-        "trn2": {
-          "baseline": 23.06,
-          "baseline_date": "2026-10-05",
-          "threshold": 21.68
-        },
-        "trn3pds-b1": {
-          "baseline": 26.88,
-          "baseline_date": "2026-10-05",
-          "threshold": 25.8
+          "baseline": 37.99,
+          "baseline_date": "2026-08-27",
+          "threshold": 34.19
         }
       },
       "n_layers": 4,
@@ -178,12 +126,12 @@
         "trn2": {
           "baseline": 54.3,
           "baseline_date": "2026-06-02",
-          "threshold": 52.13
+          "threshold": 51.58
         },
         "trn3pds-b1": {
           "baseline": 71.8,
           "baseline_date": "2026-08-27",
-          "threshold": 67.49
+          "threshold": 64.62
         }
       },
       "n_layers": 4,

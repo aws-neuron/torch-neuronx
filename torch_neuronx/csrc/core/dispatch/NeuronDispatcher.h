@@ -35,9 +35,6 @@ struct DispatchCacheEntry {
   // Which flattened inputs the HLO actually uses
   std::vector<int> kept_input_indices;
 
-  // Number of inputs in the compiled IR. -1 preserves legacy filtering.
-  int64_t ir_input_count = -1;
-
   // Which original outputs the HLO produces
   std::vector<int> kept_output_indices;
 
@@ -102,8 +99,8 @@ struct OpRegistration {
   std::unordered_set<std::string> static_argnames;
 
   // When true, always call lower_func on every dispatch — never cache the
-  // lowering result. Python derives it from preprocessing=VALUE_DEPENDENT, for a
-  // factory op that resolves a tensor value into the graph.
+  // lowering result. Set for ops with uses_preprocessing=True whose
+  // preprocessing reads tensor values (not just shapes/dtypes).
   bool skip_cache = false;
 
   // When true, this op has a lower_func and is eligible for the C++ meta
@@ -191,7 +188,8 @@ class NeuronDispatcher {
    * static destructor (which runs *after* Python is gone) finds empty
    * containers and does not segfault on py::object decref.
    *
-   * Follows the same pattern as _stream_cleanup_capsule in NeuronBindings.cpp.
+   * Follows the same pattern as python_contiguous_op / _stream_cleanup_capsule
+   * in NeuronBindings.cpp.
    */
   void Cleanup();
 
@@ -312,7 +310,6 @@ class NeuronDispatcher {
    * @param args                   Preprocessed IValue args
    * @param schema                 Op schema (to distinguish positional vs kwarg-only)
    * @param kept_input_indices     Which flattened indices the IR actually uses
-   * @param ir_input_count         Exact IR input count, or -1 for legacy filtering
    * @param op_name                Op name for error messages
    * @return                       Filtered tensors ready for IR execution
    */
@@ -320,7 +317,7 @@ class NeuronDispatcher {
       const std::vector<c10::IValue>& args, const c10::FunctionSchema& schema,
       const std::vector<int>& kept_input_indices, const std::string& op_name,
       const std::unordered_set<size_t>& static_argnums = {},
-      const std::unordered_set<std::string>& static_argnames = {}, int64_t ir_input_count = -1);
+      const std::unordered_set<std::string>& static_argnames = {});
 
   // ════════════════════════════════════════════════════
   //  Dispatch implementations — called with a pre-captured
@@ -351,24 +348,6 @@ class NeuronDispatcher {
    */
   static void DispatchToCopyImpl(const c10::OperatorHandle& op, c10::DispatchKeySet dispatch_keys,
                                  torch::jit::Stack* stack, const OpRegistration& reg);
-
-  /**
-   * Dedicated handler for aten::_foreach_copy_.
-   *   (Tensor(a!)[] self, Tensor[] src, bool non_blocking=False) -> ()
-   *
-   * One kernel copying every src into its dst works for any memory layout, so a
-   * list whose every pair that kernel can express goes to DispatchImpl and the
-   * ordinary cached path. Any other list is copied pair by pair through
-   * DispatchCopyImpl, which already has a ladder per dtype and stream.
-   *
-   * The choice belongs here, ahead of the cache lookup, because it turns on what
-   * a cache entry cannot carry: the current stream is not part of the key, and
-   * the Python factory runs only on a miss, so its decision would be replayed on
-   * calls it never saw.
-   */
-  static void DispatchForeachCopyImpl(const c10::OperatorHandle& op,
-                                      c10::DispatchKeySet dispatch_keys, torch::jit::Stack* stack,
-                                      const OpRegistration& reg);
 
   /**
    * Dedicated handler implementation for aten::contiguous.
@@ -447,8 +426,7 @@ class NeuronDispatcher {
       at::neuron::CPUFallbackContext fallback_ctx,
       const std::vector<c10::IValue>& original_args = {},
       std::shared_ptr<DispatchCacheEntry>* out_entry = nullptr,
-      bool use_complex_decomposition = false,
-      const std::vector<c10::IValue>& raw_fallback_args = {});
+      bool use_complex_decomposition = false);
 
   /**
    * Casting path: handles dtype downcasting/upcasting.

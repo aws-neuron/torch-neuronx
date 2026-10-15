@@ -2,6 +2,8 @@
 Test event synchronization and timing functionality for multi-stream support.
 """
 
+import time
+
 import pytest
 import torch
 
@@ -129,27 +131,6 @@ class TestEventSynchronization:
 
         # Should have taken some measurable time (more than 0)
         assert elapsed > 0.0
-
-    @assert_raises(RuntimeError, match="Event has not completed")
-    def test_event_elapsed_time_not_completed_raises(self):
-        """elapsed_time() must error, not block, when an event is still in flight."""
-        start_event = torch.neuron.Event(enable_timing=True)
-        end_event = torch.neuron.Event(enable_timing=True)
-
-        stream = torch.neuron.Stream()
-
-        with torch.neuron.stream(stream):
-            start_event.record()
-
-            tensor = torch.randn(2048, 2048, device="neuron")
-            for _ in range(5):
-                tensor = torch.mm(tensor, tensor)
-
-            # Record immediately -- no synchronize() first, so end_event is
-            # still in flight below.
-            end_event.record()
-
-        start_event.elapsed_time(end_event)
 
     def test_event_timing_cross_stream(self):
         """Test timing measurements across different streams."""

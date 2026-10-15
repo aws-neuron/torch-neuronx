@@ -37,23 +37,29 @@ def _validate_scatter_add_inputs(input, dim, index, src, num_shards):
 
 @nki.jit
 def scatter_add(input, dim, index, src):
-    """Scatter-add source rows into an input tensor in place.
+    """
+    Scatter-add from src into input based on indices.
+    Equivalent to PyTorch's input.scatter_add(dim=dim, index=index, src=src).
+
+    This operation performs: input[index[i], j] += src[i, j] for all i, j
+
+    Note: This is an in-place operation that modifies the input tensor directly.
+    Uses gather-add-scatter pattern to handle accumulation.
 
     Args:
-        input (nl.ndarray): Two-dimensional destination with shape ``(N, D)``.
-        dim (int): Scatter dimension, which must be ``0``.
-        index (nl.ndarray): One-dimensional destination row indices with shape ``(K,)``.
-        src (nl.ndarray): Source values with shape ``(K, D)``.
+        input: (N, D) - destination tensor to accumulate into (modified in-place)
+        dim: int - dimension along which to scatter (must be 0)
+        index: (K,) - 1D tensor of indices
+        src: (K, D) - source values to scatter
 
     Returns:
-        nl.ndarray: The modified destination, aliasing ``input``.
+        input: (N, D) - the input tensor with scattered values added (same object)
 
-    Raises:
-        AssertionError: If ranks, dimensions, or launch sharding are unsupported.
-
-    Note:
-        Each program owns disjoint columns. Indices within each 128-row tile must be
-        unique because the kernel uses a gather-add-scatter update.
+    Restrictions:
+        - Input and src tensors must be 2D
+        - Index tensor must be 1D
+        - dim must be 0
+        - Indices within a tile of 128 rows should be unique for correctness
     """
     k, d = src.shape
 

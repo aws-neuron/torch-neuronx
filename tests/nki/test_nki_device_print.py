@@ -1,9 +1,9 @@
 import os
 
-import nki
-import nki.language as nl
+import neuronxcc.nki.language as nl
 import pytest
 import torch
+from neuronxcc import nki
 
 from torch_neuronx import nki_op
 

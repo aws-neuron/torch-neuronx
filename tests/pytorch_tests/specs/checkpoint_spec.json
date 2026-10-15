@@ -1,0 +1,183 @@
+{
+  "test_configurations": [
+    {
+      "folder": "distributed/checkpoint",
+      "sanity_methods": [
+        "test_default_metadata",
+        "test_dummy_writer_works",
+        "test_dummy_reader_works",
+        "test_save_error_handling_no_dist",
+        "test_load_error_handling_no_dist",
+        "test_metadata",
+        "test_traverse_nested_dict",
+        "test_single_gpu",
+        "test_ddp",
+        "test_fsdp",
+        "test_optim_state_dict_param_matching",
+        "test_torch_save_to_dcp"
+      ],
+      "skip_tests": [
+        {
+          "reason": "Skipping as these tests are purely for testing PGTransport in torch and have mocked the process group and are executing on CPU",
+          "tests": [
+            "test_send_checkpoint_with_cpu_tensors",
+            "test_recv_checkpoint_basic",
+            "test_recv_checkpoint_with_state_dict_callback",
+            "test_send_checkpoint_basic",
+            "test_send_checkpoint_empty_state_dict",
+            "test_send_checkpoint_with_non_tensor_values"
+          ]
+        },
+        {
+          "reason": "Unsupported send/rec ops in processGroupNeuron",
+          "tests": [
+            "test_pg_transport_with_mixed_content",
+            "test_pg_transport_with_sharded_tensor",
+            "test_pg_transport"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "ValueError: <1, 2 or 3> is not in list - Neuron runtime setup failure during process group initialization",
+          "tests": [
+            "test_fsdp",
+            "test_fsdp2",
+            "test_fsdp_ddp",
+            "test_fsdp_root_not_initialized",
+            "test_set_cpu_model_state_dict_broadcast_from_rank0",
+            "test_activation_ckpt_fqns_fsdp1",
+            "test_complicated_dict",
+            "test_compiled_fsdp",
+            "test_optim_state_dict_param_matching",
+            "test_gather_object",
+            "test_broadcast_object_global_local_mismatch",
+            "test_gather_state_dict_dtensor",
+            "test_e2e",
+            "test_ddp",
+            "test_multi_device_load_model_state_dict",
+            "test_flattened_osd",
+            "test_multi_param_groups",
+            "test_activation_ckpt_fqns_ddp",
+            "test_setting_meta_device_model_broadcasting_and_memory",
+            "test_shared_weight",
+            "test_broadcast_from_rank0",
+            "test_barrier",
+            "test_scatter_object",
+            "test_cpu_offload_full_state_dict",
+            "test_deprecate_api",
+            "test_setting_meta_device_model",
+            "test_cpu_and_ranks_only",
+            "test_cpu_offload_for_dtensor",
+            "test_create_cpu_state_dict",
+            "test_broadcast_object_with_nonzero_coordinator",
+            "test_gather_with_cpu_and_ranks_only",
+            "test_state_dict_util_distribute_tensors",
+            "test_state_dict_with_hook_on_keys",
+            "test_strict",
+            "test_fine_tuning"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Sharding propagation failed for DTensor operation (aten._to_copy.default)",
+          "tests": [
+            "test_distributed_tensor_planner"
+          ]
+        },
+        {
+          "reason": "NotImplementedError: Operation all_gather is not implemented for Neuron - AllGatherXlaOp requires all tensors on neuron device, found CPU tensors",
+          "tests": [
+            "test_load_rowwise_to_colwise_thread_count_1",
+            "test_load_rowwise_to_colwise_thread_count_2",
+            "test_load_with_different_shard_plan_thread_count_1",
+            "test_load_with_different_shard_plan_thread_count_2"
+          ]
+        },
+        {
+          "reason": "NotImplementedError: Operation all_reduce is not implemented for Neuron - AllReduceXLAOp requires all tensors on neuron device, found CPU tensors",
+          "tests": [
+            "test_switch_between_sharded_tensor_to_tensor_thread_count_1",
+            "test_switch_between_sharded_tensor_to_tensor_thread_count_2"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Expected neuron device but got: cpu",
+          "tests": [
+            "test_dtensor"
+          ]
+        },
+        {
+          "reason": "NotImplementedError: Operation reduce_scatter is not implemented for Neuron - ReduceScatterXLAOp requires all tensors on neuron device, found CPU tensors",
+          "tests": [
+            "test_replication_dtensors"
+          ]
+        },
+        {
+          "reason": "RuntimeError: No backend type associated with device type cpu",
+          "tests": [
+            "test_replication_persistence",
+            "test_replication_sharded_tensors"
+          ]
+        },
+        {
+          "reason": "AssertionError: A CPU backend must be enabled for async save; try initializing process group with 'cpu:gloo,cuda:nccl'",
+          "tests": [
+            "test_e2e_async_cached_cache_staged_state_dict_True_async_checkpointer_type3_zoc_False",
+            "test_e2e_async_cached_cache_staged_state_dict_False_async_checkpointer_type2_zoc_False",
+            "test_e2e_async_cached_cache_staged_state_dict_False_async_checkpointer_type0_zoc_False",
+            "test_e2e_async_cached_cache_staged_state_dict_False_async_checkpointer_type5_zoc_True",
+            "test_e2e_async_cached_cache_staged_state_dict_False_async_checkpointer_type4_zoc_True",
+            "test_e2e_async_cached_cache_staged_state_dict_True_async_checkpointer_type1_zoc_False"
+          ]
+        },
+        {
+          "reason": "RuntimeError: CPU fallback disabled - Device index out of range for scalar_tensor operation",
+          "tests": [
+            "test_e2e_compile_True_model_type0",
+            "test_e2e_compile_True_model_type1",
+            "test_e2e_compile_True_model_type2"
+          ]
+        },
+        {
+          "reason": "Operation mm failed to execute on Neuron - AssertionError: Expected code to be unreachable for get_device_type",
+          "tests": [
+            "test_fsdp2"
+          ]
+        },
+        {
+          "reason": "RuntimeError: Cannot re-initialize CUDA in forked subprocess - multiprocessing requires 'spawn' start method",
+          "tests": [
+            "test_complex_storage_sharing",
+            "test_dataclasses",
+            "test_different_dtypes",
+            "test_tensor_attrs",
+            "test_tensor_pinned_and_shared",
+            "test_cuda_tensors_staging"
+          ]
+        },
+        {
+          "reason": "Test execution issue - uuuu status (test setup or teardown problem)",
+          "tests": [
+            "test_empty_tensors",
+            "test_views",
+            "test_caching"
+          ]
+        },
+        {
+          "reason": "RuntimeError: cannot reshape tensor of 0 elements into shape [-1, 0] - ambiguous dimension size",
+          "tests": [
+            "test_save_with_tp_and_load_with_fsdp2_tp",
+            "test_save_with_fsdp1_and_load_with_fsdp2_tp",
+            "test_save_with_fsdp2_tp_and_load_with_tp"
+          ]
+        },
+        {
+          "reason": "AssertionError: AssertionError not raised - test expects exception but code executes successfully",
+          "tests": [
+            "test_cuda_non_blocking_without_cuda"
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -462,11 +462,6 @@ struct DeviceMemoryStats {
   std::atomic<int64_t> num_alloc_drain_retry_ok{0};    // RetryReady Schedule succeeded
   std::atomic<int64_t> num_alloc_drain_retry_fail{0};  // RetryReady Schedule OOM'd again
 
-  // Scalar device memory cache counters.
-  std::atomic<int64_t> num_scalar_cache_hits{0};
-  std::atomic<int64_t> num_scalar_cache_misses{0};
-  std::atomic<int64_t> scalar_cache_size{0};
-
   void reset_peak() {
     allocated_bytes.reset_peak();
     reserved_bytes.reset_peak();
@@ -485,9 +480,6 @@ struct DeviceMemoryStats {
     num_alloc_deferred.store(0, std::memory_order_relaxed);
     num_alloc_drain_retry_ok.store(0, std::memory_order_relaxed);
     num_alloc_drain_retry_fail.store(0, std::memory_order_relaxed);
-    num_scalar_cache_hits.store(0, std::memory_order_relaxed);
-    num_scalar_cache_misses.store(0, std::memory_order_relaxed);
-    scalar_cache_size.store(0, std::memory_order_relaxed);
   }
 
   void reset_accumulated() {
@@ -527,10 +519,6 @@ struct DeviceMemoryStatsInfo {
   int64_t num_alloc_deferred = 0;
   int64_t num_alloc_drain_retry_ok = 0;
   int64_t num_alloc_drain_retry_fail = 0;
-  // Scalar device memory cache counters.
-  int64_t num_scalar_cache_hits = 0;
-  int64_t num_scalar_cache_misses = 0;
-  int64_t scalar_cache_size = 0;
 };
 
 /**
@@ -561,8 +549,7 @@ struct PeakMemoryStats {
 void RecordNewAllocation(
     int device_id, size_t size_bytes, size_t block_size_bytes, void* tensor_data_ptr = nullptr,
     c10::StreamId stream_id = 0,
-    const std::shared_ptr<c10_neuron::NeuronMemorySnapshot::StackContext>& context = nullptr,
-    uint64_t trace_id = 0);
+    const std::shared_ptr<c10_neuron::NeuronMemorySnapshot::StackContext>& context = nullptr);
 
 /**
  * Record stats for a deallocation.
@@ -594,8 +581,7 @@ void RecordDeallocationCompleted(
  * segment_base/segment_size are paired with the later RecordSegmentUnreserve to
  * enable segment lifetime reconstruction.
  */
-void RecordSegmentReserve(int device_id, void* segment_base, size_t segment_size,
-                          uint64_t trace_id = 0);
+void RecordSegmentReserve(int device_id, void* segment_base, size_t segment_size);
 
 /**
  * Record a segment return to NRT. Decrements reserved_bytesand emits a
@@ -645,14 +631,6 @@ void RecordSplit(int device_id);
 // Record a merge event in MergeNeighbors. Caller increments once per absorbed
 // neighbor (so a block that merges with both prev and next counts twice).
 void RecordMerge(int device_id);
-
-// Scalar device memory cache counters. Called by ScalarDeviceMemoryCache.
-// A hit reuses an existing slot; a miss allocates a new slot (and increments
-// the live size). RecordScalarCacheClear zeroes the live size when the cache
-// is drained.
-void RecordScalarCacheHit(int device_id);
-void RecordScalarCacheMiss(int device_id);
-void RecordScalarCacheClear(int device_id);
 
 /**
  * Lazy-alloc defer-retry counters. Called from the Fresh/Deferred/RetryReady

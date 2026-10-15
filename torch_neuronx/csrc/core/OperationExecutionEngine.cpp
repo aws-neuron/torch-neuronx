@@ -384,12 +384,7 @@ void OperationExecutionEngine::RouteCompilationFailure(OperationContext* operati
     return;
   }
   // Executable failures are reported in stream order by the execution stage.
-  if (!error.empty()) {
-    operation->GetCompilableKernel().SetCompilationError(error);
-  }
-  auto state = operation->concatenation_state_;
   operation->MarkExecutionReady();
-  HandleCascadingCompilationComplete(state);
 }
 
 void OperationExecutionEngine::HandleCompilationComplete(OperationContext* operation) {
@@ -412,35 +407,22 @@ void OperationExecutionEngine::HandleCompilationComplete(OperationContext* opera
     return;
   }
 
+  operation->MarkExecutionReady();
   TORCH_NEURONX_DEBUG("Compilation task completed successfully", "stream_id=", stream->stream_id,
                       "op=", op_name);
 
-  auto state = operation->concatenation_state_;
-  operation->MarkExecutionReady();
-  HandleCascadingCompilationComplete(state);
-}
-
-void OperationExecutionEngine::HandleCascadingCompilationComplete(
-    const std::shared_ptr<ConcatenationState>& state) {
-  if (!state || !state->IncrementAndCheckCompiledCascadingOpsCount()) {
-    return;
-  }
-
-  // Wait for every constituent callback before the runtime worker can detach the group.
-  auto* concat_op = state->GetConcatenatedOperation();
-  for (auto* cascading_op : state->GetCascadingOperations()) {
-    if (!cascading_op->GetCompilableKernel().HasCachedNeff()) {
-      RouteCompilationFailure(concat_op, cascading_op->GetCompilableKernel().GetCompilationError());
-      return;
+  // Only trigger concatenated op compilation from individual cascading operations,
+  // not from the concatenated operation itself (to prevent infinite recursion)
+  if (!operation->IsConcatenatedOperation() && operation->HasConcatenatedOperation() &&
+      operation->concatenation_state_->IncrementAndCheckCompiledCascadingOpsCount()) {
+    auto* concat_op = operation->GetConcatenatedOperation();
+    try {
+      ProcessCompilationTask(concat_op);
+    } catch (const torch_neuronx::CompilationRuntimeException& e) {
+      concat_op->stream->HandleErrorWithCleanup(concat_op, e);
+    } catch (...) {
+      concat_op->stream->HandleErrorWithExceptionPtr(concat_op, std::current_exception());
     }
-  }
-
-  try {
-    ProcessCompilationTask(concat_op);
-  } catch (const torch_neuronx::CompilationRuntimeException& e) {
-    RouteCompilationFailure(concat_op, e.what());
-  } catch (...) {
-    concat_op->stream->HandleErrorWithExceptionPtr(concat_op, std::current_exception());
   }
 }
 
@@ -461,6 +443,9 @@ void OperationExecutionEngine::ProcessCompilationTask(OperationContext* operatio
           if (success) {
             HandleCompilationComplete(operation);
           } else {
+            if (!error.empty()) {
+              operation->GetCompilableKernel().SetCompilationError(error);
+            }
             RouteCompilationFailure(operation, error);
           }
           NotifyExecutionReady();
@@ -733,6 +718,22 @@ void OperationExecutionEngine::SubmitOperation(
   }
 }
 
+void OperationExecutionEngine::RecordHint(std::unique_ptr<OperationContext> hint,
+                                          const NeuronStream& stream) {
+  if (shutdown_requested_.load()) return;
+  if (!concatenation_enabled_) return;
+
+  // Hints need a valid StreamImpl* for the concatenation engine's stream-change detection.
+  hint->stream = GetDefaultStreamImpl(stream.device_index());
+
+  std::shared_ptr<OperationContext> shared = std::move(hint);
+  {
+    std::lock_guard<std::mutex> lock(dispatch_mutex_);
+    dispatch_queue_.push_back(std::move(shared));
+  }
+  concatenation_cv_.notify_one();
+}
+
 void OperationExecutionEngine::SubmitCompilationTask(OperationContext* operation) {
   if (shutdown_requested_.load()) {
     TORCH_NEURONX_DEBUG("Rejecting compilation task submission during shutdown",
@@ -766,15 +767,14 @@ void OperationExecutionEngine::MoveToRuntimeQueueInOrder(
     EXECUTION_RUNTIME_CHECK(
         it != owners.end(),
         "MoveToRuntimeQueueInOrder: op missing from owners map. op_name=", raw->GetOpName());
+    if (raw->GetKernelType() == KernelTypeEnum::kHint) {
+      // Hints don't enter runtime_queue_; releasing the shared_ptr destroys the op.
+      owners.erase(it);
+      continue;
+    }
     EmitToRuntimeQueue(std::move(it->second));
     owners.erase(it);
   }
-}
-
-OperationExecutionEngine::ConcatenationQueueDepthSnapshot
-OperationExecutionEngine::SnapshotConcatenationQueueDepth(bool shutdown) const {
-  int64_t current_depth = execution_queue_depth_.load();
-  return {current_depth, current_depth <= queue_low_threshold_ || shutdown};
 }
 
 void OperationExecutionEngine::TestInjectIntoRuntimeQueue(StreamImpl* stream,
@@ -888,7 +888,6 @@ void OperationExecutionEngine::ConcatenationWorker() {
     OperationContext* new_op = nullptr;
     bool needs_flush = false;
     bool shutdown = false;
-    ConcatenationQueueDepthSnapshot depth_snapshot{};
 
     // Wait for new work or flush trigger; identify the next not-yet-buffered
     // op (if any) at the head of the unconsumed suffix.
@@ -918,8 +917,7 @@ void OperationExecutionEngine::ConcatenationWorker() {
         new_op = it->get();
       }
 
-      depth_snapshot = SnapshotConcatenationQueueDepth(shutdown);
-      needs_flush = depth_snapshot.needs_flush;
+      needs_flush = (execution_queue_depth_.load() <= queue_low_threshold_) || shutdown;
 
       if (shutdown && new_op == nullptr && buffered == 0) {
         // Nothing to drain and no new ops — exit.
@@ -930,7 +928,7 @@ void OperationExecutionEngine::ConcatenationWorker() {
     // engine's internal buffer is raw-pointer aliases into dispatch_queue_;
     // the worker is the sole consumer, so prefix pointers stay stable while
     // this thread doesn't mutate the queue.
-    int64_t current_depth = depth_snapshot.current_depth;
+    int64_t current_depth = execution_queue_depth_.load();
 
     if (needs_flush) {
       auto flushed = concatenation_engine_->Flush(SIZE_MAX);
@@ -961,7 +959,7 @@ void OperationExecutionEngine::ConcatenationWorker() {
 
       try {
         ProcessPreprocessingTask(new_op);
-        if (depth_snapshot.ShouldBypassConcatenation(result_raws.size(), queue_low_threshold_)) {
+        if (result_raws.size() + current_depth <= static_cast<size_t>(queue_low_threshold_)) {
           // Skip concatenation when total queue depth is low — keep the
           // device fed.
           new_op->CompleteConcatenation();
@@ -994,10 +992,18 @@ void OperationExecutionEngine::ConcatenationWorker() {
       }
     }
 
+    // Snapshot non-hints before drain_and_move releases hint owners.
     if (!result_raws.empty()) {
+      std::vector<OperationContext*> non_hint_ops;
+      non_hint_ops.reserve(result_raws.size());
+      for (auto* op : result_raws) {
+        if (op->GetKernelType() != KernelTypeEnum::kHint) {
+          non_hint_ops.push_back(op);
+        }
+      }
       drain_and_move(result_raws.size(), result_raws);
 
-      for (auto* op : result_raws) {
+      for (auto* op : non_hint_ops) {
         submit_compile_or_ready(op);
       }
     }
@@ -1017,8 +1023,15 @@ void OperationExecutionEngine::ConcatenationWorker() {
   // Final shutdown flush.
   auto final_flush = concatenation_engine_->Flush(SIZE_MAX);
   if (!final_flush.empty()) {
-    drain_and_move(final_flush.size(), final_flush);
+    std::vector<OperationContext*> non_hint_ops;
+    non_hint_ops.reserve(final_flush.size());
     for (auto* op : final_flush) {
+      if (op->GetKernelType() != KernelTypeEnum::kHint) {
+        non_hint_ops.push_back(op);
+      }
+    }
+    drain_and_move(final_flush.size(), final_flush);
+    for (auto* op : non_hint_ops) {
       submit_compile_or_ready(op);
     }
   }
@@ -1157,14 +1170,14 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
     return true;
   }
 
-  // Host-side ops (events, barriers, allocs, deallocs) don't use NRT device scheduling.
+  // Host-side ops (events, barriers, hints, allocs, deallocs) don't use NRT device scheduling.
   bool is_pending_host_op = !IsDeviceKernelType(kernel_type);
 
   if (is_pending_host_op) {
-    // Authoritative gate (d) uses the same predicate as the runtime pre-check.
-    // Same-stream waits do not gate here; HostCC cross-stream waits retain the drain.
-    // Without HostCC, ready producer events and eligible compute fences may run ahead.
-    // prior_ops_in_flight uses the front-op
+    // Authoritative gate (d): a cross-stream event_wait must not run ahead of a
+    // still-in-flight prior op on this stream. Same predicate the runtime worker
+    // pre-checks (single source of truth). Same-stream kWait is redundant with
+    // FIFO ordering and never gates. prior_ops_in_flight uses the front-op
     // in-flight check (HasPendingAsyncOperations); refresh_completion is
     // irrelevant for the kEvent gate (no seq compare), pass false.
     if (stream->IsScheduleGatedByPriorOp(
@@ -1172,24 +1185,6 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
             /*prior_ops_in_flight=*/stream->HasPendingAsyncOperations(),
             /*refresh_completion=*/false)) {
       return false;
-    }
-    if (kernel_type == KernelTypeEnum::kEvent) {
-      auto& kernel = op->GetKernel<KernelTypeEnum::kEvent>();
-      const auto& event = kernel.GetEventImpl();
-      auto& info = stream->GetLastScheduledInfo();
-      if (kernel.GetEventAction() == EventDirectKernelExecution::EventAction::kSignal &&
-          event->allow_queue_ordering && stream->pending_barrier_count_ == 0 && info.valid &&
-          info.kind == LastKind::kDeviceXU && info.xu == NRTA_XU_COMPUTE) {
-        event->queued_compute_sequence.store(info.sequence_id, std::memory_order_release);
-      } else if (const auto fence = stream->GetComputeQueueFence(op);
-                 fence != 0 &&
-                 NRTA_SEQ_GET_SEQ_NUM(fence) > NRTA_SEQ_GET_SEQ_NUM(info.sequence_id)) {
-        // Later Host and TensorOp work must also wait for the producer.
-        info.sequence_id = fence;
-      }
-    }
-    if (kernel_type == KernelTypeEnum::kBarrier) {
-      ++stream->pending_barrier_count_;
     }
     op->nrt_async_state_.is_pending_signal = true;
     op->nrt_status_ = NRT_SUCCESS;  // Host ops have no NRT failure mode at schedule time
@@ -1239,43 +1234,25 @@ bool OperationExecutionEngine::ScheduleOperation(OperationContext* op, StreamImp
   return false;
 }
 
-bool OperationExecutionEngine::HandleFailedCompilation(OperationContext* operation,
-                                                       StreamImpl* stream) {
-  if (stream->HasPendingAsyncOperations()) {
-    return false;
-  }
-  auto& kernel = operation->GetCompilableKernel();
-  std::string error_msg =
-      kernel.IsFailedCompilation()
-          ? kernel.GetCompilationError()
-          : "NEFF creation failed for " +
-                std::string(operation->IsConcatenatedOperation() ? "merged operation: "
-                                                                 : "operation: ") +
-                operation->GetOpName();
-  stream->HandleErrorWithCleanup(operation, torch_neuronx::CompilationRuntimeException(error_msg));
-  return true;
-}
-
 bool OperationExecutionEngine::DispatchAsyncExecutionTask(OperationContext* operation) noexcept {
   auto* stream = operation->stream;
   const std::string operation_name = operation->GetOpName();
 
   try {
-    // Cascading ops own the merged op, which does not enter the runtime queue.
-    // Retain the state while recovery detaches every cascading op.
-    if (auto concatenation_state = operation->concatenation_state_) {
-      auto* merged = concatenation_state->GetConcatenatedOperation();
-      auto& merged_kernel = merged->GetCompilableKernel();
-      if (merged->IsExecutionReady() && !merged_kernel.HasCachedNeff()) {
-        return HandleFailedCompilation(merged, stream);
-      }
-    }
-
     // If the kernel is schedulable, requires compilation but does not have a
     // cached NEFF, it denotes a failed compilation. Propagate the exception for
     // recovery (e.g. CPU fallback). Ensure that prior ops complete first.
     if (operation->RequiresCompilation() && !operation->GetCompilableKernel().HasCachedNeff()) {
-      return HandleFailedCompilation(operation, stream);
+      if (stream->HasPendingAsyncOperations()) {
+        return false;
+      }
+      auto& kernel = operation->GetCompilableKernel();
+      std::string error_msg = kernel.IsFailedCompilation()
+                                  ? kernel.GetCompilationError()
+                                  : "NEFF creation failed for operation: " + operation_name;
+      stream->HandleErrorWithCleanup(operation,
+                                     torch_neuronx::CompilationRuntimeException(error_msg));
+      return true;
     }
 
     // Capture dispatch start for profiler on first attempt only — retries (e.g., event_wait
@@ -1356,14 +1333,6 @@ void OperationExecutionEngine::ProcessCompletions(StreamImpl* stream,
         break;
       }
       if (op_ptr->nrt_async_state_.is_pending_signal) {
-        if (op_ptr->GetKernelType() == KernelTypeEnum::kEvent) {
-          auto& kernel = op_ptr->GetKernel<KernelTypeEnum::kEvent>();
-          if (kernel.GetEventAction() == EventDirectKernelExecution::EventAction::kWait &&
-              kernel.GetSignalStreamImpl() != stream &&
-              kernel.GetEventImpl()->allow_queue_ordering && !kernel.IsReady()) {
-            break;
-          }
-        }
         ops_to_complete.push_back(op_ptr);
         continue;
       }
@@ -1378,20 +1347,13 @@ void OperationExecutionEngine::ProcessCompletions(StreamImpl* stream,
       const KernelTypeEnum kernel_type = op->GetKernelType();
       try {
         // kAlloc is already scheduled in ScheduleAllocOperation; all other
-        // pending-signal host ops (events, barriers, deallocs) Schedule here.
+        // pending-signal host ops (events, hints, barriers, deallocs) Schedule here.
         if (kernel_type != KernelTypeEnum::kAlloc) {
           op->execute_start = std::chrono::steady_clock::now();
           op->neuron_stream_os_tid = getOsTid();
           op->kernel_execution->Schedule(&op->nrt_status_, &op->nrt_async_state_.sequence_id,
                                          op->stream_id);
           op->nrt_status_ = NRT_SUCCESS;
-          if (kernel_type == KernelTypeEnum::kEvent) {
-            auto& kernel = op->GetKernel<KernelTypeEnum::kEvent>();
-            if (kernel.GetEventAction() == EventDirectKernelExecution::EventAction::kSignal &&
-                kernel.GetEventImpl()->allow_queue_ordering) {
-              NotifyExecutionReady();
-            }
-          }
         }
         stream->CompleteOperation(op);
       } catch (const torch_neuronx::ExecutionRuntimeException& e) {

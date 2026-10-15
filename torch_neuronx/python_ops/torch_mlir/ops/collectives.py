@@ -42,13 +42,12 @@ def _all_reduce_coalesced(tensors, *, reduce_op, group_name):
 
 @cache
 def get_all_reduce_kernel(coalesced: bool) -> TorchMlirKernel:
-    """Return a cached Torch-MLIR all-reduce kernel.
+    """Return a cached TorchMlirKernel for all_reduce.
 
     Args:
-        coalesced (bool): Select the multi-tensor coalesced variant.
-
-    Returns:
-        TorchMlirKernel: Kernel for functional single-tensor or coalesced all-reduce.
+        coalesced: when True, returns the multi-tensor variant
+            (`_c10d_functional.all_reduce_coalesced`); when False, the
+            single-tensor variant (`_c10d_functional.all_reduce`).
     """
     if coalesced:
         return TorchMlirKernel(
@@ -122,14 +121,12 @@ def _reduce_scatter_tensor(input, *, reduce_op, group_size, group_name, out_shap
 
 @cache
 def get_reduce_scatter_kernel() -> TorchMlirKernel:
-    """Return the cached Torch-MLIR reduce-scatter kernel.
+    """Return a cached TorchMlirKernel for reduce_scatter.
 
-    Returns:
-        TorchMlirKernel: Kernel for functional single-tensor reduce-scatter.
-
-    Note:
-        ``NeuronBackend.cpp`` coalesces inputs before lowering and submits one input
-        and output, so the functional coalesced variant is unreachable.
+    Only the single-tensor form is needed: `NeuronBackend.cpp` pre-concatenates
+    coalesced reduce_scatter inputs host-side and always submits a 1-input,
+    1-output op. The multi-tensor `_c10d_functional.reduce_scatter_tensor_coalesced`
+    is unreachable from the C++ PG path.
     """
     return TorchMlirKernel(
         torch_fn=_reduce_scatter_tensor,
@@ -166,11 +163,7 @@ def _all_to_all_concat(inputs, *, group_size, group_name):
 
 @cache
 def get_all_to_all_kernel() -> TorchMlirKernel:
-    """Return the cached Torch-MLIR all-to-all kernel.
-
-    Returns:
-        TorchMlirKernel: Kernel that concatenates inputs for functional all-to-all.
-    """
+    """Return a cached TorchMlirKernel for all_to_all."""
     return TorchMlirKernel(
         torch_fn=_all_to_all_concat,
         op_name="all_to_all_single",
@@ -223,14 +216,11 @@ def _all_gather_coalesced_sliced(inputs, *, group_size, group_name):
 
 @cache
 def get_all_gather_kernel(sliced: bool, coalesced: bool) -> TorchMlirKernel:
-    """Return a cached Torch-MLIR all-gather kernel.
+    """Return a cached TorchMlirKernel for all_gather.
 
     Args:
-        sliced (bool): Split gathered tensors into one output per rank when ``True``.
-        coalesced (bool): Process multiple input tensors when ``True``.
-
-    Returns:
-        TorchMlirKernel: Kernel matching the requested output and input forms.
+        sliced: when True, returns sliced outputs (N per input tensor).
+        coalesced: when True, handles multiple input tensors.
     """
     torch_fn = {
         (True, True): _all_gather_coalesced_sliced,

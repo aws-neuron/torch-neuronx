@@ -20,24 +20,9 @@ def nki_call_lower_func(
     operand_output_aliases,
     has_collectives,
 ):
-    """Lower a registered custom NKI kernel to StableHLO after a cache miss.
+    """Lower a custom NKI kernel to StableHLO.
 
-    Args:
-        tensor_args (Sequence[torch.Tensor]): Runtime tensor operands.
-        kernel_idx (int): Kernel registry index.
-        constant_args_key (Hashable): Registry key for constant arguments.
-        grid (Any): NKI launch grid specification.
-        operand_output_aliases (Any): Dispatcher aliases superseded by kernel configuration.
-        has_collectives (bool): Dispatcher flag superseded by kernel configuration.
-
-    Returns:
-        LoweringResult: Lowered kernel result with return types, aliases, and collective status.
-
-    Note:
-        Dynamo evaluation is disabled during lowering and restored before returning.
-        The dispatcher alias and collective arguments are ignored because the kernel
-        configuration supplies both. Lowering also updates the shared NKI kernel's
-        operand-output alias setting.
+    Called by C++ NkiDispatchCore on cache miss.
     """
     prior = torch._dynamo.eval_frame.set_eval_frame(None)
     try:
@@ -80,11 +65,6 @@ def _lower_custom_nki(
     }
 
     _global_nki_op.kernel.operand_output_aliases = aliases
-    # Always set the flag (default False) so it never leaks across kernels that
-    # reuse the shared op impl.
-    _global_nki_op.kernel.alias_outputs_in_place = kernel_registry.get_alias_outputs_in_place(
-        kernel_idx
-    )
     result = _global_nki_op.kernel.lower(*tensor_args, **nki_params)
 
     # Preserve the collective flag from the config: the NKI frontend sets

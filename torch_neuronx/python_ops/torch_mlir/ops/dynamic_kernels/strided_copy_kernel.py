@@ -41,18 +41,7 @@ _MAX_H_SEGMENTS = 8192
 
 
 def width_within_unroll_budget(width, elem_bytes):
-    """Check whether a copy width fits the static unroll budget.
-
-    Args:
-        width (int): Number of elements in each copied row.
-        elem_bytes (int): Bytes per element used to derive the DMA-width knee.
-
-    Returns:
-        bool: Whether the required segment count is at most the unroll limit.
-
-    Note:
-        A false result causes the adapter to decline this kernel.
-    """
+    """False when ceil(width / knee) exceeds the unroll budget -> adapter declines."""
     knee = _TILE_H_BYTES // elem_bytes
     return -(-width // knee) <= _MAX_H_SEGMENTS
 
@@ -130,44 +119,28 @@ def _emit_tile(
 
 
 def make_strided_copy_kernel(out_dtype, tile_m=_TILE_M):
-    """Build a strided-copy kernel for a target dtype and row tile size.
-
-    Args:
-        out_dtype (NKI dtype or None): Result dtype, or ``None`` to retain the source dtype.
-        tile_m (int, optional): Rows per tile. Defaults to ``128``.
-
-    Returns:
-        Callable: JIT-compiled strided-copy kernel.
-
-    Note:
-        Only the passthrough variant supports int32. Defaults bind trace-time constants
-        because the tracer cannot resolve closure values.
-    """
+    """Build a strided-copy kernel whose result dtype is ``out_dtype``; None keeps the
+    source dtype (the passthrough variant, and the only one that can move int32).
+    ``tile_m`` is the rows per tile. Both are default-bound so the tracer reads them as
+    local constants -- a closure fails to trace."""
 
     @nki.jit()
     def strided_copy_kernel(
         base, stride_proto, width_proto, fan_proto, meta, out_dtype=out_dtype, tile_m=tile_m
     ):
-        """Gather a strided view into a contiguous result.
+        """
+        Gather a strided view into a contiguous result.
 
         Args:
-            base (tensor): Flat ``[N, 1]`` view of the source storage.
-            stride_proto (tensor): Shape-only ``[1, dyn_stride]`` source row stride.
-            width_proto (tensor): Shape-only ``[1, width]`` contiguous run length.
-            fan_proto (tensor): Shape-only ``[1, fanout]`` stride-zero fan-out.
-            meta (tensor): Int32 ``[4, 1]`` full-trip count, starting input element
-                offset, tail input element offset, and tail output row.
-            out_dtype (NKI dtype or None, optional): Bound target dtype.
-                Defaults to the factory's ``out_dtype`` value.
-            tile_m (int, optional): Bound rows per tile. Defaults to the factory's
-                ``tile_m`` value.
-
+            base:         [N, 1]           flat view of the source storage
+            stride_proto: [1, dyn_stride]  shape-only: source row stride
+            width_proto:  [1, width]       shape-only: contiguous run length
+            fan_proto:    [1, fanout]      shape-only: stride-0 fan-out (1 = none)
+            meta:         [4, 1] int32     [rows // tile_m, in_start,
+                                            in_start + (rows - tile_m) * dyn_stride,
+                                            rows - tile_m]
         Returns:
-            tensor: Contiguous ``[rows_static, width * fanout]`` result in HBM.
-
-        Note:
-            Runtime metadata supports varying row counts and storage offsets. The
-            backward-aligned tail may repeat rows because copying is idempotent.
+            result: [rows_static, width * fanout] on HBM
         """
         dyn_stride = stride_proto.shape[1]
         width = width_proto.shape[1]
@@ -213,11 +186,6 @@ def make_strided_copy_kernel(out_dtype, tile_m=_TILE_M):
         nisa.register_load(trips_reg, trips)
 
         def body(_i):
-            """Copy one dynamic row-tile iteration.
-
-            Args:
-                _i (int): Loop iteration index, accepted but unused.
-            """
             _emit_tile(
                 base,
                 result,

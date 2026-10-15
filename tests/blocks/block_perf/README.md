@@ -74,8 +74,6 @@ To run the Qwen3 group without enforcing a hardware golden:
 python run_group.py --config group_configs/qwen3.json --platform trn2 --skip-mfu-threshold
 ```
 
-Every group run automatically hydrates a higher validated baseline from the repo-scoped persistent cache when storage is available. Each threshold contains its per-test, per-platform tolerance band, with a `1.0` workflow multiplier. A failed MFU gate runs once more before the group result. The canonical nightly additionally passes `--refresh-persistent-goldens`; on `main`, it updates each passing test with a median-of-5 history while preserving a monotone baseline floor. A failed cache write is reported as a warning and readers continue to fall back to the checked-in seed. See [group_configs/README.md](group_configs/README.md) for the seed, fallback, and refresh rules.
-
 ### Run with TP
 
 ```bash

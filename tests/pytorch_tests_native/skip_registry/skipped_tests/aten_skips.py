@@ -25,9 +25,6 @@ ATEN_INT64_OVERFLOW = [
     "test_div_rounding_modes_neuron_int64",
     "test_div_rounding_numpy_neuron_int64",
     "test_fmod_remainder_overflow_neuron_int64",
-    "test_index_reduce_reduce_amax_neuron_int64",
-    "test_index_reduce_reduce_amin_neuron_int64",
-    "test_large_linspace_neuron_int64",
     "test_low_high_boolean_integral2_neuron_int64",
     "test_meta_inplace_index_copy_neuron_int64",
     "test_meta_inplace_scatter_neuron_int64",
@@ -122,25 +119,39 @@ ATEN_FOREACH_WORKER_CRASH = [
 # These are added alongside the *complex*/*fft_* pattern-based skip because
 # their test method names don't match those patterns.
 ATEN_COMPLEX_DTYPE_UNSUPPORTED = [
-    # test_ones iterates every dtype, including complex32 (ScalarType 8)
-    "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_ones_neuron",
     # polar: outputs complex by definition (re^iθ → complex)
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_size1__refs__conversions_polar_neuron_float32",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_size1__refs__conversions_polar_neuron_float64",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_size1_large_dim__refs__conversions_polar_neuron_float32",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_size1_large_dim__refs__conversions_polar_neuron_float64",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_size1_large_dim_polar_neuron_float32",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_size1_large_dim_polar_neuron_float64",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_size1_polar_neuron_float32",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_size1_polar_neuron_float64",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_vs_every_other__refs__conversions_polar_neuron_float32",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_vs_every_other__refs__conversions_polar_neuron_float64",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_vs_every_other_polar_neuron_float32",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_vs_every_other_polar_neuron_float64",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_vs_transposed__refs__conversions_polar_neuron_float32",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_vs_transposed__refs__conversions_polar_neuron_float64",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_vs_transposed_polar_neuron_float32",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_contig_vs_transposed_polar_neuron_float64",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_non_contig__refs__conversions_polar_neuron_float32",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_non_contig__refs__conversions_polar_neuron_float64",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_non_contig_expand__refs__conversions_polar_neuron_float32",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_non_contig_expand__refs__conversions_polar_neuron_float64",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_non_contig_expand_polar_neuron_float32",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_non_contig_expand_polar_neuron_float64",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_non_contig_index__refs__conversions_polar_neuron_float32",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_non_contig_index__refs__conversions_polar_neuron_float64",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_non_contig_index_polar_neuron_float32",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_non_contig_index_polar_neuron_float64",
+    "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_non_contig_polar_neuron_float32",
     "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_non_contig_polar_neuron_float64",
-    "test_decomp.py::TestDecompNEURON::test_comprehensive_polar_neuron_float64",
+    "test_ops.py::TestCommonNEURON::test_out__refs__conversions_polar_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_polar_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_out_warning__refs__conversions_polar_neuron",
+    "test_ops.py::TestCommonNEURON::test_out_warning_polar_neuron",
     # linalg_eig / linalg_eigvals: outputs complex eigenvalues for real input.
     # The backward pass calls aten::_linalg_solve_ex with a complex intermediate.
     # With TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1 there is no
@@ -155,7 +166,9 @@ ATEN_COMPLEX_DTYPE_UNSUPPORTED = [
     "test_ops.py::TestCommonNEURON::test_dtypes_linalg_eigvals_neuron",
     "test_ops.py::TestCommonNEURON::test_dtypes_stft_neuron",
     "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_linalg_eig_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_polar_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_linalg_eigvals_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_polar_neuron_float32",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_linalg_eig_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_linalg_eigvals_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_linalg_eig_neuron_float64",
@@ -167,10 +180,6 @@ ATEN_COMPLEX_DTYPE_UNSUPPORTED = [
     # block_diag: iterates all dtypes including complex64/complex128
     "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_block_diag_neuron",
     "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_block_diag_scipy_neuron",
-    # linspace deduction: helper passes complex endpoints (1j, 2j) expecting a
-    # cfloat result; Neuron rejects complex with TypeError (crash, not wrong
-    # output) so this is a skip, not an xfail.
-    "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_linspace_deduction_neuron",
     # stft: FFT produces complex output
     "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_stft_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_stft_neuron_float64",
@@ -213,9 +222,6 @@ ATEN_UPSTREAM_STRICT_XFAIL_PASSES_ON_NEURON = [
     "test_meta.py::TestMetaNEURON::test_meta_outplace__foreach_lerp_neuron_int64",
     "test_meta.py::TestMetaNEURON::test_meta_outplace__foreach_sub_neuron_float64",
     "test_meta.py::TestMetaNEURON::test_meta_outplace__foreach_sub_neuron_int64",
-    # matmul OpInfo xfails test_out ("Strides are not the same!"); Neuron now
-    # binds the strided, non-contiguous out= correctly, so the test passes.
-    "test_ops.py::TestCommonNEURON::test_out_matmul_neuron_float32",
 ]
 
 
@@ -254,48 +260,4 @@ ATEN_UPSAMPLINGBIMODE2D_AA_NO_LOWERING = [
     "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_False_mode_bicubic_memory_format1_neuron",
     "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_True_mode_bicubic_memory_format0_neuron",
     "test_nn.py::TestNNDeviceTypeNEURON::test_upsamplingBiMode2d_antialias_True_align_corners_True_mode_bicubic_memory_format1_neuron",
-]
-
-# Tests that explicitly pass backend="eager", backend="inductor", or
-# backend="aot_eager" to torch.compile. These backends target CPU/GPU and
-# are not applicable on Neuron.
-ATEN_NON_NEURON_COMPILE_BACKEND = [
-    # test_custom_ops.py
-    "TestCustomOpAPI::test_compile",
-    "TestCustomOpAPI::test_custom_op_inplace_tag_compile_eager",
-    "TestCustomOpAPI::test_custom_op_inplace_tag_compile_eager_fullgraph",
-    "TestCustomOpAPI::test_custom_op_inplace_tag_compile_inductor_fullgraph",
-    "TestCustomOpAPI::test_custom_op_out_tag_compile_eager",
-    "TestCustomOpAPI::test_custom_op_out_tag_compile_eager_fullgraph",
-    "TestCustomOpAPI::test_custom_op_out_tag_compile_inductor_fullgraph",
-    # test_fake_tensor.py
-    "FakeTensorTest::test_embedding_meta_indices_torch_compile",
-    # test_opaque_obj_v2.py
-    "TestOpaqueObject::test_compile1",
-    "TestOpaqueObject::test_compile_contiguous_strides",
-    "TestOpaqueObject::test_compile_create_intermediate",
-    "TestOpaqueObject::test_compile_exact_strides",
-    "TestOpaqueObject::test_compile_fixed_stride_order",
-    "TestOpaqueObject::test_compile_inline_methods",
-    "TestOpaqueObject::test_custom_op_reference_return",
-    "TestOpaqueObject::test_hoist_basic",
-    "TestOpaqueObject::test_hoist_cache_hits",
-    "TestOpaqueObject::test_multiple_opaque_objects_in_backward",
-    "TestOpaqueObject::test_op_passthrough_counter_in_tuple",
-    "TestOpaqueObject::test_opaque_obj_saved_for_backward",
-    "TestOpaqueObject::test_opaque_produced_by_call_function_saved_for_backward",
-    "TestOpaqueObject::test_script_object_intermediate_exposed_from_checkpoint",
-    "TestOpaqueObject::test_subclass_opaque_attrs_cache_hit",
-    "TestOpaqueObject::test_tensor_subclass_opaque_backward_compiled_autograd",
-    "TestOpaqueObject::test_tensor_subclass_shared_opaque_backward",
-    "TestOpaqueObject::test_tensor_subclass_shared_opaque_remapping",
-    "TestOpaqueObject::test_value_type_graph_intermediate",
-    "TestOpaqueObject::test_value_type_graph_output_backend_aot_eager",
-    "TestOpaqueObject::test_value_type_graph_output_backend_eager",
-    "TestOpaqueObject::test_value_type_graph_output_backend_inductor",
-    "TestOpaqueObject::test_value_type_list",
-    "TestOpaqueObject::test_value_type_nested",
-    "TestOpaqueObject::test_value_type_subclass",
-    # test_out_dtype_op.py
-    "TestOutDtypeOp::test_out_dtype_dynamo",
 ]

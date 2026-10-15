@@ -119,7 +119,7 @@ struct AsyncSchedulingState {
   SequenceId sequence_id{0};  // Sequence number from Schedule()
   bool is_scheduled{false};   // Whether async scheduling was called (in-flight)
   // Host-side op pending completion via a completion hook (not NRT device
-  // scheduling). Set for kEvent/kBarrier/kAlloc/kDealloc; all advance the
+  // scheduling). Set for kEvent/kHint/kBarrier/kAlloc/kDealloc; all advance the
   // stream cursor past themselves once scheduled.
   bool is_pending_signal{false};
   std::atomic<bool> is_host_inflight{false};  // kHost: submitted to HostWorkerPool
@@ -252,15 +252,6 @@ inline NRT_STATUS AllocateSliceTensor(nrt_tensor_t* base_tensor, size_t offset, 
  */
 inline void* GetTensorVA(nrt_tensor_t* tensor) { return nrt_tensor_get_va(tensor); }
 
-/**
- * Get the runtime trace correlation id of a tensor.
- * The runtime stamps the same id on its system-trace events, so the framework
- * memory snapshot and the runtime trace correlate.
- * @param tensor Tensor to query
- * @return Trace correlation id
- */
-inline uint64_t GetTensorTraceId(nrt_tensor_t* tensor) { return nrt_tensor_get_trace_id(tensor); }
-
 // NRT Profiling/Tracing Functions
 // These provide access to NRT inspect functionality for comprehensive profiling
 
@@ -285,15 +276,6 @@ inline void PrecacheEnable() { nrt_inspect_precache_enable(); }
  * @brief Disable pre-caching of profile info.
  */
 inline void PrecacheDisable() { nrt_inspect_precache_disable(); }
-
-/**
- * Get per-category HBM memory usage breakdown for a VNC.
- *
- * @param vnc_id Virtual NeuronCore id
- * @return Vector of (category name, bytes) pairs. Empty on failure or when no
- *         category has non-zero usage.
- */
-std::vector<std::pair<std::string, size_t>> GetMemoryUsageBreakdown(uint32_t vnc_id);
 
 // ============================================================================
 // Asynchronous NRT operations
@@ -350,19 +332,6 @@ inline NRT_STATUS ScheduleTensorCopy(nrt_tensor_t* src, uint64_t src_offset, nrt
                                      int queue, NRT_STATUS* ret, SequenceId* req_sequence) {
   return nrta_tensor_copy(src, src_offset, dst, dst_offset, size_bytes, lnc_idx, queue, ret,
                           req_sequence);
-}
-
-/**
- * Enqueue an asynchronous cross-dtype tensor cast.
- *
- * Descriptor offsets are measured in elements of their respective dtypes.
- * The referenced tensors must remain allocated until the request completes.
- */
-inline NRT_STATUS ScheduleTensorCast(const nrt_compute_tensor_t& src,
-                                     const nrt_compute_tensor_t& dst, uint64_t num_elements,
-                                     int lnc_idx, int queue, NRT_STATUS* ret,
-                                     SequenceId* req_sequence) {
-  return nrta_tensor_cast(&src, &dst, num_elements, lnc_idx, queue, ret, req_sequence);
 }
 
 /**

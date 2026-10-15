@@ -73,26 +73,4 @@ SKIP_GROUPS: list[SkipGroup] = [
             "TestProfilerDeviceNEURON::test_event_list_neuron",
         ],
     ),
-    SkipGroup(
-        reason=(
-            "[PT 2.14] CppThreadTest references self.device_type which is"
-            " set by instantiate_device_type_tests. The fork's test_cpp_thread.py"
-            " is missing this instantiation (merge corruption dropped it)."
-        ),
-        tests=[
-            "CppThreadTest::test_profile_memory",
-            "CppThreadTest::test_with_enable_profiler_in_child_thread",
-            "CppThreadTest::test_without_enable_profiler_in_child_thread",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "[PT 2.14] Neuron profiler does not generate overhead events —"
-            " test_overhead_activities_own_no_device_time asserts at least"
-            " one overhead event but Neuron produces zero."
-        ),
-        tests=[
-            "TestProfilerDeviceNEURON::test_overhead_activities_own_no_device_time_neuron",
-        ],
-    ),
 ]

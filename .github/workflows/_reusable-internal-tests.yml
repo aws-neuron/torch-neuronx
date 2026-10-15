@@ -3,6 +3,11 @@ name: Internal Tests
 on:
   workflow_call:
     inputs:
+      test_set:
+        description: Select the full, PR, or CI test set.
+        required: false
+        type: string
+        default: full
       suite_id:
         description: Test suite identifier.
         required: false
@@ -23,16 +28,6 @@ on:
         required: false
         type: string
         default: ''
-      build_os:
-        description: Operating system label for a build image.
-        required: false
-        type: string
-        default: ''
-      ubuntu_codename:
-        description: Ubuntu codename for a build image.
-        required: false
-        type: string
-        default: ''
       checkout_ref:
         description: Git reference to check out.
         required: false
@@ -40,6 +35,11 @@ on:
         default: ''
       refresh_neff_cache:
         description: Refresh the shared NEFF cache.
+        required: false
+        type: boolean
+        default: false
+      collect_coverage:
+        description: Collect coverage for supported test suites.
         required: false
         type: boolean
         default: false
@@ -65,51 +65,147 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.checkout_ref || github.sha }}
-      - if: ${{ inputs.build_image && inputs.build_os == '' }}
-        run: echo "build_os is required when build_image is true." && exit 1
-      - if: ${{ inputs.build_image && inputs.ubuntu_codename == '' }}
-        run: echo "ubuntu_codename is required when build_image is true." && exit 1
       # Step env does not reach run steps on this runner, so set the variable inline.
       - id: matrix
-        run: DIST_CONFIG=internal_test_distribution_config.json python3 tests/pytorch_tests_native/runner/emit_upstream_matrix.py
+        run: |
+          TEST_SET='${{ inputs.test_set }}'
+          matrix='{
+            "include": [
+              {
+                "id": "aten-unit-tests",
+                "name": "ATen Unit Tests (trn2)",
+                "test_command": "",
+                "artifact_name": "aten-test-results",
+                "artifact_suffix": "aten",
+                "runner_timeout": "32400",
+                "timeout_minutes": 600,
+                "uses_neff_cache": true,
+                "supports_coverage": true,
+                "sets": ["full", "pr"],
+                "summary_path": "test-results/outputs/test-reports/step_summary.md"
+              },
+              {
+                "id": "dist-unit-tests",
+                "name": "Distributed Unit Tests-Async (trn2)",
+                "test_command": "./tools/run-test-parallel tests/distributed --num_workers=8 --json-report --report-dir=outputs/test-reports --ignore=tests/distributed/collective_ops/test_multistream_collectives_with_host_cc.py",
+                "artifact_name": "dist-test-results",
+                "artifact_suffix": "dist",
+                "runner_timeout": "32400",
+                "timeout_minutes": 600,
+                "uses_neff_cache": false,
+                "supports_coverage": true,
+                "sets": ["full", "pr"],
+                "summary_path": "test-results/outputs/test-reports/step_summary.md"
+              },
+              {
+                "id": "cpp-unit-tests",
+                "name": "C++ Unit Tests (trn2)",
+                "test_command": "./tools/run-cpp-test --verbose",
+                "artifact_name": "cpp-test-results",
+                "artifact_suffix": "cpp",
+                "runner_timeout": "32400",
+                "timeout_minutes": 600,
+                "uses_neff_cache": false,
+                "supports_coverage": false,
+                "sets": ["full", "pr", "ci"],
+                "summary_path": ""
+              },
+              {
+                "id": "concat-unit-tests",
+                "name": "Concatenation Unit Tests (trn2)",
+                "test_command": "TORCH_NEURONX_ENABLE_CONCATENATION=1 ./tools/run-test-parallel tests/python_ops/test_concatenation_ops.py --num_workers=1 --json-report --report-dir=outputs/test-reports",
+                "artifact_name": "concat-test-results",
+                "artifact_suffix": "concat",
+                "runner_timeout": "32400",
+                "timeout_minutes": 600,
+                "uses_neff_cache": false,
+                "supports_coverage": true,
+                "sets": ["full", "pr", "ci"],
+                "summary_path": "test-results/outputs/test-reports/step_summary.md"
+              },
+              {
+                "id": "dynamic-nki-unit-tests",
+                "name": "Dynamic NKI Kernel Tests (trn2)",
+                "test_command": "TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS=1 TORCH_NEURONX_INT64_MODE=packed NEURON_CC_FLAGS=--disable-internal-gather-scatter-bound-check ./tools/run-test-parallel tests/python_ops/test_dynamic_nki_kernels.py --num_workers=8 --json-report --report-dir=outputs/test-reports",
+                "artifact_name": "dynamic-nki-test-results",
+                "artifact_suffix": "dynamic-nki",
+                "runner_timeout": "32400",
+                "timeout_minutes": 600,
+                "uses_neff_cache": false,
+                "supports_coverage": false,
+                "sets": ["full", "pr"],
+                "summary_path": "test-results/outputs/test-reports/step_summary.md"
+              },
+              {
+                "id": "torch-mlir-lit",
+                "name": "Torch-MLIR LIT Tests (trn2)",
+                "test_command": "./tools/run-torch-mlir-lit-tests",
+                "artifact_name": "torch-mlir-lit-results",
+                "artifact_suffix": "torch-mlir-lit",
+                "runner_timeout": "32400",
+                "timeout_minutes": 600,
+                "uses_neff_cache": false,
+                "supports_coverage": false,
+                "sets": ["full", "pr", "ci"],
+                "summary_path": ""
+              },
+              {
+                "id": "accuracy-op-tests",
+                "name": "Op-Accuracy Tests (trn2)",
+                "test_command": "mkdir -p outputs/test-reports/json_reports && NEURON_ACCURACY_OUTPUT_DIR=outputs/accuracy python -m pytest tests/vertical/accuracy/test_accuracy.py --traced-model qwen3_235b_ep64_tp4 --max-shapes-per-op 0 -n 16 --dist load --json-report --json-report-file=outputs/test-reports/json_reports/report.json --tb=short -q",
+                "artifact_name": "accuracy-op-results",
+                "artifact_suffix": "accuracy",
+                "runner_timeout": "32400",
+                "timeout_minutes": 600,
+                "uses_neff_cache": false,
+                "supports_coverage": false,
+                "sets": ["full", "pr", "ci"],
+                "summary_path": "test-results/outputs/accuracy/step_summary.md"
+              }
+            ]
+          }'
+          if [[ "$TEST_SET" != "full" && "$TEST_SET" != "pr" && "$TEST_SET" != "ci" ]]; then
+            echo "The test set '$TEST_SET' is not valid. Use full, pr, or ci."
+            exit 1
+          fi
+          echo "matrix=$(jq -c --arg test_set "$TEST_SET" \
+            '{include: [.include[] | select(.sets | index($test_set)) | del(.sets)]}' \
+            <<< "$matrix")" >> "$GITHUB_OUTPUT"
 
   test:
     needs: define-matrix
-    name: ${{ matrix.label }}
+    name: ${{ matrix.name }}
     env:
-      MATRIX_LABEL: ${{ matrix.label }}
+      MATRIX_LABEL: ${{ matrix.id }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.define-matrix.outputs.matrix) }}
     runs-on: >-
       ${{ inputs.noop && fromJSON(format(
       '["self-hosted","linux","neuron.image:neuron-gate-tools","neuron.run-{0}-{1}-noop-{2}"]',
-      github.run_id, inputs.suite_id, matrix.node)) || inputs.build_image &&
+      github.run_id, inputs.suite_id, matrix.id)) || inputs.build_image &&
       fromJSON(format(
-      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.build-image","neuron.build-os:{5}","neuron.build-arg:UBUNTU_CODENAME:{6}","neuron.run-{0}-{1}","neuron.pr:{2}","neuron.timeout:32400"{3}{4}]',
+      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.build-image","neuron.run-{0}-{1}","neuron.pr:{2}","neuron.timeout:{3}"{4}{5}]',
       github.run_id,
-      matrix.node,
+      matrix.id,
       inputs.pr_number,
-      matrix.neff_cache && ',"neuron.internal_compute.persistent-storage:read"' || '',
-      inputs.dkms != '' && format(',"neuron.dkms:{0}"', inputs.dkms) || '',
-      inputs.build_os,
-      inputs.ubuntu_codename
+      matrix.runner_timeout,
+      matrix.uses_neff_cache && ',"neuron.internal_compute.persistent-storage:read"' || '',
+      inputs.dkms != '' && format(',"neuron.dkms:{0}"', inputs.dkms) || ''
       )) || fromJSON(format(
-      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.run-{0}-{1}-{2}","neuron.image:{3}","neuron.timeout:32400"{4}{5}]',
+      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.run-{0}-{1}-{2}","neuron.image:{3}","neuron.timeout:{4}"{5}{6}]',
       github.run_id,
       inputs.suite_id,
-      matrix.node,
+      matrix.id,
       inputs.image,
-      matrix.neff_cache && format(
+      matrix.runner_timeout,
+      matrix.uses_neff_cache && format(
       ',"neuron.internal_compute.persistent-storage:{0}"',
       inputs.refresh_neff_cache && 'write' || 'read'
       ) || '',
       inputs.dkms != '' && format(',"neuron.dkms:{0}"', inputs.dkms) || ''
       )) }}
-    timeout-minutes: 240
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     steps:
       - uses: actions/checkout@v4
         if: ${{ !inputs.noop }}
@@ -118,83 +214,22 @@ jobs:
       - uses: ./.github/actions/run-test-suite
         if: ${{ !inputs.noop }}
         with:
-          # A shared-process run needs a longer per-test timeout than an upstream test.
           test-command: >-
-            ${{ format(
-            'GITHUB_REF_NAME={0} TEST_TIMEOUT=1800 python3 tests/pytorch_tests_native/runner/run_upstream_tests.py --node {1} --output-dir outputs/test-reports{2}{3}',
+            ${{ matrix.id == 'aten-unit-tests' && (inputs.build_image &&
+            './tools/run-test-parallel --no-forked --persistent-cache --skip-distributed --skip_pt_test_distributed --json-report --report-dir=outputs/test-reports' || format(
+            'GITHUB_REF_NAME={0} ./tools/run-test-parallel {1} --skip-distributed --skip_pt_test_distributed {2} --json-report --report-dir=outputs/test-reports',
             github.ref_name,
-            matrix.node,
-            matrix.neff_cache && ' --download-neff-cache' || '',
-            !inputs.build_image && matrix.neff_cache && inputs.refresh_neff_cache && ' --refresh-neff-cache' || ''
+            inputs.refresh_neff_cache && '--no-forked --persistent-cache --refresh-persistent-cache' || '--no-forked --persistent-cache',
+            inputs.collect_coverage && '--coverage' || ''
+            )) || format(
+            '{0} {1}',
+            matrix.test_command,
+            inputs.collect_coverage && matrix.supports_coverage && '--coverage' || ''
             ) }}
-          artifact-name: ${{ inputs.suite_id }}-${{ matrix.node }}-results
-          summary-path: test-results/outputs/test-reports/step_summary.md
-      - name: Merge-queue no-op
-        if: ${{ inputs.noop }}
-        run: echo "The tests ran on the pull request head. Pass this merge queue check."
-
-  cpp-lit-accuracy:
-    name: C++, MLIR LIT, Op-Accuracy Tests
-    env:
-      MATRIX_LABEL: cpp-lit-accuracy
-    runs-on: >-
-      ${{ inputs.noop && fromJSON(format(
-      '["self-hosted","linux","neuron.image:neuron-gate-tools","neuron.run-{0}-{1}-noop-{2}"]',
-      github.run_id, inputs.suite_id, 'cpp-lit-accuracy')) || inputs.build_image &&
-      fromJSON(format(
-      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.build-image","neuron.build-os:{3}","neuron.build-arg:UBUNTU_CODENAME:{4}","neuron.run-{0}-cpp-lit-accuracy","neuron.pr:{1}","neuron.timeout:32400"{2}]',
-      github.run_id,
-      inputs.pr_number,
-      inputs.dkms != '' && format(',"neuron.dkms:{0}"', inputs.dkms) || '',
-      inputs.build_os,
-      inputs.ubuntu_codename
-      )) || fromJSON(format(
-      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.run-{0}-{1}-cpp-lit-accuracy","neuron.image:{2}","neuron.timeout:32400"{3}]',
-      github.run_id,
-      inputs.suite_id,
-      inputs.image,
-      inputs.dkms != '' && format(',"neuron.dkms:{0}"', inputs.dkms) || ''
-      )) }}
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-        if: ${{ !inputs.noop }}
-        with:
-          ref: ${{ inputs.checkout_ref || github.sha }}
-      # Run all of the suites. Then fail if one of them failed.
-      - uses: ./.github/actions/run-test-suite
-        if: ${{ !inputs.noop }}
-        with:
-          test-command: |
-            mkdir -p outputs/accuracy outputs/test-reports
-            # C++ and MLIR LIT write no JSON report, so record a pass/fail row
-            # for each command. Otherwise a failure is not visible in the
-            # summary. Write the rows to a separate file. The accuracy test
-            # writes its own step_summary.md, so do not share that file.
-            rows=outputs/command-status.md
-            {
-              echo "## Test results: C++, MLIR LIT, Op-Accuracy"
-              echo ""
-              echo "| command | status |"
-              echo "|---|---|"
-            } > "$rows"
-            rc=0
-            ./tools/run-cpp-test --verbose \
-              && echo "| C++ tests | PASS |" >> "$rows" \
-              || { echo "| C++ tests | FAIL |" >> "$rows"; rc=1; }
-            ./tools/run-torch-mlir-lit-tests \
-              && echo "| MLIR LIT tests | PASS |" >> "$rows" \
-              || { echo "| MLIR LIT tests | FAIL |" >> "$rows"; rc=1; }
-            TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1 NEURON_ACCURACY_OUTPUT_DIR=outputs/accuracy python -m pytest tests/vertical/accuracy/test_accuracy.py --traced-model qwen3_235b_ep64_tp4 --max-shapes-per-op 0 -n 16 --dist load --json-report --json-report-file=outputs/test-reports/accuracy.json --tb=short -q \
-              && echo "| Op-accuracy tests | PASS |" >> "$rows" \
-              || { echo "| Op-accuracy tests | FAIL |" >> "$rows"; rc=1; }
-            # Put the command table on top, then the accuracy detail summary.
-            summary=outputs/accuracy/step_summary.md
-            { cat "$rows"; echo; [ -f "$summary" ] && cat "$summary"; } > outputs/combined-summary.md
-            mv outputs/combined-summary.md "$summary"
-            exit $rc
-          artifact-name: ${{ inputs.suite_id }}-cpp-lit-accuracy-results
-          summary-path: test-results/outputs/accuracy/step_summary.md
+          artifact-name: >-
+            ${{ inputs.build_image && matrix.artifact_name ||
+            format('{0}-{1}-results', inputs.suite_id, matrix.artifact_suffix) }}
+          summary-path: ${{ matrix.summary_path }}
       - name: Merge-queue no-op
         if: ${{ inputs.noop }}
         run: echo "The tests ran on the pull request head. Pass this merge queue check."

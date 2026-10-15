@@ -8,10 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
-#include <charconv>
 #include <chrono>
-#include <limits>
-#include <optional>
 
 #include "CorrelationTracker.h"
 #include "LogWrapper.h"
@@ -41,18 +38,9 @@ inline const char* GetXUTypeName(int32_t xu_type) {
   }
 }
 
-// Hold raw policy text until the config parse pass ends. Missing fields remain nullopt.
-struct RawExportPolicy {
-  std::optional<std::string> policy{};
-  std::optional<std::string> intervalMs{};
-  std::optional<std::string> mask{};
-};
-
-// Borrow Session configurations during the synchronous parse pass and retain raw policy fields.
 struct ParseContext {
   nrt_inspect_config_t* nrtConfig{nullptr};
-  ExportConfig& exportConfig;
-  RawExportPolicy rawExportPolicy{};
+  ExportConfig* exportConfig{nullptr};
 };
 
 // Helper to cast context to NRT config
@@ -60,52 +48,8 @@ inline nrt_inspect_config_t* toNrtConfig(void* ctx) {
   return static_cast<ParseContext*>(ctx)->nrtConfig;
 }
 
-// Return the required export configuration owned by the Session.
-inline ExportConfig& toExportConfig(void* ctx) {
+inline ExportConfig* toExportConfig(void* ctx) {
   return static_cast<ParseContext*>(ctx)->exportConfig;
-}
-
-// Parse a complete unsigned decimal value; reject signs, suffixes, and overflow.
-// Return nullopt when the raw field is absent or invalid.
-std::optional<uint64_t> parseExportDecimal(const std::optional<std::string>& raw) {
-  if (!raw) {
-    return std::nullopt;
-  }
-  const auto& text = *raw;
-  uint64_t value = 0;
-  const auto end = text.data() + text.size();
-  const auto result = std::from_chars(text.data(), end, value);
-  if (result.ec != std::errc{} || result.ptr != end) {
-    return std::nullopt;
-  }
-  return value;
-}
-
-/**
- * Validate the policy after all raw fields have passed through the existing parser.
- * Invalid settings produce one warning and preserve explicit manual export enablement.
- *
- * @param rawPolicy Raw policy fields collected during the config parse pass.
- * @return A complete time policy, or nullopt when the policy is absent or invalid.
- */
-std::optional<TimeExportConfig> parseTimeExportPolicy(const RawExportPolicy& rawPolicy) {
-  if (!rawPolicy.policy && !rawPolicy.intervalMs && !rawPolicy.mask) {
-    return std::nullopt;
-  }
-
-  const auto intervalMs = parseExportDecimal(rawPolicy.intervalMs);
-  const auto mask = parseExportDecimal(rawPolicy.mask);
-  constexpr uint64_t maxIntervalMs = std::numeric_limits<int64_t>::max() / 1000000;
-  if (!rawPolicy.policy || *rawPolicy.policy != "time" || !intervalMs || *intervalMs == 0 ||
-      *intervalMs > maxIntervalMs || !mask || *mask > std::numeric_limits<uint32_t>::max() ||
-      !isSupportedInspectExportMask(static_cast<uint32_t>(*mask))) {
-    NPROF_WARN("Time export policy disabled. Set export_policy:time, export_interval_ms from 1 to",
-               maxIntervalMs, "and a supported decimal export_mask.");
-    return std::nullopt;
-  }
-
-  return TimeExportConfig{std::chrono::nanoseconds{static_cast<int64_t>(*intervalMs) * 1000000},
-                          static_cast<uint32_t>(*mask)};
 }
 
 ConfigRegistry createNeuronConfigRegistry() {
@@ -233,26 +177,10 @@ ConfigRegistry createNeuronConfigRegistry() {
       {"continuous_export", NConfigParser::parseBool,
        [](void* ctx, const ConfigValue& v) {
          bool enabled = std::get<bool>(v);
-         toExportConfig(ctx).enabled = enabled;
+         if (auto* exportConfig = toExportConfig(ctx)) {
+           exportConfig->enabled = enabled;
+         }
          NPROF_INFO("  Set continuous_export:", enabled ? "enabled" : "disabled");
-         return true;
-       }},
-
-      {"export_policy", NConfigParser::parseString,
-       [](void* ctx, const ConfigValue& v) {
-         static_cast<ParseContext*>(ctx)->rawExportPolicy.policy = std::get<std::string>(v);
-         return true;
-       }},
-
-      {"export_interval_ms", NConfigParser::parseString,
-       [](void* ctx, const ConfigValue& v) {
-         static_cast<ParseContext*>(ctx)->rawExportPolicy.intervalMs = std::get<std::string>(v);
-         return true;
-       }},
-
-      {"export_mask", NConfigParser::parseString,
-       [](void* ctx, const ConfigValue& v) {
-         static_cast<ParseContext*>(ctx)->rawExportPolicy.mask = std::get<std::string>(v);
          return true;
        }},
   };
@@ -315,10 +243,8 @@ void NeuronActivityProfilerSession::applyCustomConfig() {
   NPROF_INFO("  Custom config:", customConfig);
 
   static const auto registry = createNeuronConfigRegistry();
-  ParseContext parseContext{nrtConfig_, exportConfig_};
+  ParseContext parseContext{nrtConfig_, &exportConfig_};
   torch_neuronx::profiler::NConfigParser::parseAndApply(customConfig, registry, &parseContext);
-  const auto timePolicy = parseTimeExportPolicy(parseContext.rawExportPolicy);
-  exportConfig_.timePolicy = exportConfig_.enabled ? timePolicy : std::nullopt;
 }
 
 NeuronActivityProfilerSession::~NeuronActivityProfilerSession() {
@@ -405,7 +331,7 @@ void NeuronActivityProfilerSession::start() {
     // (e.g. std::thread throwing under resource pressure) must not abort the
     // profiling session. Degrade to no continuous export and keep going.
     try {
-      continuousExporter_ = std::make_unique<ContinuousExporter>(exportConfig_);
+      continuousExporter_ = std::make_unique<ContinuousExporter>();
       continuousExporter_->start();
     } catch (const std::exception& e) {
       NPROF_WARN("Failed to start continuous exporter:", e.what(), "- continuing without it");
@@ -499,18 +425,8 @@ void NeuronActivityProfilerSession::processTrace(
   // Heap-allocate trace buffer so the TraceSpan address is stable
   // (GenericTraceActivity stores a raw pointer to the span).
   traceBuffer_ = std::make_unique<libkineto::CpuTraceBuffer>();
-  // Kineto expects every child event inside the capture window. The session
-  // starts before the window opens and stops after it closes, so clip to it.
-  // The window end is exclusive: an event that ends exactly at the end can
-  // overshoot it after the trace converts ts and dur to floating-point us.
-  const int64_t windowLast = captureWindowEnd_ - 1;
-  const auto clipToWindow = [this, windowLast](libkineto::GenericTraceActivity& activity) {
-    activity.startTime = std::max(activity.startTime, captureWindowStart_);
-    activity.endTime = std::max(std::min(activity.endTime, windowLast), activity.startTime);
-  };
   traceBuffer_->span =
-      libkineto::TraceSpan(std::max(profileStartTime_, captureWindowStart_),
-                           std::min(profileEndTime_, windowLast), "__neuron_profiler__");
+      libkineto::TraceSpan(profileStartTime_, profileEndTime_, "__neuron_profiler__");
 
   // Drain profiled operations collected between start() and stop()
   auto profiled_ops = eventBuffer_.drain();
@@ -638,7 +554,6 @@ void NeuronActivityProfilerSession::processTrace(
       submit_act.addMetadataQuoted("persistent_cache_key", op.persistent_cache_key);
     }
 
-    clipToWindow(submit_act);
     submit_act.log(logger);
 
     // Activity 2: PRIVATEUSE1_RUNTIME — dispatch on RuntimeWorker thread
@@ -679,7 +594,6 @@ void NeuronActivityProfilerSession::processTrace(
       dispatch_act.addMetadata("dispatch_slot", op.dispatch_slot);
       dispatch_act.addMetadataQuoted("xu_type", GetXUTypeName(op.xu_type));
 
-      clipToWindow(dispatch_act);
       dispatch_act.log(logger);
 
       std::string slot_label = "Stream " + std::to_string(op.stream_id) + " / " +
@@ -743,7 +657,6 @@ void NeuronActivityProfilerSession::processTrace(
       exec_act.addMetadataQuoted("persistent_cache_key", op.persistent_cache_key);
     }
 
-    clipToWindow(exec_act);
     exec_act.log(logger);
 
     // Register resources
@@ -778,7 +691,6 @@ void NeuronActivityProfilerSession::processTrace(
       sleep_act.device = libkineto::processId();
       sleep_act.resource = kSleepTid;
       sleep_act.threadId = kSleepTid;
-      clipToWindow(sleep_act);
       sleep_act.log(logger);
     }
     recordResource(libkineto::processId(), kSleepTid, "RuntimeWorker / Idle");

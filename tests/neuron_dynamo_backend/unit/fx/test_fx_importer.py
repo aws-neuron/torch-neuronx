@@ -2,9 +2,7 @@
 Unit tests for FX importer
 """
 
-import ast
 import operator
-import re
 
 import pytest
 import sympy
@@ -12,8 +10,6 @@ import torch
 import torch.nn as nn
 from functorch.compile import make_boxed_func
 from torch._dynamo.backends.common import aot_autograd
-from torch._subclasses.fake_tensor import FakeTensorMode
-from torch_mlir import fx
 from torch_mlir import ir as mlir_ir
 from torch_mlir.dialects import func as func_d
 from torch_mlir.dialects import torch as torch_d
@@ -21,21 +17,7 @@ from torch_mlir.extras.fx_importer import _emit_operation
 from torch_mlir.fx import OutputType, stateless_fx_import
 from torch_mlir.ir import IntegerAttr, IntegerType
 
-from tests.neuron_dynamo_backend.unit.utils.test_utils import get_aot_graphs
-from torch_neuronx.neuron_dynamo_backend.fx.fx_hooks import CustomFxImporterHooks
 from torch_neuronx.neuron_dynamo_backend.fx.fx_importer import NeuronFxImporter
-
-
-def _extract_dense_data(module_str):
-    """Extract data from dense<...> patterns in an MLIR module string."""
-    matches = re.findall(r"dense<([^>]+)>", module_str)
-    out = []
-    for m in matches:
-        try:
-            out.append(ast.literal_eval(m.replace("true", "True").replace("false", "False")))
-        except (ValueError, SyntaxError):
-            continue
-    return out
 
 
 class TestFxImporterTensorConstants:
@@ -57,32 +39,6 @@ class TestFxImporterTensorConstants:
         compiled = torch.compile(model, fullgraph=True, backend="neuron")
         out = compiled(x)
         assert out.shape == (1, 512)
-
-    def test_get_attr_constant_under_fake_tensor_mode(self, monkeypatch):
-        """The fx importer runs inside FakeTensorMode; get_attr tensor
-        constants are real. A real tensor whose .cpu() dispatches
-        aten._to_copy would trip fake mode's real-tensor guard without
-        unset_fake_temporarily in resolve_literal."""
-
-        constant = [[1.0, 2.0], [3.0, 4.0]]
-
-        def _dispatching_cpu(self):
-            return torch.ops.aten._to_copy.default(self, device=torch.device("cpu"))
-
-        monkeypatch.setattr(torch.Tensor, "cpu", _dispatching_cpu)
-
-        class Model(nn.Module):
-            def forward(self, x):
-                return x + torch.tensor(constant, dtype=torch.float32)
-
-        gm = get_aot_graphs(Model(), torch.ones((2, 2), dtype=torch.float32)).post_aot_forward_graph
-
-        with FakeTensorMode(allow_non_fake_inputs=False):
-            mlir_module = fx.stateless_fx_import(gm, hooks=CustomFxImporterHooks())
-
-        module_str = str(mlir_module)
-        assert "torch.vtensor.literal" in module_str
-        assert constant in _extract_dense_data(module_str)
 
 
 def _get_mlir_op_names(module):

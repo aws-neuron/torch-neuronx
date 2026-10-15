@@ -14,7 +14,7 @@ name: Vertical Op Tests (Reusable)
 #
 # Job graph:
 #   vertical-tests (trn2: eager + compile on inputs.image, writes CSVs)
-#       -> aggregate (gate runner: CSV -> parquet -> S3; non-gate modes)
+#       -> aggregate (ubuntu-latest: CSV -> parquet -> S3; non-gate modes)
 #
 # The aggregate job uploads the ``custom-test-artifacts`` artifact, which the
 # DevOps mirror copies to S3 verbatim for Athena. A run can upload that artifact
@@ -48,15 +48,15 @@ on:
         type: string
         default: ""
       runner-timeout:
-        description: "neuron.timeout label (seconds). The fleet keeps the runner alive this long."
+        description: "neuron.timeout label (seconds). The fleet keeps the runner alive this long. This does not include queue time. Keep it above the gate wall-clock guard."
         required: false
         type: string
-        default: "32400"
+        default: "10800"
       job-timeout-minutes:
         description: "GitHub job timeout for the trn2 test job."
         required: false
         type: number
-        default: 600
+        default: 240
       # Persistent NEFF cache. On by default: the node hydrates the shared S3
       # cache to local NVMe before the run and reads from it. Fail-open: an S3
       # error degrades to a cold compile, never blocks the run. Perf must run
@@ -75,7 +75,7 @@ on:
         type: boolean
         default: false
       dkms:
-        description: "Value of the neuron.dkms runner label. Empty uses the branch config pin."
+        description: Value of the neuron.dkms runner label. Empty uses the branch config pin.
         required: false
         type: string
         default: ''
@@ -129,15 +129,21 @@ jobs:
       # backstop for a hang in the exec loop or the correctness oracle, which
       # nothing else caps. Use signal method, not thread.
       #
-      # Perf splits the two suites into two pytest runs. The eager suite keeps a
-      # live Neuron runtime, so it cannot fork; it runs at -n 16 with the signal
-      # --timeout for stable per-op timing. The compile suite has no live
-      # runtime, so it runs --forked at the caller worker count for process
-      # isolation and a clean neuronx-cc teardown per op. The forked run drops
-      # --timeout and uses an outer "timeout -s KILL". A per-test signal
-      # --timeout is not safe with --forked: the alarm fires in the parent while
-      # it waits in proc.join, which raises a pytest INTERNALERROR and fails the
-      # whole run.
+      # run_gate.py owns the gate wall-clock guard (GATE_WALL_CLOCK_SECONDS). The
+      # per-op signal --timeout cannot catch a hang outside a test, for example
+      # in collection or in a worker that stops answering signals. The script
+      # kills the run and fails the gate before the runner cap, which blocks the
+      # merge.
+      #
+      # Perf splits the two suites into two pytest runs, the same way the NTTE
+      # Brazil pipeline runs them. The eager suite keeps a live Neuron runtime, so
+      # it cannot fork; it runs at -n 16 with the signal --timeout for stable
+      # per-op timing. The compile suite has no live runtime, so it runs --forked
+      # at the caller worker count for process isolation and a clean neuronx-cc
+      # teardown per op. The forked run drops --timeout and uses an outer
+      # "timeout -s KILL", the same as Brazil. A per-test signal --timeout is not
+      # safe with --forked: the alarm fires in the parent while it waits in
+      # proc.join, which raises a pytest INTERNALERROR and fails the whole run.
       # The forked run also sets NEURON_COMPILE_HARD_ABORT=1, so compile_time_limit
       # ends the child process on a compile that ignores SIGALRM and has no
       # subprocess to kill. The test pre-writes a compile_timeout row, so the
@@ -178,37 +184,34 @@ jobs:
     name: Aggregate Vertical Results
     needs: [vertical-tests]
     if: always() && inputs.mode != 'gate'
-    runs-on: [self-hosted, linux, "neuron.image:neuron-gate-tools", "neuron.run-${{ github.run_id }}-vertical-aggregate-${{ inputs.mode }}"]
-    timeout-minutes: 30
+    runs-on: ubuntu-latest
     env:
       RUN_KIND_FLAG: ${{ inputs.mode == 'perf' && '--run-kind perf' || '' }}
     steps:
       - uses: actions/checkout@v4
-      # The download-artifact action runs on the host. The run steps run in the
-      # gate container, which shares only the workspace and RUNNER_TEMP.
       - name: Download results
         uses: actions/download-artifact@v4
         with:
           name: vertical-${{ inputs.mode }}-results
-          path: ${{ runner.temp }}/vertical-results-in
+          path: /tmp/vertical-results-in
       - name: Install aggregator dependencies
-        # The gate image lacks the test image's [dev] extras, so pyarrow must be
-        # installed here.
-        run: python3 -m pip install "pyarrow>=15,<20"
+        # ubuntu-latest lacks the test image's [dev] extras, so pyarrow must be
+        # installed here. Pin to a version with prebuilt wheels for python 3.12.
+        run: pip install "pyarrow>=15,<20"
       - name: Convert CSVs to parquet
         run: |
           set -euo pipefail
-          eager=$(find "${RUNNER_TEMP}/vertical-results-in" -name 'target_ops_coverage_*.csv' | head -n1)
-          compile=$(find "${RUNNER_TEMP}/vertical-results-in" -name 'target_ops_compile_coverage_*.csv' | head -n1)
+          eager=$(find /tmp/vertical-results-in -name 'target_ops_coverage_*.csv' | head -n1)
+          compile=$(find /tmp/vertical-results-in -name 'target_ops_compile_coverage_*.csv' | head -n1)
           if [ -n "$eager" ]; then
-            python3 testing/vertical/aggregate_vertical_results.py \
-              --csv "$eager" --suite target_ops_coverage ${{ env.RUN_KIND_FLAG }} --output-dir "${RUNNER_TEMP}/vertical-results"
+            python testing/vertical/aggregate_vertical_results.py \
+              --csv "$eager" --suite target_ops_coverage ${{ env.RUN_KIND_FLAG }} --output-dir /tmp/vertical-results
           else
             echo "WARNING: no eager CSV found"
           fi
           if [ -n "$compile" ]; then
-            python3 testing/vertical/aggregate_vertical_results.py \
-              --csv "$compile" --suite target_ops_compile_coverage ${{ env.RUN_KIND_FLAG }} --output-dir "${RUNNER_TEMP}/vertical-results"
+            python testing/vertical/aggregate_vertical_results.py \
+              --csv "$compile" --suite target_ops_compile_coverage ${{ env.RUN_KIND_FLAG }} --output-dir /tmp/vertical-results
           else
             echo "WARNING: no compile CSV found"
           fi
@@ -220,5 +223,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: custom-test-artifacts
-          path: ${{ runner.temp }}/vertical-results/custom-test-artifacts/
+          path: /tmp/vertical-results/custom-test-artifacts/
           retention-days: 30

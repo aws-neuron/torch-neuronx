@@ -2,7 +2,7 @@ from .base import Operation
 
 
 class NativeMultiHeadAttnPrefixOp(Operation):
-    """Provide QKV projection and head-layout transformation for native attention."""
+    """Native multi-head attention prefix operation for transforming Q, K, V tensors"""
 
     def _setup_implementations(self):
         """Setup available implementations"""
@@ -14,9 +14,5 @@ class NativeMultiHeadAttnPrefixOp(Operation):
 
     @property
     def op_name(self) -> str:
-        """Return the registered operation name.
-
-        Returns:
-            str: ``"native_multi_head_attn_prefix"``.
-        """
+        """Return the operation name"""
         return "native_multi_head_attn_prefix"

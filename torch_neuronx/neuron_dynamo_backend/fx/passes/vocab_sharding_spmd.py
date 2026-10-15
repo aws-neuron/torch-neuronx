@@ -4,7 +4,7 @@ FX Passes: ShardIndexInjection + VocabShardingSPMD
 Two passes for SPMD vocab sharding that make compiled graphs identical
 across all TP ranks:
 
-1. ShardIndexInjection: Appends a vocab_shard_index int32 scalar placeholder to every
+1. ShardIndexInjection: Appends a vocab_shard_index i64[] placeholder to every
    graph. The shard index is inferred from vocab sharding pattern constants
    (lower_bound // shard_size). The Executor injects torch.tensor(shard_index)
    at runtime via the IOMutation interface.
@@ -45,16 +45,7 @@ def _fake_i64_scalar():
 
 @dataclass
 class VocabTriad:
-    """Store a connected vocabulary-sharding comparison triad.
-
-    Args:
-        lt_node (Node): Lower-bound comparison node.
-        ge_node (Node): Upper-bound comparison node.
-        bitwise_or_node (Node): Node combining the comparison results.
-        sub_node (Node | None): Associated offset-subtraction node, if found.
-        lower_bound (int): Inclusive lower vocabulary bound.
-        upper_bound (int): Exclusive upper vocabulary bound.
-    """
+    """A connected lt/ge/bitwise_or triad with its associated sub node."""
 
     lt_node: Node
     ge_node: Node
@@ -65,25 +56,15 @@ class VocabTriad:
 
     @property
     def shard_size(self) -> int:
-        """Compute the vocabulary shard size.
-
-        Returns:
-            int: Difference between the upper and lower bounds.
-        """
         return self.upper_bound - self.lower_bound
 
 
 @dataclass
 class FlatOffsetAdd:
-    """Store a matched constant-offset addition that feeds a scatter.
+    """An add.Tensor(flat_indices, C) node where C = vocab_shard_index * flat_shard_size.
 
-    Args:
-        node (Node): ``add.Tensor`` node that applies the constant offset.
-        flat_shard_size (int): Length of the matched one-dimensional int64 input.
-
-    Note:
-        The match requires a nonnegative offset divisible by ``flat_shard_size``.
-        The addition must feed a dimension-zero ``scatter_add`` operation.
+    This is the backward of index_select for RowwiseParallel embedding.
+    flat_shard_size = shard_size * hidden_dim.
     """
 
     node: Node
@@ -91,17 +72,13 @@ class FlatOffsetAdd:
 
 
 def find_flat_offset_adds(graph: Graph) -> list[FlatOffsetAdd]:
-    """Find backward flat-offset additions for row-wise embeddings.
+    """Find add.Tensor(x, C) nodes matching the backward flat-offset pattern.
 
-    Args:
-        graph (Graph): FX graph to search.
-
-    Returns:
-        list[FlatOffsetAdd]: Matches in graph order.
-
-    Note:
-        A match adds a nonnegative multiple of a one-dimensional int64 input's
-        length and feeds dimension zero of ``scatter_add``.
+    Detection criteria:
+    1. add.Tensor with integer constant second arg C >= 0
+    2. First arg x has 1-D shape [N] with N > 0
+    3. C % N == 0 (C is a multiple of the flat shard size)
+    4. The result feeds into a scatter_add (index_select backward pattern)
     """
     results = []
     for node in graph.nodes:
@@ -147,16 +124,10 @@ def find_flat_offset_adds(graph: Graph) -> list[FlatOffsetAdd]:
 
 @dataclass
 class BackwardSlice:
-    """Store a backward vocabulary-gradient slice match.
+    """A slice.Tensor(grad, 0, start, end) where start = shard_index * shard_size.
 
-    Args:
-        node (Node): ``slice.Tensor`` node extracting the shard.
-        start (int): Inclusive shard start index.
-        shard_size (int): Number of vocabulary rows in the shard.
-
-    Note:
-        DTensor extracts a row-wise embedding shard with
-        ``start = shard_index * shard_size``.
+    This is the backward redistribution slice for RowwiseParallel embedding.
+    DTensor slices the full vocab gradient to extract this rank's shard.
     """
 
     node: Node
@@ -185,18 +156,15 @@ def _is_reshaped_graph_input(node: Node) -> bool:
 
 
 def find_backward_slices(graph: Graph) -> list[BackwardSlice]:
-    """Find shard-like dimension-zero slices of two-dimensional graph inputs.
+    """Find slice.Tensor nodes matching the backward vocab gradient slice pattern.
 
-    Args:
-        graph (Graph): FX graph to search.
-
-    Returns:
-        list[BackwardSlice]: Structurally matched slice candidates in graph order.
-
-    Note:
-        A match has aligned nonnegative integer bounds. Its shard size is at least two and
-        evenly divides a first dimension larger than one shard. The input is a placeholder
-        or comes through single-input operations that preserve the element count.
+    Detection criteria:
+    1. slice.Tensor on dim=0 with integer constant start and end
+    2. shard_size = end - start >= 2 (non-trivial shard)
+    3. start % shard_size == 0 (start is aligned to shard boundary)
+    4. Input is 2-D (vocab_size, hidden_dim) — vocab gradient is always 2-D
+    5. Input shape[0] % shard_size == 0 and shape[0] > shard_size
+    6. The sliced value is a graph input, or a reshape of one
     """
     results = []
     for node in graph.nodes:
@@ -239,19 +207,23 @@ def find_backward_slices(graph: Graph) -> list[BackwardSlice]:
 
 
 def find_vocab_triads(graph: Graph) -> list[VocabTriad]:
-    """Find connected vocabulary-sharding comparison triads.
+    """Find connected lt/ge/bitwise_or triads that match the vocab sharding pattern.
+
+    A valid triad requires:
+    1. bitwise_or.Tensor(lt, ge) where lt and ge feed directly into bitwise_or
+    2. lt = lt.Scalar(tokens, LOWER_BOUND) with integer constant
+    3. ge = ge.Scalar(tokens, UPPER_BOUND) with integer constant
+    4. lt and ge operate on the same input tensor
+    5. UPPER_BOUND - LOWER_BOUND > 0 and LOWER_BOUND % shard_size == 0
+
+    The associated sub.Tensor is found by searching for sub.Tensor(x, LOWER_BOUND)
+    among users of the shared input (or its clones), not by global search.
 
     Args:
-        graph (Graph): FX graph to search.
+        graph: The FX graph to search.
 
     Returns:
-        list[VocabTriad]: Matches in topological order.
-
-    Note:
-        A direct ``bitwise_or(lt.Scalar, ge.Scalar)`` must compare one input against
-        numeric bounds. Bounds are converted to integers before requiring a shard size
-        of at least two and an aligned lower bound. The subtraction is searched only
-        among that input's direct users and depth-one clones.
+        List of VocabTriad instances found in topological order.
     """
     triads = []
     claimed_sub_nodes: set[Node] = set()
@@ -374,30 +346,19 @@ def _infer_shard_index(graph: fx.Graph) -> int | None:
 
 
 class ShardIndexInjection(NeuronFXPass):
-    """Inject a vocabulary-shard-index placeholder after existing graph inputs.
+    """Inject a vocab_shard_index scalar placeholder at the end of graph inputs.
 
-    Args:
-        state (NeuronFXPassState | None, optional): Shared state used to record the
-            added runtime input. Defaults to ``None``.
-
-    Note:
-        The pass is idempotent and skips when
-        ``TORCH_NEURONX_VOCAB_SHARDING_SPMD_DISABLE=1`` or the graph is empty,
-        unmatched, already injected, or has conflicting inferred shard indices.
+    Guards:
+    - Disabled by TORCH_NEURONX_VOCAB_SHARDING_SPMD_DISABLE=1
+    - Skips if vocab_shard_index already exists (idempotent)
+    - Skips if graph has no placeholders
+    - Skips if shard indices from different patterns conflict
     """
 
     def __init__(self, state: NeuronFXPassState | None = None):
         super().__init__(state)
 
     def call(self, graph_module: fx.GraphModule) -> PassResult:
-        """Inject a runtime vocabulary-shard-index graph input.
-
-        Args:
-            graph_module (fx.GraphModule): Graph module to inspect and potentially modify.
-
-        Returns:
-            PassResult: The graph module and whether the placeholder was added.
-        """
         graph = graph_module.graph
 
         # Escape hatch
@@ -449,30 +410,25 @@ class ShardIndexInjection(NeuronFXPass):
 
 
 class VocabShardingSPMD(NeuronFXPass):
-    """Rewrite rank-specific vocabulary constants as shard-index expressions.
+    """Rewrite vocab sharding constants to vocab-shard-index-dependent expressions.
 
-    Args:
-        state (NeuronFXPassState, optional): Shared FX-pass state used for artifact
-            dumping. Defaults to ``None``.
+    Finds the vocab_shard_index placeholder injected by ShardIndexInjection, then rewrites
+    each pattern's constants to expressions of vocab_shard_index:
 
-    Note:
-        For forward triads, lower and subtraction offsets become ``index * shard_size``
-        and upper bounds add ``shard_size``. Backward flat offsets become
-        ``index * flat_shard_size``. Backward slice bounds use an int64-cast index times
-        ``shard_size`` and add ``shard_size`` for the end. ``index`` is the placeholder
-        injected by ``ShardIndexInjection``.
+    Triads (forward):
+        lower_bound -> mul(vocab_shard_index, shard_size)
+        upper_bound -> add(mul(vocab_shard_index, shard_size), shard_size)
+        sub offset  -> mul(vocab_shard_index, shard_size)
+
+    Flat-offset adds (backward):
+        add.Tensor(x, C) -> add.Tensor(x, mul(vocab_shard_index, flat_shard_size))
+
+    Backward slices (backward):
+        slice.Tensor(grad, 0, start, end) -> slice.Tensor(grad, 0, offset, offset + shard_size)
+        where offset = mul(to_i64(vocab_shard_index), shard_size)
     """
 
     def call(self, graph_module: torch.fx.GraphModule) -> PassResult:
-        """Rewrite vocabulary-sharding patterns in an FX graph.
-
-        Args:
-            graph_module (torch.fx.GraphModule): Graph module containing the injected
-                shard-index placeholder.
-
-        Returns:
-            PassResult: The graph module and whether any pattern was rewritten.
-        """
         graph = graph_module.graph
 
         # Find the vocab_shard_index placeholder

@@ -6,32 +6,14 @@ import torch.nn.functional as f
 
 
 def create_causal_mask(seq_length, device):
-    """Create an additive causal mask for self-attention.
-
-    Args:
-        seq_length (int): Number of query and key positions.
-        device (torch.device or str): Device on which to create the mask.
-
-    Returns:
-        torch.Tensor: Mask shaped ``(1, 1, seq_length, seq_length)`` containing zeros
-            on and below the diagonal and negative infinity above it.
-    """
+    """Create a causal mask for self-attention."""
     mask = torch.triu(torch.ones(seq_length, seq_length, device=device), diagonal=1)
     mask = mask.masked_fill(mask == 1, float("-inf"))
     return mask.unsqueeze(0).unsqueeze(0)
 
 
 class MultiHeadAttention(nn.Module):
-    """Implement scaled dot-product multi-head self-attention.
-
-    Args:
-        d_model (int): Input and output feature dimension.
-        n_heads (int): Number of attention heads.
-        dropout (float, optional): Attention-weight dropout probability. Defaults to ``0.0``.
-
-    Raises:
-        AssertionError: If ``d_model`` is not divisible by ``n_heads``.
-    """
+    """Multi-head attention mechanism used in transformers."""
 
     def __init__(self, d_model, n_heads, dropout=0.0):
         super().__init__()
@@ -50,16 +32,6 @@ class MultiHeadAttention(nn.Module):
         self.scale = 1.0 / math.sqrt(self.d_k)
 
     def forward(self, x, mask=None):
-        """Apply multi-head self-attention to an input sequence.
-
-        Args:
-            x (torch.Tensor): Input shaped ``(batch, sequence, d_model)``.
-            mask (torch.Tensor, optional): Additive mask broadcastable to attention scores.
-                Defaults to ``None``.
-
-        Returns:
-            torch.Tensor: Attention output with the same shape as ``x``.
-        """
         batch_size, seq_length, d_model = x.shape
 
         # Linear transformations and reshape

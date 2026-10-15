@@ -295,27 +295,6 @@ void RunNkiStridedCopy(const at::Tensor& src, at::Tensor& dst) {
 
 }  // namespace
 
-void cast_neuron_to_neuron(const at::Tensor& src, at::Tensor& dst) {
-  if (src.numel() == 0) {
-    return;
-  }
-
-  const int device = src.device().index();
-  void* src_ptr = src.storage().mutable_data();
-  void* dst_ptr = dst.storage().mutable_data();
-  auto src_tensor_ptr = c10_neuron::NeuronCachingAllocator::findTensorPtr(src_ptr);
-  auto dst_tensor_ptr = c10_neuron::NeuronCachingAllocator::findTensorPtr(dst_ptr);
-  auto cast_kernel = std::make_unique<at::neuron::CastDirectKernelExecution>(
-      "neuron::cast::neuron_to_neuron",
-      at::neuron::TensorDataRef{std::move(src_tensor_ptr), src_ptr},
-      at::neuron::TensorDataRef{std::move(dst_tensor_ptr), dst_ptr},
-      static_cast<uint64_t>(src.storage_offset()), static_cast<uint64_t>(dst.storage_offset()),
-      src.scalar_type(), dst.scalar_type(), static_cast<uint64_t>(src.numel()), device);
-  auto context = std::make_unique<at::neuron::OperationContext>(std::move(cast_kernel));
-  auto stream = at::neuron::getCurrentNeuronStream(device);
-  at::neuron::SubmitOperationContext(stream, std::move(context));
-}
-
 namespace {
 
 // One contiguous (src_offset, dst_offset, nbytes) piece of a strided copy.

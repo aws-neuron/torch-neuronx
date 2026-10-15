@@ -16,16 +16,7 @@ from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
 
 @dataclass(frozen=True)
 class KernelKey:
-    """Identify a normalized MLIR kernel configuration.
-
-    Args:
-        fn_id (str): Module-and-name callable identifier used in the cache key.
-        op_name (str): Operation name associated with the kernel.
-        static_argnums (tuple[int, ...]): Positional arguments treated as static.
-        static_argnames (tuple[str, ...]): Named arguments treated as static.
-        output_params (tuple[str, ...]): Parameter names used as outputs.
-        argproc_id (str): Identity of the argument processor configuration.
-    """
+    """Normalized identity for a kernel configuration."""
 
     fn_id: str
     op_name: str
@@ -54,20 +45,7 @@ def get_or_create_mlir_kernel(
     op_name: str,
     static_argnames: tuple[str, ...] | None = None,
 ) -> TorchMlirKernel:
-    """Return a cached MLIR kernel for a normalized configuration.
-
-    Args:
-        mlir_fn (Callable): Python function wrapped by the kernel.
-        op_name (str): Operation name used for lowering.
-        static_argnames (tuple[str, ...], optional): Named arguments treated as static.
-            Defaults to ``None``.
-
-    Returns:
-        TorchMlirKernel: Existing or newly created kernel instance.
-
-    Note:
-        Cache lookup and creation are process-local and protected by a reentrant lock.
-    """
+    """Return a cached TorchMlirKernel for the given configuration."""
     key = KernelKey(
         fn_id=_fn_identity(mlir_fn),
         op_name=op_name,
@@ -91,10 +69,6 @@ def get_or_create_mlir_kernel(
 
 
 def kernel_cache_size() -> int:
-    """Return the number of process-local cached kernel instances.
-
-    Returns:
-        int: Current number of entries in the MLIR kernel cache.
-    """
+    """Return the number of cached kernel instances (for tests/diagnostics)."""
     with _MLIR_LOCK:
         return len(_MLIR_CACHE)

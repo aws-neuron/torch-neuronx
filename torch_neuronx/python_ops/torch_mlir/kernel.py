@@ -1,4 +1,3 @@
-import contextlib
 import functools
 import hashlib
 import logging
@@ -19,14 +18,6 @@ from torch._functorch._aot_autograd.utils import create_tree_flattened_fn
 from torch._subclasses.functional_tensor import FunctionalTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils._filelock import FileLock
-from torch.utils._python_dispatch import (
-    _disable_current_modes,
-    _get_current_dispatch_mode_stack,
-    _pop_mode,
-    _pop_mode_temporarily,
-    _push_mode,
-)
-from torch.utils.checkpoint import _CachedTorchDispatchMode, _CachingTorchDispatchMode
 
 from torch_neuronx import _C
 from torch_neuronx.int64_policy import use_packed_int64_view_for_op
@@ -41,6 +32,7 @@ from torch_neuronx.packed_storage import (
     packed_logical_view,
     packed_physical_dtype,
     packed_physical_layout,
+    packed_physical_view,
 )
 from torch_neuronx.python_ops import io_tensor
 from torch_neuronx.python_ops.compilation.hlo_cache import CACHE_DIR, CachedHLO
@@ -59,85 +51,6 @@ from ..processors import ArgumentProcessor
 from .compilation import TorchMlirCompiler
 
 logger = logging.getLogger(__name__)
-
-
-@contextlib.contextmanager
-def _isolated_kernel_trace():
-    """Hide internal lowering from selective activation checkpoint modes.
-
-    Other dispatch modes can define operator behavior and must remain active.
-    """
-    modes = _get_current_dispatch_mode_stack()
-    sac_modes = (_CachingTorchDispatchMode, _CachedTorchDispatchMode)
-    if not any(isinstance(mode, sac_modes) for mode in modes):
-        yield
-        return
-
-    with contextlib.ExitStack() as stack:
-        for _ in modes:
-            stack.enter_context(_pop_mode_temporarily())
-        for mode in modes:
-            if not isinstance(mode, sac_modes):
-                # Re-entering a mode can reset its state.
-                _push_mode(mode)
-                stack.callback(_pop_mode)
-        yield
-
-
-@contextlib.contextmanager
-def _isolated_dispatch():
-    """Detach from the caller's tracing state so it neither observes nor shapes the lowering.
-
-    The capture needs ``Python`` un-excluded: ``FakeTensorMode`` excludes it, together with
-    ``PythonTLSSnapshot``, while constant-folding a small device tensor, and the StableHLO
-    importer types a graph value only from a fake tensor. ``PreDispatch`` stays excluded,
-    because the capture traces post-dispatch. Torch-function modes take a separate switch,
-    since ``_disable_current_modes`` covers only the dispatch stacks.
-
-    A caller that never excluded the key is left entirely alone. Establishing the state
-    unconditionally would also drop the modes an ordinary compile is relying on, and a
-    ``TorchDispatchMode`` that runs comparisons of its own then reads a bool where it
-    expects a number.
-    """
-    python_key = torch._C.DispatchKey.Python
-    if not torch._C._dispatch_tls_local_exclude_set().has(python_key):
-        yield
-        return
-    exclude = (
-        torch._C._dispatch_tls_local_exclude_set()
-        .remove(python_key)
-        .remove(torch._C.DispatchKey.PythonTLSSnapshot)
-    )
-    include = torch._C._dispatch_tls_local_include_set()
-    with contextlib.ExitStack() as stack:
-        stack.enter_context(torch._C._ForceDispatchKeyGuard(include, exclude))
-        # Gated so an already-empty stack is never unwound.
-        if torch._C._len_torch_dispatch_stack():
-            stack.enter_context(_disable_current_modes())
-        stack.enter_context(torch._C.DisableTorchFunction())
-        yield
-
-
-@contextlib.contextmanager
-def _capture_dispatch_state():
-    """The state ``make_fx`` needs, on top of the isolation.
-
-    The functional mode is entered rather than inherited because the isolation dropped the
-    caller's, and ``to_fun`` reads it off the dispatch stack. ``Functionalize`` is excluded so
-    the C++ pass does not wrap each operand again alongside it. The Python dispatcher is what
-    makes ``py_impl`` decompositions visible.
-    """
-    with _isolated_dispatch():
-        disable_functionalize = torch._C._ExcludeDispatchKeyGuard(
-            torch._C.DispatchKeySet(torch._C.DispatchKey.Functionalize)
-        )
-        with (
-            torch.no_grad(),
-            disable_functionalize,
-            enable_python_dispatcher(),
-            FunctionalTensorMode(),
-        ):
-            yield
 
 
 def _wrap_torch_fn_for_packed_int64(fn, original_inputs, output_positions):
@@ -172,30 +85,11 @@ def _wrap_torch_fn_for_packed_int64(fn, original_inputs, output_positions):
             # nothing to gather, and gathering would reintroduce a zero-size
             # packed value. Pass it through clean.
             return arg
-        if (
-            isinstance(orig, torch.Tensor)
-            and orig.dtype == torch.int64
-            and isinstance(arg, torch.Tensor)
-            and arg.dtype == torch.int64
-        ):
-            # int64 inputs are kept as i64 graph parameters; reinterpret them to
-            # the packed int32[..., 2] view IN-GRAPH (zero-copy bitcast via
-            # view(int32)), matching the fake input's packed_physical_layout
-            # shape, then gather the low words. Avoids the out-of-graph
-            # physical_view set_ (no meta-cross-ref leak) and keeps the input
-            # boundary i64 (prologue and op agree — no i64/i32x2 merge boundary).
-            phys_shape, _, _ = packed_physical_layout(
-                torch.int64, shape=tuple(orig.shape), stride=tuple(orig.stride())
-            )
-            # Add-dim bitcast: unsqueeze a trailing 1, then view(int32) scales that
-            # last dim 1->2, giving int32[..., 2] directly (i64[*s,1]->i32[*s,2]).
-            # This matches the compilable add-dim bitcast_convert form; the flat
-            # form (view(int32) -> i32[2N] then reshape) trips a neuronx-cc
-            # TensorOpSimplifier memcpy element-count assertion (NCC_ITOS901).
-            packed = arg.unsqueeze(-1).view(torch.int32)
-            if tuple(packed.shape) != tuple(phys_shape):
-                packed = packed.reshape(phys_shape)
-            return packed_gather_nki(packed).reshape(tuple(orig.shape))
+        if is_packed_physical_view(arg, orig):
+            # arg is the packed physical view of the int64 `orig`; gather the low
+            # words in-graph and reshape to orig's logical shape (handles the
+            # scalar (1,2) -> () case, where packed_gather_nki alone yields (1,)).
+            return packed_gather_nki(arg).reshape(tuple(orig.shape))
         if (
             isinstance(orig, list | tuple)
             and isinstance(arg, list | tuple)
@@ -205,16 +99,6 @@ def _wrap_torch_fn_for_packed_int64(fn, original_inputs, output_positions):
         return arg
 
     def wrapped(*args, **kwargs):
-        """Run the operation with packed int64 input and output transforms.
-
-        Args:
-            *args: Positional operation arguments.
-            **kwargs: Keyword operation arguments.
-
-        Returns:
-            Any: Result with nonempty selected int32 tensors packed; empty selected outputs
-                remain unchanged, and sequence results become tuples when outputs are selected.
-        """
         if original_inputs is not None:
             args = [
                 _gather_arg(a, original_inputs[i] if i < len(original_inputs) else None)
@@ -255,23 +139,9 @@ def _reinterpret_packed_int64_output(exec_tensor, orig_out, downcast_out):
 
 
 class TorchMlirKernel(BaseNeuronKernel):
-    """Compile and execute PyTorch operations through StableHLO and NEFF.
+    """Torch-MLIR kernel implementation.
 
-    Args:
-        torch_fn (Callable): PyTorch operation to compile.
-        op_name (str): Operation name used for dispatch and caching.
-        static_argnums (tuple[int, ...], optional): Static positional argument indices.
-            Defaults to ``None`` (no static positional arguments).
-        static_argnames (tuple[str, ...], optional): Static keyword argument names.
-            Defaults to ``None`` (no static keyword arguments).
-        output_params (tuple[str, ...], optional): Parameters used as output tensors.
-            Defaults to ``None`` (no output parameters).
-        has_collectives (bool, optional): Whether the traced graph contains collective
-            operations. Defaults to ``False``.
-
-    Note:
-        Execution enqueues NEFF work on the current Neuron stream. Setting
-        ``NEURON_LAUNCH_BLOCKING=1`` waits for completion before returning.
+    Compiles PyTorch operations to StableHLO via torch-mlir, then to NEFF.
     """
 
     def __init__(
@@ -362,7 +232,7 @@ class TorchMlirKernel(BaseNeuronKernel):
         return compilation_kwargs
 
     def _generate_fake_inputs(
-        self, inputs: tuple, compilation_kwargs: dict | None = None
+        self, inputs: tuple, compilation_kwargs: dict | None = None, physical_int64: bool = False
     ) -> tuple[list, dict]:
         """Generate fake inputs and mapping for flattened indices.
 
@@ -386,21 +256,25 @@ class TorchMlirKernel(BaseNeuronKernel):
         flattened_idx = 0
 
         def create_fake_recursive(obj, original_idx):
-            """Create meta tensors recursively and record flattened positions.
-
-            Args:
-                obj (Any): Input object or nested tensor sequence to convert.
-                original_idx (int): Top-level positional index accepted but not used.
-
-            Returns:
-                Any: Meta-tensor equivalent with the original container structure.
-            """
             nonlocal flattened_idx
             if isinstance(obj, torch.Tensor):
-                # int64 inputs stay i64 at the graph boundary; the in-graph
-                # reinterpret (view(int32).reshape(..., 2)) packs them inside the
-                # traced fn, so the fake input is a plain meta tensor of obj's dtype.
-                fake_tensor = torch.empty_like(obj, device="meta")
+                if physical_int64 and obj.dtype == torch.int64 and obj.numel() > 0:
+                    # Packed int64: the NEFF parameter is the int32 physical view.
+                    # Use packed_physical_layout (single source of truth for the
+                    # physical shape) so this matches the execution binding exactly
+                    # — including the scalar/0-dim case ((1, 2), not (2,)).
+                    phys_shape, _, _ = packed_physical_layout(
+                        torch.int64, shape=tuple(obj.shape), stride=tuple(obj.stride())
+                    )
+                    fake_tensor = torch.empty(phys_shape, dtype=torch.int32, device="meta")
+                else:
+                    # Empty int64 stays *unpacked* (nothing to pack for 0 elements):
+                    # a packed (…, 2) view of an empty tensor is a zero-size 2-D
+                    # tensor the compiler elides, shifting the 1:1 inplace output
+                    # binding. Keeping it a clean empty makes it a trivial
+                    # pass-through (the execution binding + _gather_arg skip
+                    # packing/gathering it too).
+                    fake_tensor = torch.empty_like(obj, device="meta")
                 fake_to_flattened_idx[id(fake_tensor)] = flattened_idx
                 flattened_idx += 1
                 return fake_tensor
@@ -424,38 +298,24 @@ class TorchMlirKernel(BaseNeuronKernel):
 
         return fake_inputs, fake_to_flattened_idx
 
-    # A dtype cache hit skips meta operations that SAC must not count during forward.
-    @_isolated_kernel_trace()
     def infer_outputs_from_meta(self, inputs: tuple, kwargs: dict):
-        """Infer operation outputs by evaluating the PyTorch function on meta tensors.
-
-        Args:
-            inputs (tuple): Positional inputs used to create meta tensors.
-            kwargs (dict): Keyword arguments used for meta evaluation.
-
-        Returns:
-            Any: Output structure produced by the operation on meta tensors.
-        """
+        """Infer outputs by running torch_fn with meta tensors."""
         compilation_kwargs = self._get_compilation_kwargs(kwargs)
-        with _isolated_dispatch():
-            fake_inputs, _ = self._generate_fake_inputs(inputs, compilation_kwargs)
-            return self.torch_fn(*fake_inputs, **compilation_kwargs)
+        fake_inputs, _ = self._generate_fake_inputs(inputs, compilation_kwargs)
+        return self.torch_fn(*fake_inputs, **compilation_kwargs)
 
     @torch._dynamo.disable
     def infer_output_dtypes(self, *args, **kwargs):
-        """Infer output dtypes at original precision without Dynamo tracing.
+        """Infer output dtypes at original (pre-downcast) precision.
 
-        Args:
-            *args: Positional operation arguments before downcasting.
-            **kwargs: Keyword operation arguments before downcasting.
+        Called by C++ NeuronDispatcher on the casting path to determine
+        what dtypes to upcast execution outputs back to.
+
+        Decorated with @torch._dynamo.disable because this is called from C++
+        via pybind11 and must not be traced by Dynamo.
 
         Returns:
-            list[torch.dtype | None]: Dtypes for tensor outputs, with ``None`` for
-            non-tensor elements of tuple or list outputs. A single non-tensor result
-            yields an empty list.
-
-        Note:
-            The C++ NeuronDispatcher uses these values to upcast execution outputs.
+            list[int]: c10::ScalarType int values for each output tensor.
         """
         prior = torch._dynamo.eval_frame.set_eval_frame(None)
         try:
@@ -552,14 +412,6 @@ class TorchMlirKernel(BaseNeuronKernel):
             @functools.wraps(flat_fn)
             def wrapped_fn(*args):
                 # flat_fn returns result in a list
-                """Normalize flattened tracing results to scalar or tuple form.
-
-                Args:
-                    *args: Flattened positional arguments for the traced function.
-
-                Returns:
-                    Any: The sole flattened result, or a tuple when the result count is not one.
-                """
                 result = flat_fn(*args)
                 return result[0] if len(result) == 1 else tuple(result)
 
@@ -574,16 +426,6 @@ class TorchMlirKernel(BaseNeuronKernel):
             # reflects NKI kernel output aliasing.
             def functionalized_fn(*args):
                 # Wrap inputs as FunctionalTensor (like aot_autograd's to_fun)
-                """Functionalize tensor arguments and expose mutated inputs as outputs.
-
-                Args:
-                    *args: Flattened positional arguments to functionalize.
-
-                Returns:
-                    tuple: Unwrapped outputs followed by mutated input tensors; when
-                        ``alias_outputs_in_place`` is enabled, mutated tensors already present
-                        in the outputs are not appended again.
-                """
                 func_args = [to_fun(a) if isinstance(a, torch.Tensor) else a for a in args]
                 result = wrapped_fn(*func_args)
                 if not isinstance(result, tuple):
@@ -598,19 +440,13 @@ class TorchMlirKernel(BaseNeuronKernel):
 
                 # Unwrap all outputs and mutated inputs
                 unwrapped = tuple(from_fun(r) if isinstance(r, torch.Tensor) else r for r in result)
-                unwrapped_mutated = [from_fun(a) for a in mutated_inputs]
+                unwrapped_mutated = tuple(from_fun(a) for a in mutated_inputs)
+                return unwrapped + unwrapped_mutated if unwrapped_mutated else unwrapped
 
-                # Opt-in in-place aliasing: a must-alias kernel that returns the
-                # tensors it mutates emits each such tensor twice (once as a
-                # return, once as an appended mutated input). Drop the duplicate
-                # so the NEFF writes in place instead of to a fresh buffer.
-                if getattr(self, "alias_outputs_in_place", False):
-                    returned = {id(u) for u in unwrapped if isinstance(u, torch.Tensor)}
-                    unwrapped_mutated = [m for m in unwrapped_mutated if id(m) not in returned]
-
-                return unwrapped + tuple(unwrapped_mutated) if unwrapped_mutated else unwrapped
-
-            with _capture_dispatch_state():
+            disable_functionalize = torch._C._ExcludeDispatchKeyGuard(
+                torch._C.DispatchKeySet(torch._C.DispatchKey.Functionalize)
+            )
+            with disable_functionalize, enable_python_dispatcher(), FunctionalTensorMode():
                 decomposed_gm = make_fx(functionalized_fn, decomposition_table=decomposition_table)(
                     *flat_args
                 )
@@ -636,7 +472,6 @@ class TorchMlirKernel(BaseNeuronKernel):
 
         return decomposed_gm
 
-    @_isolated_kernel_trace()
     def _generate_hlo(
         self,
         inputs: tuple,
@@ -658,10 +493,14 @@ class TorchMlirKernel(BaseNeuronKernel):
         """
         compilation_kwargs = self._get_compilation_kwargs(kwargs)
 
-        # Create fake tensors and track flattened indices. int64 inputs are kept
-        # as i64 graph parameters; the in-graph reinterpret packs them to the
-        # int32[..., 2] view inside the traced fn (see _wrap_torch_fn_for_packed_int64).
-        fake_inputs, fake_to_flattened_idx = self._generate_fake_inputs(inputs, compilation_kwargs)
+        # Create fake tensors and track flattened indices. In packed int64 mode
+        # the int64 inputs are faked as their int32[..., 2] physical view so the
+        # traced graph parameter is int32 (the compiler has no int64 HLO type);
+        # the wrap gathers the low words and the physical view is bound at exec.
+        physical_int64 = use_packed_int64_view_for_op(self.op_name, inputs)
+        fake_inputs, fake_to_flattened_idx = self._generate_fake_inputs(
+            inputs, compilation_kwargs, physical_int64=physical_int64
+        )
 
         # Generate original_outputs by running meta eval
         original_outputs = self.infer_outputs_from_meta(
@@ -679,7 +518,7 @@ class TorchMlirKernel(BaseNeuronKernel):
         # + interleave and bound to the output's physical storage.
         packed_output_positions = []
         trace_fn = None
-        if use_packed_int64_view_for_op(self.op_name):
+        if use_packed_int64_view_for_op(self.op_name, inputs):
             # The wrap keys off `inputs` (the post-preprocess args the fakes were
             # generated from) — NOT context.original_inputs. `inputs` is aligned
             # 1:1 with fake_inputs, so operands promoted after the original
@@ -735,19 +574,6 @@ class TorchMlirKernel(BaseNeuronKernel):
         kept_output_indices = []
 
         def capture_backend(gm, example_inputs):
-            """Capture an FX graph after filtering passthrough outputs and eligible unused inputs.
-
-            Args:
-                gm (torch.fx.GraphModule): Graph module to filter and capture.
-                example_inputs (list[Any]): Flattened example inputs for the graph.
-
-            Returns:
-                torch.fx.GraphModule: Filtered input graph module.
-
-            Note:
-                The graph is mutated in place. Placeholder 0 is retained for pure-generation
-                in-place operations even when unused so output aliasing remains valid.
-            """
             nonlocal captured_gm, kept_input_indices, kept_output_indices
 
             # Get output node
@@ -773,21 +599,10 @@ class TorchMlirKernel(BaseNeuronKernel):
             new_output_args = [out_arg for out_arg in output_args if out_arg not in placeholders]
             output_node.args = (tuple(new_output_args),)
 
-            # Remove unused placeholders (empty pass-throughs now have no users).
-            # Exception: for PURE-GENERATION in-place ops (uniform_, normal_,
-            # random_), keep self (placeholder 0) even when it has no users.
-            # These never read self, but the in-place output must alias self's
-            # address. If self is pruned here it drops out of kept_input_indices,
-            # the alias in _build_input_output_aliases cannot fire, and the
-            # compiled module ends up with 0 args while the runtime binds self as
-            # 1 input — raising "Module2 input address count (1) ... (0)".
-            # NOTE: scoped to pure-generation ops only — applying this to all
-            # in-place ops (copy_, add_, mul_) pins a phantom self input that
-            # breaks the neuron::copy direct path and lazy-alloc accounting.
-            keep_self_inplace = self._is_pure_generation_op()
+            # Remove unused placeholders (empty pass-throughs now have no users)
             used_placeholder_indices = []
             for i, p in enumerate(placeholders):
-                if len(p.users) > 0 or (keep_self_inplace and i == 0):
+                if len(p.users) > 0:
                     used_placeholder_indices.append(i)
                 else:
                     gm.graph.erase_node(p)
@@ -848,9 +663,18 @@ class TorchMlirKernel(BaseNeuronKernel):
             capture_backend(decomposed_gm, flat_args)
             gm = captured_gm
 
-        # Emit mhlo.input_output_alias for NKI kernels that alias outputs to
-        # inputs so the NEFF writes in place instead of copying back.
-        aliasing_info = self._nki_output_input_alias_map(kept_input_indices)
+        # Build aliasing info for inplace ops.
+        # For inplace ops (e.g. add_, mul_), output[0] aliases the first input
+        # (the "self" tensor). We map the flattened input position 0 to its IR
+        # parameter index via kept_input_indices so the StableHLO module gets
+        # the correct mhlo.input_output_alias attribute.
+        aliasing_info = None
+        # if self._is_inplace_op() and 0 in kept_input_indices:
+        #     ir_param_idx = list(kept_input_indices).index(0)
+        #     aliasing_info = AliasingInfo()
+        #     aliasing_info.add(
+        #         parameter_number=ir_param_idx, parameter_index=[], output_index=0
+        #     )
 
         # Pure input passthrough: every output was a bare placeholder,
         # so capture_backend removed them all. convert_fx_to_stablehlo rejects a
@@ -1452,19 +1276,6 @@ class TorchMlirKernel(BaseNeuronKernel):
         """
         return is_inplace_op(self.op_name)
 
-    def _is_pure_generation_op(self) -> bool:
-        """In-place ops that write self without reading it (uniform_/normal_/random_).
-
-        Declared via ``register_aten(output_params=("self",))``: the op names ``self``
-        as its output tensor (the out-arg mechanism used by functional ``.out`` ops),
-        so ``self`` (placeholder 0) is retained for output aliasing. Other in-place ops
-        (copy_, add_, masked_fill) read self or a src that aliases the output and must
-        NOT have a phantom self pinned — doing so breaks the neuron::copy direct path
-        and lazy-alloc accounting. The distinction is semantic and not exposed by the FX
-        graph (masked_fill has the same graph shape yet reads self), so it is declared.
-        """
-        return "self" in self.output_params
-
     # ── lower() helpers ──────────────────────────────────────────
     #
     # ORDERING CONTRACT: The helpers below build metadata that must stay
@@ -1627,21 +1438,6 @@ class TorchMlirKernel(BaseNeuronKernel):
                 )
         return input_specs, kw_input_specs
 
-    def _nki_output_input_alias_map(self, kept_input_indices):
-        """Return {neff_output_index: neff_input_param} for a NKI kernel's declared
-        operand_output_aliases ({input_index: output_index}), or None if it has none.
-        """
-        nki_aliases = getattr(self, "operand_output_aliases", None)
-        if not nki_aliases or not kept_input_indices:
-            return None
-        param_of_input = {inp: p for p, inp in enumerate(kept_input_indices)}
-        alias_map = {
-            out_idx: param_of_input[in_idx]
-            for in_idx, out_idx in nki_aliases.items()
-            if in_idx in param_of_input
-        }
-        return alias_map or None
-
     def _build_input_output_aliases(
         self,
         kept_input_indices,
@@ -1661,10 +1457,6 @@ class TorchMlirKernel(BaseNeuronKernel):
         fused_adam's updated params from its read-only grads, and reduces to i -> i for
         foreach. Ops with no out= (add_, relu_) donate output 0 to self.
         """
-        nki_map = self._nki_output_input_alias_map(kept_input_indices)
-        if nki_map:
-            return [(param, out) for out, param in nki_map.items() if 0 <= out < num_outputs]
-
         if not self._is_inplace_op() or not kept_input_indices or num_outputs == 0:
             return []
 
@@ -1705,26 +1497,25 @@ class TorchMlirKernel(BaseNeuronKernel):
         reuse_dispatch_key=True,
         **kwargs,
     ):
-        """Produce lowering metadata for C++ dispatch without executing a NEFF.
+        """Lower the operation to StableHLO without executing.
+
+        Called by C++ NeuronDispatcher on cache miss. Produces a LoweringResult
+        with all metadata needed for C++ to replay execution without Python.
 
         Args:
-            *args: Downcasted or preprocessed positional arguments.
-            original_args (tuple, optional): Pre-downcast arguments. Defaults to ``None``.
-            original_kwargs (dict, optional): Pre-downcast keywords. Defaults to ``None``.
-            alias_out_tensors (list, optional): Output buffers for in-place donation.
-                Defaults to ``None``.
-            alias_flat_inputs (list, optional): Donated-buffer inputs. Defaults to ``None``.
-            reuse_dispatch_key (bool, optional): Whether to key the HLO/NEFF cache on raw
-                arguments. Defaults to ``True``.
-            **kwargs: Downcasted or preprocessed keyword arguments.
-
-        Returns:
-            LoweringResult: Dispatch metadata containing StableHLO when execution requires
-                compilation, or metadata without StableHLO for zero-sized or pure-passthrough
-                outputs.
-
-        Note:
-            Set ``reuse_dispatch_key=False`` when preprocessing resolves graph-changing values.
+            *args: Downcasted/preprocessed positional args (for HLO compilation).
+            original_args: Original (pre-downcast) positional args as a tuple,
+                passed by C++ for dtype inference at original precision.
+            original_kwargs: Original (pre-downcast) keyword args as a dict.
+            alias_out_tensors, alias_flat_inputs: Buffer-donation hints for in-place
+                factory ops; see ``_build_input_output_aliases``. None otherwise.
+            reuse_dispatch_key: Key the HLO/NEFF cache on the C++ dispatch key
+                (built from raw args), which is the same base as the dispatch cache
+                entry. Pass False when the raw args do not determine the graph — a
+                value-dependent op resolves its value during preprocessing, so the
+                key must come from the preprocessed args instead or two calls with
+                identical raw args would share one NEFF.
+            **kwargs: Downcasted/preprocessed keyword args.
         """
         from torch_neuronx.python_ops.lowering_result import LoweringResult
 
@@ -1843,7 +1634,6 @@ class TorchMlirKernel(BaseNeuronKernel):
                 stablehlo_bytes=hlo_bytes,
                 cache_key=cache_key,
                 kept_input_indices=list(kept_input_indices) if kept_input_indices else [],
-                ir_input_count=len(io_spec.inputs) if io_spec else -1,
                 kept_output_indices=list(kept_output_indices) if kept_output_indices else [],
                 output_specs=self._build_output_specs_from_io(io_spec),
                 original_output_specs=self._build_original_output_specs(original_outputs),
@@ -2062,6 +1852,24 @@ class TorchMlirKernel(BaseNeuronKernel):
         # Create filtered inputs using kept_input_indices on flattened inputs
         filtered_inputs = tuple(flattened_processed_inputs[i] for i in kept_input_indices)
 
+        # Packed int64: dispatch args are kept logical int64; bind their
+        # int32[..., 2] physical view to the NEFF here (matches the int32 graph
+        # parameter — the fake input was generated as int32[..., 2] — and the
+        # in-graph gather extracts the low words). Zero-copy reinterpret.
+        if use_packed_int64_view_for_op(self.op_name, flattened_processed_inputs):
+            filtered_inputs = tuple(
+                packed_physical_view(t)
+                if (
+                    isinstance(t, torch.Tensor)
+                    and t.dtype == torch.int64
+                    and t.device.type == "neuron"
+                    and t.is_contiguous()
+                    and t.numel() > 0
+                )
+                else t
+                for t in filtered_inputs
+            )
+
         # Normalize execution_tensors to sequence for execution
         exec_tensors = (
             execution_tensors
@@ -2116,9 +1924,12 @@ class TorchMlirKernel(BaseNeuronKernel):
     ) -> torch.Tensor | None:
         """Try to execute via a pre-compiled dynamic NKI NEFF (Python path).
 
-        Thin wrapper over ``try_dynamic_nki_dispatch``, the shared, ``self``-free
-        entry point also used by the C++ ``DispatchImpl`` hook. Both call the same
-        function so the compile/execute logic has one source of truth.
+        Thin wrapper over ``try_dynamic_nki_dispatch`` — the shared, ``self``-free
+        entry point also used by the C++ ``DispatchImpl`` hook. This method is
+        reached only when ``TORCH_NEURONX_CPP_DISPATCH=0`` routes ops through the
+        Python ``_call_impl``; under the default C++ dispatch the same function
+        is invoked directly from C++. Kept so the compile/execute logic has one
+        source of truth.
 
         Returns the result tensor if handled, None otherwise.
         """

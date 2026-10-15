@@ -187,9 +187,6 @@ TEST_F(NeuronHooksInterfaceTest, ResizePreservesStorageIdentity) {
 }
 
 TEST_F(NeuronHooksInterfaceTest, ConcurrentResizeOperations) {
-  // TODO: Remove this skip after the compiler dependency regression is fixed.
-  GTEST_SKIP() << "The current compiler dependency fails concurrent storage resize.";
-
   // Test concurrent resize operations
   auto device = at::Device(c10::DeviceType::PrivateUse1, 0);
 

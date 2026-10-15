@@ -22,15 +22,15 @@ logger = logging.getLogger(__name__)
 
 
 def save_fx_graph_txt(gm: torch.fx.GraphModule, path: str | Path) -> Path:
-    """Save an FX graph module as human-readable text.
+    """
+    Save FX GraphModule as human-readable text file (.fx.txt)
 
     Args:
-        gm (torch.fx.GraphModule): Graph module to render with
-            ``print_readable``.
-        path (str | Path): Destination file path.
+        gm: FX GraphModule to save
+        path: Output path for .fx.txt file
 
     Returns:
-        Path: Destination path after writing the graph text.
+        Path: Path to saved file
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,18 +57,17 @@ def fx_to_mlir_string(
     verbose: bool = False,
     enable_ir_printing: bool = False,
 ) -> str:
-    """Convert an FX graph module to an MLIR string.
+    """
+    Convert FX GraphModule to MLIR string
 
     Args:
-        gm (torch.fx.GraphModule): Graph module to import.
-        output_type (OutputType, optional): MLIR dialect to produce. Defaults to
-            ``OutputType.RAW``.
-        verbose (bool, optional): Enable verbose importer output. Defaults to ``False``.
-        enable_ir_printing (bool, optional): Enable importer IR printing. Defaults to
-            ``False``.
+        gm: FX GraphModule to convert
+        output_type: MLIR output type (RAW, STABLEHLO, etc.)
+        verbose: Enable verbose output
+        enable_ir_printing: Enable IR printing during conversion
 
     Returns:
-        str: Text representation of the imported MLIR module.
+        str: MLIR string representation
     """
     logger.debug(f"Converting FX graph to MLIR ({output_type})...")
 
@@ -83,14 +82,15 @@ def fx_to_mlir_string(
 
 
 def save_mlir(mlir_str: str, path: str | Path) -> Path:
-    """Save an MLIR string to a file.
+    """
+    Save MLIR string to file
 
     Args:
-        mlir_str (str): MLIR text to write.
-        path (str | Path): Destination file path.
+        mlir_str: MLIR string to save
+        path: Output path (e.g., .raw.mlir, .stablehlo.mlir)
 
     Returns:
-        Path: Destination path after writing the MLIR text.
+        Path: Path to saved file
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,18 +104,15 @@ def save_mlir(mlir_str: str, path: str | Path) -> Path:
 
 
 def load_mlir(path: str | Path, context=None) -> mlir_ir.Module:
-    """Load an MLIR module from a file.
+    """
+    Load MLIR module from file
 
     Args:
-        path (str | Path): Source MLIR file path.
-        context (mlir_ir.Context, optional): Context passed to the parser.
-            Defaults to ``None``.
+        path: Path to MLIR file
+        context: Optional MLIR context (creates new if None)
 
     Returns:
-        mlir_ir.Module: Parsed MLIR module.
-
-    Raises:
-        FileNotFoundError: If ``path`` does not exist.
+        mlir_ir.Module: Loaded MLIR module
     """
     path = Path(path)
 
@@ -138,19 +135,20 @@ def save_fx_as_mlir(
     verbose: bool = False,
     enable_ir_printing: bool = False,
 ) -> Path:
-    """Convert an FX graph module to MLIR and save it.
+    """
+    Convert FX GraphModule to MLIR and save to file
+
+    Convenience function that combines fx_to_mlir_string and save_mlir.
 
     Args:
-        gm (torch.fx.GraphModule): Graph module to import.
-        path (str | Path): Destination MLIR file path.
-        output_type (OutputType, optional): MLIR dialect to produce. Defaults to
-            ``OutputType.RAW``.
-        verbose (bool, optional): Enable verbose importer output. Defaults to ``False``.
-        enable_ir_printing (bool, optional): Enable importer IR printing. Defaults to
-            ``False``.
+        gm: FX GraphModule to convert and save
+        path: Output path (e.g., .raw.mlir, .stablehlo.mlir)
+        output_type: MLIR output type (RAW, STABLEHLO, etc.)
+        verbose: Enable verbose output
+        enable_ir_printing: Enable IR printing during conversion
 
     Returns:
-        Path: Destination path after writing the converted MLIR text.
+        Path: Path to saved file
     """
     mlir_str = fx_to_mlir_string(gm, output_type, verbose, enable_ir_printing)
     return save_mlir(mlir_str, path)
@@ -168,19 +166,18 @@ def save_fx_graph_all_formats(
     save_raw_mlir: bool = True,
     save_stablehlo_mlir: bool = False,
 ) -> dict:
-    """Save an FX graph module in selected debugging formats.
+    """
+    Save FX GraphModule in multiple formats for debugging
 
     Args:
-        gm (torch.fx.GraphModule): Graph module to save.
-        base_path (str | Path): Base path whose suffix is replaced per format.
-        save_txt (bool, optional): Save human-readable ``.fx.txt`` output. Defaults to
-            ``True``.
-        save_raw_mlir (bool, optional): Save RAW Torch dialect MLIR. Defaults to ``True``.
-        save_stablehlo_mlir (bool, optional): Save StableHLO MLIR. Defaults to ``False``.
+        gm: FX GraphModule to save
+        base_path: Base path (without extension)
+        save_txt: Save as .fx.txt (human-readable)
+        save_raw_mlir: Save as .raw.mlir (RAW Torch dialect)
+        save_stablehlo_mlir: Save as .stablehlo.mlir (StableHLO)
 
     Returns:
-        dict[str, Path]: Saved paths keyed by ``"txt"``, ``"raw_mlir"``, and/or
-            ``"stablehlo_mlir"`` for the enabled formats.
+        dict: Mapping of format name to saved file path
     """
     base_path = Path(base_path)
     saved_files = {}

@@ -19,8 +19,6 @@ from torch_neuronx.distributed.mesh_registry import (
     clear_mesh_registry,
 )
 
-pytestmark = pytest.mark.neuron_cores(8)
-
 
 def run_2d_fsdp4_tp2(rank, world_size, kwargs):
     """2D mesh (4,2): verify exact rank values in registry."""

@@ -12,7 +12,6 @@ import torch_neuronx
 
 def main():
     # Configuration
-    """Run batched and self-attention inference on a Neuron device."""
     batch_size = 2
     seq_len = 2048  # Must be multiple of 512 for Neuron flash attention
     embed_dim = 1024

@@ -13,8 +13,4 @@ COMPILER_ERROR_TORCH_MLIR = [
     "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_int64",
     "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_int8",
     "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_uint8",
-    # PT 2.14: new unsigned integer dtype instantiations
-    "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_uint16",
-    "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_uint32",
-    "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_uint64",
 ]

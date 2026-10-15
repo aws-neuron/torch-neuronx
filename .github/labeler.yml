@@ -5,11 +5,10 @@
 #   ciflow:*  — CI action. Tells automation what to run.
 #
 # Manual-only labels (apply by hand on a PR; not in this file):
-#   ciflow:run-full-suite — force the full upstream suite regardless of paths
-#                           (e.g. for runtime-core / build PRs that don't
-#                           match a module label cleanly).
+#   ciflow:full-suite — force the full upstream suite and vertical gate
+#                       regardless of paths.
 # ``ciflow:skip-upstream`` is auto-applied below for docs-only PRs, but can
-# also be added manually to bypass the suite for any PR.
+# also be added manually. ``ciflow:full-suite`` overrides it.
 #
 # Format: actions/labeler v5 (changed-files / any-glob-to-any-file).
 # Docs: https://github.com/actions/labeler

@@ -14,34 +14,14 @@ from .argument_processor import ArgumentProcessor
 
 
 class NoCastArgumentProcessor(ArgumentProcessor):
-    """Prepare arguments without converting tensor dtypes.
+    """Argument processor that avoids dtype conversions for tensors.
 
-    Args:
-        static_argnames (tuple[str, ...], optional): Keyword argument names to keep
-            static. Defaults to ``None``.
-
-    Note:
-        Tensor dtypes are preserved, noncontiguous tensors are made contiguous,
-        and inherited static positional and keyword arguments remain unchanged.
+    - Preserves tensor dtypes
+    - Ensures contiguity for predictable kernel memory access
+    - Respects static_argnums/static_argnames like the base class
     """
 
     def preprocess_inputs(self, inputs: tuple) -> tuple:
-        """Prepare inputs without converting tensor dtypes.
-
-        Args:
-            inputs (tuple): Input tensors, dtypes, scalars, and nested structures.
-
-        Returns:
-            tuple: Inputs with noncontiguous tensors made contiguous and nested
-            structures converted to tuples.
-
-        Raises:
-            RuntimeError: If static positional indices have not been configured.
-
-        Note:
-            ``torch.dtype`` values become scalar-type integers while tensor dtypes are
-            preserved. Inputs at static argument indices remain unchanged.
-        """
         converted = []
         for i, inp in enumerate(inputs):
             if i in self.static_argnums:

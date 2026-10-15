@@ -1,5 +1,0 @@
-blank_issues_enabled: false
-contact_links:
-  - name: AWS Neuron Documentation
-    url: https://awsdocs-neuron.readthedocs-hosted.com/en/latest/
-    about: Check the official Neuron documentation before filing an issue

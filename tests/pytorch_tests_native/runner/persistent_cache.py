@@ -37,11 +37,6 @@ from pathlib import Path
 # are set by the platform, so they are the one place these strings must appear.
 STORAGE_BUCKET_ENV = "PERSISTENT_STORAGE_BUCKET"
 STORAGE_PREFIX_ENV = "PERSISTENT_STORAGE_PREFIX"
-# The refs that may seed the shared cache: main, a release train, and a
-# contribute branch (contribute-N.M or contribute-N.M.P).
-SEEDING_REF_PATTERN = re.compile(
-    r"(?:main|release-[0-9]+\.[0-9]+(?:\.[0-9]+)?|contribute-[0-9]+\.[0-9]+(?:\.[0-9]+)?)"
-)
 
 # Local NVMe hydration target. The compile path reads/writes this dir; S3 is
 # staged in and out around it. Kept off any network FS on purpose. This is the
@@ -184,14 +179,13 @@ class PersistentNeffCache:
     def upload(self) -> None:
         """Upload the local NEFF cache back to S3, recording upload metrics.
 
-        Only writes on ``main``, a release train, or a ``contribute-N.M`` branch
-        (the nightly workflow is sometimes run on a custom branch; those runs must
-        not write to the shared cache) and only when a storage bucket is present (the
-        persistent-storage:write label). The prefix keys on the compiler version,
-        so a train with its own compiler seeds a prefix that main never reads.
+        Only writes on the ``main`` branch (the nightly workflow is sometimes run
+        on a custom branch; those runs must not write to the shared cache) and
+        only when a storage bucket is present (the persistent-storage:write label).
         """
         branch = os.environ.get("GITHUB_REF_NAME", "")
-        if not SEEDING_REF_PATTERN.fullmatch(branch):
+        # TEST-ONLY on contribute-9.9: same branch rule as private kunind/seed-neff-cache.
+        if not re.fullmatch(r"(?:main|release-[0-9]+\.[0-9]+(?:\.[0-9]+)?|contribute-[0-9]+\.[0-9]+)", branch):
             print(f"=== Persistent cache: skip upload (branch '{branch}' cannot seed) ===")
             return
         base = self._s3_base()

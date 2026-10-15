@@ -11,26 +11,25 @@ _TORCH_MLIR_REGISTRY = {}
 def register_torch_mlir_op(
     aten_name: str, torch_fn: callable, output_params: tuple[str, ...] | None = None
 ):
-    """Register or replace a PyTorch implementation for an ATen operation.
+    """Register a torch-mlir operation.
 
     Args:
-        aten_name (str): ATen operation name.
-        torch_fn (Callable): PyTorch implementation function.
-        output_params (tuple[str, ...], optional): Parameters used as output tensors.
-            Defaults to ``None``.
+        aten_name: ATen operation name (e.g., "aten::add")
+        torch_fn: PyTorch function implementation
+        output_params: Names of output tensor parameters
     """
     _TORCH_MLIR_REGISTRY[aten_name] = {"torch_fn": torch_fn, "output_params": output_params}
     logger.debug(f"Registered torch-mlir op: {aten_name}")
 
 
 def get_torch_mlir_function(aten_name: str):
-    """Return the registry record for an ATen operation.
+    """Get registered torch-mlir function.
 
     Args:
-        aten_name (str): ATen operation name to look up.
+        aten_name: ATen operation name
 
     Returns:
-        dict or None: Record with ``torch_fn`` and ``output_params`` keys, or ``None``.
+        Registered torch function or None
     """
     return _TORCH_MLIR_REGISTRY.get(aten_name)
 
@@ -39,28 +38,21 @@ def register_aten(
     operations: str | list[str],
     output_params: tuple[str, ...] | None = None,
 ):
-    """Create a decorator that registers torch-mlir implementations.
+    """Decorator to register torch-mlir implementations.
 
     Args:
-        operations (str or list[str]): ATen operation names to register.
-        output_params (tuple[str, ...], optional): Parameters used as output tensors.
-            Defaults to ``None``.
+        operations: Single operation name or list of names
+        output_params: Names of output tensor parameters
 
-    Returns:
-        Callable: Decorator that stores the supplied implementation function.
+    Usage:
+        @register_aten("aten::add")
+        def torch_add(x, y):
+            return torch.add(x, y)
     """
     if isinstance(operations, str):
         operations = [operations]
 
     def decorator(func: callable):
-        """Register a function for each configured ATen operation.
-
-        Args:
-            func (Callable): PyTorch implementation to register.
-
-        Returns:
-            Callable: The registered implementation function.
-        """
         for op_name in operations:
             register_torch_mlir_op(op_name, func, output_params)
         return func

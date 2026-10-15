@@ -63,11 +63,9 @@ def test_globally_empty_group_skips_payload_collective(monkeypatch):
     assert observed["payload_launched"] is False
 
 
-def test_list_output_copies_packed_result_into_each_tensor(monkeypatch):
-    """List-form output consumes explicit-displacement blocks from a packed prefix."""
+def test_list_output_gathers_directly_into_each_tensor(monkeypatch):
+    """List-form output avoids a contiguous intermediate and preserves rank slots."""
     from torch_neuronx.distributed.ops import all_to_all_v
-
-    observed = {}
 
     class FakeNkiLauncher:
         def __init__(self, kernel):
@@ -76,21 +74,19 @@ def test_list_output_copies_packed_result_into_each_tensor(monkeypatch):
         def __getitem__(self, grid):
             def launch(*args, **kwargs):
                 if self.kernel is all_to_all_v._all_reduce_max_hbm:
-                    assert torch.equal(args[0], torch.tensor([[2, 4]], dtype=torch.int32))
-                    return torch.tensor([[2, 4]], dtype=torch.int32)
+                    return torch.tensor([[2, 2]], dtype=torch.int32)
 
-                assert args[0].shape == (4, 2)
-                assert torch.count_nonzero(args[0][2:]) == 0
-                observed["metadata"] = args[1].cpu()
-                observed["dst_rows"] = args[3]
-                observed["recv_counts_known"] = kwargs["recv_counts_known"]
-                observed["has_rdispls"] = kwargs["has_rdispls"]
+                # Four rank slots, each with a globally uniform two-row capacity.
                 return torch.tensor(
                     [
                         [10, 11],
+                        [12, 13],
+                        [20, 21],
+                        [22, 23],
                         [30, 31],
                         [32, 33],
                         [40, 41],
+                        [42, 43],
                     ],
                     dtype=torch.float32,
                 )
@@ -117,21 +113,6 @@ def test_list_output_copies_packed_result_into_each_tensor(monkeypatch):
     )
 
     assert returned is outputs
-    assert observed["dst_rows"] == 4
-    assert observed["recv_counts_known"] is True
-    assert observed["has_rdispls"] is True
-    assert torch.equal(
-        observed["metadata"],
-        torch.tensor(
-            [
-                [2, 0, 2, 0],
-                [0, 2, 2, 4],
-                [2, 0, 4, 2],
-                [0, 2, 2, 6],
-            ],
-            dtype=torch.uint32,
-        ),
-    )
     assert torch.equal(outputs[0], torch.tensor([[10, 11]], dtype=torch.float32))
     assert outputs[1].shape == (0, 2)
     assert torch.equal(outputs[2], torch.tensor([[30, 31], [32, 33]], dtype=torch.float32))
@@ -627,7 +608,6 @@ class TestAllToAllV(BaseCollectiveOpTest):
         self.distributed_tester.run_test(run_invalid_split_sizes_test)
 
 
-@pytest.mark.neuron_cores(8)
 class TestAllToAllVWorldSize8(BaseCollectiveOpTest):
     """Partial-group all_to_all_v in world size 8 (group size 4 is
     hardware-supported), following test_alltoall.py's TestAllToAllWorldSize8."""

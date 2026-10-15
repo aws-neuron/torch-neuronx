@@ -39,26 +39,22 @@ def _validate_inputs(index, src):
 
 @nki.jit
 def embedding_dense_backward_nki(num_weights, index, src):
-    """Scatter-add sorted embedding gradients into a dense weight gradient.
+    """Scatter-add with per-tile dedup; allocates + zeros the [E, D] output.
 
     Args:
-        num_weights (int): Number of rows in the output embedding table.
-        index (nl.ndarray): Sorted ``int32`` row indices with shape ``(N,)``.
-        src (nl.ndarray): Source gradients with shape ``(N, D)``.
+        num_weights: int - E, number of output rows (vocab size).
+        index: (N,) - int32 row indices in [0, E), pre-sorted ascending.
+        src:   (N, D) - source rows; accumulated in fp32.
 
     Returns:
-        nl.ndarray: Zero-filled dense result with shape ``(num_weights, D)`` and
-            data type matching ``src``.
+        output: (E, D) in src.dtype.
 
-    Raises:
-        AssertionError: If ``index`` is not one-dimensional, ``src`` is not
-            two-dimensional, or their first dimensions differ.
-
-    Note:
-        Programs update disjoint output-column slices without cross-program barriers.
-        Duplicate indices are reduced in ``float32`` per tile, with a carry and ordered
-        overwrite across tiles, before narrowing and scattering results. Columns must
-        divide evenly among programs; the caller uses one program otherwise.
+    D-sharded across cores: each shard owns a disjoint column slice
+    [d_offset, d_offset + d_shard) of every row and both zero-fills AND scatters
+    only its own columns. Because the shards touch disjoint memory there is no
+    cross-shard write race (and no core_barrier needed); the row-index dedup/carry
+    logic is replicated per shard on its own columns. Single-shard (num_shards=1)
+    reduces to d_offset=0, d_shard=d.
     """
     n, d = src.shape
     e = num_weights

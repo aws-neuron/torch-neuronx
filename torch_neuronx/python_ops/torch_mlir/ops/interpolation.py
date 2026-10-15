@@ -79,20 +79,6 @@ def _make_validator(kernel_name, *, allow_uint8):
     lowering_result_transform=_make_output_stride_transform(aten.upsample_nearest1d),
 )
 def torch_upsample_nearest1d(self, output_size, scales=None, out=None):
-    """Lower nearest-neighbor 1-D upsampling through ATen.
-
-    Args:
-        self (torch.Tensor): Input tensor.
-        output_size (sequence[int]): Requested output width.
-        scales (float, optional): Explicit width scale. Defaults to ``None``.
-        out (torch.Tensor, optional): Registered output tensor. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Nearest-neighbor upsampled tensor.
-
-    Raises:
-        NotImplementedError: If ``self`` is neither floating point nor ``uint8``.
-    """
     return aten.upsample_nearest1d.default(self, output_size, scales)
 
 
@@ -104,20 +90,6 @@ def torch_upsample_nearest1d(self, output_size, scales=None, out=None):
     lowering_result_transform=_make_output_stride_transform(aten._upsample_nearest_exact1d),
 )
 def torch_upsample_nearest_exact1d(self, output_size, scales=None, out=None):
-    """Lower exact nearest-neighbor 1-D upsampling through ATen.
-
-    Args:
-        self (torch.Tensor): Input tensor.
-        output_size (sequence[int]): Requested output width.
-        scales (float, optional): Explicit width scale. Defaults to ``None``.
-        out (torch.Tensor, optional): Registered output tensor. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Exact nearest-neighbor upsampled tensor.
-
-    Raises:
-        NotImplementedError: If ``self`` is neither floating point nor ``uint8``.
-    """
     return aten._upsample_nearest_exact1d.default(self, output_size, scales)
 
 
@@ -129,21 +101,6 @@ def torch_upsample_nearest_exact1d(self, output_size, scales=None, out=None):
     lowering_result_transform=_make_output_stride_transform(aten.upsample_nearest2d),
 )
 def torch_upsample_nearest2d(self, output_size, scales_h=None, scales_w=None, out=None):
-    """Lower nearest-neighbor 2-D upsampling through ATen.
-
-    Args:
-        self (torch.Tensor): Input tensor.
-        output_size (sequence[int]): Requested output height and width.
-        scales_h (float, optional): Explicit height scale. Defaults to ``None``.
-        scales_w (float, optional): Explicit width scale. Defaults to ``None``.
-        out (torch.Tensor, optional): Registered output tensor. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Nearest-neighbor upsampled tensor.
-
-    Raises:
-        NotImplementedError: If ``self`` is neither floating point nor ``uint8``.
-    """
     return aten.upsample_nearest2d.default(self, output_size, scales_h, scales_w)
 
 
@@ -155,21 +112,6 @@ def torch_upsample_nearest2d(self, output_size, scales_h=None, scales_w=None, ou
     lowering_result_transform=_make_output_stride_transform(aten._upsample_nearest_exact2d),
 )
 def torch_upsample_nearest_exact2d(self, output_size, scales_h=None, scales_w=None, out=None):
-    """Lower exact nearest-neighbor 2-D upsampling through ATen.
-
-    Args:
-        self (torch.Tensor): Input tensor.
-        output_size (sequence[int]): Requested output height and width.
-        scales_h (float, optional): Explicit height scale. Defaults to ``None``.
-        scales_w (float, optional): Explicit width scale. Defaults to ``None``.
-        out (torch.Tensor, optional): Registered output tensor. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Exact nearest-neighbor upsampled tensor.
-
-    Raises:
-        NotImplementedError: If ``self`` is neither floating point nor ``uint8``.
-    """
     return aten._upsample_nearest_exact2d.default(self, output_size, scales_h, scales_w)
 
 
@@ -181,21 +123,6 @@ def torch_upsample_nearest_exact2d(self, output_size, scales_h=None, scales_w=No
     lowering_result_transform=_make_output_stride_transform(aten.upsample_linear1d),
 )
 def torch_upsample_linear1d(self, output_size, align_corners, scales=None, out=None):
-    """Lower linear 1-D upsampling through ATen.
-
-    Args:
-        self (torch.Tensor): Input tensor.
-        output_size (sequence[int]): Requested output width.
-        align_corners (bool): Whether to align the input and output corner points.
-        scales (float, optional): Explicit width scale. Defaults to ``None``.
-        out (torch.Tensor, optional): Registered output tensor. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Linearly upsampled tensor.
-
-    Raises:
-        NotImplementedError: If ``self`` is not floating point.
-    """
     return aten.upsample_linear1d.default(self, output_size, align_corners, scales)
 
 
@@ -209,22 +136,6 @@ def torch_upsample_linear1d(self, output_size, align_corners, scales=None, out=N
 def torch_upsample_bilinear2d(
     self, output_size, align_corners, scales_h=None, scales_w=None, out=None
 ):
-    """Lower bilinear 2-D upsampling through ATen.
-
-    Args:
-        self (torch.Tensor): Input tensor.
-        output_size (sequence[int]): Requested output height and width.
-        align_corners (bool): Whether to align the input and output corner points.
-        scales_h (float, optional): Explicit height scale. Defaults to ``None``.
-        scales_w (float, optional): Explicit width scale. Defaults to ``None``.
-        out (torch.Tensor, optional): Registered output tensor. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Bilinearly upsampled tensor.
-
-    Raises:
-        NotImplementedError: If ``self`` is neither floating point nor ``uint8``.
-    """
     return aten.upsample_bilinear2d.default(self, output_size, align_corners, scales_h, scales_w)
 
 
@@ -238,55 +149,7 @@ def torch_upsample_bilinear2d(
 def torch_upsample_bicubic2d(
     self, output_size, align_corners, scales_h=None, scales_w=None, out=None
 ):
-    """Lower bicubic 2-D upsampling through ATen.
-
-    Args:
-        self (torch.Tensor): Input tensor.
-        output_size (sequence[int]): Requested output height and width.
-        align_corners (bool): Whether to align the input and output corner points.
-        scales_h (float, optional): Explicit height scale. Defaults to ``None``.
-        scales_w (float, optional): Explicit width scale. Defaults to ``None``.
-        out (torch.Tensor, optional): Registered output tensor. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Bicubically upsampled tensor.
-
-    Raises:
-        NotImplementedError: If ``self`` is neither floating point nor ``uint8``.
-    """
     return aten.upsample_bicubic2d.default(self, output_size, align_corners, scales_h, scales_w)
-
-
-@register_aten(
-    ["aten::upsample_trilinear3d", "aten::upsample_trilinear3d.out"],
-    output_params=("out",),
-    static_argnums=(1, 2, 3, 4, 5),
-    validate_static_inputs=_make_validator(_LINEAR_INTERP_KERNEL, allow_uint8=False),
-    lowering_result_transform=_make_output_stride_transform(aten.upsample_trilinear3d),
-)
-def torch_upsample_trilinear3d(
-    self, output_size, align_corners, scales_d=None, scales_h=None, scales_w=None, out=None
-):
-    """Lower trilinear 3-D upsampling through ATen.
-
-    Args:
-        self (torch.Tensor): Input tensor.
-        output_size (sequence[int]): Requested output depth, height, and width.
-        align_corners (bool): Whether to align the input and output corner points.
-        scales_d (float, optional): Explicit depth scale. Defaults to ``None``.
-        scales_h (float, optional): Explicit height scale. Defaults to ``None``.
-        scales_w (float, optional): Explicit width scale. Defaults to ``None``.
-        out (torch.Tensor, optional): Registered output tensor. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Trilinearly upsampled tensor.
-
-    Raises:
-        NotImplementedError: If ``self`` is not floating point.
-    """
-    return aten.upsample_trilinear3d.default(
-        self, output_size, align_corners, scales_d, scales_h, scales_w
-    )
 
 
 @register_aten(
@@ -298,21 +161,6 @@ def torch_upsample_trilinear3d(
 def torch_upsample_nearest1d_backward(
     grad_output, output_size, input_size, scales=None, grad_input=None
 ):
-    """Lower the nearest-neighbor 1-D upsampling gradient through ATen.
-
-    Args:
-        grad_output (torch.Tensor): Gradient with respect to the upsampled output.
-        output_size (sequence[int]): Forward output width.
-        input_size (sequence[int]): Full forward input shape.
-        scales (float, optional): Explicit width scale. Defaults to ``None``.
-        grad_input (torch.Tensor, optional): Registered gradient output. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Gradient with respect to the forward input.
-
-    Raises:
-        NotImplementedError: If ``grad_output`` is not floating point.
-    """
     return aten.upsample_nearest1d_backward.default(grad_output, output_size, input_size, scales)
 
 
@@ -328,21 +176,6 @@ def torch_upsample_nearest1d_backward(
 def torch_upsample_nearest_exact1d_backward(
     grad_output, output_size, input_size, scales=None, grad_input=None
 ):
-    """Lower the exact nearest-neighbor 1-D upsampling gradient through ATen.
-
-    Args:
-        grad_output (torch.Tensor): Gradient with respect to the upsampled output.
-        output_size (sequence[int]): Forward output width.
-        input_size (sequence[int]): Full forward input shape.
-        scales (float, optional): Explicit width scale. Defaults to ``None``.
-        grad_input (torch.Tensor, optional): Registered gradient output. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Gradient with respect to the forward input.
-
-    Raises:
-        NotImplementedError: If ``grad_output`` is not floating point.
-    """
     return aten._upsample_nearest_exact1d_backward.default(
         grad_output, output_size, input_size, scales
     )
@@ -357,22 +190,6 @@ def torch_upsample_nearest_exact1d_backward(
 def torch_upsample_nearest2d_backward(
     grad_output, output_size, input_size, scales_h=None, scales_w=None, grad_input=None
 ):
-    """Lower the nearest-neighbor 2-D upsampling gradient through ATen.
-
-    Args:
-        grad_output (torch.Tensor): Gradient with respect to the upsampled output.
-        output_size (sequence[int]): Forward output height and width.
-        input_size (sequence[int]): Full forward input shape.
-        scales_h (float, optional): Explicit height scale. Defaults to ``None``.
-        scales_w (float, optional): Explicit width scale. Defaults to ``None``.
-        grad_input (torch.Tensor, optional): Registered gradient output. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Gradient with respect to the forward input.
-
-    Raises:
-        NotImplementedError: If ``grad_output`` is not floating point.
-    """
     return aten.upsample_nearest2d_backward.default(
         grad_output, output_size, input_size, scales_h, scales_w
     )
@@ -390,22 +207,6 @@ def torch_upsample_nearest2d_backward(
 def torch_upsample_nearest_exact2d_backward(
     grad_output, output_size, input_size, scales_h=None, scales_w=None, grad_input=None
 ):
-    """Lower the exact nearest-neighbor 2-D upsampling gradient through ATen.
-
-    Args:
-        grad_output (torch.Tensor): Gradient with respect to the upsampled output.
-        output_size (sequence[int]): Forward output height and width.
-        input_size (sequence[int]): Full forward input shape.
-        scales_h (float, optional): Explicit height scale. Defaults to ``None``.
-        scales_w (float, optional): Explicit width scale. Defaults to ``None``.
-        grad_input (torch.Tensor, optional): Registered gradient output. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Gradient with respect to the forward input.
-
-    Raises:
-        NotImplementedError: If ``grad_output`` is not floating point.
-    """
     return aten._upsample_nearest_exact2d_backward.default(
         grad_output, output_size, input_size, scales_h, scales_w
     )
@@ -420,22 +221,6 @@ def torch_upsample_nearest_exact2d_backward(
 def torch_upsample_linear1d_backward(
     grad_output, output_size, input_size, align_corners, scales=None, grad_input=None
 ):
-    """Lower the linear 1-D upsampling gradient through ATen.
-
-    Args:
-        grad_output (torch.Tensor): Gradient with respect to the upsampled output.
-        output_size (sequence[int]): Forward output width.
-        input_size (sequence[int]): Full forward input shape.
-        align_corners (bool): Forward corner-alignment setting.
-        scales (float, optional): Explicit width scale. Defaults to ``None``.
-        grad_input (torch.Tensor, optional): Registered gradient output. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Gradient with respect to the forward input.
-
-    Raises:
-        NotImplementedError: If ``grad_output`` is not floating point.
-    """
     return aten.upsample_linear1d_backward.default(
         grad_output, output_size, input_size, align_corners, scales
     )
@@ -456,23 +241,6 @@ def torch_upsample_bilinear2d_backward(
     scales_w=None,
     grad_input=None,
 ):
-    """Lower the bilinear 2-D upsampling gradient through ATen.
-
-    Args:
-        grad_output (torch.Tensor): Gradient with respect to the upsampled output.
-        output_size (sequence[int]): Forward output height and width.
-        input_size (sequence[int]): Full forward input shape.
-        align_corners (bool): Forward corner-alignment setting.
-        scales_h (float, optional): Explicit height scale. Defaults to ``None``.
-        scales_w (float, optional): Explicit width scale. Defaults to ``None``.
-        grad_input (torch.Tensor, optional): Registered gradient output. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Gradient with respect to the forward input.
-
-    Raises:
-        NotImplementedError: If ``grad_output`` is not floating point.
-    """
     return aten.upsample_bilinear2d_backward.default(
         grad_output, output_size, input_size, align_corners, scales_h, scales_w
     )
@@ -493,64 +261,8 @@ def torch_upsample_bicubic2d_backward(
     scales_w=None,
     grad_input=None,
 ):
-    """Lower the bicubic 2-D upsampling gradient through ATen.
-
-    Args:
-        grad_output (torch.Tensor): Gradient with respect to the upsampled output.
-        output_size (sequence[int]): Forward output height and width.
-        input_size (sequence[int]): Full forward input shape.
-        align_corners (bool): Forward corner-alignment setting.
-        scales_h (float, optional): Explicit height scale. Defaults to ``None``.
-        scales_w (float, optional): Explicit width scale. Defaults to ``None``.
-        grad_input (torch.Tensor, optional): Registered gradient output. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Gradient with respect to the forward input.
-
-    Raises:
-        NotImplementedError: If ``grad_output`` is not floating point.
-    """
     return aten.upsample_bicubic2d_backward.default(
         grad_output, output_size, input_size, align_corners, scales_h, scales_w
-    )
-
-
-@register_aten(
-    ["aten::upsample_trilinear3d_backward", "aten::upsample_trilinear3d_backward.grad_input"],
-    output_params=("grad_input",),
-    static_argnums=(1, 2, 3, 4, 5, 6),
-    validate_static_inputs=_make_validator("upsample_trilinear3d_backward", allow_uint8=False),
-)
-def torch_upsample_trilinear3d_backward(
-    grad_output,
-    output_size,
-    input_size,
-    align_corners,
-    scales_d=None,
-    scales_h=None,
-    scales_w=None,
-    grad_input=None,
-):
-    """Lower the trilinear 3-D upsampling gradient through ATen.
-
-    Args:
-        grad_output (torch.Tensor): Gradient with respect to the upsampled output.
-        output_size (sequence[int]): Forward output depth, height, and width.
-        input_size (sequence[int]): Full forward input shape.
-        align_corners (bool): Forward corner-alignment setting.
-        scales_d (float, optional): Explicit depth scale. Defaults to ``None``.
-        scales_h (float, optional): Explicit height scale. Defaults to ``None``.
-        scales_w (float, optional): Explicit width scale. Defaults to ``None``.
-        grad_input (torch.Tensor, optional): Registered gradient output. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Gradient with respect to the forward input.
-
-    Raises:
-        NotImplementedError: If ``grad_output`` is not floating point.
-    """
-    return aten.upsample_trilinear3d_backward.default(
-        grad_output, output_size, input_size, align_corners, scales_d, scales_h, scales_w
     )
 
 
@@ -570,25 +282,6 @@ def torch_upsample_trilinear3d_backward(
 def torch_upsample_bilinear2d_aa(
     self, output_size, align_corners, scales_h=None, scales_w=None, out=None
 ):
-    """Lower anti-aliased bilinear 2-D upsampling through ATen.
-
-    Args:
-        self (torch.Tensor): Input tensor.
-        output_size (sequence[int]): Requested output height and width.
-        align_corners (bool): Whether to align the input and output corner points.
-        scales_h (float, optional): Explicit height scale. Defaults to ``None``.
-        scales_w (float, optional): Explicit width scale. Defaults to ``None``.
-        out (torch.Tensor, optional): Registered output tensor. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Anti-aliased bilinearly resampled tensor.
-
-    Raises:
-        NotImplementedError: If ``self`` is neither floating point nor ``uint8``.
-
-    Note:
-        Reduced-precision inputs are supported by accumulating in ``float32``.
-    """
     return aten._upsample_bilinear2d_aa.default(
         self, output_size, align_corners, scales_h, scales_w
     )
@@ -612,249 +305,6 @@ def torch_upsample_bilinear2d_aa_backward(
     scales_w=None,
     grad_input=None,
 ):
-    """Lower the anti-aliased bilinear 2-D upsampling gradient through ATen.
-
-    Args:
-        grad_output (torch.Tensor): Gradient with respect to the upsampled output.
-        output_size (sequence[int]): Forward output height and width.
-        input_size (sequence[int]): Full forward input shape.
-        align_corners (bool): Forward corner-alignment setting.
-        scales_h (float, optional): Explicit height scale. Defaults to ``None``.
-        scales_w (float, optional): Explicit width scale. Defaults to ``None``.
-        grad_input (torch.Tensor, optional): Registered gradient output. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Gradient with respect to the forward input.
-
-    Raises:
-        NotImplementedError: If ``grad_output`` is not floating point.
-
-    Note:
-        Reduced-precision gradients are supported by accumulating in ``float32``.
-    """
     return aten._upsample_bilinear2d_aa_backward.default(
         grad_output, output_size, input_size, align_corners, scales_h, scales_w
-    )
-
-
-# --- grid sample ---
-
-
-def _check_grid_sampler_common(input, grid):
-    """Reproduce aten's check_grid_sampler_common with the exact CPU wording.
-
-    The Neuron dispatch path skips PyTorch structured validation, so a bad shape
-    reaches the body and the meta kernel raises the wrong error type. Check here
-    first, in the CPU order: batch size, grid last dimension, non-empty spatial dims.
-    """
-    if input.size(0) != grid.size(0):
-        raise RuntimeError(
-            "grid_sampler(): expected grid and input to have same batch size, but got "
-            f"input with sizes {list(input.shape)} and grid with sizes {list(grid.shape)}"
-        )
-    if grid.size(-1) != input.dim() - 2:
-        raise RuntimeError(
-            f"grid_sampler(): expected grid to have size {input.dim() - 2} in last "
-            f"dimension, but got grid with sizes {list(grid.shape)}"
-        )
-    for i in range(2, input.dim()):
-        if input.size(i) <= 0:
-            raise RuntimeError(
-                "grid_sampler(): expected input to have non-empty spatial dimensions, "
-                f"but input has sizes {list(input.shape)} with dimension {i} being empty"
-            )
-
-
-def _check_grid_sampler_shapes(input, grid, expected_dim):
-    """Reproduce aten's common checks, then the dimension check, with the CPU messages."""
-    _check_grid_sampler_common(input, grid)
-    if input.dim() != expected_dim or input.dim() != grid.dim():
-        raise RuntimeError(
-            f"grid_sampler(): expected {expected_dim}D input and grid with same number "
-            f"of dimensions, but got input with sizes {list(input.shape)} and grid with "
-            f"sizes {list(grid.shape)}"
-        )
-
-
-def _check_grid_sampler_backward_grad_output(input, grid, grad_output):
-    """Reproduce aten's check_grid_sampler_backward for the grad_output shape.
-
-    A mismatched grad_output shape causes out-of-bounds reads in the kernel. The
-    Neuron dispatch path skips this structured check. Raise ValueError here, with
-    the CPU wording, to match the aten TORCH_CHECK_VALUE error type.
-    """
-    expected = [input.size(0), input.size(1)]
-    for i in range(1, grid.dim() - 1):
-        expected.append(grid.size(i))
-    if list(grad_output.shape) != expected:
-        raise ValueError(
-            "grid_sampler(): expected grad_output to have sizes "
-            f"{expected} but got grad_output with sizes {list(grad_output.shape)}"
-        )
-
-
-def _make_grid_sampler_validator(kernel_name, expected_dim):
-    """Validate the grid_sampler dtype, then shapes, with the CPU messages."""
-    dtype_validate = _make_validator(kernel_name, allow_uint8=False)
-
-    def _validate(input, grid, *_args, **_kwargs):
-        dtype_validate(input)
-        _check_grid_sampler_shapes(input, grid, expected_dim)
-
-    return _validate
-
-
-def _make_grid_sampler_backward_validator(kernel_name, expected_dim):
-    """Validate the grid_sampler backward dtype, shapes, and grad_output shape."""
-    dtype_validate = _make_validator(kernel_name, allow_uint8=False)
-
-    def _validate(grad_output, input, grid, *_args, **_kwargs):
-        dtype_validate(input)
-        _check_grid_sampler_shapes(input, grid, expected_dim)
-        _check_grid_sampler_backward_grad_output(input, grid, grad_output)
-
-    return _validate
-
-
-@register_aten(
-    ["aten::grid_sampler_2d", "aten::grid_sampler_2d.out"],
-    output_params=("out",),
-    static_argnums=(2, 3, 4),
-    validate_static_inputs=_make_grid_sampler_validator("grid_sampler_2d", 4),
-)
-def torch_grid_sampler_2d(input, grid, interpolation_mode, padding_mode, align_corners, out=None):
-    """Lower two-dimensional grid sampling through ATen.
-
-    Args:
-        input (torch.Tensor): Four-dimensional input tensor.
-        grid (torch.Tensor): Four-dimensional sampling grid with two coordinates per point.
-        interpolation_mode (int): Interpolation-mode code.
-        padding_mode (int): Padding-mode code.
-        align_corners (bool): Whether coordinates align with corner-pixel centers.
-        out (torch.Tensor, optional): Registered output tensor. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Sampled four-dimensional tensor.
-
-    Raises:
-        NotImplementedError: If ``input`` is not floating point.
-        RuntimeError: If input and grid shapes violate grid-sampler constraints.
-    """
-    return aten.grid_sampler_2d.default(
-        input, grid, interpolation_mode, padding_mode, align_corners
-    )
-
-
-@register_aten(
-    ["aten::grid_sampler_2d_backward", "aten::grid_sampler_2d_backward.out"],
-    output_params=("out0", "out1"),
-    static_argnums=(3, 4, 5, 6),
-    validate_static_inputs=_make_grid_sampler_backward_validator("grid_sampler_2d_backward", 4),
-)
-def torch_grid_sampler_2d_backward(
-    grad_output,
-    input,
-    grid,
-    interpolation_mode,
-    padding_mode,
-    align_corners,
-    output_mask,
-    out0=None,
-    out1=None,
-):
-    """Lower the two-dimensional grid-sampler gradient through ATen.
-
-    Args:
-        grad_output (torch.Tensor): Gradient with respect to the sampled output.
-        input (torch.Tensor): Forward input tensor.
-        grid (torch.Tensor): Forward sampling grid.
-        interpolation_mode (int): Interpolation-mode code.
-        padding_mode (int): Padding-mode code.
-        align_corners (bool): Forward corner-alignment setting.
-        output_mask (sequence[bool]): Selects input and grid gradients.
-        out0 (torch.Tensor, optional): Registered input-gradient output. Defaults to ``None``.
-        out1 (torch.Tensor, optional): Registered grid-gradient output. Defaults to ``None``.
-
-    Returns:
-        tuple: ``input`` and ``grid`` gradients; ``None`` where ``output_mask`` is False.
-
-    Raises:
-        NotImplementedError: If ``input`` is not floating point.
-        RuntimeError: If input and grid shapes violate grid-sampler constraints.
-        ValueError: If ``grad_output`` has the wrong shape.
-    """
-    return aten.grid_sampler_2d_backward.default(
-        grad_output, input, grid, interpolation_mode, padding_mode, align_corners, output_mask
-    )
-
-
-@register_aten(
-    ["aten::grid_sampler_3d", "aten::grid_sampler_3d.out"],
-    output_params=("out",),
-    static_argnums=(2, 3, 4),
-    validate_static_inputs=_make_grid_sampler_validator("grid_sampler_3d", 5),
-)
-def torch_grid_sampler_3d(input, grid, interpolation_mode, padding_mode, align_corners, out=None):
-    """Lower three-dimensional grid sampling through ATen.
-
-    Args:
-        input (torch.Tensor): Five-dimensional input tensor.
-        grid (torch.Tensor): Five-dimensional sampling grid with three coordinates per point.
-        interpolation_mode (int): Interpolation-mode code.
-        padding_mode (int): Padding-mode code.
-        align_corners (bool): Whether coordinates align with corner-voxel centers.
-        out (torch.Tensor, optional): Registered output tensor. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Sampled five-dimensional tensor.
-
-    Raises:
-        NotImplementedError: If ``input`` is not floating point.
-        RuntimeError: If input and grid shapes violate grid-sampler constraints.
-    """
-    return aten.grid_sampler_3d.default(
-        input, grid, interpolation_mode, padding_mode, align_corners
-    )
-
-
-@register_aten(
-    ["aten::grid_sampler_3d_backward", "aten::grid_sampler_3d_backward.out"],
-    output_params=("out0", "out1"),
-    static_argnums=(3, 4, 5, 6),
-    validate_static_inputs=_make_grid_sampler_backward_validator("grid_sampler_3d_backward", 5),
-)
-def torch_grid_sampler_3d_backward(
-    grad_output,
-    input,
-    grid,
-    interpolation_mode,
-    padding_mode,
-    align_corners,
-    output_mask,
-    out0=None,
-    out1=None,
-):
-    """Lower the three-dimensional grid-sampler gradient through ATen.
-
-    Args:
-        grad_output (torch.Tensor): Gradient with respect to the sampled output.
-        input (torch.Tensor): Forward input tensor.
-        grid (torch.Tensor): Forward sampling grid.
-        interpolation_mode (int): Interpolation-mode code.
-        padding_mode (int): Padding-mode code.
-        align_corners (bool): Forward corner-alignment setting.
-        output_mask (sequence[bool]): Selects input and grid gradients.
-        out0 (torch.Tensor, optional): Registered input-gradient output. Defaults to ``None``.
-        out1 (torch.Tensor, optional): Registered grid-gradient output. Defaults to ``None``.
-
-    Returns:
-        tuple: ``input`` and ``grid`` gradients; ``None`` where ``output_mask`` is False.
-
-    Raises:
-        NotImplementedError: If ``input`` is not floating point.
-        RuntimeError: If input and grid shapes violate grid-sampler constraints.
-        ValueError: If ``grad_output`` has the wrong shape.
-    """
-    return aten.grid_sampler_3d_backward.default(
-        grad_output, input, grid, interpolation_mode, padding_mode, align_corners, output_mask
     )

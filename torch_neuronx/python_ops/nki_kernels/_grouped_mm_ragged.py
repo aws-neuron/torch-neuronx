@@ -28,22 +28,6 @@ PART = 128  # SBUF partitions; K2 blocks its schedule by this
 
 @nki.jit()
 def grouped_mm_ragged_2d_3d(a, b, offs):
-    """Multiply token rows by expert-specific matrices using ragged offsets.
-
-    Args:
-        a (nl.ndarray): Left operand with shape ``(R, D)``.
-        b (nl.ndarray): Expert matrices with shape ``(E, D, F)``.
-        offs (nl.ndarray): Cumulative expert end offsets with shape ``(E,)``.
-
-    Returns:
-        nl.ndarray: Result with shape ``(R + 128, F)`` and 128 spare tail rows.
-
-    Raises:
-        AssertionError: If ``F`` is not divisible by the number of programs.
-
-    Note:
-        Offsets need no padding or alignment, and accumulation uses ``float32``.
-    """
     R, D = a.shape
     E, _d1b, F = b.shape
     # One program per logical NeuronCore, each owning a disjoint F slice.
@@ -93,13 +77,6 @@ def grouped_mm_ragged_2d_3d(a, b, offs):
         # Duplicated because the tracer forbids calling inner functions; the bodies
         # differ only in the A load.
         def safe_body(i, g=g):
-            """Process an expert token tile that is fully within the input.
-
-            Args:
-                i (int): Expert-local tile index.
-                g (int, optional): Expert index captured by the traced loop body.
-                    Defaults to the enclosing expert index.
-            """
             i_sb = nl.ndarray((1, 1), nl.int32, nl.sbuf)
             base_sb = nl.ndarray((1, 1), nl.int32, nl.sbuf)
             a_tile = nl.ndarray((M_TILE, D), a.dtype, nl.sbuf)
@@ -166,13 +143,6 @@ def grouped_mm_ragged_2d_3d(a, b, offs):
 
         def tail_body(i, g=g):
             # the tail tile IS the expert's last tile, so its base is last[g]
-            """Process an expert's final token tile with clamped input rows.
-
-            Args:
-                i (int): Unused expert-local tile index supplied by the traced loop.
-                g (int, optional): Expert index captured by the traced loop body.
-                    Defaults to the enclosing expert index.
-            """
             base_sb = nl.ndarray((1, 1), nl.int32, nl.sbuf)
             base_bc = nl.ndarray((M_TILE, 1), nl.int32, nl.sbuf)
             iot = nl.ndarray((M_TILE, 1), nl.int32, nl.sbuf)
@@ -251,22 +221,6 @@ def grouped_mm_ragged_2d_3d(a, b, offs):
 
 @nki.jit()
 def grouped_mm_ragged_2d_2d(a, b, offs):
-    """Accumulate ragged token products into per-expert weight gradients.
-
-    Args:
-        a (nl.ndarray): Left operand with shape ``(D1, T)``.
-        b (nl.ndarray): Right operand with shape ``(T, D2)``.
-        offs (nl.ndarray): Cumulative expert end offsets with shape ``(E,)``.
-
-    Returns:
-        nl.ndarray: Per-expert result with shape ``(E, D1, D2)``.
-
-    Raises:
-        AssertionError: If ``D2`` is not divisible by the number of programs.
-
-    Note:
-        Offsets need no padding or alignment, and accumulation uses ``float32``.
-    """
     D1, T = a.shape
     _tb, D2 = b.shape
     (E,) = offs.shape
@@ -352,13 +306,6 @@ def grouped_mm_ragged_2d_2d(a, b, offs):
         nisa.memset(acc, 0.0)
 
         def body(c, g=g):
-            """Accumulate one token chunk for an expert's weight gradient.
-
-            Args:
-                c (int): Expert-local token-chunk index.
-                g (int, optional): Expert index captured by the traced loop body.
-                    Defaults to the enclosing expert index.
-            """
             c_sb = nl.ndarray((1, 1), nl.int32, nl.sbuf)
             base_sb = nl.ndarray((1, 1), nl.int32, nl.sbuf)
             lo_bc = nl.ndarray((TOK, 1), nl.int32, nl.sbuf)

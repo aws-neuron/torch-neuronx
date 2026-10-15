@@ -9,7 +9,6 @@ from typing import Final
 import torch
 
 import torch_neuronx
-from torch_neuronx.kernels.cache_utils import TensorDumper
 from torch_neuronx.neuron_dynamo_backend.exceptions import NEFFExecutionError
 from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
     PassMutations,
@@ -31,30 +30,10 @@ logger = logging.getLogger(__name__)
 
 
 class Executor:
-    """Execute a separately compiled graph through cache-based NEFF execution.
+    """
+    Executor for separated compile/execute flow using cache-based execution.
 
-    Args:
-        graph_name (str): Human-readable graph name passed to the runtime.
-        cache_key (str): Compilation cache key used as the execution handle.
-        io_spec (FunctionIO): StableHLO input and output specifications.
-        cast_spec (list[TensorSpec]): Output specifications for dtype restoration.
-        has_collectives (bool, optional): Mark graphs with collectives. Defaults to ``False``.
-        retain_device (bool, optional): Restore the input device type. Defaults to ``False``.
-        pass_mutations (list[PassMutations] | None, optional): Ordered I/O mutations.
-            Defaults to ``None``.
-        alias_buffer_map (dict[int, int] | None, optional): NEFF output-to-input reuse map.
-            Defaults to ``None``.
-        wlo_transforms (list | None, optional): WLO weight-relayout rules. Defaults to ``None``.
-        dump_dir (str | None, optional): Tensor-dump directory. Defaults to ``None``.
-
-    Raises:
-        WLOContractError: If a WLO rule violates its contract, targets an unavailable input,
-            or conflicts with an aliased relayout input.
-        TypeError: If transpose entries in a WLO rule cannot be sorted together.
-
-    Note:
-        ``execute_compiled_graph`` resolves the NEFF by cache key, writes preallocated
-        outputs, and enqueues execution asynchronously on the current Neuron stream.
+    Uses final_cache_key to retrieve NEFF from cache and execute via execute_compiled_graph.
     """
 
     INT_64_TO_32: Final = {
@@ -73,7 +52,6 @@ class Executor:
         pass_mutations: list[PassMutations] | None = None,
         alias_buffer_map: dict[int, int] | None = None,
         wlo_transforms: list | None = None,
-        dump_dir: str | None = None,
     ):
         """Initialize executor with cache key and I/O specifications.
 
@@ -89,8 +67,6 @@ class Executor:
             wlo_transforms (list | None): Weight-layout relayout rules discovered at compile
                 time. Each rule follows the shared contract in wlo_contract (reshape = target
                 dims, transpose = permutation of the reshape rank); see _prepare_inputs.
-            dump_dir (str | None): Directory for tensor I/O dumps. If set, a
-                TensorDumper is attached.
         """
         self.graph_name = graph_name
         self.cache_key = cache_key
@@ -102,13 +78,10 @@ class Executor:
         self.copy_back_map = get_mutation_copy_back_inputs(self.pass_mutations)
 
         self.retain_device = retain_device
-        self._tensor_dumper = TensorDumper(dump_dir) if dump_dir else None
-        self._execution_counter = 0
 
         self.wlo_transforms = wlo_transforms or []
         self._wlo_cache: dict[int, tuple[int, torch.Tensor]] = {}
 
-        relayout_indices = set()
         for t in self.wlo_transforms:
             validate_transform(t)
             if not 0 <= t["input_index"] < len(self.io_spec.inputs):
@@ -116,19 +89,6 @@ class Executor:
                     f"WLO transform input_index {t['input_index']} out of range for a graph "
                     f"with {len(self.io_spec.inputs)} input(s); the relayout rules do not match "
                     "this graph (likely a stale or mismatched cache entry)"
-                )
-            relayout_indices.add(t["input_index"])
-
-        # A relayout buffer holds permuted bytes under the caller's original shape, so it can
-        # be neither end of an alias. Rejected at construction, before the NEFF writes.
-        for out_idx, neff_in_idx in (alias_buffer_map or {}).items():
-            if neff_in_idx in relayout_indices:
-                raise WLOContractError(
-                    f"Output {out_idx} aliases input {neff_in_idx}, whose bytes are relaid out "
-                    "for weight-layout optimization. A relaid-out buffer can serve as neither "
-                    "end of an alias: a mutation cannot be copied back in the caller's layout, "
-                    "and a passthrough would return permuted bytes and poison the relayout "
-                    "cache."
                 )
 
         logger.debug(
@@ -161,7 +121,6 @@ class Executor:
         """
         device_str = f"neuron:{device_id}"
         disable_cpu_autocopy = _getenv_bool("TORCH_NEURONX_DYNAMO_DISABLE_CPU_AUTOCOPY", False)
-        prepared = []
 
         for i, inp in enumerate(inputs):
             # Convert Python scalars to scalar tensors
@@ -178,7 +137,11 @@ class Executor:
                 tensor = inp
 
             if not tensor.is_contiguous():
-                tensor = tensor.contiguous()
+                contiguous_tensor = torch.empty(
+                    tensor.shape, dtype=tensor.dtype, device=tensor.device
+                )
+                torch_neuronx._C._nki_copy_strided_neuron_to_neuron(tensor, contiguous_tensor)
+                tensor = contiguous_tensor
             if tensor.dtype in self.INT_64_TO_32:
                 if tensor.dim() == 0:
                     tensor = tensor.reshape(1).view(self.INT_64_TO_32[tensor.dtype])
@@ -186,8 +149,6 @@ class Executor:
                     tensor = tensor.view(self.INT_64_TO_32[tensor.dtype])
             elif tensor.dtype == torch.float64:
                 tensor = tensor.to(torch.float32)
-            elif tensor.dtype == torch.complex128:
-                tensor = tensor.to(torch.complex64)
 
             if self.wlo_transforms:
                 for t in self.wlo_transforms:
@@ -222,9 +183,7 @@ class Executor:
                             self._wlo_cache[i] = (ptr, tensor)
                         break
 
-            prepared.append(tensor)
-
-        return prepared
+            yield tensor
 
     def _process_outputs(self, outputs):
         """Process execution outputs with dtype upcasting and shape correction.
@@ -243,7 +202,7 @@ class Executor:
         for tensor, cast_spec in zip(outputs, self.cast_spec, strict=False):
             if cast_spec.dtype in self.INT_64_TO_32:
                 tensor = tensor.view(cast_spec.dtype).reshape(cast_spec.shape)
-            elif cast_spec.dtype == torch.float64 or cast_spec.dtype == torch.complex128:
+            elif cast_spec.dtype == torch.float64:
                 tensor = tensor.to(cast_spec.dtype)
             tensors.append(tensor)
 
@@ -316,79 +275,23 @@ class Executor:
             else:
                 yield output
 
-    def _validate_copy_back_targets(self, inputs):
-        """Check the copy-back metadata before anything executes.
+    def _writeback_downcast_aliases(self, inputs, neuron_outputs, tensors):
+        """Write fp64 aliased-out results back into the caller's buffer.
 
-        Once the NEFF has written its aliased buffers a raise cannot unwind them. A negative
-        index would resolve from the end and copy over an unrelated caller tensor.
+        An fp64 out= input is downcast to fp32 by a copy, so the NEFF writes the
+        shadow, not the caller's tensor. int64 downcasts via a storage-sharing
+        view and is already correct, so it's skipped.
         """
         for out_idx, caller_in_idx in self.copy_back_map.items():
-            if not 0 <= caller_in_idx < len(inputs):
-                raise NEFFExecutionError(
-                    f"Output {out_idx} mutates caller input {caller_in_idx}, which is out of "
-                    f"range for the {len(inputs)} input(s) passed; the mutation metadata does "
-                    "not match this call (likely a stale or mismatched cache entry)"
-                )
             orig = inputs[caller_in_idx]
-            if not isinstance(orig, torch.Tensor):
-                raise NEFFExecutionError(
-                    f"Output {out_idx} holds a mutation result for caller input "
-                    f"{caller_in_idx}, which is a {type(orig).__name__} rather than a tensor; "
-                    "the mutation metadata does not match this call (likely a stale or "
-                    "mismatched cache entry)"
-                )
-            # TensorSpec.dtype is not coerced, so only shape is comparable here, and only
-            # when static. The write-back checks both against the real tensors.
-            spec = self.cast_spec[out_idx]
-            if not spec.is_dynamic() and tuple(spec.shape) != tuple(orig.shape):
-                raise NEFFExecutionError(
-                    f"Output {out_idx} has shape {tuple(spec.shape)} but the input it mutates "
-                    f"has shape {tuple(orig.shape)}; refusing to copy back"
-                )
-
-    def _writeback_shadowed_aliases(self, inputs, tensors):
-        """Copy a mutation result into the caller's tensor when the NEFF did not write it.
-
-        The caller's tensor is returned either way, which is the aten out= identity, so a
-        mutated output carries the device of the tensor it mutates rather than the execution
-        device.
-
-        Known limitation: if two mutated inputs share storage and only one was given a
-        separate buffer, this copy applies a result computed from the pre-call bytes over
-        storage the other mutation already updated. Overlap is not detected, because telling
-        it apart from disjoint slices of one allocation needs interval arithmetic over strides.
-        """
-        # copy_ broadcasts a mismatched shape and casts a mismatched dtype rather than
-        # failing, so check everything before copying anything.
-        pending = []
-        for out_idx, caller_in_idx in self.copy_back_map.items():
-            orig = inputs[caller_in_idx]
-            result = tensors[out_idx]
+            shadow = neuron_outputs[out_idx]
             if (
-                result.device == orig.device
-                and result.data_ptr() == orig.data_ptr()
-                and result.shape == orig.shape
-                and result.stride() == orig.stride()
+                isinstance(orig, torch.Tensor)
+                and orig.dtype == torch.float64
+                and shadow.dtype == torch.float32
             ):
-                # The NEFF wrote this in place. Read from the storage so the int64 view()
-                # downcast, a new tensor object over the same memory, is covered too.
+                orig.copy_(shadow)
                 tensors[out_idx] = orig
-                continue
-            if orig.shape != result.shape:
-                raise NEFFExecutionError(
-                    f"Output {out_idx} has shape {tuple(result.shape)} but the input it "
-                    f"mutates has shape {tuple(orig.shape)}; refusing to copy back"
-                )
-            if orig.dtype != result.dtype:
-                raise NEFFExecutionError(
-                    f"Output {out_idx} has dtype {result.dtype} but the input it mutates "
-                    f"has dtype {orig.dtype}; refusing to copy back"
-                )
-            pending.append((out_idx, orig, result))
-
-        for out_idx, orig, result in pending:
-            orig.copy_(result.to(orig.device) if result.device != orig.device else result)
-            tensors[out_idx] = orig
         return tensors
 
     def __call__(self, *inputs) -> tuple[torch.Tensor, ...]:
@@ -426,19 +329,12 @@ class Executor:
                 f"got {len(mutated_inputs)}"
             )
 
-        self._validate_copy_back_targets(inputs)
-
-        neuron_inputs = self._prepare_inputs(mutated_inputs, device_id)
+        neuron_inputs = list(self._prepare_inputs(mutated_inputs, device_id))
 
         neuron_outputs = [
             self._allocate_output(i, out, neuron_inputs, device_str)
             for i, out in enumerate(self.io_spec.outputs)
         ]
-
-        execution_count = self._execution_counter
-        self._execution_counter += 1
-        if self._tensor_dumper:
-            self._tensor_dumper.dump_tensors(neuron_inputs, execution_count, is_input=True)
 
         logger.debug(f"Calling execute_compiled_graph: cache_key={self.cache_key}")
         torch_neuronx._C.execute_compiled_graph(
@@ -449,11 +345,8 @@ class Executor:
             self.has_collectives,
         )
 
-        if self._tensor_dumper:
-            self._tensor_dumper.dump_tensors(neuron_outputs, execution_count, is_input=False)
-
         tensors = self._process_outputs(neuron_outputs)
-        tensors = self._writeback_shadowed_aliases(inputs, tensors)
+        tensors = self._writeback_downcast_aliases(inputs, neuron_outputs, tensors)
 
         if self.retain_device:
             # Apply copy-back from NEFF outputs directly back to caller inputs

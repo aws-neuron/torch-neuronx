@@ -260,27 +260,27 @@ c10_neuron::NeuronSegmentPool& NeuronResourceManager::GetSegmentPool(int device)
   return *pool;
 }
 
-c10_neuron::ScalarDeviceMemoryCache& NeuronResourceManager::GetScalarCache(int device) {
+c10_neuron::NrtTensorPool& NeuronResourceManager::GetTensorPool(int device) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  if (scalar_caches_.empty()) {
+  if (tensor_pools_.empty()) {
     int count = c10_neuron::device_count();
     if (count <= 0) {
       throw std::runtime_error("No Neuron devices available");
     }
-    scalar_caches_.resize(count);
+    tensor_pools_.resize(count);
   }
 
-  if (device < 0 || device >= static_cast<int>(scalar_caches_.size())) {
+  if (device < 0 || device >= static_cast<int>(tensor_pools_.size())) {
     throw std::runtime_error("Invalid device: " + std::to_string(device));
   }
 
-  auto& cache = scalar_caches_[device];
-  if (!cache) {
-    cache = std::make_unique<c10_neuron::ScalarDeviceMemoryCache>(device);
+  auto& pool = tensor_pools_[device];
+  if (!pool) {
+    pool = std::make_unique<c10_neuron::NrtTensorPool>(device);
   }
 
-  return *cache;
+  return *pool;
 }
 
 bool ResourceSemaphore::TryAcquireImmediate() {

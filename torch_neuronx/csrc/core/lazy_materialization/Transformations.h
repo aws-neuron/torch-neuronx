@@ -65,13 +65,10 @@ struct StrideDecompositionResult {
  * @param tensor The non-contiguous tensor to analyze
  * @param op_name Name of the operation (for logging)
  * @param index Index of this tensor in the operation (for logging)
- * @param anchor_at_view_offset If true, start the base tensor at the view storage offset.
- *        If false, start the base tensor at storage offset 0 and slice to the view.
  * @return StrideDecompositionResult if decomposition succeeds, nullopt otherwise
  */
 std::optional<StrideDecompositionResult> DecomposeStrides(const at::Tensor& tensor,
-                                                          const std::string& op_name, size_t index,
-                                                          bool anchor_at_view_offset = false);
+                                                          const std::string& op_name, size_t index);
 
 // ============================================================================
 // CREATORS: Detect transformation patterns from tensor properties

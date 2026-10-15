@@ -129,10 +129,13 @@ std::list<OperationContext*> ConcatenationEngine::FlushStreamBuffer(StreamImpl* 
 
   // Partition for execution order allocs → compute → deallocs. Under lazy
   // alloc the merged op resolves all I/O VAs at dispatch, so kAllocs must
-  // precede it and kDeallocs must follow.
+  // precede it and kDeallocs must follow. Hints flow back through the
+  // result list so the dispatch worker can drop their shared_ptr at
+  // transfer time.
   std::list<OperationContext*> alloc_ops;
   std::list<OperationContext*> compute_ops;
   std::list<OperationContext*> dealloc_ops;
+  std::list<OperationContext*> hint_ops;
   for (auto* op : buffer) {
     op->CompleteConcatenation();
     auto kt = op->GetKernelType();
@@ -140,10 +143,20 @@ std::list<OperationContext*> ConcatenationEngine::FlushStreamBuffer(StreamImpl* 
       alloc_ops.push_back(op);
     } else if (kt == KernelTypeEnum::kDealloc) {
       dealloc_ops.push_back(op);
+    } else if (kt == KernelTypeEnum::kHint) {
+      hint_ops.push_back(op);
     } else {
       compute_ops.push_back(op);
     }
   }
+
+  // kHint and kAlloc/kDealloc come from mutually-exclusive paths (host-alloc
+  // vs. lazy-alloc) and must never share a flush.
+  TORCH_CHECK(hint_ops.empty() || (alloc_ops.empty() && dealloc_ops.empty()),
+              "[CONCATENATION_ENGINE] kHint must not coexist with kAlloc/kDealloc in the "
+              "same buffer flush. hint_count=",
+              hint_ops.size(), " alloc_count=", alloc_ops.size(),
+              " dealloc_count=", dealloc_ops.size());
 
   buffer.clear();
   buffering_impl_->output_ptrs_.clear();
@@ -158,6 +171,7 @@ std::list<OperationContext*> ConcatenationEngine::FlushStreamBuffer(StreamImpl* 
   result.splice(result.end(), alloc_ops);
   result.splice(result.end(), compute_ops);
   result.splice(result.end(), dealloc_ops);
+  result.splice(result.end(), hint_ops);
   return result;
 }
 

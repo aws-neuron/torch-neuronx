@@ -54,24 +54,6 @@ void NRTHandler::DispatchModelExecution(const std::shared_ptr<nrt::ModelHandle>&
                    "NRT model scheduling failed");
 }
 
-NRT_STATUS NRTHandler::ScheduleTensorCast(const TensorCastOperand& src,
-                                          const TensorCastOperand& dst, uint64_t num_elements,
-                                          int lnc_idx, int queue, NRT_STATUS* nrt_status,
-                                          nrt::SequenceId* sequence_id) {
-  const nrt_compute_tensor_t nrt_src{
-      src.tensor,
-      src.offset_elements,
-      static_cast<nrt_dtype_t>(nrt::MapScalarTypeToNRT(src.dtype)),
-  };
-  const nrt_compute_tensor_t nrt_dst{
-      dst.tensor,
-      dst.offset_elements,
-      static_cast<nrt_dtype_t>(nrt::MapScalarTypeToNRT(dst.dtype)),
-  };
-  return nrt::ScheduleTensorCast(nrt_src, nrt_dst, num_elements, lnc_idx, queue, nrt_status,
-                                 sequence_id);
-}
-
 nrt_tensor_t* NRTHandler::AllocateSliceTensor(nrt_tensor_t* base_tensor, size_t offset, size_t size,
                                               const char* name) {
   TORCH_NEURONX_DEBUG("NRTHandler allocating tensor slice");

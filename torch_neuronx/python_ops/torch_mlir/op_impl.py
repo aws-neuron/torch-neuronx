@@ -17,23 +17,10 @@ logger = logging.getLogger(__name__)
 
 
 class TorchMlirOpImpl(CompilableOpImpl):
-    """Execute Torch-MLIR operations with policy-selected CPU fallback.
+    """Torch-MLIR based operation implementation.
 
-    Args:
-        aten_op_name (str): Qualified ATen operation name.
-        torch_fn (Callable): PyTorch function to compile or preprocess.
-        output_params (tuple[str, ...] | None, optional): Output parameter names.
-            Defaults to ``None``.
-        static_argnums (tuple[int, ...] | None, optional): Positional static argument
-            indices. Defaults to ``None``.
-        static_argnames (tuple[str, ...] | None, optional): Named static arguments.
-            Defaults to ``None``.
-        validate_static_inputs_func (Callable | None, optional): Validator called on
-            raw inputs before preprocessing. Defaults to ``None``.
-
-    Note:
-        Kernel paths compile StableHLO to a NEFF for Neuron execution. Selected
-        direct positional ``int64`` tensor inputs instead use C++ CPU fallback.
+    Executes PyTorch operations by compiling to StableHLO via torch-mlir,
+    then to NEFF for Neuron execution.
     """
 
     def __init__(
@@ -74,26 +61,14 @@ class TorchMlirOpImpl(CompilableOpImpl):
             self.kernel = None
 
     def execute(self, *args, **kwargs) -> ExecutionResult:
-        """Execute the operation through preprocessing and the Torch-MLIR kernel.
+        """Execute the operation.
 
         Args:
-            *args (Any): Positional operation arguments.
-            **kwargs (Any): Keyword operation arguments.
+            *args: Positional arguments
+            **kwargs: Keyword arguments
 
         Returns:
-            ExecutionResult: Successful output or captured kernel failure details.
-
-        Raises:
-            IndexError: If any phase reports an invalid index.
-            ValueError: If any phase rejects an input value.
-            TypeError: If any phase rejects an input type.
-            Exception: If validation, preprocessing, kernel setup, dtype handling, or C++ CPU
-                fallback raises another exception.
-
-        Note:
-            Validation runs on raw inputs before preprocessing. Policy-selected direct
-            positional ``int64`` tensors use C++ CPU fallback, preserving schema aliases;
-            other inputs may be dtype-autocast and outputs postprocessed.
+            ExecutionResult with output tensor(s)
         """
         # Run validator on raw args before preprocessing. Mirrors what the C++
         # dispatch path does in kernel.lower

@@ -15,9 +15,16 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "(autodiff, binary/unary op cross-device, reduce, fastpath parity)."
         ),
         tests=[
+            "TestForeachNEURON::test_autodiff__foreach_lgamma_outplace_neuron_float64",
             "TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_add_neuron_bool",
             "TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_div_neuron_float16",
             "TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_mul_neuron_bfloat16",
+            "TestForeachNEURON::test_foreach_reduce_large_input__foreach_norm_w_empty_True_neuron_float64",
+            "TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_erf_neuron_bool",
+            "TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_reciprocal_neuron_bool",
+            "TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_reciprocal_neuron_float32",
+            "TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_reciprocal_neuron_int8",
+            "TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_tanh_neuron_float64",
         ],
     ),
 ]

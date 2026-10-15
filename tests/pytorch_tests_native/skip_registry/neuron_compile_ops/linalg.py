@@ -97,6 +97,7 @@ SKIP = [
     "test_neuron_compile_ops.py::TestCompileLinalgOpInfoNEURON::test_compile_linalg_linalg_solve_neuron_float32",
     "test_neuron_compile_ops.py::TestCompileLinalgOpInfoNEURON::test_compile_linalg_linalg_solve_neuron_float64",
     "test_neuron_compile_ops.py::TestCompileLinalgOpInfoNEURON::test_compile_linalg_linalg_solve_triangular_neuron_complex64",
+    "test_neuron_compile_ops.py::TestCompileLinalgOpInfoNEURON::test_compile_linalg_linalg_solve_triangular_neuron_float32",
     "test_neuron_compile_ops.py::TestCompileLinalgOpInfoNEURON::test_compile_linalg_linalg_solve_triangular_neuron_float64",
     "test_neuron_compile_ops.py::TestCompileLinalgOpInfoNEURON::test_compile_linalg_linalg_svd_neuron_complex64",
     "test_neuron_compile_ops.py::TestCompileLinalgOpInfoNEURON::test_compile_linalg_linalg_svd_neuron_float32",

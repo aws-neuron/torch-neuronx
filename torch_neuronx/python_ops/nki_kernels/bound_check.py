@@ -176,27 +176,20 @@ def _mask_bounds_check(index: torch.Tensor, hi: int, lo: int) -> torch.Tensor:
     the kernel). On a fault the runtime invokes the op's registered
     ``error_handler`` (with inputs reconstructed from the OperationContext) to
     raise the exact op-specific exception (see op_error_handlers.py)."""
-    return wrap_nki(_mask_bounds_check_kernel)(index=index, hi=hi, lo=lo)
+    return wrap_nki(_mask_bounds_check_kernel)[(1,)](index=index, hi=hi, lo=lo)
 
 
 def assert_index_in_bounds(index: torch.Tensor, hi: int, lo: int = 0) -> torch.Tensor:
-    """Validate index bounds in graph and return indices for the consuming op.
+    """Return ``index`` (int32) unchanged, faulting on any value outside
+    ``[lo, hi)``. The consuming op MUST use the returned tensor — that data
+    dependency forces the in-graph check to run (and orders it before the op).
+    Works for any bounds (int32-exact), any shape, any size; dimension-agnostic
+    (only the scalar bounds are used). ``lo=0`` rejects negatives; ``lo=-hi``
+    accepts ``[-hi, hi)``.
 
-    Args:
-        index (torch.Tensor): Index tensor of any shape.
-        hi (int): Exclusive upper bound.
-        lo (int, optional): Inclusive lower bound. Defaults to ``0``.
-
-    Returns:
-        torch.Tensor: Checked ``int32`` indices with the original shape, or the
-        original tensor when empty or when the check is skipped by a transform.
-
-    Note:
-        Values outside ``[lo, hi)`` fault when the check runs. The consumer must use
-        the result to preserve the check through DCE. The check is exact across
-        ``int32``, accepts ``[-hi, hi)`` when ``lo=-hi``, and is skipped under vmap
-        or functorch transforms because the NKI HOP cannot batch.
-    """
+    The kernel tiles the index flat via access patterns and returns it in the
+    SAME shape, so no host reshape/pad/slice is needed — only an int32 cast
+    (a no-op when the index is already int32)."""
     hi = int(hi)
     lo = int(lo)
     if index.numel() == 0:

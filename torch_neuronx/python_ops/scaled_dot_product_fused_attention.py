@@ -89,15 +89,7 @@ def _sdpa_fwd_traceable(
     # max_q and max_k are plain ints in the ATen schema output — they cannot
     # be part of the traced HLO.  Return only tensor outputs from the traceable
     # function; the lower_func wrapper will splice max_q/max_k back in.
-    if _can_use_nki_flash_attention(
-        query,
-        key,
-        value,
-        attn_bias,
-        dropout_p,
-        scale=scale,
-        return_debug_mask=return_debug_mask,
-    ):
+    if _can_use_nki_flash_attention(query, key, value, attn_bias, dropout_p):
         output, logsumexp = _compute_attention_nki(
             query, key, value, is_causal, scale, training=True
         )
@@ -146,15 +138,7 @@ def _sdpa_bwd_traceable(
     scale: float | None = None,
 ):
     """Traceable backward wrapper for make_fx. Mirrors the backward decomposition."""
-    if _can_use_nki_flash_attention_backward(
-        query,
-        key,
-        value,
-        attn_bias,
-        dropout_p,
-        scale=scale,
-        is_causal=is_causal,
-    ):
+    if _can_use_nki_flash_attention_backward(query, key, value, attn_bias, dropout_p):
         grad_q, grad_k, grad_v = _compute_attention_backward_nki(
             grad_out,
             query,
@@ -189,29 +173,22 @@ def _sdpa_bwd_traceable(
         scale_val,
         is_causal,
         dropout_p,
+        True,
         philox_seed,
     )
 
     grad_k, grad_v = _reduce_gqa_gradients(
-        grad_k,
-        grad_v,
-        is_gqa,
-        b,
-        orig_kv_heads,
-        q_heads,
-        seq_k,
-        e,
-        value.shape[-1],
+        grad_k, grad_v, is_gqa, b, orig_kv_heads, q_heads, seq_k, e
     )
 
-    if grad_attn_bias is None or grad_attn_bias.numel() == 1:
+    if grad_attn_bias.numel() == 1:
         grad_attn_bias = query.new_zeros(())
 
     return grad_q, grad_k, grad_v, grad_attn_bias
 
 
 class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
-    """Implement fused scaled dot-product attention with NKI."""
+    """NKI implementation of fused scaled dot-product attention (returns tuple for training)"""
 
     def can_handle(
         self,
@@ -224,43 +201,13 @@ class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
         return_debug_mask: bool = False,
         scale: float | None = None,
     ) -> bool:
-        """Determine whether the NKI forward kernel supports the inputs.
-
-        Args:
-            query (torch.Tensor): Query shaped ``(B, H_q, L, E)``.
-            key (torch.Tensor): Key shaped ``(B, H_kv, S, E)``.
-            value (torch.Tensor): Value shaped ``(B, H_kv, S, D_v)``.
-            attn_bias (torch.Tensor | None, optional): Bias; NKI requires ``None``.
-                Defaults to ``None``.
-            dropout_p (float, optional): Dropout; NKI requires ``0.0``. Defaults to ``0.0``.
-            is_causal (bool, optional): Accepted but does not affect eligibility.
-                Defaults to ``False``.
-            return_debug_mask (bool, optional): Must be ``False``. Defaults to ``False``.
-            scale (float | None, optional): Attention scale; explicit ``0.0`` is
-                unsupported. Defaults to ``None``.
-
-        Returns:
-            bool: Whether common validation and NKI shape, bias, and dropout checks pass.
-
-        Raises:
-            RuntimeError: If query heads are not divisible by key/value heads.
-        """
+        """Check if NKI implementation can handle the given inputs"""
         if not super().can_handle(
             query, key, value, attn_bias, dropout_p, is_causal, return_debug_mask, scale
         ):
             return False
 
-        requires_lse = not hasattr(self, "_returns_single_tensor") or torch.is_grad_enabled()
-        return _can_use_nki_flash_attention(
-            query,
-            key,
-            value,
-            attn_bias,
-            dropout_p=dropout_p,
-            scale=scale,
-            return_debug_mask=return_debug_mask,
-            requires_lse=requires_lse,
-        )
+        return _can_use_nki_flash_attention(query, key, value, attn_bias, dropout_p=dropout_p)
 
     def _execute_impl(
         self,
@@ -380,11 +327,7 @@ class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
             return ExecutionResult(success=False, error_msg=str(e))
 
     def get_lower_func(self):
-        """Create the C++ dispatch lowering function for NKI attention.
-
-        Returns:
-            Callable: Function that lowers fused attention and records output strides.
-        """
+        """Return a lower function for C++ dispatch of NKI SDPA forward."""
         op_name = "_scaled_dot_product_fused_attention_overrideable"
         # static_argnums: 4=dropout_p, 5=is_causal, 6=return_debug_mask, 7=scale
         kernel = TorchMlirKernel(
@@ -394,16 +337,6 @@ class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
         )
 
         def sdpa_fwd_lower(*args, **kwargs):
-            """Lower fused-attention forward through the traceable kernel.
-
-            Args:
-                *args (Any): Positional fused-attention arguments.
-                **kwargs (Any): Keyword fused-attention arguments.
-
-            Returns:
-                LoweringResult: Empty metadata for a meta input, or lowered StableHLO
-                    metadata with a compatible attention-output target stride optionally recorded.
-            """
             query = args[0] if args else kwargs.get("query")
             if query.device.type == "meta":
                 return LoweringResult(
@@ -427,7 +360,7 @@ class ScaledDotProductFusedAttentionNKIImpl(AttentionOpImpl):
 
 
 class ScaledDotProductFusedAttentionOp(Operation):
-    """Register fused scaled dot-product attention implementations."""
+    """Fused scaled dot-product attention operation with NKI implementation"""
 
     def _setup_implementations(self):
         self._implementations.append(ScaledDotProductFusedAttentionNKIImpl())
@@ -437,11 +370,6 @@ class ScaledDotProductFusedAttentionOp(Operation):
 
     @property
     def op_name(self) -> str:
-        """Return the overrideable fused-attention ATen operation name.
-
-        Returns:
-            str: ATen operation name.
-        """
         return "_scaled_dot_product_fused_attention_overrideable"
 
     def _unhandled_cpu_fallback(self, *args, **kwargs):
@@ -465,26 +393,15 @@ def scaled_dot_product_fused_attention_overrideable_neuron(
     return_debug_mask: bool = False,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Run PyTorch overrideable fused attention for training or dropout on a Neuron device.
+    """
+    Implements the overrideable fused attention interface for Neuron devices.
 
-    Args:
-        query (torch.Tensor): Query tensor on a Neuron device.
-        key (torch.Tensor): Key tensor on a Neuron device.
-        value (torch.Tensor): Value tensor on a Neuron device.
-        attn_bias (torch.Tensor | None, optional): Attention bias. Defaults to ``None``.
-        dropout_p (float, optional): Dropout probability. Defaults to ``0.0``.
-        is_causal (bool, optional): Whether to apply causal masking. Defaults to ``False``.
-        return_debug_mask (bool, optional): Debug-mask request. Defaults to ``False``.
-        scale (float | None, optional): Attention score scale. Defaults to ``None``.
+    This is called by PyTorch when it needs a custom fused attention implementation
+    for training or when dropout is enabled.
 
     Returns:
-        tuple: Output, float32 log-sum-exp, two cumulative-sequence placeholders, query/key
-            lengths, path-specific RNG state and offset, and a debug-mask slot; state may be empty.
-
-    Raises:
-        ValueError: If ``query`` is not on a Neuron device.
-        NotImplementedError: If a debug mask is requested.
-        RuntimeError: If query heads are not divisible by key/value heads.
+        Tuple of (output, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k,
+                  philox_seed, philox_offset, debug_attn_mask)
     """
     # Validate device
     if query.device.type != "neuron":
@@ -509,42 +426,20 @@ def scaled_dot_product_fused_attention_overrideable_neuron(
 
 
 class ScaledDotProductAttentionBackwardNKIImpl(AttentionOpImpl):
-    """Implement scaled dot-product attention backward with NKI."""
+    """NKI implementation of scaled dot-product attention backward"""
 
     def can_handle(self, *args, **kwargs) -> bool:
-        """Determine whether the NKI backward kernel supports the inputs.
-
-        Args:
-            *args (Any): Positional ATen arguments; positions 1, 2, 3, 4, 12, 13, and 16
-                supply query, key, value, bias, dropout, causal mode, and scale, respectively.
-            **kwargs (Any): Keyword alternatives for those values.
-
-        Returns:
-            bool: Whether common validation and NKI backward eligibility checks pass.
-
-        Raises:
-            RuntimeError: If query heads are not divisible by key/value heads.
-        """
+        """Check if this implementation can handle the given inputs"""
         query = args[1] if len(args) > 1 else kwargs.get("query")
         key = args[2] if len(args) > 2 else kwargs.get("key")
         value = args[3] if len(args) > 3 else kwargs.get("value")
         attn_bias = args[4] if len(args) > 4 else kwargs.get("attn_bias")
         dropout_p = args[12] if len(args) > 12 else kwargs.get("dropout_p", 0.0)
-        is_causal = args[13] if len(args) > 13 else kwargs.get("is_causal", False)
-        scale = args[16] if len(args) > 16 else kwargs.get("scale")
 
         if not super().can_handle(query, key, value, attn_bias):
             return False
 
-        return _can_use_nki_flash_attention_backward(
-            query,
-            key,
-            value,
-            attn_bias,
-            dropout_p,
-            scale=scale,
-            is_causal=is_causal,
-        )
+        return _can_use_nki_flash_attention_backward(query, key, value, attn_bias, dropout_p)
 
     def _execute_impl(self, *args, **kwargs) -> ExecutionResult:
         """Execute the backward pass"""
@@ -631,12 +526,7 @@ class ScaledDotProductAttentionBackwardNKIImpl(AttentionOpImpl):
         return None
 
     def get_lower_func(self):
-        """Create the C++ dispatch lowering function for NKI attention backward.
-
-        Returns:
-            Callable: Function that lowers attention gradients and, when epilogue relayout is
-                enabled and compatible, records noncontiguous target strides.
-        """
+        """Return a lower function for C++ dispatch of NKI SDPA backward."""
         op_name = "_scaled_dot_product_fused_attention_overrideable_backward"
         # static_argnums: 5=grad_input_mask, 10=max_q, 11=max_k,
         #                 12=dropout_p, 13=is_causal, 16=scale
@@ -647,17 +537,6 @@ class ScaledDotProductAttentionBackwardNKIImpl(AttentionOpImpl):
         )
 
         def sdpa_bwd_lower(*args, **kwargs):
-            """Lower fused-attention backward through the traceable kernel.
-
-            Args:
-                *args (Any): Positional fused-attention backward arguments.
-                **kwargs (Any): Keyword fused-attention backward arguments; the non-meta
-                    stride-relayout path requires query, key, and value positionally.
-
-            Returns:
-                LoweringResult: Empty metadata for a meta input, or lowered StableHLO metadata
-                    with compatible gradient target strides optionally recorded.
-            """
             query = args[1] if len(args) > 1 else kwargs.get("query")
             if query.device.type == "meta":
                 return LoweringResult(
@@ -683,7 +562,7 @@ class ScaledDotProductAttentionBackwardNKIImpl(AttentionOpImpl):
 
 
 class ScaledDotProductAttentionBackwardOp(Operation):
-    """Register scaled dot-product attention backward implementations."""
+    """Scaled dot-product attention backward operation with NKI implementation"""
 
     def _setup_implementations(self):
         self._implementations.append(ScaledDotProductAttentionBackwardNKIImpl())
@@ -695,11 +574,6 @@ class ScaledDotProductAttentionBackwardOp(Operation):
 
     @property
     def op_name(self) -> str:
-        """Return the overrideable fused-attention backward ATen operation name.
-
-        Returns:
-            str: ATen operation name.
-        """
         return "_scaled_dot_product_fused_attention_overrideable_backward"
 
 
@@ -727,33 +601,11 @@ def scaled_dot_product_fused_attention_overrideable_backward_neuron(
     *,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return query, key, value, and optional bias gradients for fused attention backward.
-
-    Args:
-        grad_out (torch.Tensor): Gradient of the attention output.
-        query (torch.Tensor): Forward query tensor.
-        key (torch.Tensor): Forward key tensor.
-        value (torch.Tensor): Forward value tensor.
-        attn_bias (torch.Tensor | None): Forward attention bias.
-        grad_input_mask (list[bool]): Gradient-selection mask; Neuron implementations ignore it.
-        out (torch.Tensor): Forward attention output.
-        logsumexp (torch.Tensor): Forward log-sum-exp values.
-        cum_seq_q (torch.Tensor): Query sequence metadata; Neuron implementations ignore it.
-        cum_seq_k (torch.Tensor): Key sequence metadata; Neuron implementations ignore it.
-        max_q (int): Maximum query length; Neuron implementations ignore it.
-        max_k (int): Maximum key length; Neuron implementations ignore it.
-        dropout_p (float): Forward dropout probability.
-        is_causal (bool): Whether forward used causal masking.
-        philox_seed (torch.Tensor): Forward Philox seed or primitive-path dropout mask.
-        philox_offset (torch.Tensor): Forward Philox offset; Neuron implementations ignore it.
-        scale (float | None, optional): Forward attention score scale. Defaults to ``None``.
+    """
+    Backward pass for fused attention using the Operation pattern.
 
     Returns:
-        tuple: Query, key, value, and bias gradients; bias is a tensor, scalar zero, or ``None``.
-
-    Raises:
-        ValueError: If ``query`` is not on the Neuron device.
-        RuntimeError: If query heads are not divisible by key/value heads.
+        Tuple of (grad_query, grad_key, grad_value, grad_attn_bias)
     """
     # Validate device
     if query.device.type != "neuron":
@@ -800,33 +652,7 @@ def scaled_dot_product_fused_attention_overrideable_backward_meta(
     philox_offset,
     scale=None,
 ):
-    """Return empty query, key, value, and optional bias-gradient metadata tensors.
-
-    Args:
-        grad_out (torch.Tensor): Accepted for schema compatibility but unused.
-        query (torch.Tensor): Template for the query-gradient metadata tensor.
-        key (torch.Tensor): Template for the key-gradient metadata tensor.
-        value (torch.Tensor): Template for the value-gradient metadata tensor.
-        attn_bias (torch.Tensor | None): Template for the bias gradient, or ``None``.
-        grad_input_mask (list[bool]): Accepted for schema compatibility but unused.
-        out (torch.Tensor): Accepted for schema compatibility but unused.
-        logsumexp (torch.Tensor): Accepted for schema compatibility but unused.
-        cum_seq_q (torch.Tensor): Accepted for schema compatibility but unused.
-        cum_seq_k (torch.Tensor): Accepted for schema compatibility but unused.
-        max_q (int): Accepted for schema compatibility but unused.
-        max_k (int): Accepted for schema compatibility but unused.
-        dropout_p (float): Accepted for schema compatibility but unused.
-        is_causal (bool): Accepted for schema compatibility but unused.
-        philox_seed (torch.Tensor): Accepted for schema compatibility but unused.
-        philox_offset (torch.Tensor): Accepted for schema compatibility but unused.
-        scale (float | None, optional): Accepted for schema compatibility but unused.
-            Defaults to ``None``.
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]: Empty
-            meta tensors shaped like ``query``, ``key``, and ``value``, plus one shaped
-            like ``attn_bias``, or ``None`` when ``attn_bias`` is ``None``.
-    """
+    """Meta implementation for fake tensor dispatch"""
     grad_query = torch.empty_like(query)
     grad_key = torch.empty_like(key)
     grad_value = torch.empty_like(value)

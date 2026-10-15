@@ -75,26 +75,25 @@ def _get_process_group_ranks(group_name: str) -> list[list[int]]:
 
 
 class CollectiveLegalization(NeuronFXPass):
-    """Rewrite collective group names as explicit replica groups.
-
-    Args:
-        state (NeuronFXPassState | None, optional): Shared state used for pass
-            artifact dumping. Defaults to ``None``.
-
-    Note:
-        Convert identifiers such as ``'0'`` to groups such as ``'[[0, 1]]'``
-        for consistent SPMD compilation across ranks.
     """
+    Rewrite collective operation group names to explicit replica groups.
+
+    Example:
+        Transforms the following:
+
+        opcode         name         target                                args
+        -------------  -----------  ------------------------------------  --------------------
+        call_function  all_reduce   _c10d_functional.all_reduce.default   (arg0_1, 'sum', '0')
+
+        Into:
+
+        opcode         name         target                                args
+        -------------  -----------  ------------------------------------  ---------------------------
+        call_function  all_reduce   _c10d_functional.all_reduce.default   (arg0_1, 'sum', '[[0, 1]]')
+
+    """  # noqa: E501
 
     def call(self, gm: torch.fx.GraphModule) -> PassResult:
-        """Rewrite supported collective nodes in an FX graph.
-
-        Args:
-            gm (torch.fx.GraphModule): FX graph module to legalize.
-
-        Returns:
-            PassResult: Graph module and whether any collective argument changed.
-        """
         modified = False
 
         for node in gm.graph.nodes:

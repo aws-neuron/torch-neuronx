@@ -25,17 +25,13 @@ from torch_neuronx.utils import is_native_int64_enabled
 
 
 def bounce_64bit(dtype: torch.dtype | None) -> bool:
-    """Determine whether a dtype requires a CPU bounce.
+    """Return True if dtype is a 64-bit type needing CPU bounce on Neuron.
 
     Args:
-        dtype (torch.dtype | None): Dtype to evaluate.
+        dtype: torch dtype or None
 
     Returns:
-        bool: Whether transfers or casts for the dtype must use CPU fallback.
-
-    Note:
-        ``torch.float64`` always bounces. ``torch.int64`` bounces only when neither
-        native int64 nor packed int64 mode is enabled.
+        bool: True for torch.float64; True for torch.int64 only in cpu_bounce mode.
     """
     if is_native_int64_enabled():
         return dtype == torch.float64
@@ -47,15 +43,10 @@ def bounce_64bit(dtype: torch.dtype | None) -> bool:
 
 
 def validate_neuron_memory_format(memory_format: torch.memory_format | None, op_name: str) -> None:
-    """Validate a requested Neuron tensor memory format.
+    """Validate memory format constraints for Neuron tensors.
 
-    Args:
-        memory_format (torch.memory_format | None): Memory format to validate.
-        op_name (str): Operation name included in an error message.
-
-    Raises:
-        RuntimeError: If a non-``None`` format is not contiguous, preserve,
-            channels-last, or channels-last-3d.
+    Supported formats: contiguous, preserve, channels_last, channels_last_3d.
+    Raise a clear error otherwise.
     """
     if memory_format is None:
         return
@@ -70,17 +61,10 @@ def validate_neuron_memory_format(memory_format: torch.memory_format | None, op_
 
 
 def ensure_contiguous_on_device(t: torch.Tensor) -> torch.Tensor:
-    """Make a tensor contiguous through the appropriate device path.
+    """Ensure tensor is contiguous, using device-appropriate path.
 
-    Args:
-        t (torch.Tensor): Tensor whose layout to inspect.
-
-    Returns:
-        torch.Tensor: The input tensor if contiguous, otherwise a contiguous tensor.
-
-    Note:
-        Neuron tensors use the internal contiguous operation to avoid redispatch
-        recursion; other tensors use ``Tensor.contiguous``.
+    For Neuron tensors, use the internal contiguous op to avoid redispatch
+    recursion; for CPU tensors, use the standard `.contiguous()`.
     """
     if t.is_contiguous():
         return t
@@ -98,26 +82,12 @@ def copy_cpu_to_neuron(
     target_dtype: torch.dtype,
     non_blocking: bool = False,
 ) -> torch.Tensor:
-    """Copy a CPU tensor to a Neuron device with the requested dtype.
+    """Copy CPU tensor to Neuron, casting on CPU first if needed.
 
-    Args:
-        cpu_src (torch.Tensor): CPU tensor to transfer.
-        target_device (torch.device): Neuron device that receives the tensor.
-        target_dtype (torch.dtype): Dtype of the transferred tensor.
-        non_blocking (bool, optional): Whether to request an asynchronous copy.
-            Defaults to ``False``.
-
-    Returns:
-        torch.Tensor: Neuron tensor with the source shape, values, and logical strides.
-
-    Raises:
-        RuntimeError: If the source is not on CPU, the target is not a Neuron device,
-            or a native transfer fails.
-
-    Note:
-        The source is cast and made contiguous on CPU before the raw NRT transfer.
-        Non-contiguous strides are restored on device, and packed int64 uses physical
-        int32 pairs so scalar and strided layouts are preserved.
+    Ensures the CPU tensor is contiguous and in the target dtype, then allocates
+    a Neuron tensor and performs a raw transfer via NRT copy. If the source had
+    non-contiguous strides (e.g. from transpose), the result is re-strided on
+    device to match, preserving the same layout as CUDA's .to() behaviour.
     """
     import torch_neuronx._C as _C  # local import
     from torch_neuronx.int64_policy import is_packed_int64_mode
@@ -172,23 +142,10 @@ def copy_cpu_to_neuron(
 def copy_neuron_to_cpu(
     neuron_src: torch.Tensor, target_dtype: torch.dtype | None = None, non_blocking: bool = False
 ) -> torch.Tensor:
-    """Copy a Neuron tensor to CPU and optionally cast it.
+    """Copy Neuron tensor to CPU; optionally cast on CPU after copy.
 
-    Args:
-        neuron_src (torch.Tensor): Neuron tensor to transfer.
-        target_dtype (torch.dtype, optional): CPU result dtype. Defaults to ``None``.
-        non_blocking (bool, optional): Whether to use pinned memory for an asynchronous
-            copy. Defaults to ``False``.
-
-    Returns:
-        torch.Tensor: Contiguous CPU tensor in the requested or source dtype.
-
-    Raises:
-        RuntimeError: If the source is not on a Neuron device or a native transfer fails.
-
-    Note:
-        The raw transfer preserves the source dtype before any CPU cast. Packed int64
-        downloads physical int32 pairs and restores the logical shape.
+    The initial copy is a raw byte transfer preserving the source dtype.
+    If `target_dtype` is provided and differs, the CPU cast is performed.
     """
     import torch_neuronx._C as _C  # local import
     from torch_neuronx.int64_policy import is_packed_int64_mode
@@ -228,17 +185,12 @@ def copy_neuron_to_cpu(
 
 
 def prepare_src_for_neuron_to_neuron_copy(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-    """Prepare a source tensor for a Neuron-to-Neuron copy.
+    """Prepare source for Neuron->Neuron copy following layout policy.
 
-    Args:
-        src (torch.Tensor): Source tensor to prepare.
-        dst (torch.Tensor): Destination tensor whose shape and layout are required.
-
-    Returns:
-        torch.Tensor: The source tensor or a contiguous copy of it.
-
-    Raises:
-        RuntimeError: If shapes differ or the destination layout is unsupported.
+    - Shapes must match.
+    - If both are contiguous: return src.
+    - If dst is contiguous but src is not: make src contiguous on device.
+    - Otherwise: raise a layout-change error.
     """
     if tuple(src.shape) != tuple(dst.shape):
         raise RuntimeError("Neuron->Neuron copy with size mismatch is not supported")
@@ -253,25 +205,11 @@ def prepare_src_for_neuron_to_neuron_copy(src: torch.Tensor, dst: torch.Tensor) 
 
 
 def write_neuron_to_neuron(dst: torch.Tensor, src: torch.Tensor) -> None:
-    """Copy or cast a source tensor into a Neuron destination in place.
+    """In-place copy/cast from Neuron tensor `src` to Neuron tensor `dst`.
 
-    Args:
-        dst (torch.Tensor): Neuron tensor to update.
-        src (torch.Tensor): Neuron tensor providing values.
-
-    Raises:
-        RuntimeError: If either tensor is not on a Neuron device or shape, device, or
-            native-copy constraints are not satisfied.
-        TypeError: If an up-to-32-bit dtype cast targets a noncontiguous destination; that path
-            currently passes an unsupported keyword to the device-cast helper.
-
-    Note:
-        Matching dtypes with a contiguous destination use a direct device copy.
-        Policy-controlled 64-bit casts use CPU fallback; up-to-32-bit casts with contiguous
-        destinations use a device kernel. Noncontiguous same-dtype and 64-bit-converted values
-        use a strided device copy or CPU fallback. An up-to-32-bit dtype change to a
-        noncontiguous destination currently fails as described above. Successful device-only
-        paths are stream ordered and may return before completion.
+    - If dtypes match: direct NRT device copy.
+    - If 64-bit is involved (src or dst): CPU bounce for cast (Neuron lacks 64-bit).
+    - Else: device-side cast kernel for <=32-bit dtypes.
     """
     import torch_neuronx._C as _C  # local import
 

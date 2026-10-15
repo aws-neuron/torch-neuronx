@@ -341,34 +341,6 @@ TEST_F(NRTUtilsTest, ScheduleTensorCopyFailure) {
   EXPECT_EQ(status, NRT_FAILURE);
 }
 
-TEST_F(NRTUtilsTest, ScheduleTensorCastSuccess) {
-  nrt_compute_tensor_t src{reinterpret_cast<nrt_tensor_t*>(0x1234), 3, NRT_DTYPE_FLOAT32};
-  nrt_compute_tensor_t dst{reinterpret_cast<nrt_tensor_t*>(0x5678), 7, NRT_DTYPE_BFLOAT16};
-  nrta_seq_t expected_seq = 789;
-  NRT_STATUS ret = NRT_SUCCESS;
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrta_tensor_cast(&src, &dst, 128, 1, 2, &ret, _))
-      .WillOnce(DoAll(SetArgPointee<6>(expected_seq), Return(NRT_SUCCESS)));
-
-  nrta_seq_t result_seq;
-  NRT_STATUS status = ScheduleTensorCast(src, dst, 128, 1, 2, &ret, &result_seq);
-  EXPECT_EQ(status, NRT_SUCCESS);
-  EXPECT_EQ(result_seq, expected_seq);
-}
-
-TEST_F(NRTUtilsTest, ScheduleTensorCastFailure) {
-  nrt_compute_tensor_t src{reinterpret_cast<nrt_tensor_t*>(0x1234), 0, NRT_DTYPE_BFLOAT16};
-  nrt_compute_tensor_t dst{reinterpret_cast<nrt_tensor_t*>(0x5678), 0, NRT_DTYPE_FLOAT32};
-  NRT_STATUS ret = NRT_SUCCESS;
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrta_tensor_cast(&src, &dst, 128, 0, 0, &ret, _))
-      .WillOnce(Return(NRT_FAILURE));
-
-  nrta_seq_t result_seq;
-  NRT_STATUS status = ScheduleTensorCast(src, dst, 128, 0, 0, &ret, &result_seq);
-  EXPECT_EQ(status, NRT_FAILURE);
-}
-
 // IsNRTAsyncRequestCompleted tests
 
 TEST_F(NRTUtilsTest, IsNRTAsyncRequestCompletedTrue) {

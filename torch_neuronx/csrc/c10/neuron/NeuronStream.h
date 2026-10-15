@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <functional>
 #include <future>
-#include <memory>
 #include <utility>
 
 #include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
@@ -21,7 +20,6 @@ namespace at::neuron {
 
 // Forward declarations
 class NeuronEvent;
-struct EventImpl;
 struct OperationContext;
 struct OperationContextResult;
 struct StreamImpl;
@@ -126,7 +124,6 @@ class NeuronStream {
 
   /// Submit an event wait primitive to this stream
   void SubmitEventWait(const NeuronEvent& event) const;
-  void SubmitEventWait(const std::shared_ptr<EventImpl>& event) const;
 
   /// Underlying StreamImpl identity (for logical-stream comparison).
   StreamImpl* get_stream_impl() const;

@@ -8,20 +8,18 @@ logger = logging.getLogger(__name__)
 
 
 class BaseEmptyTensorHandler:
-    """Detect empty tensors in operation arguments.
-
-    Note:
-        This handler does not implement every API from the legacy empty-tensor handler.
+    """Handles operations on empty tensors.
+    Note: Not all the APIs are ported over from the legacy empty tensor handler.
     """
 
     def check_for_empty(self, *args) -> bool:
-        """Check recursively for empty tensor arguments.
+        """Check if any tensor arguments are empty.
 
         Args:
-            *args (object): Values to inspect; lists and tuples are traversed recursively.
+            *args: Arguments to check
 
         Returns:
-            bool: ``True`` if any tensor has zero elements; otherwise ``False``.
+            True if any tensor is empty
         """
         for arg in args:
             if isinstance(arg, torch.Tensor):

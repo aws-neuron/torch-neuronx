@@ -214,7 +214,6 @@ class TestGenerateTileTypes:
             "masks_npy_path",
             "masks_int8_npy_path",
             "last_compute_section",
-            "section_len",
             "max_large_tiles_needed",
         }
         assert set(result.keys()) == expected_keys
@@ -382,13 +381,6 @@ class TestLastComputeSection:
         lcs = result["last_compute_section"]
         for i in range(1, len(lcs)):
             assert lcs[i] >= lcs[i - 1]
-
-    def test_head_dims_shorten_the_section(self):
-        """Two head dimension tiles halve the section, so 6144 keys need two sections."""
-        mask_mod = _make_mask_mod(_no_mask)
-        assert _generate_tile_types(mask_mod, 128, 6144, 512)["last_compute_section"] == [0]
-        result = _generate_tile_types(mask_mod, 128, 6144, 512, d_head_qk=192, d_head_v=128)
-        assert result["last_compute_section"] == [1]
 
 
 # ============================================================================

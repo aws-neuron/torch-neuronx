@@ -1086,11 +1086,11 @@ std::vector<CompactGroup> DiscoverCompactGroups(const std::vector<int64_t>& act_
 // ============================================================================
 
 std::optional<StrideDecompositionResult> DecomposeStrides(const at::Tensor& tensor,
-                                                          const std::string& op_name, size_t index,
-                                                          bool anchor_at_view_offset) {
+                                                          const std::string& op_name,
+                                                          size_t index) {
   auto shape = tensor.sizes();
   auto strides = tensor.strides();
-  int64_t offset = anchor_at_view_offset ? 0 : tensor.storage_offset();
+  int64_t offset = tensor.storage_offset();
   int64_t ndims = shape.size();
 
   if (ndims == 0 || tensor.is_contiguous()) {
@@ -1113,7 +1113,7 @@ std::optional<StrideDecompositionResult> DecomposeStrides(const at::Tensor& tens
   // Handle all-broadcast: return a scalar base tensor with broadcast metadata
   if (non_bc_dims.empty()) {
     std::string element_type = ScalarTypeToElementTypeString(tensor.scalar_type());
-    at::Tensor base_tensor = tensor.as_strided({1}, {1}, tensor.storage_offset());
+    at::Tensor base_tensor = tensor.as_strided({1}, {1}, offset);
 
     StrideDecompositionResult result;
     result.base_tensor = base_tensor;
@@ -1264,7 +1264,7 @@ std::optional<StrideDecompositionResult> DecomposeStrides(const at::Tensor& tens
 
   auto base_strides = ComputeRowMajorStrides(phys_base_shape);
 
-  int64_t base_offset = tensor.storage_offset();
+  int64_t base_offset = offset;
   for (int i = 0; i < total_dims; ++i) {
     base_offset -= phys_starts[i] * base_strides[i];
   }
@@ -1719,11 +1719,6 @@ std::optional<TransformationCreationResult> TryCreateCompound(const at::Tensor& 
                                                               size_t input_index) {
   // Use shared stride decomposition (Steps 1-6)
   auto decomp = DecomposeStrides(input, op_name, input_index);
-  // Anchor the base at the view offset only when the offset-0 decomposition fails. An anchored base
-  // reads from the view offset, so a shared-storage dedup input must keep the offset-0 base.
-  if (!decomp.has_value() && input.storage_offset() != 0) {
-    decomp = DecomposeStrides(input, op_name, input_index, /*anchor_at_view_offset=*/true);
-  }
   if (!decomp.has_value()) {
     return std::nullopt;
   }

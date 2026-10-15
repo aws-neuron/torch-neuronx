@@ -141,29 +141,25 @@ def _expand_source_1d_index(index_node: Node, expected_shape: tuple[int, ...]) -
 
 
 class RewriteRowScatterAdd(NeuronFXPass):
-    """Rewrite row-broadcast scatter and gather operations as windowed indexing.
+    """Rewrite a row-broadcast scatter_add / gather to windowed indexing.
 
-    Args:
-        state (NeuronFXPassState, optional): Shared FX-pass state used for artifact dumping.
-            Defaults to ``None``.
+    Two mirror-image rewrites, both gated on a provable row-broadcast index
+    (dim 0, operand rank >= 2, index = expand/broadcast_to of a
+    ``[N, 1, ..., 1]`` source):
 
-    Note:
-        Rewrites only dimension-zero operations on rank-two-or-higher tensors when the
-        index is provably an expanded ``[N, 1, ..., 1]`` source. Converts ``scatter_add``
-        to accumulating ``index_put`` and ``gather`` to ``index.Tensor``. The windowed
-        forms keep trailing dimensions contiguous during lowering, while accumulation
-        preserves repeated-row updates used by top-k MoE combine.
+    - ``scatter_add(x, 0, expand(idx_1d), src)``
+        -> ``index_put(x, [idx_1d], src, accumulate=True)``
+    - ``gather(x, 0, expand(idx_1d))``
+        -> ``index(x, [idx_1d])``  (the ``aten.Tensor`` overload)
+
+    The scatter_add rewrite preserves accumulate semantics (top-k MoE combine
+    sends several updates to the same row). The gather is the backward twin of
+    that combine. Both windowed forms lower to a StableHLO scatter/gather with
+    the trailing dims as window dims, so the tensorizer tiles the hidden dim as
+    a contiguous free axis (128x512) instead of the scalar 128x1 form.
     """
 
     def call(self, gm: torch.fx.GraphModule) -> PassResult:
-        """Rewrite supported row-broadcast operations in an FX graph.
-
-        Args:
-            gm (torch.fx.GraphModule): FX graph module to update in place.
-
-        Returns:
-            PassResult: Graph module and whether any scatter or gather node changed.
-        """
         graph = gm.graph
         modified = False
 

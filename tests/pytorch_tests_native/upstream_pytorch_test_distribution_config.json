@@ -141,7 +141,6 @@
       "items": [
         "torch_test_root_files"
       ],
-      "root": true,
       "soft_fail": true
     },
     {

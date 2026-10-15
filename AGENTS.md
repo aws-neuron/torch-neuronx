@@ -6,9 +6,6 @@ the skills (see "Skills" below).
 
 ## Critical rules (MANDATORY)
 
-Read [AI_POLICY.md](AI_POLICY.md). The person who directs you must follow it. You
-must follow these rules every time you touch GitHub.
-
 - Never act autonomously on GitHub. Do not open, edit, comment on, or merge a PR
   or issue unless the user reviewed and approved the exact content.
 - Do not create a PR on your own. Push a branch and stop. If you open a PR, open
@@ -18,31 +15,6 @@ must follow these rules every time you touch GitHub.
 - Do not commit to `main`. Branch first.
 - Confirm before any destructive or outward-facing action (delete, force-push,
   upload, file a ticket).
-
-## Before you open a pull request (MANDATORY)
-
-Check that the work is not already done, or already in progress:
-
-```bash
-gh issue view <issue_number> --repo aws-neuron/torch-neuronx --comments
-gh pr list --repo aws-neuron/torch-neuronx --state open --search "<issue_number> in:body"
-gh pr list --repo aws-neuron/torch-neuronx --state open --search "<area keywords>"
-```
-
-- If an open PR already does this work, do not open a second one.
-- If your approach is different, explain the difference in the issue first.
-
-Do not open a PR for one typo, one isolated style change, or a mechanical cleanup on
-its own. Put those changes together with substantive work.
-
-If the work is a duplicate, or it is busywork, **stop**. Report what you found and
-why you stopped. Do not open the PR.
-
-State these three things in the PR description:
-
-- Why this work does not duplicate an open PR.
-- The exact test commands you ran, and the results.
-- That an AI assistant helped to write the change.
 
 ## Writing style: Simplified Technical English (MANDATORY)
 
@@ -117,14 +89,13 @@ raise ValueError(f"n={n} exceeds the limit {limit}. Pass a smaller n.")
 
 ## Build
 
-- Build with `uv run ./tools/build` (Bazel). Add `--python 3.14` to set the Python version.
+- Build with `uv run ./tools/build` (Bazel). Add `--python 3.12` to set the Python version.
 - See `BAZEL_BUILD.md` for details.
 - A Python-only change needs no rebuild. Rebuild for C++ or codegen changes.
 
 ## Testing
 
-- Run tests with `tools/run-test`. C++ tests use `tools/run-cpp-test`.
-- Run a CI node with `tests/pytorch_tests_native/runner/run_upstream_tests.py --node <id>`.
+- Run tests with `tools/run-test` (or `tools/run-test-parallel`). C++ tests use `tools/run-cpp-test`.
 - Upstream PyTorch tests use `tests/pytorch_tests_native/run_upstream_tests.sh`.
 - Tests need a Neuron (trn) host. State clearly when you did not run them.
 
@@ -139,7 +110,7 @@ raise ValueError(f"n={n} exceeds the limit {limit}. Pass a smaller n.")
 - Do not make a bullet list of every change. State what changed and why.
 - Add a Test Plan. Put the exact commands you ran in fenced code blocks.
 - For a bug fix, state the root cause and how the fix works.
-- If the repository has a pull request template, fill every section. Keep it short. Do not narrate the diff.
+- Fill every section of `.github/PULL_REQUEST_TEMPLATE.md`. Keep it short. Do not narrate the diff.
 
 ## Scratch space
 
@@ -148,19 +119,12 @@ raise ValueError(f"n={n} exceeds the limit {limit}. Pass a smaller n.")
 
 ## Skills
 
-Task workflows live in `.external/skills/<name>/SKILL.md`. See
-[.external/skills/README.md](.external/skills/README.md) for the list. Load the skill that
-matches the task. Do not copy a skill into another directory.
-Contributors outside the core team: read [.external/README.md](.external/README.md) for setup.
-
-Route these tasks to the matching skill:
+Route these tasks to the matching skill in `.kiro/skills/` (`SKILL.md` in each):
 
 - Repo questions ("how does X work", "where is Y") -> `torch-neuronx-docs`.
 - Review a PR or a branch -> `pr-review`.
 - Fix a failing or xfailing upstream test -> `pytorch-upstream-test-debugger`.
 - Isolate a compiler bug and package the HLO/NEFF for the compiler team -> `compiler-artifact-repro`.
-- Lower or fix an ATen operation -> `aten-op-lowering`.
-- Lower a list of ATen operations in parallel -> `aten-lowering-orchestrator`.
-- Run several agents in parallel on one Neuron host -> `agent-isolation`.
-
-Agent definitions that run these skills live in `.external/agents/`.
+- Validate or debug Neuron-vs-GPU model accuracy -> `accuracy`.
+- Run many debug agents in parallel on one host -> `agent-isolation`.
+- Optimize a dynamic NKI kernel -> `dynamic-kernel-optimize`.

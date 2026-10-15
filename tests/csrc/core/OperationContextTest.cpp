@@ -454,6 +454,16 @@ TEST_F(OperationContextTest, IsDeviceKernelTypeEventReturnsFalse) {
   EXPECT_FALSE(IsDeviceKernelType(kt));
 }
 
+TEST_F(OperationContextTest, IsDeviceKernelTypeHintReturnsFalse) {
+  auto kernel = std::make_unique<MockNeuronKernelExecution>();
+  EXPECT_CALL(*kernel, GetKernelType()).WillRepeatedly(Return(KernelTypeEnum::kHint));
+
+  OperationContext context(std::move(kernel));
+
+  KernelTypeEnum kt = context.GetKernelType();
+  EXPECT_FALSE(IsDeviceKernelType(kt));
+}
+
 TEST_F(OperationContextTest, IsDeviceOperationForDeviceKernels) {
   auto kernel = std::make_unique<MockNeuronKernelExecution>();
   EXPECT_CALL(*kernel, GetKernelType()).WillRepeatedly(Return(KernelTypeEnum::kHLO));

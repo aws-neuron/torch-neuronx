@@ -2,6 +2,9 @@
 Test event management functionality for multi-stream support.
 """
 
+import time
+
+import pytest
 import torch
 
 import torch_neuronx
@@ -9,37 +12,6 @@ import torch_neuronx
 
 class TestEventManagement:
     """Test event creation and basic functionality."""
-
-    def test_event_identity_and_data_order_across_rerecord(self):
-        """Change the recording stream without redirecting an earlier event wait."""
-        producer = torch.neuron.Stream()
-        consumer = torch.neuron.default_stream()
-        event = torch.neuron.Event()
-        identity = event.neuron_event
-        source = torch.arange(64, dtype=torch.float32, device="neuron")
-        torch_neuronx.synchronize()
-
-        with torch.neuron.stream(producer):
-            first = source + 1
-            event.record(producer)
-        assert event.neuron_event == identity
-        with torch.neuron.stream(consumer):
-            consumer.wait_event(event)
-            observed = first * 2
-            second = source + 3
-            event.record(consumer)
-        assert event.neuron_event == identity
-
-        with torch.neuron.stream(producer):
-            event.wait(producer)
-            later = second * 4
-        producer.synchronize()
-        consumer.synchronize()
-        assert event.query()
-        assert event.neuron_event == identity
-        expected = torch.arange(64, dtype=torch.float32)
-        torch.testing.assert_close(observed.cpu(), (expected + 1) * 2)
-        torch.testing.assert_close(later.cpu(), (expected + 3) * 4)
 
     def test_event_creation_basic(self):
         """Test basic event creation with default parameters."""

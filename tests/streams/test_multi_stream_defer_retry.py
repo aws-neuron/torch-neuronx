@@ -5,8 +5,11 @@ import torch_neuronx
 from tests.utils.defer_retry_helpers import (
     big_mib,
     floats_for_mib,
+    requires_lazy_alloc,
     stage_pending_kdeallocs,
 )
+
+_requires_lazy_alloc = requires_lazy_alloc
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
@@ -14,6 +17,7 @@ from tests.utils.defer_retry_helpers import (
 class TestMultiStreamDeferRetry:
     """Cross-stream interactions with the defer-retry path."""
 
+    @_requires_lazy_alloc
     def test_defer_on_stream_a_does_not_block_stream_b(self):
         """A Deferred kAlloc on stream A must not stall stream B. B's chain
         is queued AFTER A's pressure alloc so B's ops hit the scheduler

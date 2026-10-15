@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 from torch._decomp import decomposition_table
 
-from torch_neuronx import _sdpa_math
 from torch_neuronx.neuron_dynamo_backend import decompositions
 
 
@@ -925,25 +924,6 @@ class TestOrmqrDecomposition:
         torch.testing.assert_close(result, expected)
 
 
-class TestPolarDecomposition:
-    """Test the polar decomposition (abs*cos + i*abs*sin, repacked to complex)."""
-
-    def test_registered_in_decomposition_table(self):
-        assert torch.ops.aten.polar.default in decompositions.neuron_decompositions
-
-    @pytest.mark.parametrize("shape", [(4,), (3, 5), (2, 3, 4)])
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-    def test_polar_decomp_matches_reference(self, shape, dtype):
-        torch.manual_seed(0)
-        abs_ = torch.rand(shape, dtype=dtype)
-        angle = torch.randn(shape, dtype=dtype)
-        result = decompositions.polar_decomp(abs_, angle)
-        expected = torch.polar(abs_, angle)
-        assert result.shape == expected.shape
-        assert result.dtype == expected.dtype
-        torch.testing.assert_close(result, expected)
-
-
 class TestThnnFusedLstmCellDecomposition:
     """Test the fused LSTM cell forward + backward decompositions.
 
@@ -1136,33 +1116,6 @@ class TestOrmqrDecompositionE2E:
         compiled = torch.compile(fn, backend="neuron", fullgraph=True)
         result = compiled(reflectors.to("neuron"), tau.to("neuron"), C.to("neuron"))
         torch.testing.assert_close(result.cpu(), expected, rtol=1e-2, atol=1e-3)
-
-
-@pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")
-class TestPolarDecompositionE2E:
-    """Compile polar end-to-end on Neuron and diff against the CPU kernel.
-
-    polar has a real input boundary and a complex output boundary. The
-    decomposition keeps the interior real, so this runs without the framework
-    complex-decomposition flag. Angles stay small (< pi) to keep fp32 cos/sin
-    accurate; large angles need a separate reduction test.
-    """
-
-    @pytest.mark.parametrize("shape", [(4,), (3, 5)])
-    def test_polar_e2e(self, shape):
-        torch.manual_seed(0)
-        abs_ = torch.rand(shape)
-        angle = (torch.rand(shape) * 2 - 1) * math.pi
-
-        def fn(a, ang):
-            return torch.polar(a, ang)
-
-        expected = fn(abs_, angle)
-
-        compiled = torch.compile(fn, backend="neuron", fullgraph=True)
-        result = compiled(abs_.to("neuron"), angle.to("neuron"))
-        assert result.dtype == torch.complex64, result.dtype
-        torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-5)
 
 
 def _lstm_cell_ref_forward(ig, hg, cx, ib=None, hb=None):
@@ -5588,8 +5541,8 @@ class TestForeachDecompositionCompileE2E:
             def fn(t1, t2):
                 return torch.ops.aten._foreach_add.List(t1, t2)
 
-            t1 = [torch.randn(256, 256).to("neuron") for _ in range(3)]
-            t2 = [torch.randn(256, 256).to("neuron") for _ in range(3)]
+            t1 = [torch.randn(256, 256, device="neuron") for _ in range(3)]
+            t2 = [torch.randn(256, 256, device="neuron") for _ in range(3)]
             compiled = torch.compile(fn, backend="neuron", fullgraph=True)
             compiled(t1, t2)
             import torch_neuronx as tnx
@@ -7828,18 +7781,15 @@ class TestUpsampleBilinear2dAADecomposition:
 
         The matrix must be built in the float accumulator, not the input dtype —
         a uint8 tap matrix rounds every weight to 0/1 and destroys the blend.
-
-        The tolerance is off-by-two. aten's uint8 kernel uses int16 fixed-point
-        weights; the decomposition uses float weights, so a rare pixel differs by
-        two after the two rounding passes. A sweep of many seeds and shapes shows
-        two is the true maximum. The seed pins an input that reaches the bound.
+        aten's uint8 kernel narrows between the two separable passes, so the
+        result matches within one ULP (allowed off-by-one, as the framework's
+        exact-match uses the same per-pass rounding).
         """
-        torch.manual_seed(1)
         x = torch.randint(0, 256, (2, 3, 16, 16), dtype=torch.uint8)
         result = decompositions.upsample_bilinear2d_aa_decomposition(x, list(out_hw), False)
         expected = torch.ops.aten._upsample_bilinear2d_aa.default(x, list(out_hw), False)
         assert result.dtype == torch.uint8
-        torch.testing.assert_close(result, expected, atol=2, rtol=0)
+        torch.testing.assert_close(result, expected, atol=1, rtol=0)
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     def test_narrow_float_accumulates_in_fp32(self, dtype):
@@ -8581,300 +8531,3 @@ class TestMaskedScatterDecompositionE2E:
         compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True, dynamic=False)
         result = compiled_fn(self_cpu.to("neuron"), mask_cpu.to("neuron"), source_cpu.to("neuron"))
         torch.testing.assert_close(result.cpu(), expected)
-
-
-class TestSdpaDecompositionMatchesEager:
-    """The torch.compile SDPA decomposition must be a thin adapter over the eager op.
-
-    The compile path used to carry its own copy of the attention math, which had drifted:
-    it ran the softmax/LSE chain in the input dtype, so bf16 training under torch.compile
-    accumulated the softmax in bf16 and applied `scale` after rounding it to bf16, while
-    eager has always accumulated that chain in fp32 (NCC-9271). The copy is gone, so the
-    only thing left to test is that the adapter reproduces eager exactly.
-    """
-
-    @staticmethod
-    def _qkv(dtype, seq_q=51, seq_k=51):
-        torch.manual_seed(0)
-        # (B, H, L, E); 51x48 is the reported NCC-9271 shape
-        return (
-            torch.randn(2, 4, seq_q, 48, dtype=dtype),
-            torch.randn(2, 4, seq_k, 48, dtype=dtype),
-            torch.randn(2, 4, seq_k, 48, dtype=dtype),
-        )
-
-    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-    @pytest.mark.parametrize("seq_q,seq_k", [(51, 51), (13, 51)])
-    @pytest.mark.parametrize("mask_kind", ["none", "float", "bool"])
-    @pytest.mark.parametrize("is_causal", [False, True])
-    def test_matches_eager(self, dtype, seq_q, seq_k, mask_kind, is_causal):
-        """Bit-identical to compute_attention, which is what "no second copy" means."""
-        from torch_neuronx.python_ops.torch_mlir.ops.scaled_dot_product_attention import (
-            compute_attention,
-        )
-
-        query, key, value = self._qkv(dtype, seq_q, seq_k)
-        scale = 1.0 / math.sqrt(query.shape[-1])
-
-        if mask_kind == "none":
-            attn_mask = None
-        elif mask_kind == "float":
-            attn_mask = torch.randn(2, 4, seq_q, seq_k, dtype=dtype)
-        else:
-            attn_mask = torch.rand(2, 4, seq_q, seq_k) > 0.3
-
-        out, lse, dropout_mask = decompositions.scaled_dot_product_attention_decomposition(
-            query, key, value, attn_mask=attn_mask, is_causal=is_causal, scale=scale
-        )
-
-        # Same normalization the adapter performs, spelled out: eager takes one additive
-        # bias, treats an empty tensor as absent, and applies is_causal *or* the bias.
-        if attn_mask is None:
-            attn_bias = query.new_zeros((0,))
-        elif attn_mask.dtype == torch.bool:
-            attn_bias = torch.where(attn_mask, 0.0, float("-inf")).to(dtype)
-        else:
-            attn_bias = attn_mask
-        eager_causal = is_causal
-        if is_causal and attn_bias.numel() > 0:
-            keep = torch.ones(seq_q, seq_k, dtype=torch.bool).tril(diagonal=0)
-            attn_bias = attn_bias.masked_fill(keep.logical_not(), float("-inf"))
-            eager_causal = False
-
-        eager_out, eager_lse = compute_attention(
-            query,
-            key,
-            value,
-            attn_bias,
-            query.new_zeros((0,)),
-            scale,
-            eager_causal,
-            0.0,
-        )
-
-        assert dropout_mask is None
-        torch.testing.assert_close(out, eager_out, rtol=0, atol=0)
-        torch.testing.assert_close(lse, eager_lse, rtol=0, atol=0)
-
-    def test_softmax_chain_is_not_bf16(self):
-        """Guards the NCC-9271 regression directly, without reaching into eager."""
-        query, key, value = self._qkv(torch.bfloat16)
-        scale = 1.0 / math.sqrt(query.shape[-1])
-
-        _, lse, _ = decompositions.scaled_dot_product_attention_decomposition(
-            query, key, value, scale=scale
-        )
-        golden = torch.logsumexp(
-            torch.matmul(query.double(), key.double().transpose(-2, -1)) * scale, dim=-1
-        )
-        rel_err = (lse.double() - golden).norm().item() / golden.norm().item()
-        # the old bf16 chain measured ~2.5e-3 here
-        assert rel_err < 5e-4, f"LSE relative error {rel_err:.3e} suggests a bf16 softmax chain"
-
-    def test_explicit_mask_is_not_dropped_when_causal(self):
-        """aten allows attn_mask together with is_causal; both must apply."""
-        query, key, value = self._qkv(torch.float32)
-        attn_mask = torch.randn(2, 4, 51, 51)
-
-        out, _, _ = decompositions.scaled_dot_product_attention_decomposition(
-            query, key, value, attn_mask=attn_mask, is_causal=True
-        )
-        # Compute reference by combining both masks manually. PT 2.14
-        # (pytorch/pytorch#187966) rejects passing attn_mask together with
-        # is_causal=True to F.scaled_dot_product_attention. The validation
-        # was moved from the math backend to the common entry point, so it
-        # now raises before dispatch on all backends. We merge the causal
-        # mask into attn_mask ourselves and pass only attn_mask.
-        L, S = query.shape[-2], key.shape[-2]
-        causal_mask = torch.ones(L, S, dtype=torch.bool).tril()
-        combined_mask = attn_mask.double().masked_fill(~causal_mask, float("-inf"))
-        reference = torch.nn.functional.scaled_dot_product_attention(
-            query.double(),
-            key.double(),
-            value.double(),
-            attn_mask=combined_mask,
-        )
-        torch.testing.assert_close(out.double(), reference, rtol=1e-5, atol=1e-5)
-
-    @pytest.mark.parametrize(
-        "is_causal,dropout_p",
-        [(False, 0.0), (True, 0.0), (False, 0.25)],
-    )
-    def test_shared_backward_matches_autograd(self, is_causal, dropout_p):
-        """The shared backward formula must match its forward formula."""
-        query, key, value = [
-            tensor.requires_grad_(True) for tensor in self._qkv(torch.float32, 7, 7)
-        ]
-        attn_bias = torch.randn(2, 4, 7, 7, requires_grad=True)
-        dropout_mask = torch.rand(2, 4, 7, 7) >= dropout_p
-        scale = 1.0 / math.sqrt(query.shape[-1])
-        grad_out = torch.randn_like(query)
-
-        output, lse = _sdpa_math.compute_attention(
-            query,
-            key,
-            value,
-            attn_bias,
-            dropout_mask,
-            scale,
-            is_causal,
-            dropout_p,
-        )
-        output.backward(grad_out)
-
-        actual = _sdpa_math.compute_attention_backward(
-            grad_out,
-            query.detach(),
-            key.detach(),
-            value.detach(),
-            attn_bias.detach(),
-            dropout_mask,
-            output.detach(),
-            lse.detach(),
-            scale,
-            is_causal,
-            dropout_p,
-        )
-        expected = (query.grad, key.grad, value.grad, attn_bias.grad)
-        for actual_grad, expected_grad in zip(actual, expected, strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-4, atol=1e-5)
-
-    def test_shared_backward_handles_fully_masked_rows(self):
-        """The shared backward formula must keep all gradients finite."""
-        query, key, value = self._qkv(torch.float32, 7, 7)
-        attn_bias = torch.zeros(2, 4, 7, 7)
-        attn_bias[:, :, :2, :] = float("-inf")
-        dropout_mask = torch.empty(0)
-        scale = 1.0 / math.sqrt(query.shape[-1])
-        grad_out = torch.randn_like(query)
-
-        output, lse = _sdpa_math.compute_attention(
-            query,
-            key,
-            value,
-            attn_bias,
-            dropout_mask,
-            scale,
-            False,
-            0.0,
-        )
-        gradients = _sdpa_math.compute_attention_backward(
-            grad_out,
-            query,
-            key,
-            value,
-            attn_bias,
-            dropout_mask,
-            output,
-            lse,
-            scale,
-            False,
-            0.0,
-        )
-
-        for gradient in gradients:
-            assert gradient is not None
-            assert torch.isfinite(gradient).all()
-        assert torch.equal(gradients[0][:, :, :2, :], torch.zeros_like(query[:, :, :2, :]))
-
-    def test_no_dropout_ignores_philox_placeholder(self):
-        """Math2 backward must ignore a Philox placeholder without dropout."""
-        query, key, value = self._qkv(torch.float32, 7, 7)
-        scale = 1.0 / math.sqrt(query.shape[-1])
-        attn_bias = torch.zeros(1)
-        dropout_mask = torch.empty(0)
-        grad_out = torch.randn_like(query)
-        output, lse = _sdpa_math.compute_attention(
-            query,
-            key,
-            value,
-            attn_bias,
-            dropout_mask,
-            scale,
-            False,
-            0.0,
-        )
-
-        actual = decompositions.compute_attention_backward_decomposition(
-            grad_out,
-            query,
-            key,
-            value,
-            attn_bias,
-            output,
-            lse,
-            scale,
-            False,
-            0.0,
-            torch.zeros((), dtype=torch.int32),
-        )
-        expected = _sdpa_math.compute_attention_backward(
-            grad_out,
-            query,
-            key,
-            value,
-            attn_bias,
-            dropout_mask,
-            output,
-            lse,
-            scale,
-            False,
-            0.0,
-        )
-
-        for actual_grad, expected_grad in zip(actual[:3], expected[:3], strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
-
-    def test_dropout_placeholder_does_not_zero_gradients(self):
-        """Math2 backward must treat a 1-element dropout mask as absent.
-
-        A lowering path sends a zero placeholder of shape (1,) and a non-zero dropout_p.
-        The mask must not multiply the gradients, because that makes every gradient zero.
-        """
-        query, key, value = self._qkv(torch.float32, 7, 7)
-        scale = 1.0 / math.sqrt(query.shape[-1])
-        attn_bias = torch.zeros(1)
-        grad_out = torch.randn_like(query)
-
-        output, lse = _sdpa_math.compute_attention(
-            query,
-            key,
-            value,
-            attn_bias,
-            torch.empty(0),
-            scale,
-            False,
-            0.0,
-        )
-
-        actual = _sdpa_math.compute_attention_backward(
-            grad_out,
-            query,
-            key,
-            value,
-            attn_bias,
-            torch.zeros((1,), dtype=query.dtype),
-            output,
-            lse,
-            scale,
-            False,
-            0.5,
-        )
-        expected = _sdpa_math.compute_attention_backward(
-            grad_out,
-            query,
-            key,
-            value,
-            attn_bias,
-            torch.empty(0),
-            output,
-            lse,
-            scale,
-            False,
-            0.0,
-        )
-
-        for gradient in actual[:3]:
-            assert gradient.abs().sum() > 0.0
-        for actual_grad, expected_grad in zip(actual[:3], expected[:3], strict=True):
-            torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)

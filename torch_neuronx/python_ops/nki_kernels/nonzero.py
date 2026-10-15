@@ -53,20 +53,21 @@ _P_STRIDE = 16  # partition gap between adjacent GpSimd cores
 
 @nki.jit
 def flat_nonzero_kernel(input_tensor, chunk_size: int = DEFAULT_CHUNK_SIZE):
-    """Find ascending flat indices of nonzero elements.
+    """Find ascending flat indices of nonzero elements in a [1, N] tensor.
+
+    Processes 8 chunks at a time across the 8 GpSimd cores (one ISA call per
+    group of ``8 * chunk_size`` elements), then handles the remaining <8 full
+    chunks and a final partial tail on a single partition. Works for any ``N``.
 
     Args:
-        input_tensor (nl.ndarray): Two-dimensional ``[1, N]`` ``float32`` or ``int32`` input.
-        chunk_size (int, optional): Per-core free-dimension tile width. Defaults to
-            ``DEFAULT_CHUNK_SIZE``.
+        input_tensor (nl.ndarray): [1, N] input on HBM. dtype float32 or int32.
+            An element is "nonzero" iff it != 0.
+        chunk_size (int): per-core free-dimension tile width.
 
     Returns:
-        tuple[nl.ndarray, nl.ndarray]: A ``[1, N]`` index buffer whose first
-            ``count`` entries are valid and whose remaining entries are unspecified,
-            plus a ``[1, 1]`` nonzero count.
-
-    Note:
-        The kernel processes eight GpSimd chunks concurrently and supports any ``N``.
+        indices (nl.ndarray): [1, N] int32 — first ``count`` entries are the
+            ascending flat indices of nonzeros; remainder unspecified.
+        count (nl.ndarray): [1, 1] int32 — number of nonzeros.
     """
     n = input_tensor.shape[-1]
     group = _NUM_CORES * chunk_size
@@ -185,20 +186,16 @@ try:
     _wrapped_nonzero = wrap_nki(flat_nonzero_kernel)
 
     @nki_op("nki_kernels::nonzero", mutates_args={})
-    def nonzero_nki(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run flattened nonzero through the wrapped NKI kernel.
+    def nonzero_nki(x: torch.Tensor, lnc: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+        """Flat nonzero on a [1, N] int32/float32 tensor, for any N.
 
-        Args:
-            x (torch.Tensor): Two-dimensional ``[1, N]`` ``int32`` or ``float32`` input.
+        The kernel handles any N (full tiles + a tail tile), so no host-side
+        padding is needed.
 
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]: A ``[1, N]`` index buffer whose first
-                ``count`` entries are ascending, and a ``[1, 1]`` nonzero count.
-
-        Note:
-            Full and tail tiles are handled without host-side padding.
+        Returns (indices[1, N] int32, count[1, 1] int32) where the first
+        ``count`` entries of ``indices`` are the ascending flat indices.
         """
-        return _wrapped_nonzero(x, chunk_size=DEFAULT_CHUNK_SIZE)
+        return _wrapped_nonzero[(lnc,)](x, chunk_size=DEFAULT_CHUNK_SIZE)
 
     _has_nki_nonzero = True
 except (ImportError, ModuleNotFoundError):

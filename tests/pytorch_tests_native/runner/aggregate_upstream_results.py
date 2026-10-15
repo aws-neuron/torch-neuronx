@@ -52,10 +52,14 @@ SKIPPED_STATUSES = ("skipped", "skipped_on_retry")
 # results dir, uploaded by the aggregate job itself for debugging — it is NOT an
 # aggregation input. On a workflow *re-run*, ``actions/download-artifact`` fetches
 # it back into ``results_dir`` (its name matches the ``upstream-pytorch-*``
-# download pattern), so its nested reports would be counted a second time.
-# The copy uses the ``all`` label and can bypass the soft-fail report filter.
-# Skip this directory. The per-suite artifacts are the single source of truth.
-# New runs use a different bundle name. Keep this check for older run artifacts.
+# download pattern), so its nested copy of every suite's reports would be counted
+# a SECOND time — under the bogus suite label ``all``. That duplicate is not in
+# the soft_fail label set, so it bypasses the merge-gate soft_fail exclusion and
+# can block a merge on a flaky failure that already ran (and was excluded) in its
+# real per-suite artifact. Skip this dir entirely: the per-suite artifacts are the
+# single source of truth. (New runs also rename the bundle so it no longer matches
+# the download pattern — see ``_upstream-tests.yml`` — but we still skip the old
+# name defensively for runs whose artifacts predate that change.)
 BUNDLE_ARTIFACT_DIR = "upstream-pytorch-all"
 
 
@@ -72,10 +76,11 @@ def _artifact_label(json_file: str, results_dir: Path) -> str:
 def _soft_fail_labels(config_path: Path | None = None) -> set[str]:
     """Matrix labels of suites flagged ``soft_fail`` in the distribution config.
 
-    Mirror ``emit_upstream_matrix.py`` label logic. The aggregator excludes these
-    suites from aggregate reports and the merge gate.
-
-    Return an empty set if the config cannot be read. This result keeps all suites.
+    Mirrors ``emit_upstream_matrix.py``'s label logic so the merge gate can
+    exclude soft_fail suites' failures from the gate count -- they still RUN and
+    report to the dashboard/CSVs, but must not block CI. Best-effort: returns an
+    empty set (no exclusion -- the strict/safe direction) if the config can't be
+    read.
     """
     import json as _json
 
@@ -97,12 +102,12 @@ def _soft_fail_labels(config_path: Path | None = None) -> set[str]:
                 label += f"-shard{node['shard_id']}"
             labels.add(label)
     except Exception as exc:
-        logger.warning("Could not resolve soft-fail labels for report exclusion: %s", exc)
+        logger.warning("Could not resolve soft_fail labels for gate exclusion: %s", exc)
     return labels
 
 
 # Maps the GitHub workflow ``name:`` (``GITHUB_WORKFLOW`` — the *caller* of the shared
-# ``_reusable-upstream-tests.yml``) to a stable dashboard enum, so the upstream parquet records
+# ``_upstream-tests.yml``) to a stable dashboard enum, so the upstream parquet records
 # which kind of run produced it without a cross-table join. Add a new entry when a new
 # caller workflow is onboarded. Keys mirror ``job_metrics.github_workflow`` verbatim.
 #
@@ -272,11 +277,7 @@ def _group_from_file(test_file: str) -> str:
     return test_file
 
 
-def aggregate_summary(
-    results_dir: Path,
-    output_csv: Path,
-    excluded_labels: set[str] | None = None,
-) -> dict:
+def aggregate_summary(results_dir: Path, output_csv: Path) -> dict:
     """Aggregate test stats from all node artifacts and write summary CSV.
 
     Args:
@@ -284,7 +285,6 @@ def aggregate_summary(
             each with ``test_results_*.json`` files directly inside (no
             nested ``json_reports/`` layer — the runner writes them flat).
         output_csv: Path where the summary CSV is written.
-        excluded_labels: Suite labels to exclude from all aggregate reports.
 
     Returns:
         Dict with ``test_rows`` (list of per-test dicts), ``stats`` (nested
@@ -298,9 +298,6 @@ def aggregate_summary(
     # Dedupe by (per-node-dir, filename); prefer the `outputs/` copy.
     candidates = list(results_dir.glob("upstream-pytorch-*/**/test_results_*.json"))
 
-    excluded_labels = excluded_labels or set()
-    excluded_artifacts: set[str] = set()
-    excluded_report_count = 0
     by_node_and_name: dict[tuple[str, str], str] = {}
     for p in candidates:
         # Per-node dir is the immediate child of results_dir.
@@ -312,22 +309,11 @@ def aggregate_summary(
             # Redundant re-bundle of every suite (see BUNDLE_ARTIFACT_DIR) —
             # counting it would double-count each test under the "all" label.
             continue
-        artifact_label = _artifact_label(str(p), results_dir)
-        if artifact_label in excluded_labels:
-            excluded_artifacts.add(artifact_label)
-            excluded_report_count += 1
-            continue
         key = (node_dir, p.name)
         existing = by_node_and_name.get(key)
         if existing is None or "/outputs/" in str(p):
             by_node_and_name[key] = str(p)
     json_files = list(by_node_and_name.values())
-
-    if excluded_artifacts:
-        logger.info(
-            "Excluded soft-fail suites from aggregate reports: %s",
-            ", ".join(sorted(excluded_artifacts)),
-        )
 
     if not json_files:
         logger.warning(f"No JSON files found under {results_dir}")
@@ -341,7 +327,6 @@ def aggregate_summary(
             "group_durations": {},
             "total_stats": {},
             "failures_by_label": {},
-            "excluded_report_count": excluded_report_count,
         }
 
     # Split main vs retry reports. Retry files end in ``_retry.json``
@@ -432,7 +417,6 @@ def aggregate_summary(
         "group_durations": dict(group_durations),
         "total_stats": dict(total_stats),
         "failures_by_label": dict(failures_by_label),
-        "excluded_report_count": excluded_report_count,
         "sorted_statuses": sorted_statuses,
     }
 
@@ -688,12 +672,6 @@ def _parse_args(argv: list | None = None) -> argparse.Namespace:
         default=None,
         help="If set, exit non-zero when failing tests (failed/error) exceed this threshold.",
     )
-    parser.add_argument(
-        "--dist-config",
-        type=Path,
-        default=None,
-        help="Distribution config that identifies soft-fail suites.",
-    )
     return parser.parse_args(argv)
 
 
@@ -788,15 +766,9 @@ def main(argv: list | None = None) -> int:
         logger.error(f"Results directory not found: {results_dir}")
         return 1
 
-    soft_labels = _soft_fail_labels(args.dist_config)
-    result = aggregate_summary(results_dir, summary_csv, excluded_labels=soft_labels)
+    result = aggregate_summary(results_dir, summary_csv)
 
     if not result["test_rows"]:
-        if result["excluded_report_count"]:
-            logger.info("No reportable test data found. All reports came from soft-fail suites.")
-            exit_code, outputs = evaluate_gate(0, max_failures)
-            emit_github_outputs(**outputs)
-            return exit_code
         logger.warning("No test data found — skipping summary")
         # Fail closed when gating: no data usually means the run broke.
         if max_failures is not None:
@@ -880,19 +852,37 @@ def main(argv: list | None = None) -> int:
     with open(summary_csv) as f:
         sys.stdout.write(f.read())
     print("=" * 60)
-    # The aggregate result excludes soft-fail suites. Use its failure count for the gate.
-    exit_code, outputs = evaluate_gate(failure_count, max_failures)
+    # Merge-queue gate; only enforced when --max-failures was supplied.
+    # soft_fail suites (distribution config) RUN and report to the dashboard/CSVs
+    # but must NOT block CI, so their failures are excluded from the gate count.
+    soft_labels = _soft_fail_labels()
+    soft_fail_failures = sum(
+        result.get("failures_by_label", {}).get(label, 0) for label in soft_labels
+    )
+    gate_failure_count = max(0, failure_count - soft_fail_failures)
+    if soft_labels:
+        logger.info(
+            "Gate: %d total failing tests; %d from soft_fail suites (%s) excluded; "
+            "%d count toward the gate.",
+            failure_count,
+            soft_fail_failures,
+            ", ".join(sorted(soft_labels)),
+            gate_failure_count,
+        )
+    exit_code, outputs = evaluate_gate(gate_failure_count, max_failures)
     if max_failures is not None:
         if exit_code:
             logger.error(
-                "FAILURE GATE: %d failing tests exceeds the allowed maximum of %d. Blocking merge.",
-                failure_count,
+                "FAILURE GATE: %d failing tests (excl. soft_fail) exceeds the allowed "
+                "maximum of %d. Blocking merge.",
+                gate_failure_count,
                 max_failures,
             )
         else:
             logger.info(
-                "Failure gate passed: %d failing tests is within the allowed maximum of %d.",
-                failure_count,
+                "Failure gate passed: %d failing tests (excl. soft_fail) is within the "
+                "allowed maximum of %d.",
+                gate_failure_count,
                 max_failures,
             )
     emit_github_outputs(**outputs)

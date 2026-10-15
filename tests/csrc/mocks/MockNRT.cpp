@@ -320,16 +320,6 @@ NRT_STATUS nrta_tensor_copy(nrt_tensor_t* src, uint64_t src_offset, nrt_tensor_t
   return NRT_FAILURE;
 }
 
-NRT_STATUS nrta_tensor_cast(const nrt_compute_tensor_t* src, const nrt_compute_tensor_t* dst,
-                            uint64_t num_elements, int lnc_idx, int queue, NRT_STATUS* ret,
-                            nrta_seq_t* req_seq) {
-  if (g_mocks_initialized) {
-    return torch_neuronx::testing::MockNRT::GetInstance()->nrta_tensor_cast(
-        src, dst, num_elements, lnc_idx, queue, ret, req_seq);
-  }
-  return NRT_FAILURE;
-}
-
 NRT_STATUS nrta_is_completed(nrta_seq_t seq, bool* is_completed) {
   if (g_mocks_initialized) {
     return torch_neuronx::testing::MockNRT::GetInstance()->nrta_is_completed(seq, is_completed);

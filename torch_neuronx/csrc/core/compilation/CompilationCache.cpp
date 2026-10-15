@@ -190,7 +190,6 @@ void CompilationCache::ClearInMemoryCache() {
 
   cache_.clear();
   pending_compilations_.clear();
-  persistent_key_hints_.clear();
 
   // Reset in-memory cache metrics
   auto* arena = metrics::NeuronMetricsArena::Get();
@@ -256,43 +255,10 @@ bool CompilationCache::CheckInMemoryCacheAndPending(
   return false;
 }
 
-std::string CompilationCache::ResolvePersistentKeyLocked(const CompilationCacheKey& key) const {
-  // A key with no IR cannot name its NEFF by content, so a recorded mapping beats the
-  // key's own derivation. This matters when the content-key gate is off: the key then
-  // derives hash(base_key || config), which is not where put_neff_cache() put the NEFF.
-  // A key WITH IR keeps its content-addressed name, so a stale hint cannot serve the
-  // wrong NEFF.
-  if (!key.HasHloBytes()) {
-    auto it = persistent_key_hints_.find(key.GetKey());
-    if (it != persistent_key_hints_.end()) {
-      return it->second;
-    }
-  }
-  if (const std::string* pk = key.GetPersistentKey()) {
-    return *pk;
-  }
-  return std::string();
-}
-
-void CompilationCache::RegisterPersistentKeyHint(const std::string& base_key,
-                                                 const std::string& persistent_key) {
-  std::unique_lock<std::shared_mutex> lock(cache_mutex_);
-  RecordPersistentKeyHintLocked(base_key, persistent_key);
-}
-
-void CompilationCache::RecordPersistentKeyHintLocked(const std::string& base_key,
-                                                     const std::string& persistent_key) {
-  if (base_key.empty() || persistent_key.empty()) {
-    return;
-  }
-  persistent_key_hints_[base_key] = persistent_key;
-}
-
 bool CompilationCache::CheckCacheAndCoordinateWork(
     const CompilationCacheKey& key, const CompilableKernelExecution& kernel_execution,
     uint32_t stream_id) {
   const std::string& cache_key = key.GetKey();
-  std::string persistent_cache_key;
   // First check in-memory cache and pending compilations with lock held.
   {
     std::unique_lock<std::shared_mutex> lock(cache_mutex_);
@@ -310,32 +276,39 @@ bool CompilationCache::CheckCacheAndCoordinateWork(
       cache_cv_.notify_all();
       return false;
     }
-    persistent_cache_key = ResolvePersistentKeyLocked(key);
-    if (persistent_cache_key.empty()) {
-      TORCH_NEURONX_DEBUG("Skipping persistent cache (no HLO bytes and no key hint):",
-                          key.ToString());
-      auto compilation_promise = std::make_shared<std::promise<std::shared_ptr<CacheEntry>>>();
-      pending_compilations_.emplace(cache_key, PendingCompilation(compilation_promise));
-      cache_cv_.notify_all();
-      return false;
-    }
+  }  // Lock released before I/O persistent cache check.
+
+  // Check persistent cache (NFS/disk) using the persistent key from CompilationCacheKey.
+  // GetPersistentKey() returns nullptr if HLO bytes aren't available
+  // (e.g., NeffDirectKernelExecution paths) — gracefully skip persistent
+  // lookup in that case and register pending compilation.
+  const std::string* persistent_cache_key = key.GetPersistentKey();
+  if (persistent_cache_key == nullptr) {
+    TORCH_NEURONX_DEBUG("Skipping persistent cache (no HLO bytes):", key.ToString());
+    std::unique_lock<std::shared_mutex> lock(cache_mutex_);
+    auto compilation_promise = std::make_shared<std::promise<std::shared_ptr<CacheEntry>>>();
+    pending_compilations_.emplace(cache_key, PendingCompilation(compilation_promise));
+    cache_cv_.notify_all();
+    return false;
   }
 
   const bool requires_wrapped_hlo = kernel_execution.RequiresWrappedNeffHlo();
 
-  // Release the cache lock before disk or NFS access.
-  auto neff_bytes = persistent_cache_->Get(persistent_cache_key);
+  auto neff_bytes = persistent_cache_->Get(*persistent_cache_key);
   std::optional<std::vector<uint8_t>> wrapped_hlo_bytes;
   if (neff_bytes && requires_wrapped_hlo && wrapped_hlo_cache_) {
-    if (auto stored = wrapped_hlo_cache_->Get(persistent_cache_key)) {
+    if (auto stored = wrapped_hlo_cache_->Get(*persistent_cache_key)) {
       wrapped_hlo_bytes = DecodeWrappedHloSidecar(*stored);
     }
   }
   if (neff_bytes && (!requires_wrapped_hlo || wrapped_hlo_bytes)) {
     TORCH_NEURONX_DEBUG("Persistent cache hit:", key.ToString());
 
+    // Record persistent cache hit.
+    TORCH_NEURONX_COUNTER("CompilationCache.PersistentHits", 1);
+
     // Create cache entry and store in memory cache.
-    auto cache_entry = std::make_shared<CacheEntry>(std::move(*neff_bytes), persistent_cache_key,
+    auto cache_entry = std::make_shared<CacheEntry>(std::move(*neff_bytes), *persistent_cache_key,
                                                     std::chrono::milliseconds(0));
     if (wrapped_hlo_bytes) {
       cache_entry->wrapped_neff_hlo = std::move(*wrapped_hlo_bytes);
@@ -343,21 +316,11 @@ bool CompilationCache::CheckCacheAndCoordinateWork(
 
     {
       std::unique_lock<std::shared_mutex> lock(cache_mutex_);
-      // Keep a successful entry because a kernel can still refer to its NEFF bytes.
-      auto [it, inserted] = cache_.try_emplace(cache_key, cache_entry);
-      if (!inserted && !it->second->IsFailed()) {
-        it->second->UpdateAccess();
-        TORCH_NEURONX_COUNTER("CompilationCache.InMemoryHits", 1);
-      } else {
-        // A failed entry has no NEFF pointer. Replace it with the valid disk result.
-        if (!inserted) it->second = cache_entry;
-        TORCH_NEURONX_COUNTER("CompilationCache.PersistentHits", 1);
-      }
-      RecordPersistentKeyHintLocked(cache_key, persistent_cache_key);
+      cache_[cache_key] = cache_entry;
       cache_cv_.notify_all();
 
       // Create managed pointer and set on kernel execution.
-      auto neff_ptr = CreateNeffBytesPtr(it->second->neff_bytes, cache_key);
+      auto neff_ptr = CreateNeffBytesPtr(cache_entry->neff_bytes, cache_key);
       kernel_execution.SetCachedNeff(std::move(neff_ptr));
     }
     // Check if eviction is needed after adding new entry.
@@ -405,6 +368,7 @@ void CompilationCache::GetOrCompileNeffAsync(
     const CompilableKernelExecution& kernel_execution, uint32_t stream_id,
     std::function<void(bool success, const std::string& error)> callback) {
   const auto& key = kernel_execution.GetCompilationCacheKey();
+  const std::string& cache_key = key.GetKey();
 
   // Check caches (memory + persistent) and coordinate work scheduling.
   if (CheckCacheAndCoordinateWork(key, kernel_execution, stream_id)) {
@@ -413,7 +377,45 @@ void CompilationCache::GetOrCompileNeffAsync(
       callback(true, "");
       return;
     }
-    ContinuePendingCompilationAsync(kernel_execution, std::move(callback));
+    // Another thread is compiling — get the future before it's cleaned up.
+    std::shared_future<std::shared_ptr<CacheEntry>> compilation_future;
+    {
+      std::shared_lock<std::shared_mutex> lock(cache_mutex_);
+      auto pending_it = pending_compilations_.find(cache_key);
+      if (pending_it != pending_compilations_.end()) {
+        compilation_future = pending_it->second.future;
+      }
+    }
+
+    if (!compilation_future.valid()) {
+      std::shared_lock<std::shared_mutex> lock(cache_mutex_);
+      auto it = cache_.find(cache_key);
+      if (it != cache_.end() && it->second) {
+        auto neff_ptr = CreateNeffBytesPtr(it->second->neff_bytes, cache_key);
+        kernel_execution.SetCachedNeff(std::move(neff_ptr));
+        callback(true, "");
+        return;
+      }
+      callback(false, "");
+      return;
+    }
+
+    // Submit wait to thread pool (don't block compilation worker).
+    std::string cache_key_copy = cache_key;
+    compilation_pool_->Submit([this, cache_key_copy, &kernel_execution,
+                               compilation_future = std::move(compilation_future),
+                               callback = std::move(callback)]() {
+      try {
+        auto cache_entry = compilation_future.get();
+        auto neff_ptr = CreateNeffBytesPtr(cache_entry->neff_bytes, cache_key_copy);
+        kernel_execution.SetCachedNeff(std::move(neff_ptr));
+        callback(true, "");
+      } catch (const std::exception& e) {
+        callback(false, e.what());
+      } catch (...) {
+        callback(false, "Unknown error while waiting for pending compilation");
+      }
+    });
     return;
   }
 
@@ -430,57 +432,6 @@ void CompilationCache::GetOrCompileNeffAsync(
           callback(false, "Unknown internal compilation error");
         }
       });
-}
-
-void CompilationCache::ContinuePendingCompilationAsync(
-    const CompilableKernelExecution& kernel_execution,
-    std::function<void(bool success, const std::string& error)> callback) {
-  const std::string& cache_key = kernel_execution.GetCompileKey();
-  std::shared_future<std::shared_ptr<CacheEntry>> compilation_future;
-  bool success = false;
-  std::string error;
-  {
-    std::shared_lock<std::shared_mutex> lock(cache_mutex_);
-    auto pending_it = pending_compilations_.find(cache_key);
-    if (pending_it != pending_compilations_.end()) {
-      compilation_future = pending_it->second.future;
-    } else {
-      // The compilation can finish before this request captures its future.
-      auto it = cache_.find(cache_key);
-      if (it != cache_.end() && it->second) {
-        if (it->second->IsFailed()) {
-          error = it->second->GetFailureMessage();
-        } else {
-          auto neff_ptr = CreateNeffBytesPtr(it->second->neff_bytes, cache_key);
-          kernel_execution.SetCachedNeff(std::move(neff_ptr));
-          success = true;
-        }
-      }
-    }
-  }
-
-  if (!compilation_future.valid()) {
-    // Release the cache lock before the callback calls other cache methods.
-    callback(success, error);
-    return;
-  }
-
-  // Submit the wait to the thread pool so the caller can continue.
-  std::string cache_key_copy = cache_key;
-  compilation_pool_->Submit([this, cache_key_copy, &kernel_execution,
-                             compilation_future = std::move(compilation_future),
-                             callback = std::move(callback)]() {
-    try {
-      auto cache_entry = compilation_future.get();
-      auto neff_ptr = CreateNeffBytesPtr(cache_entry->neff_bytes, cache_key_copy);
-      kernel_execution.SetCachedNeff(std::move(neff_ptr));
-      callback(true, "");
-    } catch (const std::exception& e) {
-      callback(false, e.what());
-    } catch (...) {
-      callback(false, "Unknown error while waiting for pending compilation");
-    }
-  });
 }
 
 std::string CompilationCache::GetBackendName() const {
@@ -671,8 +622,6 @@ std::vector<uint8_t> CompilationCache::GetWrappedNeffHlo(const std::string& cach
 
 at::neuron::NeffBytesPtr CompilationCache::CreateNeffBytesPtr(
     const std::vector<uint8_t>& neff_bytes, const std::string& cache_key) {
-  // TODO: Retain CacheEntry ownership in each NEFF handle to keep bytes alive during eviction.
-  // Protect entries before activation and count active users per key.
   MarkEntryActive(cache_key);
   CacheEntryGuard guard(this, cache_key);
   return NeffBytesPtr(&neff_bytes, std::move(guard));
@@ -768,25 +717,22 @@ std::shared_ptr<CacheEntry> CompilationCache::Compile(
     return compilation_result;
   } catch (const std::exception& e) {
     HandleCompilationFailure(key, compilation_promise, e.what());
-    ThrowCompilationError(key, e.what());
+    throw;
   }
 }
 
 std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
     const CompilableKernelExecution& kernel_execution, const CompilationCacheKey& key) {
   const std::string& cache_key = key.GetKey();
-  // Get persistent key for the file lock and cache storage. When it is empty we compile
-  // without persistent coordination: no cross-process file lock, no persistent put.
-  std::string persistent_cache_key;
-  {
-    std::shared_lock<std::shared_mutex> cache_lock(cache_mutex_);
-    persistent_cache_key = ResolvePersistentKeyLocked(key);
-  }
+  // Get persistent key for file lock and cache storage. May be nullptr when
+  // HLO bytes aren't available — in that case we compile without persistent
+  // coordination (no cross-process file lock, no persistent put).
+  const std::string* persistent_cache_key = key.GetPersistentKey();
 
   // Optional file lock: only when we have a persistent key to coordinate on.
   std::optional<FileLockGuard> lock_guard;
-  if (!persistent_cache_key.empty()) {
-    std::filesystem::path lock_path = GetLockPath(persistent_cache_key);
+  if (persistent_cache_key != nullptr) {
+    std::filesystem::path lock_path = GetLockPath(*persistent_cache_key);
     TORCH_NEURONX_DEBUG("Acquiring compilation lock:", "CompilationCacheKey=", key.ToString(),
                         "lock_path=", lock_path.string());
     lock_guard.emplace(lock_path);
@@ -797,11 +743,11 @@ std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
 
   // Double-check persistent cache after acquiring lock.
   // Another process may have completed compilation while waiting for lock.
-  if (persistent_cache_ && !persistent_cache_key.empty()) {
-    auto neff_bytes = persistent_cache_->Get(persistent_cache_key);
+  if (persistent_cache_ && persistent_cache_key != nullptr) {
+    auto neff_bytes = persistent_cache_->Get(*persistent_cache_key);
     std::optional<std::vector<uint8_t>> wrapped_hlo_bytes;
     if (neff_bytes && requires_wrapped_hlo && wrapped_hlo_cache_) {
-      if (auto stored = wrapped_hlo_cache_->Get(persistent_cache_key)) {
+      if (auto stored = wrapped_hlo_cache_->Get(*persistent_cache_key)) {
         wrapped_hlo_bytes = DecodeWrappedHloSidecar(*stored);
       }
     }
@@ -813,7 +759,7 @@ std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
       TORCH_NEURONX_COUNTER("CompilationCache.PersistentHits", 1);
 
       // Create cache entry from persistent cache hit.
-      auto cache_entry = std::make_shared<CacheEntry>(std::move(*neff_bytes), persistent_cache_key,
+      auto cache_entry = std::make_shared<CacheEntry>(std::move(*neff_bytes), *persistent_cache_key,
                                                       std::chrono::milliseconds(0));
       if (wrapped_hlo_bytes) {
         cache_entry->wrapped_neff_hlo = std::move(*wrapped_hlo_bytes);
@@ -822,13 +768,8 @@ std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
       // Store in memory cache using original cache_key.
       {
         std::unique_lock<std::shared_mutex> cache_lock(cache_mutex_);
-        auto [it, inserted] = cache_.try_emplace(cache_key, cache_entry);
-        if (!inserted) cache_entry = it->second;
-        RecordPersistentKeyHintLocked(cache_key, persistent_cache_key);
+        cache_[cache_key] = cache_entry;
         cache_cv_.notify_all();
-      }
-      if (cache_entry->IsFailed()) {
-        ThrowCompilationError(key, cache_entry->GetFailureMessage());
       }
 
       // Check if eviction is needed after adding new entry.
@@ -884,7 +825,8 @@ std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
   // Create cache entry with compiled NEFF and timing information.
   // Use persistent key when available, fall back to in-memory cache_key
   // for entries that can't be persistently cached (no HLO bytes).
-  const std::string& entry_key = !persistent_cache_key.empty() ? persistent_cache_key : cache_key;
+  const std::string& entry_key =
+      persistent_cache_key != nullptr ? *persistent_cache_key : cache_key;
   auto cache_entry = std::make_shared<CacheEntry>(std::move(compile_result.neff_bytes), entry_key,
                                                   compilation_time);
   cache_entry->wrapped_neff_hlo = std::move(compile_result.wrapped_neff_hlo);
@@ -892,24 +834,19 @@ std::shared_ptr<CacheEntry> CompilationCache::CompileAndCache(
   // Store the cache entry in memory using original cache_key.
   {
     std::unique_lock<std::shared_mutex> cache_lock(cache_mutex_);
-    auto [it, inserted] = cache_.try_emplace(cache_key, cache_entry);
-    if (!inserted) cache_entry = it->second;
-    RecordPersistentKeyHintLocked(cache_key, persistent_cache_key);
-  }
-  if (cache_entry->IsFailed()) {
-    ThrowCompilationError(key, cache_entry->GetFailureMessage());
+    cache_[cache_key] = cache_entry;
   }
 
   // Store to persistent cache (NFS/disk) for cross-process sharing.
   // Skip when no persistent key (no HLO bytes available).
-  if (persistent_cache_ && !persistent_cache_key.empty()) {
-    if (persistent_cache_->Put(persistent_cache_key, cache_entry->neff_bytes)) {
+  if (persistent_cache_ && persistent_cache_key != nullptr) {
+    if (persistent_cache_->Put(*persistent_cache_key, cache_entry->neff_bytes)) {
       TORCH_NEURONX_DEBUG("Stored to persistent cache", key.ToString());
     }
     // Always persist a version-tagged sidecar for WLO (even zero transforms) so a cross-process
     // WLO hit can tell "zero transforms" (valid) from "sidecar missing" (recompile).
     if (wrapped_hlo_cache_ && requires_wrapped_hlo) {
-      wrapped_hlo_cache_->Put(persistent_cache_key,
+      wrapped_hlo_cache_->Put(*persistent_cache_key,
                               EncodeWrappedHloSidecar(cache_entry->wrapped_neff_hlo));
     }
   }
@@ -933,7 +870,7 @@ void CompilationCache::HandleCompilationFailure(
   // Cache the failed entry so subsequent lookups fail fast.
   {
     std::unique_lock<std::shared_mutex> lock(cache_mutex_);
-    cache_.try_emplace(cache_key, CacheEntry::Failed(cache_key, full_error_msg));
+    cache_[cache_key] = CacheEntry::Failed(cache_key, full_error_msg);
   }
   CheckAndEvictIfNeeded();
 

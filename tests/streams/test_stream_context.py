@@ -12,9 +12,6 @@ from tests.utils.neuron_test_utils import requires_nrt_streams
 class TestStreamContext:
     """Test stream context manager functionality."""
 
-    @pytest.mark.needs_process_isolation(
-        reason="requires_nrt_streams sets the stream flags, which C++ keeps after first use."
-    )
     @requires_nrt_streams
     def test_stream_context_manager(self):
         """Test stream context manager switches current stream."""

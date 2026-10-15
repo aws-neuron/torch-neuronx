@@ -14,20 +14,15 @@ import nki.language as nl
 
 @nki.jit()
 def sigmoid_backward_kernel(grad_output, output, num_m_tiles):
-    """Compute sigmoid input gradients over dynamic row tiles.
+    """
+    Sigmoid backward: grad_input = grad_output * output * (1 - output)
 
     Args:
-        grad_output (nki.language.ndarray): Gradient with respect to the sigmoid output.
-        output (nki.language.ndarray): Sigmoid output with shape ``[m_static, hidden]``.
-        num_m_tiles (nki.language.ndarray): Number of 128-row tiles to process.
-
+        grad_output: [m_static, hidden] bf16 on HBM
+        output: [m_static, hidden] bf16 on HBM — sigmoid(x) from the forward pass
+        num_m_tiles: [1, 1] int32
     Returns:
-        nki.language.ndarray: Tensor with the gradient shape and dtype whose first
-            ``128 * num_m_tiles[0]`` rows contain ``grad_output * output * (1 - output)``.
-
-    Note:
-        Later rows are left unwritten. Arithmetic remains in the input dtype without an
-        fp32 upcast.
+        grad_input: [m_static, hidden] bf16 on HBM
     """
     m_static, hidden = grad_output.shape
 
@@ -55,12 +50,7 @@ def sigmoid_backward_kernel(grad_output, output, num_m_tiles):
     m_tile_start = nl.ndarray((1, 1), nl.int32, buffer=nl.sbuf)
     nisa.memset(m_tile_start, 0.0)
 
-    def body(_i):
-        """Compute one dynamic row-tile iteration.
-
-        Args:
-            _i (int): Loop iteration index accepted but not used.
-        """
+    for _ in nl.dynamic_range(0, num_m_tiles_reg, 1):
         for seg in range(len(h_starts)):
             h_start = h_starts[seg]
             h_width = h_widths[seg]
@@ -127,7 +117,5 @@ def sigmoid_backward_kernel(grad_output, output, num_m_tiles):
             )
 
         nisa.tensor_scalar(m_tile_start, m_tile_start, nl.add, tile_size_m)
-
-    nl.fori_loop(0, num_m_tiles_reg, body)
 
     return result

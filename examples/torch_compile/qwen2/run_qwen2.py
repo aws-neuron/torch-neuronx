@@ -54,17 +54,7 @@ torch.set_default_dtype(torch.float32)
 
 
 def get_model_id(model_size: str) -> str:
-    """Return the Hugging Face model identifier for a configured size.
-
-    Args:
-        model_size (str): Model size key in ``MODEL_CONFIGS``.
-
-    Returns:
-        str: Hugging Face model identifier.
-
-    Raises:
-        ValueError: If ``model_size`` is not configured.
-    """
+    """Get HuggingFace model ID based on size."""
     if model_size not in MODEL_CONFIGS:
         raise ValueError(
             f"Unsupported model size: {model_size}. Choose from {list(MODEL_CONFIGS.keys())}"
@@ -74,17 +64,7 @@ def get_model_id(model_size: str) -> str:
 
 
 def get_tp_degree(model_size: str) -> int:
-    """Return the tensor-parallel degree for a configured model size.
-
-    Args:
-        model_size (str): Model size key in ``MODEL_CONFIGS``.
-
-    Returns:
-        int: Configured tensor-parallel degree.
-
-    Raises:
-        ValueError: If ``model_size`` is not configured.
-    """
+    """Get tensor parallelism degree for model size."""
     if model_size not in MODEL_CONFIGS:
         raise ValueError(
             f"Unsupported model size: {model_size}. Choose from {list(MODEL_CONFIGS.keys())}"
@@ -94,15 +74,7 @@ def get_tp_degree(model_size: str) -> int:
 
 
 def load_tokenizer(model_id: str) -> AutoTokenizer:
-    """Load and configure a Hugging Face tokenizer.
-
-    Args:
-        model_id (str): Hugging Face model identifier to load.
-
-    Returns:
-        PreTrainedTokenizerBase: Concrete tokenizer selected by ``AutoTokenizer``, with
-            its padding token set to the end-of-sequence token when absent.
-    """
+    """Load the HuggingFace tokenizer."""
     logger.info(f"Loading tokenizer from {model_id}...")
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -114,14 +86,12 @@ def load_tokenizer(model_id: str) -> AutoTokenizer:
 
 
 def apply_qwen2_tp(model, tp_mesh):
-    """Apply the Qwen2 tensor-parallel plan in place.
+    """
+    Apply tensor parallelism to HuggingFace Qwen2 model.
 
-    Args:
-        model (torch.nn.Module): Qwen2 model whose transformer layers to parallelize.
-        tp_mesh (DeviceMesh): Device mesh used to shard each layer.
-
-    Returns:
-        torch.nn.Module: The input model after its attention and MLP projections are parallelized.
+    Qwen2 Architecture:
+    - Attention: q_proj, k_proj, v_proj (Colwise), o_proj (Rowwise)
+    - MLP (SwiGLU): gate_proj, up_proj (Colwise), down_proj (Rowwise)
     """
     layer_tp_plan = {
         # Self Attention Block
@@ -148,18 +118,15 @@ def create_qwen2_model_with_tp(
     device: torch.device,
     rank: int,
 ) -> nn.Module:
-    """Create a Qwen2 model on the target device.
-
-    Args:
-        model_id (str): Hugging Face model identifier to load.
-        world_size (int): Number of distributed processes.
-        device_mesh (DeviceMesh): Mesh used for tensor parallelism when ``world_size`` exceeds one.
-        device (torch.device): Device to receive the model.
-        rank (int): Process rank used in status messages.
-
-    Returns:
-        torch.nn.Module: Loaded model, tensor-parallelized when requested, on ``device``.
     """
+    Create Qwen2 model: CPU (with weights) -> TP -> move to device.
+
+    This approach:
+    1. Loads model with real weights to CPU
+    2. Applies TP (shards the weights according to the plan)
+    3. Moves to target device
+    """
+
     logger.info(f"Rank {rank}: Loading model from {model_id}...")
     load_start = time.time()
     model = AutoModelForCausalLM.from_pretrained(
@@ -192,18 +159,11 @@ def tokenize_prompt(
     device: torch.device,
     max_seq_len: int = MAX_SEQ_LEN,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Tokenize and right-pad a prompt to a fixed sequence length.
-
-    Args:
-        tokenizer (PreTrainedTokenizerBase): Tokenizer used to encode and pad the prompt.
-        prompt (str): Text to encode.
-        device (torch.device): Device on which to create the tensors.
-        max_seq_len (int, optional): Padded sequence length. Defaults to ``MAX_SEQ_LEN``.
+    """
+    Tokenize a prompt and pad to fixed length.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor, int]: Two ``torch.long`` tensors of shape
-            ``(1, max_seq_len)`` containing input IDs and a binary attention mask,
-            followed by the post-truncation prompt length.
+        Tuple of (input_ids, attention_mask, prompt_length)
     """
     logger.info(f"Tokenizing prompt: '{prompt}'")
 
@@ -235,22 +195,7 @@ def tokenize_prompt(
 
 
 def run_qwen2_generation(**kwargs):
-    """Attempt distributed Qwen2 generation on Neuron devices.
-
-    Args:
-        **kwargs (Any): Generation options. ``model_size``, ``max_seq_len``, and
-            ``prompt`` default to ``DEFAULT_MODEL_SIZE``, ``MAX_SEQ_LEN``, and
-            ``DEFAULT_PROMPT``; ``max_new_tokens`` and unrecognized options are ignored.
-
-    Raises:
-        ValueError: If the model size is unsupported, the process count does not
-            match its tensor-parallel degree, or Transformers rejects the generation length.
-
-    Note:
-        The current path pads inputs to ``max_seq_len`` and also sets ``max_length``
-        to that value. Thus, Transformers rejects generation before decoding. An exception
-        after process-group initialization can leave the group initialized.
-    """
+    """Test Qwen2 model generation."""
     model_size = kwargs.get("model_size", DEFAULT_MODEL_SIZE)
     max_seq_len = kwargs.get("max_seq_len", MAX_SEQ_LEN)
     prompt = kwargs.get("prompt", DEFAULT_PROMPT)
@@ -361,11 +306,6 @@ def run_qwen2_generation(**kwargs):
 
 
 def parse_args():
-    """Parse command-line options for the Qwen2 generation example.
-
-    Returns:
-        argparse.Namespace: Parsed model size, token limit, sequence length, and prompt.
-    """
     parser = argparse.ArgumentParser(
         description="Test Qwen2 generation with tensor parallelism on Neuron devices"
     )

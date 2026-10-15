@@ -192,19 +192,8 @@ def _tile_for(target_bytes, num_ranks, n_prgs, dtype_size=2, per_rank=False):
 
 
 def regime_tiles(num_ranks, n_prgs, targets, dtype_size=2, per_rank=False):
-    """Convert byte targets into non-increasing element tiles.
-
-    Args:
-        num_ranks (int): Number of ranks participating in the collective.
-        n_prgs (int): Number of NKI programs used as the minimum tile size.
-        targets (tuple): Large, medium, and small byte targets for the regime.
-        dtype_size (int, optional): Number of bytes per tensor element. Defaults to ``2``.
-        per_rank (bool, optional): Whether targets count per-rank rather than gathered bytes.
-            Defaults to ``False``.
-
-    Returns:
-        tuple: Large, medium, and small element tile sizes.
-    """
+    """Convert a regime's three byte targets into three non-increasing pow2 element tiles
+    (large >= medium >= small)."""
     large_t, medium_t, small_t = targets
     large = _tile_for(large_t, num_ranks, n_prgs, dtype_size, per_rank)
     medium = min(large, _tile_for(medium_t, num_ranks, n_prgs, dtype_size, per_rank))
@@ -213,26 +202,14 @@ def regime_tiles(num_ranks, n_prgs, targets, dtype_size=2, per_rank=False):
 
 
 def compute_tiling(numel, num_ranks, n_prgs, table, dtype_size=2, per_rank=False):
-    """Select a tiling regime and derive its element tile sizes.
+    """Shared tiling core for the dynamic collectives. Walk `table` (regimes ordered by
+    DESCENDING floor, last floor == 0) by this shard's message bytes, then convert the matched
+    regime's byte targets into three non-increasing pow2 element tiles. Returns
+    (large, medium, small, regime_name).
 
-    Args:
-        numel (int): Number of logical elements in the per-rank shard.
-        num_ranks (int): Number of ranks participating in the collective.
-        n_prgs (int): Number of NKI programs used as the minimum tile size.
-        table (list): Regimes ordered by descending byte floor with a final zero floor.
-        dtype_size (int, optional): Number of bytes per tensor element. Defaults to ``2``.
-        per_rank (bool, optional): Whether message bytes exclude the world-size multiplier.
-            Defaults to ``False``.
-
-    Returns:
-        tuple: Large, medium, and small tile sizes followed by the matched regime name.
-
-    Raises:
-        RuntimeError: If no regime matches the computed message size.
-
-    Note:
-        All-gather counts gathered bytes, while all-reduce counts per-rank bytes.
-    """
+    Both collectives share this core; they differ only in the table + byte accounting:
+      * all-gather: gathered-byte table, per_rank=False (message = numel * dtype * world).
+      * all-reduce: per-rank-byte table, per_rank=True  (message = numel * dtype)."""
     message = numel * _msg_bytes_per_elem(num_ranks, dtype_size, per_rank)
     for name, floor, targets in table:
         if message >= floor:
@@ -244,20 +221,9 @@ def compute_tiling(numel, num_ranks, n_prgs, table, dtype_size=2, per_rank=False
 def pick_dynamic_tiling(
     numel, num_ranks, n_prgs, dtype_size=2, platform="trn2", collective="allgather"
 ):
-    """Select dynamic collective tiles from the platform-specific table.
-
-    Args:
-        numel (int): Number of logical elements in the per-rank shard.
-        num_ranks (int): Number of ranks participating in the collective.
-        n_prgs (int): Number of NKI programs used as the minimum tile size.
-        dtype_size (int, optional): Number of bytes per tensor element. Defaults to ``2``.
-        platform (str, optional): Neuron platform target. Defaults to ``"trn2"``.
-        collective (str, optional): Collective name, ``"allgather"`` or ``"allreduce"``.
-            Defaults to ``"allgather"``.
-
-    Returns:
-        tuple: Large, medium, and small tile sizes followed by the matched regime name.
-    """
+    """Tile selection for `collective`: resolve the (platform, collective, group-size) table and
+    walk it via the shared compute_tiling core. All-gather counts gathered bytes; all-reduce
+    counts per-rank bytes (see _COLLECTIVE_PER_RANK)."""
     table = _resolve_table(platform, num_ranks, collective)
     per_rank = _COLLECTIVE_PER_RANK[collective]
     return compute_tiling(numel, num_ranks, n_prgs, table, dtype_size, per_rank)
@@ -312,45 +278,17 @@ def _plan_dynamic(numel, world, n_prgs, dtype_size, platform, collective):
 
 
 def plan_dynamic_allgather(numel, world, n_prgs, dtype_size=2, platform="trn2"):
-    """Build the dynamic all-gather tiling plan for a per-rank shard.
-
-    Args:
-        numel (int): Number of elements in the per-rank shard.
-        world (int): Replica-group size.
-        n_prgs (int): Number of NKI programs.
-        dtype_size (int, optional): Number of bytes per tensor element. Defaults to ``2``.
-        platform (str, optional): Neuron platform target. Defaults to ``"trn2"``.
-
-    Returns:
-        dict or None: Keys ``large``, ``medium``, ``small``, ``regime``,
-            ``trace_numel``, and ``unroll``, or ``None`` when the shard is too small or
-            ``world`` is not divisible by ``n_prgs``.
-
-    Note:
-        Regime selection is keyed on gathered bytes: ``numel * dtype_size * world``.
-    """
+    """Pick the tile sizes and trace floor for gathering a per-rank shard of numel elements.
+    All-gather tiling is keyed on GATHERED bytes (numel * dtype * world); see _plan_dynamic for
+    the returned contract. Returns None when numel is too small or world % n_prgs != 0."""
     return _plan_dynamic(numel, world, n_prgs, dtype_size, platform, "allgather")
 
 
 def plan_dynamic_allreduce(numel, world, n_prgs, dtype_size=2, platform="trn2"):
-    """Build the dynamic all-reduce tiling plan for a per-rank tensor.
-
-    Args:
-        numel (int): Number of elements in the per-rank tensor.
-        world (int): Replica-group size.
-        n_prgs (int): Number of NKI programs.
-        dtype_size (int, optional): Number of bytes per tensor element. Defaults to ``2``.
-        platform (str, optional): Neuron platform target. Defaults to ``"trn2"``.
-
-    Returns:
-        dict or None: Keys ``large``, ``medium``, ``small``, ``regime``,
-            ``trace_numel``, and ``unroll``, or ``None`` when the tensor is too small or
-            ``world`` is not divisible by ``n_prgs``.
-
-    Note:
-        Within the world-selected table, regimes use per-rank bytes without a
-        world-size multiplier.
-    """
+    """Pick the tile sizes and trace floor for all-reducing a per-rank tensor of numel elements.
+    All-reduce output is the same size as its input, so tiling is keyed on per-rank bytes
+    (numel * dtype, world-independent) via the all-reduce table; see _plan_dynamic for the
+    returned contract. Returns None when numel is too small or world % n_prgs != 0."""
     return _plan_dynamic(numel, world, n_prgs, dtype_size, platform, "allreduce")
 
 
@@ -386,11 +324,6 @@ def _run_gather_loop(
     """
 
     def body(_i):
-        """Gather one unrolled trip and advance its carried offsets.
-
-        Args:
-            _i (int): Loop iteration index supplied by ``nl.fori_loop``.
-        """
         for j in range(tiles_per_trip):
             if j == 0:
                 off_in = src_load
@@ -442,25 +375,50 @@ def dynamic_allgather_kernel(
     small_tile: int,
     unroll: int,
 ) -> nl.NkiTensor:
-    """Gather a runtime-sized flattened shard across a replica group.
+    """Dynamic all-gather kernel.
+
+    The input_tensor is flattened to [numel, 1]. At runtime, numel_tensor drives the
+    large, medium, small, and tail tile counts. The large/medium/small tiers process unroll
+    tiles per iteration on independent buffers so the scheduler can overlap one tile's
+    all-gather with the next tile's load.
+
+    Dimensions:
+      numel   per-rank element count (runtime); max_numel is the traced floor.
+      tile    large_tile or small_tile elements, split half=tile/n_prgs per program.
+      output  num_ranks * numel elements; rank r occupies [r*numel : (r+1)*numel).
 
     Args:
-        input_tensor (nl.NkiTensor): Flat ``[max_numel, 1]`` bucket floor reused for larger inputs.
-        numel_tensor (nl.NkiTensor): Runtime ``[1, 1]`` int32 count driving on-device tile counts.
-        replica_group (ReplicaGroup): Ranks participating in the all-gather.
-        num_ranks (int): Compile-time group size split across programs.
-        large_tile (int): Largest tier in a greedy large-to-medium-to-small decomposition.
-        medium_tile (int): Compile-time power-of-two tile no larger than ``large_tile``.
-        small_tile (int): Compile-time tile also used for idempotent backward-aligned tails.
-        unroll (int): Non-tail width in ``{1, 2, 4}``; independent buffers overlap
-            bulk work and isolate remainders.
+      input_tensor   Per-rank shard, bound flat as [max_numel, 1] (max_numel = trace floor).
+      numel_tensor   Runtime [1, 1] int32 scalar = per-rank numel; drives on-device counts.
+      replica_group  Ranks participating in the all-gather.
+      num_ranks      World size for this group (compile-time constant).
+      large_tile     Large-tier tile size in elements (power of two, compile-time constant).
+      medium_tile    Medium-tier tile size in elements (power of two, <= large_tile).
+      small_tile     Small/tail-tier tile size in elements (power of two, <= medium_tile).
+      unroll         Tiles per large/medium/small dynamic-loop iteration; pow2 in {1, 2, 4}.
 
     Returns:
-        nl.NkiTensor: Shared-HBM ``[num_ranks * max_numel, 1]``; rank ``r`` starts at ``r * numel``.
+      out_flat  Gathered [num_ranks * max_numel, 1] shared-HBM tensor.
 
-    Raises:
-        AssertionError: If a tile or ``unroll`` is not a power of two or a tile is
-            not divisible by the program count.
+    Notes:
+      - Multi-core (LNC>=2): ranks are split across programs (ranks_per_prg = num_ranks /
+        n_prgs) and each tile's input rows are split by half; requires num_ranks % n_prgs == 0.
+      - The tail tile starts at numel - small_tile, so when numel mod small_tile != 0 it
+        re-gathers a few already-gathered elements. The double-write is idempotent (same
+        source maps to the same output element), so the result is correct.
+      - unroll splits a tier's tile count as bulk = count >> log2(unroll) plus an
+        unroll-remainder loop of count & (unroll-1) single tiles on dedicated buffers. This
+        unroll remainder is distinct from the tail tier. The tail tier is always a single
+        tile, so it never unrolls.
+      - The shard is reshaped outside the NEFF, so the kernel is shape-agnostic: one NEFF
+        traced at [trace_numel, 1] serves any larger numel in the same bucket.
+
+    Example:
+      world=4, lnc=2 (n_prgs=2), large_tile=131072, medium_tile=65536, small_tile=32768,
+      unroll=2, runtime numel=496520. On device: n_large=3, n_medium=1, n_small=1, tail=1.
+      The large tier runs bulk=1 (2 tiles) then an unroll-remainder loop of 1 tile; the
+      medium and small tiers each run one tile; the tail re-gathers the last 32768 elements.
+      Output is [4*496520, 1] with rank r's shard at [r*496520 : (r+1)*496520).
     """
     max_numel, _one = input_tensor.shape  # bound flat as [numel, 1]
     dtype = input_tensor.dtype
@@ -842,22 +800,9 @@ def _maybe_precompile_remaining_buckets(replica_groups, dtype, current_plan, cur
 
 
 def lower_dynamic_allgather(inputs, replica_groups):
-    """Lower a dynamic all-gather to a bucketed shape-agnostic NEFF.
-
-    Args:
-        inputs (Sequence[torch.Tensor]): Input tensors, with the per-rank shard first.
-        replica_groups (Sequence[Sequence[int]]): Participating replica groups.
-
-    Returns:
-        LoweringResult: StableHLO, cache key, return types, and collective metadata.
-
-    Raises:
-        RuntimeError: If the input is below the dynamic all-gather eligibility floor.
-        AssertionError: If the Python and C++ trace-floor or unroll plans differ.
-
-    Note:
-        The kernel is traced at the bucket floor and reused for larger runtime element counts.
-    """
+    """StableHLO lowering for the dynamic allgather. Traces the kernel at the bucket
+    floor (trace_numel elements) so one shape-agnostic NEFF serves any larger numel at
+    runtime."""
     import torch
 
     from torch_neuronx.nki_hop import kernel_registry
@@ -993,11 +938,6 @@ def _run_reduce_loop(
         identity_chunks = half // identity_elems
 
     def body(_i):
-        """Reduce one unrolled trip and advance its carried offset.
-
-        Args:
-            _i (int): Loop iteration index supplied by ``nl.fori_loop``.
-        """
         for j in range(tiles_per_trip):
             if j == 0:
                 off = base_off
@@ -1069,26 +1009,49 @@ def dynamic_allreduce_kernel(
     unroll: int,
     reduce_op: int,
 ) -> nl.NkiTensor:
-    """Reduce a runtime-sized flattened tensor across a replica group.
+    """Dynamic all-reduce kernel.
+
+    The input_tensor is flattened to [numel, 1]. At runtime, numel_tensor drives the large,
+    medium, small, and tail tile counts (same greedy large -> medium -> small -> tail
+    decomposition as the all-gather kernel). Each tile is all-reduced across the replica group
+    and written back element-for-element, so the output is the same [numel, 1] shape as the
+    input (no rank-major expansion).
+
+    Dimensions:
+      numel   per-rank element count (runtime); max_numel is the traced floor.
+      tile    large_tile / medium_tile / small_tile elements, split half=tile/n_prgs per program.
+      output  numel elements; element i = reduce over ranks of input[i].
 
     Args:
-        input_tensor (nl.NkiTensor): Flat ``[max_numel, 1]`` bucket floor reused for larger inputs.
-        numel_tensor (nl.NkiTensor): Runtime ``[1, 1]`` int32 count driving greedy tier counts.
-        replica_group (ReplicaGroup): Ranks participating in the all-reduce.
-        num_ranks (int): Unused compile-time argument; ``replica_group`` determines participants.
-        large_tile (int): Compile-time large power-of-two tile size.
-        medium_tile (int): Compile-time power-of-two tile no larger than ``large_tile``.
-        small_tile (int): Tile for the nonoverlapping, identity-filled OOB-skipping tail.
-        unroll (int): Non-tail width in ``{1, 2, 4}``; remainders use separate buffers.
-        reduce_op (int): Reduction code: ``0`` for sum, ``1`` for minimum, otherwise maximum.
+      input_tensor   Per-rank tensor, bound flat as [max_numel, 1] (max_numel = trace floor).
+      numel_tensor   Runtime [1, 1] int32 scalar = per-rank numel; drives on-device counts.
+      replica_group  Ranks participating in the all-reduce.
+      num_ranks      World size for this group (compile-time constant).
+      large_tile     Large-tier tile size in elements (power of two, compile-time constant).
+      medium_tile    Medium-tier tile size in elements (power of two, <= large_tile).
+      small_tile     Small/tail-tier tile size in elements (power of two, <= medium_tile).
+      unroll         Tiles per large/medium/small dynamic-loop iteration; pow2 in {1, 2, 4}.
+      reduce_op      Reduction-op code (0=sum, 1=min, 2=max); see _reduce_op_from_code.
 
     Returns:
-        nl.NkiTensor: Dedicated functional output; the backend can bind its storage
-            to the caller tensor without StableHLO alias metadata.
+      out_flat  A dedicated [max_numel, 1] shared-HBM output. The kernel is functional: one
+                ordinary NKI output and no must-alias result (no operand_output_aliases). In-place
+                is achieved by the collective backend binding the same caller tensor to both the
+                input and output NEFF ports, so no StableHLO aliasing metadata is emitted.
 
-    Raises:
-        AssertionError: If a tile or ``unroll`` is not a power of two or a tile is
-            not divisible by the program count.
+    Notes:
+      - Multi-core (LNC>=2): the ELEMENT range of each tile is split across programs (half =
+        tile / n_prgs, this program owns rows [in_start : in_start + half]); requires
+        tile % n_prgs == 0. Unlike all-gather there is no rank split -- every element is a
+        reduction over all ranks -- so there is a single read==write offset per tile.
+      - The tail starts at numel - (numel mod small_tile), the first unprocessed element. Its
+        fixed small_tile staging buffer is identity-filled, then OOB-skipped DMA overlays and
+        writes only the true remainder. No tail element overlaps an earlier in-place result.
+      - unroll splits a tier's tile count as bulk = count >> log2(unroll) plus an
+        unroll-remainder loop of count & (unroll-1) single tiles on dedicated buffers. The tail
+        tier is always a single tile, so it never unrolls.
+      - The tensor is reshaped outside the NEFF, so the kernel is shape-agnostic: one NEFF traced
+        at [trace_numel, 1] serves any larger numel in the same bucket.
     """
     max_numel, _one = input_tensor.shape  # bound flat as [numel, 1]
     dtype = input_tensor.dtype
@@ -1301,26 +1264,10 @@ _C10D_REDUCE_TO_CODE = {0: 0, 3: 1, 4: 2}
 
 
 def lower_dynamic_allreduce(inputs, replica_groups, reduce_op):
-    """Lower a dynamic all-reduce to a bucketed shape-agnostic NEFF.
-
-    Args:
-        inputs (Sequence[torch.Tensor]): Input tensors, with the per-rank tensor first.
-        replica_groups (Sequence[Sequence[int]]): Participating replica groups.
-        reduce_op (int): c10d code ``0`` (sum), ``3`` (minimum), or ``4`` (maximum).
-
-    Returns:
-        LoweringResult: StableHLO, cache key, return types, and collective metadata.
-
-    Raises:
-        RuntimeError: If ``reduce_op`` is unsupported or the input is below the
-            eligibility floor.
-        AssertionError: If the Python and C++ trace-floor or unroll plans differ.
-
-    Note:
-        The reduction code is folded into the kernel cache key, and the bucket-floor NEFF
-        serves larger runtime element counts. At execution, the C++ backend binds the caller
-        tensor to both NEFF ports, so the reduction writes in place.
-    """
+    """StableHLO lowering for the dynamic all-reduce. Traces the kernel at the bucket floor
+    (trace_numel elements) so one shape-agnostic NEFF serves any larger numel at runtime.
+    `reduce_op` is the c10d ReduceOp int (SUM/MIN/MAX); it is folded into the kernel + cache
+    key so add/min/max get distinct NEFFs."""
     import torch
 
     from torch_neuronx import _C

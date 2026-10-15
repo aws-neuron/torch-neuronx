@@ -125,6 +125,10 @@ bool NeuronWork::isCompleted() {
     }
   }
 
+  // Query the end event directly (non-blocking).
+  // Thread-safe without mutex because:
+  // NeuronEvent::query() reads from std::atomic<bool> is_completed
+  // Called from: main thread (wait()), watchdog thread (work iteration)
   return end_event_.query();
 }
 
@@ -173,9 +177,6 @@ c10::intrusive_ptr<c10::ivalue::Future> NeuronWork::getFuture() { return future_
 
 float NeuronWork::getDuration() const {
   TORCH_CHECK(timing_enabled_, "getDuration() only works if timing was enabled");
-  // wait() may return before end_event_ is CPU-complete; elapsed_time() no
-  // longer blocks, so synchronize explicitly first.
-  end_event_.synchronize();
   return start_event_.elapsed_time(end_event_);
 }
 

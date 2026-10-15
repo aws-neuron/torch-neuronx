@@ -29,16 +29,11 @@ _handlers: dict[str, Callable] = {}
 
 
 def register(op_name: str, handler: Callable) -> None:
-    """Register an ATen error handler for device faults.
+    """Register ``handler`` for ``op_name`` (aten name). Called once at import.
 
-    Args:
-        op_name (str): ATen operation name used as the registry key.
-        handler (Callable): Callback receiving the faulting operation's lazy context.
-
-    Note:
-        The callback must raise the precise exception only when its fault applies and must not
-        mutate the context or inputs. Registration replaces any handler for the same name.
-    """
+    The handler receives an ``_C.OpErrorContext`` over the faulting op's inputs
+    and must raise the precise op-specific exception iff the fault applies. It
+    should not mutate anything."""
     with _lock:
         _handlers[op_name] = handler
 

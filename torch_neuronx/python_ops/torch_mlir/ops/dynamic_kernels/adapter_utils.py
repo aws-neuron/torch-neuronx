@@ -24,14 +24,7 @@ _MM_BLOCK_N_CANDIDATES = (1024, 512, 256, 128)
 
 
 def mm_block_size_n(num_tile_k: int) -> int:
-    """Select the widest candidate N-block whose resident right operand fits SBUF.
-
-    Args:
-        num_tile_k (int): Number of K-dimension tiles in the right operand.
-
-    Returns:
-        int: Selected N-block width, or the narrowest candidate when none fit.
-    """
+    """Widest candidate n-block width whose resident rhs fits SBUF (narrowest if none)."""
     for cand in _MM_BLOCK_N_CANDIDATES:
         if num_tile_k * cand * 2 <= _MM_RESIDENT_BUDGET:
             return cand

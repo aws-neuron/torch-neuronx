@@ -89,36 +89,24 @@ def _emit_tile(input_tensor, result, hidden, h_starts, h_widths, row_off, out_dt
 
 
 def make_cast_kernel(out_dtype):
-    """Build a dynamic-row cast kernel for a target dtype.
+    """Build a dynamic-row cast kernel whose result dtype is ``out_dtype``.
 
-    Args:
-        out_dtype (NKI dtype): Result dtype to bind into the kernel.
-
-    Returns:
-        Callable: JIT-compiled cast kernel.
-
-    Note:
-        The default-bound dtype is a trace-time constant that ``wrap_nki`` folds into
-        the NEFF; a plain closure fails tracing with an unbound variable.
+    ``out_dtype`` is bound as a default parameter value: the tracer reads that as a
+    local constant (a plain closure fails to trace with "unbound variable") and
+    ``wrap_nki`` folds the non-tensor parameter into the NEFF.
     """
 
     @nki.jit()
     def cast_kernel(input_tensor, num_rows, out_dtype=out_dtype):
-        """Cast runtime-selected rows of a tensor to a bound dtype.
+        """
+        Dtype cast: output = input_tensor.astype(out_dtype)
 
         Args:
-            input_tensor (tensor): Source ``[m_static, hidden]`` tensor in HBM.
-            num_rows (tensor): Int32 ``[1, 1]`` runtime row count, at least 128.
-            out_dtype (NKI dtype, optional): Result dtype. Defaults to the dtype bound
-                by ``make_cast_kernel``.
-
+            input_tensor: [m_static, hidden] on HBM (source dtype)
+            num_rows: [1, 1] int32 — the real row count M to convert (>= 128)
+            out_dtype: NKI dtype of the result — baked constant (default-bound)
         Returns:
-            tensor: ``[m_static, hidden]`` HBM tensor in ``out_dtype``.
-
-        Note:
-            A same-dtype copy skips conversion. A backward-aligned tail repeats rows
-            rather than requiring an unsupported runtime DMA count. Only the first
-            ``num_rows`` rows of the static-shaped result are initialized.
+            output: [m_static, hidden] in `out_dtype` on HBM
         """
         m_static, hidden = input_tensor.shape
 
@@ -159,11 +147,6 @@ def make_cast_kernel(out_dtype):
         nisa.memset(row_cursor, 0.0)
 
         def body(_i):
-            """Process one dynamic row-tile iteration.
-
-            Args:
-                _i (int): Loop iteration index.
-            """
             _emit_tile(
                 input_tensor, result, hidden, h_starts, h_widths, row_cursor, out_dtype, convert
             )

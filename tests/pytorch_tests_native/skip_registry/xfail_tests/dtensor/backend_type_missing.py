@@ -17,4 +17,6 @@ DTENSOR_BACKEND_TYPE_MISSING = [
     "test_dtensor_dynamic_cat",
     "test_dtensor_dynamic_loss_parallel_log_softmax",
     "test_dtensor_dynamic_slice",
+    "test_bernoulli",
+    "test_depthwise_convolution",
 ]

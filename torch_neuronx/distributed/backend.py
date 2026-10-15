@@ -51,7 +51,6 @@ def _register_neuron_backend():
 
 
 def rendezvous_handler():
-    """Return no rendezvous result for the registered Neuron scheme."""
     pass
 
 
@@ -98,21 +97,7 @@ _graph_break_object_collectives()
 
 
 def resolve_visible_cores(visible_cores, local_rank):
-    """Set the visible Neuron core for a local process.
-
-    Args:
-        visible_cores (str or None): Comma-separated core identifiers, an
-            inclusive core range, a single identifier, or a falsey value.
-        local_rank (int): Local process rank used to select a core.
-
-    Raises:
-        RuntimeError: If ``local_rank`` exceeds the available core identifiers.
-        ValueError: If a range endpoint is not an integer.
-
-    Note:
-        Updates ``NEURON_RT_VISIBLE_CORES``. A falsey value uses ``local_rank``;
-        a single identifier is preserved unchanged.
-    """
+    """Resolve NEURON_RT_VISIBLE_CORES for this process."""
     if not visible_cores:
         os.environ["NEURON_RT_VISIBLE_CORES"] = str(local_rank)
         return

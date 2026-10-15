@@ -154,7 +154,6 @@ def _prepare_io(x, other, *, dest=None, rounding_mode=None, **_):
 
 
 def register():
-    """Register the dynamic tensor, row, and scalar division adapter."""
     register_dynamic_nki(
         "div",
         DynamicNkiEntry(

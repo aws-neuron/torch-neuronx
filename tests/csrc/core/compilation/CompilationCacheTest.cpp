@@ -2,7 +2,6 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
-#include <filesystem>
 #include <future>
 #include <thread>
 #include <vector>
@@ -12,7 +11,6 @@
 #include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
-#include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
 #include "torch_neuronx/csrc/core/utils/TempDirectory.h"
 
 using namespace at::neuron;
@@ -20,45 +18,6 @@ using ::testing::_;
 using ::testing::DoAll;
 using ::testing::Return;
 using ::testing::SetArgPointee;
-
-namespace at::neuron {
-
-class CompilationCacheTestPeer {
- public:
-  static auto SeedPending(CompilationCache& cache, const CompilationCacheKey& key) {
-    auto promise = std::make_shared<std::promise<std::shared_ptr<CacheEntry>>>();
-    std::unique_lock<std::shared_mutex> lock(cache.cache_mutex_);
-    CompilationCache::PendingCompilation pending(promise);
-    auto future = pending.future;
-    cache.pending_compilations_.emplace(key.GetKey(), std::move(pending));
-    return std::make_pair(promise, future);
-  }
-
-  static void FailPending(CompilationCache& cache, const CompilationCacheKey& key,
-                          std::shared_ptr<std::promise<std::shared_ptr<CacheEntry>>> promise) {
-    cache.HandleCompilationFailure(key, std::move(promise), "test compilation failed");
-  }
-
-  static std::shared_future<std::shared_ptr<CacheEntry>> SeedFailedPending(
-      CompilationCache& cache, const CompilationCacheKey& key) {
-    const std::string error = "test compilation failed";
-    auto promise = std::make_shared<std::promise<std::shared_ptr<CacheEntry>>>();
-    std::unique_lock<std::shared_mutex> lock(cache.cache_mutex_);
-    cache.cache_.emplace(key.GetKey(), CacheEntry::Failed(key.GetKey(), error));
-    CompilationCache::PendingCompilation pending(promise);
-    auto future = pending.future;
-    cache.pending_compilations_.emplace(key.GetKey(), std::move(pending));
-    promise->set_exception(
-        std::make_exception_ptr(torch_neuronx::CompilationRuntimeException(error)));
-    return future;
-  }
-
-  static void CleanupPending(CompilationCache& cache, const CompilationCacheKey& key) {
-    cache.CleanupPendingCompilation(key);
-  }
-};
-
-}  // namespace at::neuron
 
 class MockNeuronKernelExecution : public CompilableKernelExecution {
  public:
@@ -171,11 +130,9 @@ class CompilationCacheTest : public ::testing::Test {
     for (const auto& [name, value] : saved_env_vars_) {
       setenv(name.c_str(), value.c_str(), 1);
     }
-    // Unset any vars that weren't originally set. Every name that SetUp() saves must
-    // appear here, or SetUp()'s value leaks into a later suite in the same binary.
+    // Unset any vars that weren't originally set
     for (const char* name : {"TORCH_NEURONX_NEFF_CACHE_DIR", "TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR",
-                             "TORCH_NEURONX_NEFF_DISABLE_CACHE", "NEURON_COMPILE_SERVICE",
-                             "TORCH_NEURONX_NEFF_KEY_FROM_HLO"}) {
+                             "TORCH_NEURONX_NEFF_DISABLE_CACHE"}) {
       if (saved_env_vars_.find(name) == saved_env_vars_.end()) {
         unsetenv(name);
       }
@@ -330,14 +287,9 @@ class LimitedCompilationCacheTest : public ::testing::Test {
     SaveEnvVar("NEURON_COMPILATION_CACHE_MAX_SIZE_MB");
     SaveEnvVar("NEURON_COMPILATION_CACHE_MAX_ENTRIES");
     SaveEnvVar("TORCH_NEURONX_NEFF_DISABLE_CACHE");
-    SaveEnvVar("NEURON_COMPILE_SERVICE");
 
     // Disable persistent caching for in-memory cache tests
     setenv("TORCH_NEURONX_NEFF_DISABLE_CACHE", "true", 1);
-
-    // Force the local backend. The mock kernels return dummy NEFF bytes, so the
-    // service backend would send the dummy IR to the real neuronx-cc and fail.
-    setenv("NEURON_COMPILE_SERVICE", "0", 1);
 
     // Set test-specific limits
     setenv("NEURON_COMPILATION_CACHE_MAX_ENTRIES", std::to_string(max_entries).c_str(), 1);
@@ -364,11 +316,10 @@ class LimitedCompilationCacheTest : public ::testing::Test {
     for (const auto& [name, value] : saved_env_vars_) {
       setenv(name.c_str(), value.c_str(), 1);
     }
-    // Unset any vars that weren't originally set. Every name that SetUpWithLimits()
-    // saves must appear here, or its value leaks into a later suite in the same binary.
+    // Unset any vars that weren't originally set
     for (const char* name :
          {"NEURON_COMPILATION_CACHE_MAX_SIZE_MB", "NEURON_COMPILATION_CACHE_MAX_ENTRIES",
-          "TORCH_NEURONX_NEFF_DISABLE_CACHE", "NEURON_COMPILE_SERVICE"}) {
+          "TORCH_NEURONX_NEFF_DISABLE_CACHE"}) {
       if (saved_env_vars_.find(name) == saved_env_vars_.end()) {
         unsetenv(name);
       }
@@ -1527,225 +1478,6 @@ TEST_F(CompilationCacheTest, ConcurrentPersistentCacheAccess) {
   EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
 }
 
-// Pause the disk lookup after the initial memory check releases the lock.
-class PausedPersistentLookupKernel : public MockNeuronKernelExecution {
- public:
-  PausedPersistentLookupKernel(const std::string& key, std::promise<void>& lookup_started,
-                               std::shared_future<void> resume_lookup)
-      : MockNeuronKernelExecution(key),
-        lookup_started_(lookup_started),
-        resume_lookup_(std::move(resume_lookup)) {}
-
-  bool RequiresWrappedNeffHlo() const override {
-    lookup_started_.set_value();
-    resume_lookup_.wait();
-    return false;
-  }
-
- private:
-  std::promise<void>& lookup_started_;
-  std::shared_future<void> resume_lookup_;
-};
-
-TEST_F(CompilationCacheTest, ConcurrentPersistentHitsDoNotReplaceActiveNeff) {
-  const std::string cache_key = "concurrent_persistent_hit_lifetime";
-  MockNeuronKernelExecution first(cache_key);
-  const std::string* persistent_key = first.GetCompilationCacheKey().GetPersistentKey();
-  ASSERT_NE(persistent_key, nullptr);
-
-  const std::vector<uint8_t> neff_bytes{0x5a, 0x5b};
-  PersistentCacheBackend disk_cache(std::filesystem::path(temp_dir_->path()));
-  ASSERT_TRUE(disk_cache.Put(*persistent_key, neff_bytes));
-  MockNeuronKernelExecution::ResetCompileCounter();
-
-  std::promise<void> lookup_started;
-  std::promise<void> resume_lookup;
-  PausedPersistentLookupKernel second(cache_key, lookup_started,
-                                      resume_lookup.get_future().share());
-  auto reader = std::async(std::launch::async, [&] { return cache_->GetOrCompileNeff(second, 2); });
-  lookup_started.get_future().get();
-
-  // Install a successful entry while the other disk lookup is paused.
-  std::shared_ptr<CacheEntry> first_entry;
-  EXPECT_NO_THROW(first_entry = cache_->GetOrCompileNeff(first, 1));
-  resume_lookup.set_value();
-  std::shared_ptr<CacheEntry> second_entry;
-  EXPECT_NO_THROW(second_entry = reader.get());
-
-  ASSERT_NE(first_entry, nullptr);
-  ASSERT_NE(second_entry, nullptr);
-  EXPECT_EQ(first_entry, second_entry);
-  EXPECT_EQ(cache_->GetEntry(cache_key), first_entry);
-  EXPECT_EQ(first_entry->neff_bytes, neff_bytes);
-  ASSERT_TRUE(first.HasCachedNeff());
-  ASSERT_TRUE(second.HasCachedNeff());
-  EXPECT_EQ(&first.GetCachedNeff(), &first_entry->neff_bytes);
-  EXPECT_EQ(&second.GetCachedNeff(), &first_entry->neff_bytes);
-  EXPECT_EQ(first_entry->access_count.load(), 1);
-  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 0);
-
-  auto* arena = metrics::NeuronMetricsArena::Get();
-  auto* persistent_hits = arena->GetCounter("CompilationCache.PersistentHits");
-  auto* in_memory_hits = arena->GetCounter("CompilationCache.InMemoryHits");
-  ASSERT_NE(persistent_hits, nullptr);
-  ASSERT_NE(in_memory_hits, nullptr);
-  EXPECT_EQ(persistent_hits->Value(), 1);
-  EXPECT_EQ(in_memory_hits->Value(), 1);
-}
-
-TEST_F(CompilationCacheTest, PersistentHitReplacesConcurrentFailedEntry) {
-  class ThrowingNoHloKernel : public CompilableKernelExecution {
-   public:
-    explicit ThrowingNoHloKernel(const std::string& key)
-        : CompilableKernelExecution(key, "", "", false) {}
-
-    std::vector<uint8_t> CompileToNeff() const override {
-      throw std::runtime_error("test compilation failed");
-    }
-  };
-
-  const std::string cache_key = "persistent_hit_after_failure";
-  std::promise<void> lookup_started;
-  std::promise<void> resume_lookup;
-  PausedPersistentLookupKernel kernel(cache_key, lookup_started,
-                                      resume_lookup.get_future().share());
-  const std::string* persistent_key = kernel.GetCompilationCacheKey().GetPersistentKey();
-  ASSERT_NE(persistent_key, nullptr);
-  const std::vector<uint8_t> neff_bytes{0x5a, 0x5b};
-  PersistentCacheBackend disk_cache(std::filesystem::path(temp_dir_->path()));
-  ASSERT_TRUE(disk_cache.Put(*persistent_key, neff_bytes));
-  MockNeuronKernelExecution::ResetCompileCounter();
-
-  auto reader = std::async(std::launch::async, [&] { return cache_->GetOrCompileNeff(kernel, 1); });
-  lookup_started.get_future().get();
-
-  // The kernel with no HLO skips the disk cache and records a compilation failure.
-  ThrowingNoHloKernel failing(cache_key);
-  EXPECT_THROW(cache_->GetOrCompileNeff(failing, 2), std::runtime_error);
-  auto failed_entry = cache_->GetEntry(cache_key);
-  resume_lookup.set_value();
-  std::shared_ptr<CacheEntry> entry;
-  EXPECT_NO_THROW(entry = reader.get());
-
-  ASSERT_NE(failed_entry, nullptr);
-  EXPECT_TRUE(failed_entry->IsFailed());
-  EXPECT_FALSE(failing.HasCachedNeff());
-  ASSERT_NE(entry, nullptr);
-  EXPECT_FALSE(entry->IsFailed());
-  EXPECT_NE(entry, failed_entry);
-  EXPECT_EQ(cache_->GetEntry(cache_key), entry);
-  ASSERT_TRUE(kernel.HasCachedNeff());
-  EXPECT_EQ(kernel.GetCachedNeff(), neff_bytes);
-  EXPECT_EQ(&kernel.GetCachedNeff(), &entry->neff_bytes);
-  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 0);
-
-  auto* arena = metrics::NeuronMetricsArena::Get();
-  auto* persistent_hits = arena->GetCounter("CompilationCache.PersistentHits");
-  ASSERT_NE(persistent_hits, nullptr);
-  EXPECT_EQ(persistent_hits->Value(), 1);
-  if (auto* in_memory_hits = arena->GetCounter("CompilationCache.InMemoryHits")) {
-    EXPECT_EQ(in_memory_hits->Value(), 0);
-  }
-}
-
-TEST_F(CompilationCacheTest, PersistentHitSucceedsBeforePendingCompilationFails) {
-  for (bool asynchronous : {false, true}) {
-    const std::string cache_key =
-        asynchronous ? "persistent_hit_pending_async" : "persistent_hit_pending_sync";
-    std::promise<void> lookup_started;
-    std::promise<void> resume_lookup;
-    PausedPersistentLookupKernel kernel(cache_key, lookup_started,
-                                        resume_lookup.get_future().share());
-    const auto& key = kernel.GetCompilationCacheKey();
-    const std::string* persistent_key = key.GetPersistentKey();
-    ASSERT_NE(persistent_key, nullptr);
-    const std::vector<uint8_t> neff_bytes{0x5a, 0x5b};
-    PersistentCacheBackend disk_cache(std::filesystem::path(temp_dir_->path()));
-    ASSERT_TRUE(disk_cache.Put(*persistent_key, neff_bytes));
-
-    auto reader = std::async(std::launch::async, [&] {
-      if (!asynchronous) return cache_->GetOrCompileNeff(kernel, 1);
-      std::promise<bool> completed;
-      auto completion = completed.get_future();
-      cache_->GetOrCompileNeffAsync(
-          kernel, 1, [&](bool success, const std::string&) { completed.set_value(success); });
-      EXPECT_TRUE(completion.get());
-      return cache_->GetEntry(cache_key);
-    });
-    auto started = lookup_started.get_future();
-    if (started.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
-      resume_lookup.set_value();
-      EXPECT_NO_THROW(reader.get());
-      FAIL() << "Disk lookup did not reach the pause point";
-    }
-    started.get();
-
-    auto [pending, pending_future] = CompilationCacheTestPeer::SeedPending(*cache_, key);
-    resume_lookup.set_value();
-
-    // The disk reader must complete while the other compilation remains pending.
-    EXPECT_EQ(reader.wait_for(std::chrono::seconds(2)), std::future_status::ready);
-    EXPECT_EQ(pending_future.wait_for(std::chrono::seconds(0)), std::future_status::timeout);
-    CompilationCacheTestPeer::FailPending(*cache_, key, pending);
-    EXPECT_THROW(pending_future.get(), torch_neuronx::CompilationRuntimeException);
-
-    std::shared_ptr<CacheEntry> entry;
-    EXPECT_NO_THROW(entry = reader.get());
-    ASSERT_NE(entry, nullptr);
-    EXPECT_FALSE(entry->IsFailed());
-    EXPECT_EQ(cache_->GetEntry(cache_key), entry);
-    ASSERT_TRUE(kernel.HasCachedNeff());
-    EXPECT_EQ(kernel.GetCachedNeff(), neff_bytes);
-    EXPECT_EQ(&kernel.GetCachedNeff(), &entry->neff_bytes);
-  }
-}
-
-TEST_F(CompilationCacheTest, PersistentHitReplacesFailedEntryBeforePendingCleanup) {
-  const std::string cache_key = "persistent_hit_before_failure_cleanup";
-  std::promise<void> lookup_started;
-  std::promise<void> resume_lookup;
-  PausedPersistentLookupKernel kernel(cache_key, lookup_started,
-                                      resume_lookup.get_future().share());
-  const auto& key = kernel.GetCompilationCacheKey();
-  const std::string* persistent_key = key.GetPersistentKey();
-  ASSERT_NE(persistent_key, nullptr);
-  const std::vector<uint8_t> neff_bytes{0x5a, 0x5b};
-  PersistentCacheBackend disk_cache(std::filesystem::path(temp_dir_->path()));
-  ASSERT_TRUE(disk_cache.Put(*persistent_key, neff_bytes));
-  MockNeuronKernelExecution::ResetCompileCounter();
-
-  auto reader = std::async(std::launch::async, [&] { return cache_->GetOrCompileNeff(kernel, 1); });
-  lookup_started.get_future().get();
-
-  // Publish the failure and its ready future before the pending entry is removed.
-  auto pending_future = CompilationCacheTestPeer::SeedFailedPending(*cache_, key);
-  auto failed_entry = cache_->GetEntry(cache_key);
-  resume_lookup.set_value();
-  std::shared_ptr<CacheEntry> entry;
-  EXPECT_NO_THROW(entry = reader.get());
-  CompilationCacheTestPeer::CleanupPending(*cache_, key);
-
-  EXPECT_THROW(pending_future.get(), torch_neuronx::CompilationRuntimeException);
-  ASSERT_NE(failed_entry, nullptr);
-  EXPECT_TRUE(failed_entry->IsFailed());
-  ASSERT_NE(entry, nullptr);
-  EXPECT_FALSE(entry->IsFailed());
-  EXPECT_NE(entry, failed_entry);
-  EXPECT_EQ(cache_->GetEntry(cache_key), entry);
-  ASSERT_TRUE(kernel.HasCachedNeff());
-  EXPECT_EQ(kernel.GetCachedNeff(), neff_bytes);
-  EXPECT_EQ(&kernel.GetCachedNeff(), &entry->neff_bytes);
-  EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 0);
-
-  auto* arena = metrics::NeuronMetricsArena::Get();
-  auto* persistent_hits = arena->GetCounter("CompilationCache.PersistentHits");
-  ASSERT_NE(persistent_hits, nullptr);
-  EXPECT_EQ(persistent_hits->Value(), 1);
-  if (auto* in_memory_hits = arena->GetCounter("CompilationCache.InMemoryHits")) {
-    EXPECT_EQ(in_memory_hits->Value(), 0);
-  }
-}
-
 TEST_F(CompilationCacheTest, CentralizedMetricsHitMissTracking) {
   using namespace at::neuron::metrics;
 
@@ -2505,46 +2237,6 @@ TEST_F(CompilationCacheTest, AsyncPendingCompilation) {
   for (auto& kernel : kernels) EXPECT_TRUE(kernel->HasCachedNeff());
 }
 
-TEST_F(CompilationCacheTest, AsyncPendingFailureAfterCleanupReportsErrorWithoutCacheLock) {
-  class PendingCompilationTestCache : public CompilationCache {
-   public:
-    using CompilationCache::ContinuePendingCompilationAsync;
-  };
-  class ThrowingKernel : public MockNeuronKernelExecution {
-   public:
-    explicit ThrowingKernel(const std::string& key) : MockNeuronKernelExecution(key) {}
-
-    std::vector<uint8_t> CompileToNeff() const override {
-      throw std::runtime_error("test compilation failed");
-    }
-  };
-
-  PendingCompilationTestCache cache;
-  const std::string cache_key = "async_pending_failure_after_cleanup";
-  ThrowingKernel failing(cache_key);
-  EXPECT_THROW(cache.GetOrCompileNeff(failing, 1), torch_neuronx::CompilationRuntimeException);
-  auto failed_entry = cache.GetEntry(cache_key);
-  ASSERT_NE(failed_entry, nullptr);
-  ASSERT_TRUE(failed_entry->IsFailed());
-
-  // Resume the pending request after failure handling removes its future.
-  MockNeuronKernelExecution waiter(cache_key);
-  int callbacks = 0;
-  cache.ContinuePendingCompilationAsync(waiter, [&](bool success, const std::string& error) {
-    ++callbacks;
-    EXPECT_FALSE(success);
-    EXPECT_EQ(error, failed_entry->GetFailureMessage());
-    EXPECT_THAT(error, ::testing::HasSubstr("test compilation failed"));
-    EXPECT_FALSE(waiter.HasCachedNeff());
-    // This method needs the exclusive cache lock.
-    cache.RegisterPersistentKeyHint(cache_key, "callback_key_hint");
-    EXPECT_EQ(cache.GetEntry(cache_key), failed_entry);
-  });
-
-  EXPECT_EQ(callbacks, 1);
-  EXPECT_FALSE(waiter.HasCachedNeff());
-}
-
 TEST_F(CompilationCacheTest, AsyncMultipleDifferentKeys) {
   MockNeuronKernelExecution::ResetCompileCounter();
 
@@ -2702,38 +2394,6 @@ TEST_F(CompilationCacheTest, GracefulSkip_NoHloBytesNotPersistedAcrossCacheInsta
   NoHloKernelExecution k2("no_hlo_key_3");
   fresh_cache->GetOrCompileNeff(k2, /*stream_id=*/1);
   EXPECT_EQ(NoHloKernelExecution::GetCompileCounter().load(), 2);  // recompiled
-}
-
-TEST_F(CompilationCacheTest, KeyHint_NoHloKernelResolvesPersistentKeyFromCompileStep) {
-  // NeffDirectKernelExecution carries no IR, so it cannot compute the content key.
-  // The compile step records base_key -> persistent_key. A later IR-less execution
-  // with the same base_key must resolve that key and read the NEFF from disk.
-  MockNeuronKernelExecution::ResetCompileCounter();
-  NoHloKernelExecution::ResetCompileCounter();
-  const std::string base_key = "shared_base_key_for_hint";
-
-  // Compile with IR. This writes the NEFF to disk and records the hint.
-  // Scope the kernel: it holds the NEFF pointer, which keeps the entry active and
-  // therefore not evictable.
-  std::vector<uint8_t> compiled_neff;
-  {
-    MockNeuronKernelExecution with_hlo(base_key);
-    cache_->GetOrCompileNeff(with_hlo, /*stream_id=*/1);
-    EXPECT_EQ(MockNeuronKernelExecution::GetCompileCounter().load(), 1);
-    compiled_neff = with_hlo.GetCachedNeff();
-  }
-
-  // Drop the NEFF but keep the hint, which is what LRU eviction does.
-  EXPECT_EQ(cache_->EvictLruEntries(/*target_entries=*/0), 1u);
-
-  // The IR-less kernel must not reach CompileToNeff().
-  NoHloKernelExecution no_hlo(base_key);
-  EXPECT_EQ(no_hlo.GetCompilationCacheKey().GetPersistentKey(), nullptr);
-  cache_->GetOrCompileNeff(no_hlo, /*stream_id=*/1);
-
-  EXPECT_TRUE(no_hlo.HasCachedNeff());
-  EXPECT_EQ(NoHloKernelExecution::GetCompileCounter().load(), 0);
-  EXPECT_EQ(no_hlo.GetCachedNeff(), compiled_neff);
 }
 
 TEST_F(CompilationCacheTest, CrossCommitReuse_SameHloDifferentBaseKeyHitsPersistentCache) {

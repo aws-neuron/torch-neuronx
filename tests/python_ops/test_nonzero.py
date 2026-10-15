@@ -181,12 +181,3 @@ class TestNonzero:
             assert neuron_result.shape == cpu_result.shape
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
             assert_op_runs_on_neuron("aten::nonzero")
-
-    def test_nonzero_scalar(self, device):
-        """Test nonzero on 0-dim (scalar) tensor."""
-        x = torch.tensor(5.0, device=device)
-        neuron_result = torch.nonzero(x)
-        cpu_result = torch.nonzero(x.cpu())
-
-        assert neuron_result.shape == cpu_result.shape
-        assert neuron_result.dtype == cpu_result.dtype

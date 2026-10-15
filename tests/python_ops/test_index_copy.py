@@ -155,17 +155,3 @@ class TestIndexCopy:
         idx = torch.tensor([0, 0], dtype=torch.int64, device=device)
         src = torch.tensor(3.0, device=device)
         torch.index_copy(x, 0, idx, src)
-
-    @pytest.mark.parametrize("index_shape", [(), (1,)])
-    def test_index_copy_1d_scalar_source(self, index_shape):
-        x_cpu = torch.tensor([5.0])
-        idx_cpu = torch.zeros(index_shape, dtype=torch.int64)
-        src_cpu = torch.tensor(3.0)
-        expected = x_cpu.index_copy(0, idx_cpu, src_cpu)
-
-        x = x_cpu.to("neuron")
-        idx = idx_cpu.to("neuron")
-        src = src_cpu.to("neuron")
-        result = x.index_copy(0, idx, src)
-
-        torch.testing.assert_close(result.cpu(), expected)

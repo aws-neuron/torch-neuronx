@@ -11,13 +11,7 @@ import torch_neuronx  # Register neuron device
 
 
 class SimpleMoERouter(nn.Module):
-    """Select top-k experts and compute normalized routing weights.
-
-    Args:
-        d_model (int): Hidden-state feature dimension.
-        num_experts (int): Number of available experts.
-        top_k (int, optional): Number of experts selected per token. Defaults to ``2``.
-    """
+    """Simple router for expert selection"""
 
     def __init__(self, d_model, num_experts, top_k=2):
         super().__init__()
@@ -27,14 +21,6 @@ class SimpleMoERouter(nn.Module):
 
     def forward(self, hidden_states):
         # Router logits: [batch, seq_len, num_experts]
-        """Route each token to its highest-scoring experts.
-
-        Args:
-            hidden_states (torch.Tensor): States shaped ``(batch, sequence, d_model)``.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]: Normalized top-k weights and expert indices.
-        """
         router_logits = self.router(hidden_states)
 
         top_k_logits, top_k_indices = torch.topk(router_logits, k=self.top_k, dim=-1)
@@ -43,13 +29,7 @@ class SimpleMoERouter(nn.Module):
 
 
 class SimpleMoEExpert(nn.Module):
-    """Implement one gated-free feed-forward expert.
-
-    Args:
-        d_model (int): Input and output feature dimension.
-        d_ff (int): Intermediate feed-forward dimension.
-        dropout (float, optional): Intermediate activation dropout probability. Defaults to ``0.1``.
-    """
+    """Single expert network"""
 
     def __init__(self, d_model, d_ff, dropout=0.1):
         super().__init__()
@@ -59,28 +39,11 @@ class SimpleMoEExpert(nn.Module):
 
     def forward(self, x):
         # Simple FFN: w2(dropout(silu(w1(x))))
-        """Apply the expert feed-forward network.
-
-        Args:
-            x (torch.Tensor): Input whose final dimension is ``d_model``.
-
-        Returns:
-            torch.Tensor: Expert output with the same shape as ``x``.
-        """
         return self.w2(self.dropout(f.silu(self.w1(x))))
 
 
 class SimpleMoELayer(nn.Module):
-    """Route tokens through a collection of feed-forward experts.
-
-    Args:
-        d_model (int): Hidden-state feature dimension.
-        num_experts (int, optional): Number of experts. Defaults to ``8``.
-        top_k (int, optional): Number of experts selected per token. Defaults to ``2``.
-        d_ff (int, optional): Expert intermediate dimension. Falsy values use
-            four times ``d_model``. Defaults to ``None``.
-        dropout (float, optional): Expert dropout probability. Defaults to ``0.1``.
-    """
+    """Simple MoE layer with basic routing"""
 
     def __init__(self, d_model, num_experts=8, top_k=2, d_ff=None, dropout=0.1):
         super().__init__()
@@ -98,17 +61,6 @@ class SimpleMoELayer(nn.Module):
         )
 
     def forward(self, hidden_states):
-        """Sum the unweighted outputs of the selected experts.
-
-        Args:
-            hidden_states (torch.Tensor): States shaped ``(batch, sequence, d_model)``.
-
-        Returns:
-            torch.Tensor: Expert outputs with the same shape as ``hidden_states``.
-
-        Note:
-            The implementation uses routing indices but does not apply routing weights.
-        """
         batch_size, seq_len, d_model = hidden_states.shape
 
         # Get routing decisions
@@ -134,15 +86,7 @@ class SimpleMoELayer(nn.Module):
 
 
 class SimpleMoETransformerBlock(nn.Module):
-    """Combine self-attention and an MoE feed-forward residual block.
-
-    Args:
-        d_model (int): Hidden-state feature dimension.
-        n_heads (int): Number of attention heads.
-        num_experts (int, optional): Number of experts. Defaults to ``8``.
-        top_k (int, optional): Number of experts selected per token. Defaults to ``2``.
-        dropout (float, optional): Attention and expert dropout probability. Defaults to ``0.1``.
-    """
+    """Transformer block with MoE FFN"""
 
     def __init__(self, d_model, n_heads, num_experts=8, top_k=2, dropout=0.1):
         super().__init__()
@@ -152,16 +96,6 @@ class SimpleMoETransformerBlock(nn.Module):
         self.moe = SimpleMoELayer(d_model, num_experts, top_k, dropout=dropout)
 
     def forward(self, x, attention_mask=None):
-        """Apply attention and MoE residual transformations.
-
-        Args:
-            x (torch.Tensor): Hidden states shaped ``(batch, sequence, d_model)``.
-            attention_mask (torch.Tensor, optional): Additive attention mask. A causal
-                mask is created when omitted. Defaults to ``None``.
-
-        Returns:
-            torch.Tensor: Transformed hidden states with the same shape as ``x``.
-        """
         batch_size, seq_length, d_model = x.shape
         device = x.device
 
@@ -184,19 +118,7 @@ class SimpleMoETransformerBlock(nn.Module):
 
 
 class SimpleMoEModel(nn.Module):
-    """Build a decoder-only language model with MoE transformer blocks.
-
-    Args:
-        vocab_size (int, optional): Token vocabulary size. Defaults to ``32000``.
-        d_model (int, optional): Hidden-state feature dimension. Defaults to ``512``.
-        n_layers (int, optional): Number of transformer blocks. Defaults to ``6``.
-        n_heads (int, optional): Number of attention heads. Defaults to ``8``.
-        num_experts (int, optional): Experts per MoE layer. Defaults to ``8``.
-        top_k (int, optional): Experts selected per token. Defaults to ``2``.
-        max_seq_length (int, optional): Number of positional embeddings. Defaults to ``512``.
-        dropout (float, optional): Embedding, attention, and expert dropout probability.
-            Defaults to ``0.1``.
-    """
+    """Simple MoE model for testing"""
 
     def __init__(
         self,
@@ -243,16 +165,6 @@ class SimpleMoEModel(nn.Module):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, input_ids, attention_mask=None):
-        """Compute token logits for an input batch.
-
-        Args:
-            input_ids (torch.Tensor): Token IDs shaped ``(batch, sequence)``.
-            attention_mask (torch.Tensor, optional): Additive attention mask passed to
-                every transformer block. Defaults to ``None``.
-
-        Returns:
-            torch.Tensor: Logits shaped ``(batch, sequence, vocab_size)``.
-        """
         batch_size, seq_length = input_ids.shape
         device = input_ids.device
 
@@ -280,15 +192,7 @@ class SimpleMoEModel(nn.Module):
 
 
 def create_moe_config(size="small"):
-    """Return a predefined MoE model configuration.
-
-    Args:
-        size (str, optional): Configuration name, either ``"small"`` or ``"medium"``. Unknown
-            names fall back to ``"small"``. Defaults to ``"small"``.
-
-    Returns:
-        dict[str, int]: Model dimensions for the selected size.
-    """
+    """Create configuration for different model sizes"""
     configs = {
         "small": {
             "vocab_size": 32000,
@@ -313,7 +217,8 @@ def create_moe_config(size="small"):
 
 
 def test_moe_model():
-    """Run the small MoE language-model example on a Neuron device."""
+    """Test MoE model and identify Neuron limitations"""
+
     print("=== Simple MoE Model Test ===\n")
 
     # Use neuron device

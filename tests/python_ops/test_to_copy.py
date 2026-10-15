@@ -40,9 +40,8 @@ class TestToCopy:
             x = torch.randn(128, dtype=torch.float32, device=device)
             neuron_result = x.to(torch_dtype)
             assert neuron_result.device.type == "neuron"
-            # The neuron->neuron cast is serviced entirely by aten::_to_copy.
-            # The previous aten::copy_ assertion only passed because randn fell back to cpu.
             assert_op_runs_on_neuron("aten::_to_copy")
+            assert_op_runs_on_neuron("aten::copy_")
 
 
 def test_to_copy_blocking_uses_mlir():

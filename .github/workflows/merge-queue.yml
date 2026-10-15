@@ -57,10 +57,10 @@ jobs:
       self-hosted,
       linux,
       neuron.build-nightly-image,
-      "neuron.build-os:${{ needs.resolve-labels.outputs.pr_build_os }}",
-      "neuron.build-arg:UBUNTU_CODENAME:${{ needs.resolve-labels.outputs.pr_ubuntu_codename }}",
       "neuron.run-${{ github.run_id }}-build-tests-image",
       "neuron.dockerfile:Dockerfile.nightly-test",
+      # TEST-ONLY on contribute-9.9: the public base that PR image builds already use.
+      "neuron.base-image:684844594039.dkr.ecr.us-west-2.amazonaws.com/neuron-image-builder-public:torch-neuronx-release-2.33-nightly-base-stable",
       "neuron.build-arg:PYTORCH_CHANNEL:stable"
     ]
     timeout-minutes: 60
@@ -89,7 +89,7 @@ jobs:
       # max-failures: "0" blocks the merge on any failure/flake — calibrate first.
       max-failures: "0"
       priority: high
-      dkms: public
+      dkms: ${{ vars.NEURON_DKMS || 'private-torch-neuronx-main-stable' }}
       # download-neff-cache defaults true, so the merge gate reads the nightly's
       # seeded cache automatically. It never sets refresh-neff-cache, so a queued
       # PR can't write to the shared cache.
@@ -119,7 +119,7 @@ jobs:
       mode: gate
       image: ${{ needs.build-tests-image.outputs.main_image }}
       priority: high
-      dkms: public
+      dkms: ${{ vars.NEURON_DKMS || 'private-torch-neuronx-main-stable' }}
 
   merge-queue-gate:
     # This is the REQUIRED status check. It always runs (both events) so it can

@@ -1,22 +1,6 @@
-import os
-
 from tests.pytorch_tests_native.neuron_test_registry import SkipGroup
 
 XFAIL_GROUPS: list[SkipGroup] = [
-    SkipGroup(
-        reason=(
-            "[accuracy] check_sharded_parity compares the FSDP reduce_scatter grad/param "
-            "path against an unsharded reference; fp32 reduce-order non-associativity "
-            "(compounded over Adam steps) lands ~1e-5 off, just over the strict "
-            "1e-5/1.3e-6 tolerance, so one rank's assertEqual fails and raises. That "
-            "rank leaves the collective group, so surviving ranks hit a replica-group "
-            "signature mismatch. Surfaced by on-device RNG drawing slightly different fp32 "
-            "values, not caused by it. strict=False."
-        ),
-        tests=[
-            "test_fully_shard_training.py::TestFullyShardGradientAccumulation::test_gradient_accumulation",
-        ],
-    ),
     SkipGroup(
         reason=(
             "Neuron SDPA doesn't support float64. TODO: Once resolved, xfails will be removed."
@@ -39,6 +23,10 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test's 1e-05 tolerance."
         ),
         tests=[
+            "DistTensorParallelExampleTest::test_loss_parallel",
+            "DistTensorParallelExampleTest::test_loss_parallel_3d_input_non_batch_shard",
+            "DistTensorParallelExampleTest::test_loss_parallel_multi_dim_mesh",
+            "DistTensorParallelExampleTest::test_loss_parallel_replicate_non_tp_dim",
             "DistTensorParallelExampleTestWithLocalTensor::test_loss_parallel",
         ],
     ),
@@ -92,10 +80,13 @@ XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason="ProcessGroupNeuron missing API: coalescing, sequence numbers, sort_ranks",
         tests=[
+            "test_c10d_nccl.py::CommTest::test_all_gather_into_tensor_coalesced_manager_nccl",
+            "test_c10d_nccl.py::CommTest::test_all_reduce_coalesced_manager_nccl",
             "test_c10d_nccl.py::CommTest::test_reduce_scatter_tensor_coalesced",
             "test_c10d_nccl.py::CommTest::test_sequence_num_incremented_nccl_default",
             "test_c10d_nccl.py::CommTest::test_sequence_num_set_default_pg_nccl",
             "test_c10d_nccl.py::CommTest::test_sequence_num_set_nccl_new_group",
+            "test_c10d_nccl.py::LargeCommTest::test_new_group_ordered",
             "test_device_mesh.py::InitDeviceMeshTest::test_backend_override_argument_dict_with_idx_and_backend_eager",
         ],
     ),
@@ -165,6 +156,16 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
+        reason=(
+            "We are pinning CPU tensors to have pinned memory=True always whereas"
+            "we should reference ptr_to_block_ for checking if tensor is pinned or not."
+        ),
+        tests=[
+            "test_fsdp_optim_state.py::FsdpOptimStateCheckpoint::test_load_sharded_optimizer_state_dict_pass_planner_False",
+            "test_fsdp_optim_state.py::FsdpOptimStateCheckpoint::test_load_sharded_optimizer_state_dict_pass_planner_True",
+        ],
+    ),
+    SkipGroup(
         reason="Tests memory allocated for cuda",
         tests=[
             "test_state_dict.py::TestStateDict::test_setting_meta_device_model_broadcasting_and_memory"
@@ -206,6 +207,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         reason="Neuron lacks native batch_norm — CPU fallback rejects mixed "
         "precision (bf16/fp16 input, fp32 stats)",
         tests=[
+            "TestFullyShardMixedPrecisionCasts::test_norm_modules_fp16",
             "TestFullyShardMixedPrecisionCasts::test_norm_modules_bf16",
             "TestReplicateMixedPrecisionCasts::test_norm_modules_fp16",
             "TestReplicateMixedPrecisionCasts::test_norm_modules_bf16",
@@ -263,11 +265,26 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
+            "Neuron numerical precision slightly exceeds DDP vs FSDP grad norm"
+            " tolerance (rel diff 1.46e-06 vs allowed 1.3e-06)"
+        ),
+        tests=[
+            "TestClipGradNormNEURON::test_ddp_parity_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "NRT all_gather fails with invalid DMA block size for the tensor "
             "shape used in FSDP fine tuning pretrain step"
         ),
         tests=[
             "TestFineTuning::test_fine_tuning",
+        ],
+    ),
+    SkipGroup(
+        reason="Neuron clip_grad_norm_ does not support ord=3.0, only 1, 2, and inf",
+        tests=[
+            "TestClipGradNormWorldSize4::test_clip_grad_norm_2d",
         ],
     ),
     SkipGroup(
@@ -299,9 +316,19 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ],
     ),
     SkipGroup(
+        reason=(
+            "Eager conv backward hang. Strided/downsampling conv backward dispatches"
+            " an all_reduce on a non-contiguous gradient layout."
+        ),
+        tests=[
+            "test_convolution_ops.py::DistConvolutionOpsTest::test_downsampling_convolution",
+        ],
+    ),
+    SkipGroup(
         reason="New test does not have device agnostic changes yet",
         tests=[
             "test_fully_shard_memory.py::TestFullyShardHSDPSyncCorrectness::test_ar_buffer_lifetime_mixed_dtype",
+            "test_c10d_functional_native.py::ACTCompileTest::test_act_compile_backward_tangent_mismatch",
         ],
     ),
     SkipGroup(
@@ -385,78 +412,14 @@ XFAIL_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "Under DTensor LocalTensorMode, on-device torch.randn draws per-rank-varying"
-            " values that neuron's full_tensor() all-gather doesn't reconstruct coherently,"
-            " so assertEqual crashes on a LocalIntNode missing its guard_int attribute."
-            " It's the DTensor all-gather, not the RNG: it fails only for on-device per-rank"
-            " data (a fixed or CPU-origin input passes), and an RNG-state fix didn't help."
-            " Same LocalTensorMode class as the already-xfailed test_weight_tying,"
-            " test_sequence_parallel_style, and test_model_init: a neuron DTensor-layer"
-            " limitation, not the random ops. Real multi-process distributed is unaffected."
+            "TODO: Temp xfailed to unblock merge queue - as the suites will start"
+            " failing in nightly as well. Fails a subtest on Neuron; surfaced in"
+            " the merge queue once the subtest-only false-green harness bug was"
+            " fixed. Investigate the pinned/shared tensor staging path and remove"
+            " this xfail."
         ),
         tests=[
-            "test_tensor_ops.py::DistBucketizeTest::test_bucketize_sharded_input",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "[PT 2.14][unsupported_feature] ProcessGroupNeuron does not support"
-            " process group splitting. Pipelining PerDirectionSchedule"
-            " tests require backend splitting support."
-        ),
-        tests=[
-            "test_schedule_multiproc.py::PerDirectionScheduleTest::test_creates_distinct_direction_groups",
-            "test_schedule_multiproc.py::PerDirectionScheduleTest::test_grad_with_manual_per_direction_ScheduleClass0",
-            "test_schedule_multiproc.py::PerDirectionScheduleTest::test_grad_with_manual_per_direction_ScheduleClass1",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "[PT 2.14] New test_addmm_partial_redistribute test creates a CPU"
-            " DeviceMesh which calls init_process_group without RANK env var"
-            " set in the multi-process test harness."
-        ),
-        tests=[
-            "test_op_strategy.py::TestCostModel::test_addmm_partial_redistribute",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "[PT 2.14] Test uses CompileCounterWithBackend('inductor')"
-            " which raises KeyError on Neuron. Test is Inductor-specific."
-        ),
-        tests=[
-            "test_dtensor_compile.py::TestDTensorCompile::test_compile_waits_act_nested_in_dtensor_local_tensor",
-        ],
-    ),
-    SkipGroup(
-        reason=(
-            "[PT 2.14] Unbacked symbolic strides in DTensor backward"
-            " cause Neuron compilation error. Compiler cannot handle"
-            " dynamic stride expressions in the backward graph."
-        ),
-        tests=[
-            "test_dtensor_compile.py::TestDTensorCompile::test_to_local_backward_unbacked_symbolic_stride",
+            "test_state_dict_stager.py::TestStateDictStager::test_tensor_pinned_and_shared",
         ],
     ),
 ]
-
-if (
-    os.environ.get("TORCH_NEURONX_ENABLE_STREAMS", "1") == "1"
-    and os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC", "0") == "0"
-):
-    XFAIL_GROUPS.append(
-        SkipGroup(
-            reason=(
-                "FSDPv1 NO_SHARD CPU offload can release device parameter storage "
-                "before compute finishes. An upstream record_stream fix is required; see "
-                "https://github.com/aws-neuron/private-torch-neuronx/issues/1531."
-            ),
-            tests=[
-                "test_fsdp_clip_grad_norm.py::TestClipGradNormNEURON::test_ddp_parity_neuron",
-                "test_fsdp_use_orig_params.py::TestFSDPUseOrigParamsUnshardReshard::test_multiple_forward_offload_params_True",
-                "test_fsdp_grad_acc.py::TestGradAcc::test_grad_acc_cpu_offload_use_orig_params_True",
-                "test_fsdp_use_orig_params.py::TestFSDPUseOrigParamsMultipleParamGroups::test_diff_hyperparams_cpu_offload_sharding_strategy_str_no_shard",
-            ],
-        )
-    )

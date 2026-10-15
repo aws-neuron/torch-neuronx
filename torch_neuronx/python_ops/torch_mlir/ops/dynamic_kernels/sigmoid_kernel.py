@@ -39,11 +39,6 @@ def _run_sigmoid_loop(
     """
 
     def body(_i):
-        """Apply sigmoid to one unrolled group of row tiles.
-
-        Args:
-            _i (int): Dynamic loop iteration index, accepted but unused.
-        """
         for slot in range(1, tiles_per_trip):
             nisa.tensor_scalar(
                 dst=row_start[slot],
@@ -114,18 +109,14 @@ def _run_sigmoid_loop(
 
 @nki.jit()
 def sigmoid_kernel(input_tensor, num_m_tiles):
-    """Apply sigmoid over dynamic row tiles.
+    """
+    Sigmoid activation: output = 1 / (1 + exp(-input))
 
     Args:
-        input_tensor (nki.language.ndarray): Input with shape ``[m_static, hidden]``.
-        num_m_tiles (nki.language.ndarray): Number of 128-row tiles to process.
-
+        input_tensor: [m_static, hidden] bf16 on HBM
+        num_m_tiles: [1, 1] int32 — number of 128-row tiles to process
     Returns:
-        nki.language.ndarray: Static-shaped result in the input dtype.
-
-    Note:
-        Only the first ``128 * num_m_tiles`` rows contain sigmoid values; remaining
-        rows are not initialized.
+        output: [m_static, hidden] bf16 on HBM
     """
     m_static, hidden = input_tensor.shape
 

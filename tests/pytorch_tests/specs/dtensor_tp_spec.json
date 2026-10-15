@@ -1,0 +1,85 @@
+{
+  "test_configurations": [
+    {
+      "class": "DistTensorParallelExampleTest",
+      "file": "distributed/tensor/parallel/test_tp_examples.py",
+      "sanity_methods": [
+        "test_mlp_training_is_seq_parallel_False_recompute_activation_False",
+        "test_mlp_training_is_seq_parallel_True_recompute_activation_False"
+      ],
+      "skip_tests": [
+        {
+          "reason": "Scaled dot product attention does not work with float64 on Neuron.",
+          "tests": [
+            "test_transformer_req_grad_float64_thaw_all",
+            "test_transformer_training_is_seq_parallel_False_float64",
+            "test_transformer_training_is_seq_parallel_True_float64"
+          ]
+        }
+      ],
+      "xfail": [
+        {
+          "reason": "assert res.ndim == 0, output tensor should be scalar!",
+          "tests": [
+            "test_transformer_req_grad_seq_parallel_float32_thaw_layers_0_attention_wv__layers_0_feed_forward_w1__layers_1_feed_forward_w2__layers_1_ffn_norm__output__tok_embeddings"
+          ]
+        },
+        {
+          "reason": "Accuracy issue: AssertionError: Tensor-likes are not close!",
+          "tests": [
+            "test_loss_parallel"
+          ]
+        }
+      ]
+    },
+    {
+      "class": "TensorParallelAPITests",
+      "file": "distributed/tensor/parallel/test_parallelize_api.py",
+      "sanity_methods": [
+        "test_linear_row_wise_parallel",
+        "test_linear_col_wise_parallel",
+        "test_prepare_module_input",
+        "test_prepare_module_output",
+        "test_parallelize_module_with_star"
+      ],
+      "xfail": [
+        {
+          "test_parallelize_module_src_data_rank": {
+            "reason": "Comm debug mode checking for functional collectives on gpu, needs patch."
+          }
+        }
+      ]
+    },
+    {
+      "class": "TensorParallelRandomStateTests",
+      "file": "distributed/tensor/parallel/test_tp_random_state.py",
+      "skip_tests": [
+        {
+          "test_model_init": {
+            "reason": "No device specific seeding for Neuron."
+          }
+        }
+      ]
+    },
+    {
+      "class": "TensorParallelStyleTest",
+      "file": "distributed/tensor/parallel/test_tp_style.py",
+      "sanity_methods": [
+        "test_colwise_parallel_style",
+        "test_rowwise_parallel_style",
+        "test_colwise_parallel_embedding"
+      ]
+    },
+    {
+      "class": "TensorParallelTest",
+      "file": "distributed/tensor/experimental/test_tp_transform.py",
+      "xfail": [
+        {
+          "test_tp_transform_with_uncovered_op": {
+            "reason": "RuntimeError: Destination Neuron tensor must be contiguous"
+          }
+        }
+      ]
+    }
+  ]
+}

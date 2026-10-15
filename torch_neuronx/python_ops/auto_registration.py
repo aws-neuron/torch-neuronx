@@ -53,14 +53,9 @@ _NEURON_OPS_REGISTRY: dict[str, dict[str, Any]] = defaultdict(
 
 
 def register_implementation(aten_name: str, impl_class: type[OperationImplementation]):
-    """Register an implementation class for an ATen operation.
+    """Register an implementation class for an aten operation.
 
-    Args:
-        aten_name (str): Qualified ATen operation name used as the registry key.
-        impl_class (type[OperationImplementation]): Implementation class to append.
-
-    Note:
-        The ``neuron_op`` decorators call this function automatically.
+    Called automatically by the @neuron_op decorator.
     """
     _NEURON_OPS_REGISTRY[aten_name]["implementations"].append(impl_class)
 
@@ -72,31 +67,20 @@ def neuron_op(
     disable_dtype_autocast: bool | None = None,
     disable_empty_shortcircuit: bool | None = None,
 ):
-    """Decorate and register an operation implementation class.
+    """Enhanced decorator that auto-registers operations.
 
     Args:
-        aten_name (str): Qualified ATen operation name, such as ``aten::add.Tensor``.
-        priority (int, optional): Selection priority; higher values are tried first.
-            Defaults to ``50``.
-        disable_dtype_autocast (bool, optional): Whether to disable dtype autocasting.
-            Defaults to ``None``, which leaves the class policy unchanged.
-        disable_empty_shortcircuit (bool, optional): Whether to disable the empty-input
-            short circuit. Defaults to ``None``, which leaves the class policy unchanged.
+        aten_name: The aten operation name (e.g., "aten::add", "aten::add.Tensor")
+        priority: Priority for this implementation (higher = tried first)
 
-    Returns:
-        Callable: Class decorator that adds registration metadata and registers the class.
+    Example:
+        @neuron_op("aten::add")
+        class AddXLAImpl(BinaryOpImplementation):
+            ...
     """
 
     def decorator(cls):
         # Add metadata to class
-        """Add operation metadata to and register an implementation class.
-
-        Args:
-            cls (type): Operation implementation class to decorate.
-
-        Returns:
-            type: The same class after metadata and policy attributes are set.
-        """
         cls._aten_op_name = aten_name
         cls._has_neuron_op = True
         cls._auto_priority = priority
@@ -118,20 +102,9 @@ def neuron_op(
 def create_auto_operation(
     aten_name: str, implementations: list[type[OperationImplementation]]
 ) -> Operation:
-    """Create a dynamically typed operation for implementation classes.
-
-    Args:
-        aten_name (str): Qualified ATen operation name represented by the instance.
-        implementations (list[type[OperationImplementation]]): Implementation classes
-            to instantiate in registry order.
-
-    Returns:
-        Operation: Dynamic operation instance with pickle-resolvable generated classes.
-    """
+    """Create an Operation instance dynamically for the given implementations."""
 
     class AutoOperation(Operation):
-        """Represent a generated operation backed by registered implementations."""
-
         def __init__(self):
             # Store the actual aten name for this specific operation variant
             self._actual_aten_name = aten_name
@@ -141,26 +114,11 @@ def create_auto_operation(
             """Register all implementations for this operation."""
 
             def create_priority_impl(base_class, priority):
-                """Create a pickle-resolvable implementation subclass with a priority.
-
-                Args:
-                    base_class (type): Implementation class to subclass.
-                    priority (int): Priority returned by the generated property.
-
-                Returns:
-                    type: Generated implementation subclass registered at module scope.
-                """
+                """Factory function to create implementation with custom priority."""
 
                 class PriorityImpl(base_class):
-                    """Represent an implementation with a captured priority."""
-
                     @property
                     def priority(self) -> int:
-                        """Return the captured implementation priority.
-
-                        Returns:
-                            int: Priority supplied when the subclass was generated.
-                        """
                         return priority
 
                 # Register at module level for pickle resolution
@@ -186,11 +144,6 @@ def create_auto_operation(
         def op_name(self) -> str:
             # Extract clean op name from aten name
             # "aten::add" -> "add", "aten::add.Tensor" -> "add"
-            """Return the unqualified base ATen operation name.
-
-            Returns:
-                str: Name with the ``aten::`` prefix and overload suffix removed.
-            """
             clean_name = aten_name.replace("aten::", "")
             if "." in clean_name:
                 clean_name = clean_name.split(".")[0]
@@ -209,22 +162,15 @@ def create_auto_operation_typed(
     implementations: list[type[OperationImplementation]],
     base_class: type[Operation] = Operation,
 ) -> Operation:
-    """Create a dynamically typed operation with a specific base class.
+    """Create an Operation instance dynamically with a specific base class.
 
     Args:
-        aten_name (str): Qualified ATen operation name represented by the instance.
-        implementations (list[type[OperationImplementation]]): Implementation classes
-            to instantiate in registry order.
-        base_class (type[Operation], optional): Operation class for the generated type.
-            Defaults to ``Operation``.
-
-    Returns:
-        Operation: Dynamic typed operation with pickle-resolvable generated classes.
+        aten_name: The aten operation name
+        implementations: List of implementation classes
+        base_class: The base Operation class to inherit from (UnaryOperation, BinaryOperation, etc.)
     """
 
     class TypedAutoOperation(base_class):
-        """Represent a generated operation with a caller-selected base class."""
-
         def __init__(self):
             # Store the actual aten name for this specific operation variant
             self._actual_aten_name = aten_name
@@ -234,26 +180,11 @@ def create_auto_operation_typed(
             """Register all implementations for this operation."""
 
             def create_priority_impl(impl_base_class, priority):
-                """Create a pickle-resolvable implementation subclass with a priority.
-
-                Args:
-                    impl_base_class (type): Implementation class to subclass.
-                    priority (int): Priority returned by the generated property.
-
-                Returns:
-                    type: Generated implementation subclass registered at module scope.
-                """
+                """Factory function to create implementation with custom priority."""
 
                 class PriorityImpl(impl_base_class):
-                    """Represent an implementation with a captured priority."""
-
                     @property
                     def priority(self) -> int:
-                        """Return the captured implementation priority.
-
-                        Returns:
-                            int: Priority supplied when the subclass was generated.
-                        """
                         return priority
 
                 _register_dynamic_class(
@@ -278,11 +209,6 @@ def create_auto_operation_typed(
         def op_name(self) -> str:
             # Extract clean op name from aten name
             # "aten::add" -> "add", "aten::add.Tensor" -> "add"
-            """Return the unqualified base ATen operation name.
-
-            Returns:
-                str: Name with the ``aten::`` prefix and overload suffix removed.
-            """
             clean_name = aten_name.replace("aten::", "")
             if "." in clean_name:
                 clean_name = clean_name.split(".")[0]
@@ -297,27 +223,14 @@ def create_auto_operation_typed(
 
 
 def neuron_unary_op(aten_name: str, priority: int = 50):
-    """Decorate and register a unary operation implementation class.
+    """Decorator for unary operations (sqrt, neg, relu, etc.).
 
-    Args:
-        aten_name (str): Qualified ATen operation name to register.
-        priority (int, optional): Selection priority; higher values are tried first.
-            Defaults to ``50``.
-
-    Returns:
-        Callable: Class decorator that selects unary output-shape handling.
+    Operations registered with this decorator will automatically get
+    proper output shape calculation for unary operations.
     """
 
     def decorator(cls):
         # Add metadata to class
-        """Add unary-operation metadata to and register an implementation class.
-
-        Args:
-            cls (type): Operation implementation class to decorate.
-
-        Returns:
-            type: The class configured to use ``UnaryOperation``.
-        """
         cls._aten_op_name = aten_name
         cls._has_neuron_op = True
         cls._auto_priority = priority
@@ -332,27 +245,14 @@ def neuron_unary_op(aten_name: str, priority: int = 50):
 
 
 def neuron_binary_op(aten_name: str, priority: int = 50):
-    """Decorate and register a binary operation implementation class.
+    """Decorator for binary operations (add, mul, div, etc.).
 
-    Args:
-        aten_name (str): Qualified ATen operation name to register.
-        priority (int, optional): Selection priority; higher values are tried first.
-            Defaults to ``50``.
-
-    Returns:
-        Callable: Class decorator that selects broadcast output-shape handling.
+    Operations registered with this decorator will automatically get
+    proper output shape calculation using broadcasting rules.
     """
 
     def decorator(cls):
         # Add metadata to class
-        """Add binary-operation metadata to and register an implementation class.
-
-        Args:
-            cls (type): Operation implementation class to decorate.
-
-        Returns:
-            type: The class configured to use ``BinaryOperation``.
-        """
         cls._aten_op_name = aten_name
         cls._has_neuron_op = True
         cls._auto_priority = priority
@@ -367,27 +267,14 @@ def neuron_binary_op(aten_name: str, priority: int = 50):
 
 
 def neuron_reduction_op(aten_name: str, priority: int = 50):
-    """Decorate and register a reduction operation implementation class.
+    """Decorator for reduction operations (sum, mean, etc.).
 
-    Args:
-        aten_name (str): Qualified ATen operation name to register.
-        priority (int, optional): Selection priority; higher values are tried first.
-            Defaults to ``50``.
-
-    Returns:
-        Callable: Class decorator that selects reduction output-shape handling.
+    Operations registered with this decorator will automatically get
+    proper output shape calculation for reductions.
     """
 
     def decorator(cls):
         # Add metadata to class
-        """Add reduction metadata to and register an implementation class.
-
-        Args:
-            cls (type): Operation implementation class to decorate.
-
-        Returns:
-            type: The class configured to use ``ReductionOperation``.
-        """
         cls._aten_op_name = aten_name
         cls._has_neuron_op = True
         cls._auto_priority = priority
@@ -402,27 +289,14 @@ def neuron_reduction_op(aten_name: str, priority: int = 50):
 
 
 def neuron_comparison_op(aten_name: str, priority: int = 50):
-    """Decorate and register a comparison operation implementation class.
+    """Decorator for comparison operations (eq, lt, gt, etc.).
 
-    Args:
-        aten_name (str): Qualified ATen operation name to register.
-        priority (int, optional): Selection priority; higher values are tried first.
-            Defaults to ``50``.
-
-    Returns:
-        Callable: Class decorator that selects comparison output-shape handling.
+    Operations registered with this decorator will automatically get
+    proper output shape calculation using broadcasting rules.
     """
 
     def decorator(cls):
         # Add metadata to class
-        """Add comparison metadata to and register an implementation class.
-
-        Args:
-            cls (type): Operation implementation class to decorate.
-
-        Returns:
-            type: The class configured to use ``ComparisonOperation``.
-        """
         cls._aten_op_name = aten_name
         cls._has_neuron_op = True
         cls._auto_priority = priority
@@ -437,34 +311,19 @@ def neuron_comparison_op(aten_name: str, priority: int = 50):
 
 
 def make_composite_lower(operation):
-    """Create a composite lowering callable for an operation.
+    """Create a lower_func that iterates implementations in priority order.
 
-    Args:
-        operation (Operation): Operation whose implementations are tried in order.
+    Called by C++ NeuronDispatcher on cache miss. Walks the implementation
+    chain (same order as Operation.__call__), finds the first impl that
+    can_handle the inputs AND has a lowerable kernel, and delegates to
+    its kernel.lower().
 
-    Returns:
-        Callable: Dynamo-disabled lowerer used by the C++ Neuron dispatcher on a
-            cache miss. It returns ``None`` when the first handling implementation
-            has no lowerable function or kernel, or when no implementation handles
-            the arguments.
-
-    Note:
-        The lowerer follows ``Operation.__call__`` order, preserves the prior Dynamo
-        evaluation frame, and forwards original arguments to kernel lowering.
+    Returns None if no implementation can handle + lower, signaling C++
+    to fall back to the Python wrapper.
     """
 
     @torch._dynamo.disable
     def composite_lower(*args, **kwargs):
-        """Lower with the first handling implementation, or request CPU fallback.
-
-        Args:
-            *args (Any): Positional operation arguments.
-            **kwargs (Any): Keyword arguments, including optional original arguments
-                injected by the C++ dispatcher.
-
-        Returns:
-            Any: Lowering output, or ``None`` when CPU fallback is needed.
-        """
         prior = torch._dynamo.eval_frame.set_eval_frame(None)
         try:
             # Extract original_args/original_kwargs injected by C++ before
@@ -509,34 +368,17 @@ def make_composite_lower(operation):
 
 
 def create_wrapper_function(aten_name: str, operation: Operation) -> Callable:
-    """Create a PyTorch registration wrapper for an operation.
+    """Create a wrapper function for PyTorch registration.
 
-    Args:
-        aten_name (str): Qualified ATen name used to name the wrapper.
-        operation (Operation): Operation invoked by the generated wrapper.
-
-    Returns:
-        Callable: Generated wrapper named from the ATen operation.
-
-    Note:
-        Standard wrappers forward all arguments. In-place wrappers pass the first
-        tensor as ``out`` and return it unless the operation returns ``None``.
+    Simply passes all arguments through to the operation without
+    making any assumptions about the operation type.
     """
+
     op_name = aten_name.replace("aten::", "")
 
     if operation.is_inplace:
         # In-place operations need special handling to ensure they modify the input tensor
         def wrapper(self, *args, **kwargs):
-            """Invoke an in-place operation with ``self`` as the output.
-
-            Args:
-                self (torch.Tensor): Destination tensor passed as ``out``.
-                *args (Any): Additional positional operation arguments.
-                **kwargs (Any): Additional keyword operation arguments.
-
-            Returns:
-                Any: ``None`` when the operation returns ``None``; otherwise, ``self``.
-            """
             # Call the operation with out=self to ensure in-place modification
             kwargs["out"] = self
             result = operation(self, *args, **kwargs)
@@ -547,15 +389,6 @@ def create_wrapper_function(aten_name: str, operation: Operation) -> Callable:
     else:
         # Standard wrapper - just pass everything through
         def wrapper(*args, **kwargs):
-            """Forward arguments to the registered operation.
-
-            Args:
-                *args (Any): Positional operation arguments.
-                **kwargs (Any): Keyword operation arguments.
-
-            Returns:
-                Any: Result returned by the operation.
-            """
             return operation(*args, **kwargs)
 
     wrapper.__name__ = f"{op_name.replace('.', '_').replace(':', '_')}_neuron"
@@ -564,16 +397,8 @@ def create_wrapper_function(aten_name: str, operation: Operation) -> Callable:
 
 
 def discover_all_implementations(package_name: str = "torch_neuronx.python_ops"):
-    """Discover operation implementations by importing package modules.
+    """Discover all implementations by importing all modules in the package."""
 
-    Args:
-        package_name (str, optional): Package tree to import recursively. Defaults to
-            ``torch_neuronx.python_ops``.
-
-    Note:
-        Module names containing ``test`` or ``__pycache__`` are skipped. Failed
-        imports emit warnings, and discovery continues because imports trigger registration.
-    """
     # Import the base package
     package = importlib.import_module(package_name)
 
@@ -596,37 +421,35 @@ def discover_all_implementations(package_name: str = "torch_neuronx.python_ops")
 def auto_register_neuron_ops(
     aten_lib: torch.library.Library,
     verbose: bool = False,
+    skip_torch_mlir_ops: bool = False,
     torch_mlir_ops: set[str] | None = None,
+    use_cpp_dispatch: bool = False,
 ):
-    """Register all decorated operations with PyTorch dispatch.
+    """Auto-register all operations decorated with @neuron_op.
 
     Args:
-        aten_lib (torch.library.Library): Library used to register operations that have no
-            lowerable kernel (Python dispatch path).
-        verbose (bool, optional): Whether to print registration details. Defaults to
-            ``False``.
-        torch_mlir_ops (set[str], optional): ATen names registered by torch-mlir; these are
-            skipped here. Defaults to ``None``.
-
-    Returns:
-        int: Number of operations successfully registered.
-
-    Note:
-        Registration failures emit warnings. Operations for which no implementation
-        has a kernel or lower-function attribute are registered through ``aten_lib``
-        instead of the C++ Neuron dispatcher.
+        aten_lib: The PyTorch library to register operations with
+        verbose: If True, print registration details
+        skip_torch_mlir_ops: If True, skip operations that have torch-mlir registrations
+        torch_mlir_ops: Set of aten names that have torch-mlir registrations
+        use_cpp_dispatch: If True, register through C++ NeuronDispatcher
     """
+
     # First, discover all implementations by importing modules
     discover_all_implementations()
 
-    import torch_neuronx._C as _C
+    neuron_c = None
+    if use_cpp_dispatch:
+        import torch_neuronx._C as _C
+
+        neuron_c = _C
 
     # Now register everything in the registry
     registered_count = 0
     for aten_name, reg_info in _NEURON_OPS_REGISTRY.items():
         # Skip operations that have @register_aten torch-mlir registrations when using C++ dispatch
         # Those will be registered via C++ dispatcher by torch-mlir's finalize_registrations_cpp
-        if torch_mlir_ops and aten_name in torch_mlir_ops:
+        if skip_torch_mlir_ops and torch_mlir_ops and aten_name in torch_mlir_ops:
             if verbose:
                 print(f"⏭ Skipping {aten_name} - will use torch-mlir C++ dispatch")
             continue
@@ -662,45 +485,50 @@ def auto_register_neuron_ops(
         # Register with PyTorch
         op_name = aten_name.replace("aten::", "")
         try:
-            lower_func = None
-            if operation is not None:
-                has_any_lowerable = any(
-                    (hasattr(impl, "kernel") and impl.kernel is not None)
-                    or hasattr(impl, "get_lower_func")
-                    for impl in operation._implementations
+            if use_cpp_dispatch and neuron_c is not None:
+                lower_func = None
+                if operation is not None:
+                    has_any_lowerable = any(
+                        (hasattr(impl, "kernel") and impl.kernel is not None)
+                        or hasattr(impl, "get_lower_func")
+                        for impl in operation._implementations
+                    )
+                    if has_any_lowerable:
+                        lower_func = make_composite_lower(operation)
+                # Extract static_argnums/static_argnames from the highest-priority
+                # implementation.  These tell C++ PreprocessArgs to skip converting
+                # scalar args (like dim, non_blocking) to device tensors.
+                static_argnums = []
+                static_argnames = []
+                if operation is not None:
+                    for impl in operation._implementations:
+                        if hasattr(impl, "static_argnums") and impl.static_argnums:
+                            static_argnums = list(impl.static_argnums)
+                            break
+                    for impl in operation._implementations:
+                        if hasattr(impl, "static_argnames") and impl.static_argnames:
+                            static_argnames = list(impl.static_argnames)
+                            break
+                # Ops with no lowerable kernel (pure Python/NRT path) cannot go
+                # through the C++ dispatcher which requires a lower_func.
+                # Fall back to the Python aten_lib path for these.
+                if lower_func is None:
+                    aten_lib.impl(op_name, wrapper_func, "PrivateUse1")
+                    registered_count += 1
+                    if verbose:
+                        print(
+                            f"✓ Auto-registered (Python path): {op_name} -> {wrapper_func.__name__}"
+                        )
+                    continue
+                neuron_c._register_neuron_op(
+                    op_name,
+                    wrapper_func,
+                    lower_func,
+                    static_argnums,
+                    static_argnames,
                 )
-                if has_any_lowerable:
-                    lower_func = make_composite_lower(operation)
-            # Extract static_argnums/static_argnames from the highest-priority
-            # implementation.  These tell C++ PreprocessArgs to skip converting
-            # scalar args (like dim, non_blocking) to device tensors.
-            static_argnums = []
-            static_argnames = []
-            if operation is not None:
-                for impl in operation._implementations:
-                    if hasattr(impl, "static_argnums") and impl.static_argnums:
-                        static_argnums = list(impl.static_argnums)
-                        break
-                for impl in operation._implementations:
-                    if hasattr(impl, "static_argnames") and impl.static_argnames:
-                        static_argnames = list(impl.static_argnames)
-                        break
-            # Ops with no lowerable kernel (pure Python/NRT path) cannot go
-            # through the C++ dispatcher which requires a lower_func.
-            # Fall back to the Python aten_lib path for these.
-            if lower_func is None:
+            else:
                 aten_lib.impl(op_name, wrapper_func, "PrivateUse1")
-                registered_count += 1
-                if verbose:
-                    print(f"✓ Auto-registered (Python path): {op_name} -> {wrapper_func.__name__}")
-                continue
-            _C._register_neuron_op(
-                op_name,
-                wrapper_func,
-                lower_func,
-                static_argnums,
-                static_argnames,
-            )
             registered_count += 1
             if verbose:
                 print(f"✓ Auto-registered: {op_name} -> {wrapper_func.__name__}")
@@ -714,35 +542,21 @@ def auto_register_neuron_ops(
 
 
 def set_wrapper_override(aten_name: str, wrapper_func: Callable):
-    """Set a custom dispatch wrapper for an ATen operation.
+    """Set a custom wrapper function for an operation.
 
-    Args:
-        aten_name (str): Qualified ATen operation name to update.
-        wrapper_func (Callable): Wrapper to store as the dispatch override.
-
-    Note:
-        Registration uses the override only when it evaluates truthy.
+    Use this for complex operations that need custom dispatch logic.
     """
     _NEURON_OPS_REGISTRY[aten_name]["wrapper_override"] = wrapper_func
 
 
 def set_operation_class(aten_name: str, operation_class: Operation):
-    """Set a custom operation object for an ATen operation.
+    """Set a custom Operation class for an aten operation.
 
-    Args:
-        aten_name (str): Qualified ATen operation name to update.
-        operation_class (Operation): Hand-written operation to store in the registry.
-
-    Note:
-        Registration uses the custom object only when it evaluates truthy.
+    Use this when you have a hand-written Operation class with custom logic.
     """
     _NEURON_OPS_REGISTRY[aten_name]["operation_class"] = operation_class
 
 
 def get_registry_info() -> dict[str, dict[str, Any]]:
-    """Return a shallow copy of the operation registry.
-
-    Returns:
-        dict[str, dict[str, Any]]: Registry entries keyed by qualified ATen name.
-    """
+    """Get information about all registered operations (for debugging)."""
     return dict(_NEURON_OPS_REGISTRY)

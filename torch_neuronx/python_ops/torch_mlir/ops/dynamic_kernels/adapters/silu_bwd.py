@@ -72,7 +72,6 @@ def _reshape_silu_bwd_output(outputs, original_args):
 
 
 def register():
-    """Register the dynamic SiLU-backward adapter."""
     register_dynamic_nki(
         "silu_backward",
         DynamicNkiEntry(

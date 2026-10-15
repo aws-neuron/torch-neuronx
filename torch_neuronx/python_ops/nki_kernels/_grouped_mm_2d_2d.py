@@ -11,39 +11,11 @@ import nki.language as nl
 
 
 def div_ceil(n, d):
-    """Compute the ceiling of an integer quotient.
-
-    Args:
-        n (int): Dividend.
-        d (int): Positive divisor.
-
-    Returns:
-        int: Smallest integer greater than or equal to the quotient.
-
-    Raises:
-        ZeroDivisionError: If ``d`` is zero.
-    """
     return (n + d - 1) // d
 
 
 @nki.jit(mode="trace")
 def grouped_mm_2d_2d(a, b, offs):
-    """Compute aligned 2D-by-2D grouped matrix multiplication.
-
-    Args:
-        a (nl.ndarray): Left operand with shape ``(D1, T)``.
-        b (nl.ndarray): Right operand with shape ``(T, D2)`` and the same data type.
-        offs (nl.ndarray): Cumulative group end offsets with shape ``(G,)``.
-
-    Returns:
-        nl.ndarray: Per-group result with shape ``(G, D1, D2)``.
-
-    Raises:
-        AssertionError: If contraction sizes, data types, or launch sharding are invalid.
-
-    Note:
-        ``T`` must be divisible by 128, and each program owns a disjoint ``D2`` slice.
-    """
     D1, T = a.shape
     T_, D2 = b.shape
     (G,) = offs.shape
@@ -63,7 +35,6 @@ def grouped_mm_2d_2d(a, b, offs):
     assert T % TILE_T == 0, f"{T=} must be divisible by {TILE_T=}"
     assert D2 % num_progs == 0, f"{D2=} must be divisible by {num_progs=}"
 
-    r_acc = nl.ndarray((G, D1, D2), nl.float32, nl.shared_hbm)
     r = nl.ndarray((G, D1, D2), dtype, nl.shared_hbm)
 
     offs_tile = nl.ndarray((TILE_C, G), offs.dtype, nl.sbuf)
@@ -89,17 +60,17 @@ def grouped_mm_2d_2d(a, b, offs):
         nisa.tensor_reduce(chunk_to_group_tile, nl.add, comparison_tile_ap, 1)
         chunk_to_group_tiles.append(chunk_to_group_tile)
 
-    zero = nl.ndarray((TILE_D1, PROG_D2), nl.float32, nl.sbuf)
+    zero = nl.ndarray((TILE_D1, PROG_D2), dtype, nl.sbuf)
     nisa.memset(zero, 0)
     for g in range(G):
         for i in range(div_ceil(D1, TILE_D1)):
             MASKED_TILE_D1 = min(TILE_D1, D1 - i * TILE_D1)
-            r_acc_ap = r_acc.ap(
+            r_ap = r.ap(
                 [[D2, MASKED_TILE_D1], [1, PROG_D2]],
                 g * D1 * D2 + i * TILE_D1 * D2 + prog_id * PROG_D2,
             )
             zero_ap = zero.ap([[PROG_D2, MASKED_TILE_D1], [1, PROG_D2]])
-            nisa.dma_copy(r_acc_ap, zero_ap)
+            nisa.dma_copy(r_ap, zero_ap)
 
     for k in range(T // TILE_T):
         chunk_outer, chunk_inner = divmod(k, TILE_C)
@@ -122,13 +93,13 @@ def grouped_mm_2d_2d(a, b, offs):
             )
             nisa.dma_transpose(a_T_tile_ap, a_ap)
 
-            r_tile_sbuf = nl.ndarray((MASKED_TILE_D1, PROG_D2), nl.float32, nl.sbuf)
-            r_acc_ap = r_acc.ap(
+            r_tile_sbuf = nl.ndarray((MASKED_TILE_D1, PROG_D2), dtype, nl.sbuf)
+            r_ap = r.ap(
                 [[D2, MASKED_TILE_D1], [1, PROG_D2]],
                 i * TILE_D1 * D2 + prog_id * PROG_D2,
                 scalar_offset=chunk_to_group_tile_ap,
             )
-            nisa.dma_copy(r_tile_sbuf, r_acc_ap, oob_mode=nisa.oob_mode.skip)
+            nisa.dma_copy(r_tile_sbuf, r_ap, oob_mode=nisa.oob_mode.skip)
 
             for j in range(div_ceil(PROG_D2, TILE_D2)):
                 MASKED_TILE_D2 = min(TILE_D2, PROG_D2 - j * TILE_D2)
@@ -141,23 +112,6 @@ def grouped_mm_2d_2d(a, b, offs):
                 )
                 nisa.tensor_tensor(r_tile_sbuf_ap, r_tile_sbuf_ap, r_tile_psum, nl.add)
 
-            nisa.dma_copy(r_acc_ap, r_tile_sbuf, oob_mode=nisa.oob_mode.skip)
-
-    for g in range(G):
-        for i in range(div_ceil(D1, TILE_D1)):
-            MASKED_TILE_D1 = min(TILE_D1, D1 - i * TILE_D1)
-            acc_sbuf = nl.ndarray((MASKED_TILE_D1, PROG_D2), nl.float32, nl.sbuf)
-            out_sbuf = nl.ndarray((MASKED_TILE_D1, PROG_D2), dtype, nl.sbuf)
-            r_acc_ap = r_acc.ap(
-                [[D2, MASKED_TILE_D1], [1, PROG_D2]],
-                g * D1 * D2 + i * TILE_D1 * D2 + prog_id * PROG_D2,
-            )
-            r_ap = r.ap(
-                [[D2, MASKED_TILE_D1], [1, PROG_D2]],
-                g * D1 * D2 + i * TILE_D1 * D2 + prog_id * PROG_D2,
-            )
-            nisa.dma_copy(acc_sbuf, r_acc_ap)
-            nisa.tensor_copy(dst=out_sbuf, src=acc_sbuf)
-            nisa.dma_copy(r_ap, out_sbuf)
+            nisa.dma_copy(r_ap, r_tile_sbuf, oob_mode=nisa.oob_mode.skip)
 
     return r

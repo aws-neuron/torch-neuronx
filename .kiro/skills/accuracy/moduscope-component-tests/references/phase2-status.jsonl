@@ -1,0 +1,6 @@
+{"ts":"2026-05-26T04:14:30Z","phase":"plan","action":"phase2-started","detail":"Plan written. test_05/test_06 need S3, all other tests already valid"}
+{"ts":"2026-05-26T04:14:30Z","phase":"plan","action":"resource-confirmed","detail":"GPU pool: 1-2,1-3,1-5 (1-1=sheaak). TRN pool: 3-5,3-6,3-7,3-8"}
+{"ts":"2026-05-26T04:14:30Z","phase":"plan","action":"valid-runs","detail":"deepseekv3 test_12,test_11,test_09,test_13 GPU done; llama4/qwen3/gpt_oss test_11 valid; llama4/qwen3/gpt_oss test_09 GPU done; gpt_oss test_12_gptoss_attention valid"}
+{"ts":"2026-05-26T04:14:30Z","phase":"plan","action":"invalid-runs","detail":"llama4/qwen3 test_05 + llama4/qwen3/gpt_oss test_06 need rework (no S3)"}
+{"ts":"2026-05-26T04:17:30Z","phase":"step1","action":"code-fix-done","detail":"test_05_attention.py and test_06_transformer_block.py upgraded with TEST_MODE branching + S3 + rope-device-fix. Synced to TRN + GPU"}
+{"ts":"2026-05-26T04:17:45Z","phase":"step2","action":"round1-launched","detail":"3 GPU jobs gpu_save: llama4 test_05 on 1-2, qwen3 test_05 on 1-3, llama4 test_06 on 1-5","ts_tag":"20260526_041731"}

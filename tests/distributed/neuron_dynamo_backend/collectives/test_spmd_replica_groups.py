@@ -17,8 +17,6 @@ from torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization impor
     _get_process_group_ranks,
 )
 
-pytestmark = pytest.mark.neuron_cores(8)
-
 
 def run_spmd_replica_groups_test(rank, world_size, kwargs):
     """

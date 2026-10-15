@@ -32,13 +32,6 @@ logger = logging.getLogger(__name__)
 
 
 class MutationKind(Enum):
-    """Identify supported IO signature and alias mutation kinds.
-
-    Note:
-        ``ADD`` and ``REMOVE`` alter an IO signature, while ``ALIAS`` records
-        output-to-input buffer reuse metadata.
-    """
-
     ADD = "add"
     REMOVE = "remove"
     ALIAS = "alias"
@@ -46,25 +39,18 @@ class MutationKind(Enum):
 
 @dataclass
 class IOMutation:
-    """Represent one pass-local input or output mutation.
+    """A single IO transformation for one direction (input or output).
 
-    Args:
-        kind (MutationKind): Mutation kind to apply or record.
-        indices (list[int]): Affected IO indices in pass-local space.
-        transform_key (str | None, optional): Registry key used to generate added
-            values. Defaults to ``None``.
-        transform_params (dict | None, optional): Parameters passed to the registered
-            transform. Defaults to ``None``.
-        pass_name (str, optional): Name of the emitting FX pass. Defaults to ``""``.
-        alias_input_indices (list[int] | None, optional): Input indices paired with
-            output ``indices`` for an ``ALIAS`` mutation. Defaults to ``None``.
-        is_mutation (bool | None, optional): Whether an alias requires copy-back;
-            ``False`` denotes buffer reuse. Defaults to ``None``.
+    Input mutations (ADD/REMOVE): applied directly at execution.
+    Output mutations (ADD/REMOVE): applied inverted at execution (see module docstring).
+    ALIAS mutations: metadata only — skipped by apply_input/output_mutations.
 
-    Note:
-        Input additions and removals apply directly, output mutations apply
-        inversely, and alias mutations are metadata-only during value transforms.
-        Each pass records one alias mutation per mutation or passthrough direction.
+    For kind == ALIAS:
+      - indices[i]:             output index in pass-local space
+      - alias_input_indices[i]: input  index in pass-local space
+      - is_mutation=True:  result must be copied back to original input after execution
+      - is_mutation=False: pure buffer reuse (passthrough, no copy-back needed)
+    One ALIAS IOMutation per pass per direction (mutations vs passthroughs).
     """
 
     kind: MutationKind  # Type of mutation (add, remove, or alias)
@@ -78,17 +64,10 @@ class IOMutation:
 
 @dataclass
 class PassMutations:
-    """Group the input and output mutations emitted by one FX pass.
+    """Groups the input and output mutations emitted by a single FX pass.
 
-    Args:
-        pass_name (str): Name of the FX pass that emitted the mutations.
-        input_mutations (list[IOMutation], optional): Input mutations in application
-            order. Defaults to an empty list.
-        output_mutations (list[IOMutation], optional): Output mutations in application
-            order. Defaults to an empty list.
-
-    Note:
-        Every index uses the graph IO space before this pass runs.
+    All indices in both lists are in the graph's IO space **before** this
+    pass's mutations have been applied (pass-local space).
     """
 
     pass_name: str
@@ -189,39 +168,6 @@ def _shift_index_through_mutation(idx: int | None, m: IOMutation, *, forward: bo
     return idx
 
 
-def _log_dropped_alias(
-    source: IOMutation | None,
-    source_indices: list[int],
-    old_indices: list[int | None],
-    new_indices: list[int | None],
-    remover: IOMutation,
-    remover_pass_name: str,
-    direction: str,
-) -> None:
-    """Log one message for each pass that eliminates alias indices.
-
-    The message is at DEBUG level. A removed alias is expected, for example when
-    ReplaceDeviceMeshPlaceholders drops a device mesh input.
-    """
-    if not logger.isEnabledFor(logging.DEBUG):
-        return
-    dropped = dict.fromkeys(
-        source_indices[i]
-        for i, (old, new) in enumerate(zip(old_indices, new_indices, strict=True))
-        if old is not None and new is None
-    )
-    if not dropped:
-        return
-    logger.debug(
-        f"The alias from pass {source.pass_name if source else 'unknown'} "
-        f"on {direction} indices={list(dropped)} is not applied. "
-        f"Pass {remover_pass_name} applied {remover.kind.value} "
-        f"to the {direction} indices={remover.indices}. "
-        f"The StableHLO for neuronx-cc and the NEFF aliased buffer allocation "
-        f"do not get this alias."
-    )
-
-
 def _translate_indices(
     input_indices: list[int],
     output_indices: list[int],
@@ -249,30 +195,38 @@ def _translate_indices(
                 _shift_index_through_mutation(idx, im, forward=forward)
                 for idx in curr_input_indices
             ]
-            _log_dropped_alias(
-                source,
-                input_indices,
-                curr_input_indices,
-                new_input_indices,
-                im,
-                pm.pass_name,
-                "input",
-            )
+            for i, (old, new) in enumerate(zip(curr_input_indices, new_input_indices, strict=True)):
+                if old is not None and new is None:
+                    logger.info(
+                        f"Alias IOMutation {source} generated by pass "
+                        f"{source.pass_name if source else 'unknown'} on "
+                        f"in={input_indices[i]} "
+                        f"was removed by {pm.pass_name} "
+                        f"(input {im.kind.value} at indices={im.indices}) - "
+                        f"the corresponding alias will be ignored and not applied "
+                        f"to the stablehlo passed to neuronx-cc compilation or to "
+                        f"the NEFF output->input aliased buffer allocation"
+                    )
             curr_input_indices = new_input_indices
         for om in pm.output_mutations:
             new_output_indices = [
                 _shift_index_through_mutation(idx, om, forward=forward)
                 for idx in curr_output_indices
             ]
-            _log_dropped_alias(
-                source,
-                output_indices,
-                curr_output_indices,
-                new_output_indices,
-                om,
-                pm.pass_name,
-                "output",
-            )
+            for i, (old, new) in enumerate(
+                zip(curr_output_indices, new_output_indices, strict=True)
+            ):
+                if old is not None and new is None:
+                    logger.info(
+                        f"Alias IOMutation {source} generated by pass "
+                        f"{source.pass_name if source else 'unknown'} on "
+                        f"out={output_indices[i]} "
+                        f"was removed by {pm.pass_name} "
+                        f"(output {om.kind.value} at indices={om.indices}) - "
+                        f"the corresponding alias will be ignored and not applied "
+                        f"to the stablehlo passed to neuronx-cc compilation or to "
+                        f"the NEFF output->input aliased buffer allocation"
+                    )
             curr_output_indices = new_output_indices
     return curr_input_indices, curr_output_indices
 
@@ -280,20 +234,11 @@ def _translate_indices(
 def get_alias_output_buffer_map(
     pass_mutations: list[PassMutations],
 ) -> dict[int, int]:
-    """Return NEFF output-to-input aliases for buffer reuse and StableHLO hints.
+    """Return {neff_output_index: neff_input_index} for buffer reuse and StableHLO hints.
 
-    Args:
-        pass_mutations (list[PassMutations]): Ordered pass-local mutation records.
-
-    Returns:
-        dict[int, int]: NEFF output indices mapped to NEFF input indices.
-
-    Raises:
-        AssertionError: If an alias mutation has no paired input indices.
-
-    Note:
-        Both mutation and passthrough aliases are translated through subsequent
-        passes. Eliminated aliases are dropped, and the first duplicate mapping wins.
+    Covers both is_mutation=True and is_mutation=False ALIAS entries.
+    Translates pass-local output indices forward through subsequent output mutations
+    and pass-local input indices forward through subsequent input mutations.
     """
     alias_output_to_input_map: dict[int, int] = {}
     for i, pm in enumerate(pass_mutations):
@@ -330,20 +275,10 @@ def get_alias_output_buffer_map(
 def get_mutation_copy_back_inputs(
     pass_mutations: list[PassMutations],
 ) -> dict[int, int]:
-    """Return copy-back destinations for mutation aliases.
+    """Return {neff_output_index: caller_space_input_index} for is_mutation=True ALIAS entries.
 
-    Args:
-        pass_mutations (list[PassMutations]): Ordered pass-local mutation records.
-
-    Returns:
-        dict[int, int]: NEFF output indices mapped to caller-space input indices.
-
-    Raises:
-        AssertionError: If a mutation alias has no paired input indices.
-
-    Note:
-        Only aliases marked as mutations are included for retain-device copy-back.
-        Eliminated aliases are dropped, and the first duplicate mapping wins.
+    Maps each NEFF output index that holds a mutation result to the caller-space input
+    index whose tensor should receive the copy-back (for retain_device support).
     """
     copy_back_output_to_input_buffer_map: dict[int, int] = {}
     for i, pm in enumerate(pass_mutations):
@@ -394,24 +329,29 @@ def rebase_pre_aot_pass_mutations(
     pm: PassMutations | None,
     passes_before_functionalize: list[PassMutations],
 ) -> PassMutations | None:
-    """Rebase pre-AOT alias indices through passes before functionalization.
+    """Translate pre-AOT ALIAS mutation indices through passes that ran before
+    FunctionalizeCopyInplacePass.
+
+    The pre-AOT AliasingAnalysis sees the already-functionalized graph, so its
+    ALIAS indices are in the graph space *after* FunctionalizeCopyInplacePass has
+    run.  However, passes like FlexAttentionNKILowering and FlexAttentionLegalization
+    execute *before* FunctionalizeCopyInplacePass and may shift input/output indices.
+
+    This utility replays those earlier passes' ADD/REMOVE mutations forward onto both
+    the ALIAS output and input indices, producing a new PassMutations list whose indices
+    are valid in the graph space immediately after FunctionalizeCopyInplacePass — which
+    is where the rebased mutations should be inserted.
 
     Args:
-        pm (PassMutations | None): Alias mutations emitted by pre-AOT alias analysis.
-        passes_before_functionalize (list[PassMutations]): Mutations from passes that
-            run before ``FunctionalizeCopyInplacePass``.
+        pre_aot_pass_mutations: The PassMutations emitted by AliasingAnalysis (pre-AOT).
+        passes_before_functionalize: PassMutations from post-AOT passes that ran before
+            FunctionalizeCopyInplacePass (e.g. FlexAttentionNKILowering,
+            FlexAttentionLegalization).
 
     Returns:
-        PassMutations | None: New record with translated aliases, or the unchanged
-        falsey input.
-
-    Raises:
-        AssertionError: If ``pm`` contains input or non-alias output mutations.
-
-    Note:
-        Pre-AOT alias analysis observes post-functionalization graph space. Replay
-        earlier ``ADD`` and ``REMOVE`` mutations before inserting the result after
-        functionalization; aliases eliminated by those changes are omitted.
+        A new list of PassMutations with translated ALIAS indices, ready to be inserted
+        immediately after the FunctionalizeCopyInplacePass entry in the global
+        pass_mutations list.
     """
     if not pm:
         return pm
@@ -459,19 +399,10 @@ def apply_input_mutations(
     pass_mutations: list[PassMutations],
     device: str,
 ) -> list:
-    """Apply input mutations from caller space to NEFF space.
+    """Apply input mutations in forward order (original inputs -> NEFF inputs).
 
-    Args:
-        inputs (list): Values matching the original caller signature.
-        pass_mutations (list[PassMutations]): Ordered pass-local mutation records.
-        device (str): Device used by transforms that generate values.
-
-    Returns:
-        list: Values matching the post-pass NEFF input signature.
-
-    Note:
-        Passes and their input additions or removals are applied in forward order;
-        alias metadata does not alter values.
+    Iterates through each PassMutations entry in order and applies its
+    input ADD/REMOVE mutations sequentially.
     """
     values = inputs
     for pm in pass_mutations:
@@ -486,21 +417,10 @@ def apply_output_mutations(
     device: str,
     original_inputs: list | None = None,
 ) -> list:
-    """Restore caller outputs from the NEFF output signature.
+    """Apply output mutations in reverse order (NEFF outputs -> original outputs).
 
-    Args:
-        outputs (list): Values matching the post-pass NEFF output signature.
-        pass_mutations (list[PassMutations]): Ordered pass-local mutation records.
-        device (str): Device used by transforms that restore values.
-        original_inputs (list | None, optional): Caller inputs available to passthrough
-            transforms. Defaults to ``None``.
-
-    Returns:
-        list: Values matching the original caller output signature.
-
-    Note:
-        Passes and their output mutations are undone in reverse order; alias metadata
-        does not alter values.
+    Iterates through PassMutations entries in reverse and undoes each pass's
+    output mutations in reverse order (last mutation of last pass first).
     """
     values = outputs
     for pm in reversed(pass_mutations):
@@ -513,17 +433,13 @@ def translate_input_indices_to_neff(
     input_indices: list[int],
     pass_mutations: list[PassMutations],
 ) -> list[int]:
-    """Translate caller-space input indices to NEFF-space indices.
+    """Map caller/original-space input indices to NEFF-space (post-pass) indices.
 
-    Args:
-        input_indices (list[int]): Original input positions to translate.
-        pass_mutations (list[PassMutations]): Ordered pass-local mutation records.
-
-    Returns:
-        list[int]: Surviving input positions after applying input mutations forward.
-
-    Note:
-        Removed indices are dropped, and an empty mutation sequence is the identity.
+    Applies the FX passes' input ADD/REMOVE mutations forward — the same transform
+    apply_input_mutations performs on values — so an index in the original input space
+    is mapped to its position in the NEFF input space the compiler and executor use.
+    Indices a pass removed map to None and are dropped. With no shifting mutations this
+    is the identity.
     """
     translated, _ = _translate_indices(list(input_indices), [], pass_mutations, forward=True)
     return [idx for idx in translated if idx is not None]

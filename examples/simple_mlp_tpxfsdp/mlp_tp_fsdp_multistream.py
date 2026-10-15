@@ -36,66 +36,31 @@ SEQ_LEN = 4 * 1024  # Total sequence length (will be divided by TP_SIZE)
 
 
 def get_tp_rank(global_rank):
-    """Return the tensor-parallel rank for a global rank.
-
-    Args:
-        global_rank (int): Global distributed rank.
-
-    Returns:
-        int: Rank within the tensor-parallel group.
-    """
+    """Get TP rank within the TP group (0-3)."""
     return global_rank % TP_SIZE
 
 
 def get_fsdp_rank(global_rank):
-    """Return the fully sharded data-parallel rank for a global rank.
-
-    Args:
-        global_rank (int): Global distributed rank.
-
-    Returns:
-        int: Rank within the fully sharded data-parallel group.
-    """
+    """Get FSDP rank within the FSDP group (0-15)."""
     return global_rank // TP_SIZE
 
 
 def get_tp_group_id(global_rank):
-    """Return the tensor-parallel group index for a global rank.
-
-    Args:
-        global_rank (int): Global distributed rank.
-
-    Returns:
-        int: Index of the rank's tensor-parallel group.
-    """
+    """Get which TP group this rank belongs to (0-15)."""
     return global_rank // TP_SIZE
 
 
 def get_fsdp_group_id(global_rank):
-    """Return the fully sharded data-parallel group index for a global rank.
-
-    Args:
-        global_rank (int): Global distributed rank.
-
-    Returns:
-        int: Index of the rank's fully sharded data-parallel group.
-    """
+    """Get which FSDP group this rank belongs to (0-3)."""
     return global_rank % TP_SIZE
 
 
 def create_process_groups(rank):
-    """Create tensor-parallel and fully sharded data-parallel groups.
+    """
+    Create TP and FSDP process groups.
 
-    Args:
-        rank (int): Global rank whose process groups are returned.
-
-    Returns:
-        tuple[dist.ProcessGroup | None, dist.ProcessGroup | None]: Groups containing
-            ``rank``; each entry is ``None`` if no corresponding group contains it.
-
-    Note:
-        Tensor-parallel groups contain consecutive ranks, while fully sharded
-        data-parallel groups contain ranks strided by ``TP_SIZE``.
+    TP groups: [[0,1,2,3], [4,5,6,7], ..., [60,61,62,63]]
+    FSDP groups: [[0,4,8,...,60], [1,5,9,...,61], [2,6,10,...,62], [3,7,11,...,63]]
     """
     # Create TP groups (FSDP_SIZE groups, each with TP_SIZE consecutive ranks)
     tp_groups = []
@@ -127,23 +92,19 @@ def create_process_groups(rank):
 
 
 class MLPLayer:
-    """Implement one MLP layer with tensor and FSDP sharding.
+    """
+    Single MLP layer with TP x FSDP sharding.
 
-    Args:
-        layer_idx (int): Index of this layer.
-        rank (int): Global distributed rank.
-        tp_group (dist.ProcessGroup): Tensor-parallel process group.
-        fsdp_group (dist.ProcessGroup): Fully sharded data-parallel process group.
-        device (torch.device or str): Device on which to allocate weights and buffers.
+    Forward flow:
+    1. FSDP Stream: AllGather W1 and W2 shards
+    2. Event sync: Wait for FSDP allgather to complete
+    3. Default Stream: TP AllGather activation -> MatMul1 -> GeLU -> MatMul2 -> TP ReduceScatter
 
-    Note:
-        ``w1_shard`` has shape ``(HIDDEN_DIM/FSDP_SIZE, INTERMEDIATE_DIM/TP_SIZE)``
-        and gathers to ``(HIDDEN_DIM, INTERMEDIATE_DIM/TP_SIZE)``.
-        ``w2_shard`` has shape
-        ``(INTERMEDIATE_DIM/TP_SIZE/FSDP_SIZE, HIDDEN_DIM)`` and gathers to
-        ``(INTERMEDIATE_DIM/TP_SIZE, HIDDEN_DIM)``. Forward execution overlaps
-        activation gathering with weight gathering, synchronizes by events, and
-        reduce-scatters the output across the tensor-parallel group.
+    Weight shapes (per TP rank):
+    - W1: [HIDDEN_DIM, INTERMEDIATE_DIM/TP_SIZE]
+    - W1 FSDP-sharded: [HIDDEN_DIM/FSDP_SIZE, INTERMEDIATE_DIM/TP_SIZE]
+    - W2: [INTERMEDIATE_DIM/TP_SIZE, HIDDEN_DIM]
+    - W2 FSDP-sharded: [INTERMEDIATE_DIM/TP_SIZE/FSDP_SIZE, HIDDEN_DIM]
     """
 
     def __init__(self, layer_idx, rank, tp_group, fsdp_group, device):
@@ -192,15 +153,14 @@ class MLPLayer:
         )
 
     def fsdp_allgather_w1(self, fsdp_stream, event_w1):
-        """Gather the first weight matrix on the FSDP stream.
+        """
+        AllGather W1 across FSDP group on the FSDP stream.
 
-        Args:
-            fsdp_stream (torch.neuron.Stream): Stream used for the collective.
-            event_w1 (torch.neuron.Event): Event recorded after the gather.
+        W1: [HIDDEN_DIM/FSDP_SIZE, INTERMEDIATE_DIM/TP_SIZE] -> AllGather dim=0
+            -> [HIDDEN_DIM, INTERMEDIATE_DIM/TP_SIZE]
+        Records event_w1 after completion.
 
-        Note:
-            The collective writes directly into the preallocated ``w1_full`` buffer,
-            growing dimension zero from ``HIDDEN_DIM/FSDP_SIZE`` to ``HIDDEN_DIM``.
+        Uses all_gather_into_tensor for efficiency (single output tensor, no stack/copy overhead).
         """
         with torch.neuron.stream(fsdp_stream):
             # AllGather W1 directly into pre-allocated buffer
@@ -210,15 +170,14 @@ class MLPLayer:
             event_w1.record(fsdp_stream)
 
     def fsdp_allgather_w2(self, fsdp_stream, event_w2):
-        """Gather the second weight matrix on the FSDP stream.
+        """
+        AllGather W2 across FSDP group on the FSDP stream.
 
-        Args:
-            fsdp_stream (torch.neuron.Stream): Stream used for the collective.
-            event_w2 (torch.neuron.Event): Event recorded after the gather.
+        W2: [INTERMEDIATE_DIM/TP_SIZE/FSDP_SIZE, HIDDEN_DIM] -> AllGather dim=0
+            -> [INTERMEDIATE_DIM/TP_SIZE, HIDDEN_DIM]
+        Records event_w2 after completion.
 
-        Note:
-            The collective writes directly into the preallocated ``w2_full`` buffer,
-            growing dimension zero to ``INTERMEDIATE_DIM/TP_SIZE``.
+        Uses all_gather_into_tensor for efficiency (single output tensor, no stack/copy overhead).
         """
         with torch.neuron.stream(fsdp_stream):
             # AllGather W2 directly into pre-allocated buffer
@@ -228,21 +187,26 @@ class MLPLayer:
             event_w2.record(fsdp_stream)
 
     def forward(self, x, default_stream, fsdp_stream, event_w1, event_w2):
-        """Run the layer while overlapping activation and weight gathering.
+        """
+        Forward pass for MLP layer with pipelined weight gathering.
 
         Args:
-            x (torch.Tensor): Local activation shaped ``(SEQ_LEN/TP_SIZE, HIDDEN_DIM)``.
-            default_stream (torch.neuron.Stream): Stream for compute and TP collectives.
-            fsdp_stream (torch.neuron.Stream): Stream for FSDP weight gathering.
-            event_w1 (torch.neuron.Event): Event synchronizing the first matrix multiply.
-            event_w2 (torch.neuron.Event): Event synchronizing the second matrix multiply.
+            x: Input activation [seq/TP, hidden_dim]
+            default_stream: Stream for compute and TP collectives
+            fsdp_stream: Stream for FSDP allgather
+            event_w1: Event to synchronize W1 allgather -> MatMul1
+            event_w2: Event to synchronize W2 allgather -> MatMul2
 
         Returns:
-            torch.Tensor: Reduce-scattered output with the same shape as ``x``.
+            output: [seq/TP, hidden_dim]
 
-        Note:
-            Tensor-parallel activation gathering overlaps both FSDP weight gathers.
-            Matrix multiplies wait on their corresponding weight events.
+        Timeline (optimized - TP AllGather overlaps with FSDP AllGather):
+            FSDP Stream:    [AllGather W1]──record(evt_w1)──[AllGather W2]──record(evt_w2)──►
+                                    │                                  │
+                                    │                                  ▼ wait(evt_w2)
+            Default Stream: [TP AllGather]──────wait(evt_w1)─►[MatMul1]─►[GeLU]─►[MatMul2]─►[TP RS]
+
+            Overlap: TP AllGather runs in parallel with FSDP AllGather W1 + W2
         """
         # Step 1: Start FSDP AllGather for W1 (on FSDP stream)
         self.fsdp_allgather_w1(fsdp_stream, event_w1)
@@ -291,14 +255,7 @@ class MLPLayer:
 
 
 class MLP8Layer:
-    """Build a multilayer MLP with tensor and FSDP sharding.
-
-    Args:
-        rank (int): Global distributed rank.
-        tp_group (dist.ProcessGroup): Tensor-parallel process group.
-        fsdp_group (dist.ProcessGroup): Fully sharded data-parallel process group.
-        device (torch.device or str): Device used by each MLP layer.
-    """
+    """NUM_LAYERS-layer MLP model with TP x FSDP sharding."""
 
     def __init__(self, rank, tp_group, fsdp_group, device):
         self.rank = rank
@@ -310,15 +267,16 @@ class MLP8Layer:
         self.layers = [MLPLayer(i, rank, tp_group, fsdp_group, device) for i in range(NUM_LAYERS)]
 
     def forward(self, x, default_stream, fsdp_stream):
-        """Run the input through every sharded MLP layer.
+        """
+        Forward pass through all 8 layers.
 
         Args:
-            x (torch.Tensor): Local input shaped ``(SEQ_LEN/TP_SIZE, HIDDEN_DIM)``.
-            default_stream (torch.neuron.Stream): Stream for compute and TP collectives.
-            fsdp_stream (torch.neuron.Stream): Stream for FSDP collectives.
+            x: Input [seq/TP, hidden_dim]
+            default_stream: Stream for compute
+            fsdp_stream: Stream for FSDP collectives
 
         Returns:
-            torch.Tensor: Local output with the same shape as ``x``.
+            output: [seq/TP, hidden_dim]
         """
         # Create sync events for each layer (2 events per layer for W1 and W2)
         events_w1 = [torch.neuron.Event() for _ in range(NUM_LAYERS)]
@@ -331,15 +289,7 @@ class MLP8Layer:
 
 
 def run_mlp_forward(rank, world_size):
-    """Run the sharded MLP example on one worker.
-
-    Args:
-        rank (int): Global rank assigned by ``torch.multiprocessing.spawn``.
-        world_size (int): Total number of distributed workers.
-
-    Raises:
-        AssertionError: If the local output has an unexpected shape.
-    """
+    """Main function to run on each worker."""
     # Initialize distributed environment
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "12355"
@@ -410,7 +360,6 @@ def run_mlp_forward(rank, world_size):
 
 
 def main():
-    """Print the configuration and launch all MLP workers."""
     print(f"8-Layer MLP with TP{TP_SIZE} x FSDP{FSDP_SIZE} on {WORLD_SIZE} workers")
     print("=" * 70)
     print("Configuration:")

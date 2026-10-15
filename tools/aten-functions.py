@@ -13,17 +13,7 @@ import yaml
 
 
 def load_native_functions(yaml_path):
-    """Load and parse a ``native_functions.yaml`` file.
-
-    Args:
-        yaml_path (str or Path): Path to the YAML file to load.
-
-    Returns:
-        object: Parsed YAML content.
-
-    Raises:
-        SystemExit: If the file is missing or contains invalid YAML.
-    """
+    """Load and parse the native_functions.yaml file"""
     try:
         with open(yaml_path) as f:
             return yaml.safe_load(f)
@@ -36,17 +26,7 @@ def load_native_functions(yaml_path):
 
 
 def count_functions(functions):
-    """Count valid ATen function entries.
-
-    Args:
-        functions (list): Parsed entries from ``native_functions.yaml``.
-
-    Returns:
-        int: Number of mapping entries that contain a ``func`` key.
-
-    Raises:
-        SystemExit: If ``functions`` is not a list.
-    """
+    """Count the total number of ATen functions"""
     if not isinstance(functions, list):
         print("Error: Expected list of functions in YAML file", file=sys.stderr)
         sys.exit(1)
@@ -337,11 +317,7 @@ CATEGORY_PATTERNS = {
 
 
 def get_implemented_ops():
-    """Collect operations registered by ``torch_neuronx``.
-
-    Returns:
-        set: Registered operation names, or an empty set if discovery fails.
-    """
+    """Dynamically get the set of operations implemented in torch-neuronx"""
     try:
         import torch_neuronx  # noqa: F401
         from torch_neuronx.utils import get_neuron_registered_ops
@@ -356,14 +332,7 @@ def get_implemented_ops():
 
 
 def extract_function_name(func_signature):
-    """Extract an ATen function name from a schema signature.
-
-    Args:
-        func_signature (str): Function schema whose leading name is extracted.
-
-    Returns:
-        str or None: Leading alphanumeric or underscore name, if present.
-    """
+    """Extract the function name from the function signature"""
     match = re.match(r"^([a-zA-Z0-9_]+)", func_signature)
     if match:
         return match.group(1)
@@ -371,14 +340,7 @@ def extract_function_name(func_signature):
 
 
 def classify_function(func_name):
-    """Classify a function by matching its name against category patterns.
-
-    Args:
-        func_name (str): ATen function name to classify.
-
-    Returns:
-        list[str]: Every matching category, in category-definition order.
-    """
+    """Classify a function based on name patterns"""
     categories = []
 
     for category, patterns in CATEGORY_PATTERNS.items():
@@ -391,15 +353,7 @@ def classify_function(func_name):
 
 
 def filter_by_category(functions, category):
-    """Select function entries that match a category.
-
-    Args:
-        functions (list[dict]): Parsed ATen function entries.
-        category (str): Category name to match.
-
-    Returns:
-        list[dict]: Original entries whose function names match ``category``.
-    """
+    """Filter functions by category"""
     filtered = []
 
     for func in functions:
@@ -418,14 +372,7 @@ def filter_by_category(functions, category):
 
 
 def get_unclassified_functions(functions):
-    """Select function entries that match no category pattern.
-
-    Args:
-        functions (list[dict]): Parsed ATen function entries.
-
-    Returns:
-        list[dict]: Original entries with valid names and no category matches.
-    """
+    """Get functions that don't match any category patterns"""
     unclassified = []
 
     for func in functions:
@@ -444,14 +391,7 @@ def get_unclassified_functions(functions):
 
 
 def analyze_categories(functions):
-    """Count category matches and unclassified functions.
-
-    Args:
-        functions (list[dict]): Parsed ATen function entries.
-
-    Returns:
-        tuple: Category-to-match-count mapping and unclassified-function count.
-    """
+    """Analyze category distribution of functions"""
     category_counts = defaultdict(int)
     unclassified_count = 0
 
@@ -474,14 +414,7 @@ def analyze_categories(functions):
 
 
 def get_category_functions_map(functions):
-    """Build category metadata for unique ATen function names.
-
-    Args:
-        functions (list[dict]): Parsed ATen function entries.
-
-    Returns:
-        dict: Categories mapped to sorted metadata with name, core, and implementation flags.
-    """
+    """Get mapping of categories to functions with core op and implementation info"""
     category_map = defaultdict(list)
     core_ops = set()
     implemented_ops = get_implemented_ops()
@@ -538,14 +471,6 @@ def get_category_functions_map(functions):
 
 
 def main():
-    """Run command-line ATen function analysis.
-
-    Returns:
-        None: This command prints the requested analysis and returns no value.
-
-    Raises:
-        SystemExit: If arguments are invalid, YAML is missing, or no action is selected.
-    """
     parser = argparse.ArgumentParser(
         description="Analyze ATen functions from native_functions.yaml",
         formatter_class=argparse.RawDescriptionHelpFormatter,

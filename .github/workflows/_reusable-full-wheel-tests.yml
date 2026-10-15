@@ -50,6 +50,8 @@ permissions:
   contents: read
   id-token: write
 
+# TEST-ONLY on contribute-9.9: the reusables here predate the dkms input, so the
+# dkms pass-through is removed. Otherwise the same as private kunind/seed-neff-cache.
 jobs:
   test-internal:
     name: Internal tests

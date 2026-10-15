@@ -7,8 +7,6 @@
 #include <torch/csrc/autograd/python_variable.h>
 
 #include <algorithm>
-#include <cstdint>
-#include <cstring>
 
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
 
@@ -35,22 +33,6 @@ const std::unordered_set<std::string>& CacheKeyGenerator::FilteredKwargs() {
 
 void CacheKeyGenerator::AppendNone(std::ostringstream& key) { key << "None"; }
 
-// A float scalar must go into the key without losing precision. The default
-// ostream format keeps only 6 significant digits, so arange(0.0, -8.000001, -4.0)
-// and arange(0.0, -8.0, -4.0) both wrote "d-8" and shared one cache entry. They
-// have different output lengths (3 vs 2), so whichever compiled first returned
-// its length for both, a silent wrong result.
-// The raw bits are exact. They also separate -0.0 from 0.0 and keep every
-// nan/inf distinct, which a decimal format does not guarantee.
-static std::string ExactBits(double val) {
-  uint64_t bits = 0;
-  static_assert(sizeof(bits) == sizeof(val), "double must be 64-bit");
-  std::memcpy(&bits, &val, sizeof(bits));
-  std::ostringstream out;
-  out << std::hex << bits;
-  return out.str();
-}
-
 void CacheKeyGenerator::AppendBool(std::ostringstream& key, bool val) {
   key << "b" << (val ? 1 : 0);
 }
@@ -65,7 +47,7 @@ void CacheKeyGenerator::AppendInt(std::ostringstream& key, int64_t val, bool is_
 
 void CacheKeyGenerator::AppendDouble(std::ostringstream& key, double val, bool is_static) {
   if (is_static) {
-    key << "d" << ExactBits(val);
+    key << "d" << val;
   } else {
     key << "float";
   }
@@ -74,7 +56,7 @@ void CacheKeyGenerator::AppendDouble(std::ostringstream& key, double val, bool i
 void CacheKeyGenerator::AppendComplexDouble(std::ostringstream& key, c10::complex<double> val,
                                             bool is_static) {
   if (is_static) {
-    key << "cd:" << ExactBits(val.real()) << "+" << ExactBits(val.imag()) << "i";
+    key << "cd:" << val.real() << "+" << val.imag() << "i";
   } else {
     key << "complex";
   }
@@ -127,12 +109,6 @@ void CacheKeyGenerator::AppendTensor(std::ostringstream& key, const at::Tensor& 
   // rows). Device *type* only — the device index doesn't change lowering.
   if (!t.device().is_privateuseone()) {
     key << ":" << t.device().type();
-  }
-  // A Python scalar wrapped for a Tensor overload and an explicit rank-0
-  // tensor can otherwise have identical shape/dtype/stride/device fragments,
-  // despite requiring different promotion and lowering.
-  if (t.unsafeGetTensorImpl()->is_wrapped_number()) {
-    key << ":wrapped";
   }
 }
 

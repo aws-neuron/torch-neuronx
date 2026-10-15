@@ -67,22 +67,6 @@ def batch_norm_gather_stats_with_counts_meta_impl(
     eps: float,
     counts: torch.Tensor,
 ):
-    """Create meta outputs for batch normalization statistics gathering.
-
-    Args:
-        input (torch.Tensor): Input argument, which is ignored when constructing outputs.
-        means (torch.Tensor): Tensor whose final dimension and dtype define both outputs.
-        invstds (torch.Tensor): Inverse standard deviations, which are ignored.
-        running_mean (torch.Tensor or None): Running mean, which is ignored.
-        running_var (torch.Tensor or None): Running variance, which is ignored.
-        momentum (float): Momentum, which is ignored.
-        eps (float): Epsilon, which is ignored.
-        counts (torch.Tensor): Counts, which are ignored.
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor]: Meta tensors matching the final dimension and
-            dtype of ``means``.
-    """
     return _meta_impl_template(
         "batch_norm_gather_stats_with_counts",
         input,
@@ -101,15 +85,6 @@ def batch_norm_stats_meta_impl(
     input: torch.Tensor,
     eps: float,
 ):
-    """Create meta outputs for batch normalization statistics.
-
-    Args:
-        input (torch.Tensor): Tensor whose channel dimension and dtype define both outputs.
-        eps (float): Epsilon, which is ignored.
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor]: Channel-shaped meta tensors with the input dtype.
-    """
     return _meta_impl_template("batch_norm_stats", input, eps)
 
 
@@ -122,19 +97,6 @@ def batch_norm_elemt_meta_impl(
     invstd: torch.Tensor,
     eps: float,
 ):
-    """Create the meta output for elementwise batch normalization.
-
-    Args:
-        input (torch.Tensor): Tensor whose shape and dtype define the output.
-        weight (torch.Tensor or None): Weight, which is ignored.
-        bias (torch.Tensor or None): Bias, which is ignored.
-        mean (torch.Tensor): Mean, which is ignored.
-        invstd (torch.Tensor): Inverse standard deviation, which is ignored.
-        eps (float): Epsilon, which is ignored.
-
-    Returns:
-        torch.Tensor: Meta tensor matching the input shape and dtype.
-    """
     return _meta_impl_template("batch_norm_elemt", input, weight, bias, mean, invstd, eps)
 
 
@@ -149,24 +111,6 @@ def batch_norm_backward_reduce_meta_impl(
     training: bool,
     eps: float,
 ):
-    """Create meta outputs for the batch normalization backward reduction.
-
-    Args:
-        grad_output (torch.Tensor): Tensor whose channel dimension and dtype define the outputs.
-        input (torch.Tensor): Forward input, which is ignored.
-        mean (torch.Tensor): Mean, which is ignored.
-        invstd (torch.Tensor): Inverse standard deviation, which is ignored.
-        weight (torch.Tensor or None): Weight, which is ignored.
-        bias (torch.Tensor): Annotated as a tensor, but ATen passes the ``input_g``
-            gradient-request boolean in this position. Ignored either way.
-        training (bool): ATen's ``weight_g`` gradient-request flag, which is ignored.
-        eps (float): Annotated as a float, but ATen passes the ``bias_g``
-            gradient-request boolean in this position. Ignored either way.
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: Channel-shaped
-            meta tensors with the gradient dtype.
-    """
     return _meta_impl_template(
         "batch_norm_backward_reduce", grad_output, input, mean, invstd, weight, bias, training, eps
     )
@@ -183,21 +127,6 @@ def batch_norm_backward_elemt_meta_impl(
     sum_dy_xmu: torch.Tensor,
     count: torch.Tensor,
 ):
-    """Create the meta output for elementwise batch normalization backward.
-
-    Args:
-        grad_output (torch.Tensor): Tensor whose shape and dtype define the output.
-        input (torch.Tensor): Forward input, which is ignored.
-        mean (torch.Tensor): Mean, which is ignored.
-        invstd (torch.Tensor): Inverse standard deviation, which is ignored.
-        weight (torch.Tensor or None): Weight, which is ignored.
-        sum_dy (torch.Tensor): Gradient sum, which is ignored.
-        sum_dy_xmu (torch.Tensor): Centered-gradient sum, which is ignored.
-        count (torch.Tensor): Element count, which is ignored.
-
-    Returns:
-        torch.Tensor: Meta tensor matching the gradient output shape and dtype.
-    """
     return _meta_impl_template(
         "batch_norm_backward_elemt",
         grad_output,

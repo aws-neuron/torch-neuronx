@@ -76,12 +76,10 @@ _NEFF_CACHE: dict = {}
 
 
 def _stage_neff(neff_bytes, cache_key):
-    """Stage ``neff_bytes`` so ``execute_compiled_graph(cache_key=...)`` can find it.
-
-    No compile step runs here, so nothing binds ``cache_key`` to a persistent key.
-    Pass ``base_key`` to bind it. ``cache_key`` doubles as the persistent key: it is
-    unique and filesystem-safe."""
-    _C.put_neff_cache(cache_key, neff_bytes, base_key=cache_key)
+    """Stage ``neff_bytes`` under ``cache_key`` so
+    ``execute_compiled_graph(cache_key=...)`` can find it.
+    ``put_neff_cache`` derives the persistent-cache key internally."""
+    _C.put_neff_cache(cache_key, neff_bytes)
 
 
 def _compile_beta_add_kernel(shape, fn, input_port_names, output_port_names):

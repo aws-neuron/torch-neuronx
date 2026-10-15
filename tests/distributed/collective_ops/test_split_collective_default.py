@@ -21,21 +21,19 @@ import torch_neuronx
 
 from .base_collective_op import BaseCollectiveOpTest
 
-pytestmark = pytest.mark.nrt_stream_config(host_cc_enabled=True)
-
 
 @pytest.fixture(scope="module", autouse=True)
 def hostcc_and_small_bucket():
     saved = {
         k: os.environ.get(k)
         for k in (
+            "TORCH_NEURONX_ENABLE_HOST_CC",
             "COLLECTIVE_BUCKETSIZE_IN_MB",
             "NEURON_USE_SPLIT_REDUCE_SCATTER",
             "NEURON_USE_SPLIT_ALLGATHER",
         )
     }
-    assert os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] == "1"
-    assert os.environ["NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE"] == "true"
+    os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = "1"
     os.environ["COLLECTIVE_BUCKETSIZE_IN_MB"] = "1"
     os.environ.pop("NEURON_USE_SPLIT_REDUCE_SCATTER", None)
     os.environ.pop("NEURON_USE_SPLIT_ALLGATHER", None)

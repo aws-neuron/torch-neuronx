@@ -314,7 +314,6 @@ BLOCKLIST: list[SkipGroup] = [
             "test_pruning_op.py",  # hypothesis-based, no device
             "python_native",  # DSL native ops registry, CPU-only
             "run_test.py",  # test runner script, not a test file
-            "test_hop_infra.py",  # validates PyTorch HOP registry structure, not device execution
         ],
     ),
     SkipGroup(

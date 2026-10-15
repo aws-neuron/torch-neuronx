@@ -1,5 +1,6 @@
 """Test that scatter operation is properly registered with PyTorch dispatcher."""
 
+import os
 from contextlib import nullcontext
 from unittest.mock import patch
 
@@ -12,6 +13,8 @@ from tests.utils.neuron_test_utils import (
     assert_raises,
     track_neuron_ops,
 )
+from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
+from torch_neuronx.utils import use_mlir_aten_ops
 
 # Test cases for both scatter and gather operations
 SHAPE_TEST_CASES = [
@@ -327,6 +330,39 @@ class TestScatterGatherRegistration:
 
 class TestGatherPriorityImpl:
     """Test priority-based implementation for gather."""
+
+    _CPP_DISPATCH = os.environ.get("TORCH_NEURONX_CPP_DISPATCH", "1") == "1"
+
+    @pytest.mark.skipif(
+        _CPP_DISPATCH,
+        reason="C++ dispatch changes compiler call count due to contiguous path differences",
+    )
+    @patch(
+        "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
+        wraps=convert_fx_to_stablehlo,
+    )
+    def test_gather_nki_kernel_used(self, mock_compiler):
+        """Verify NKI kernel is used for 2D tensors with dim=0"""
+        initial_count = mock_compiler.call_count
+
+        input_neuron = torch.randn(3, 4, dtype=torch.float32, device="neuron")
+        index_tensor = torch.tensor([0, 2], device="neuron")
+        index_neuron = index_tensor.unsqueeze(1).expand(-1, 4)
+
+        with torch.no_grad(), track_neuron_ops():
+            torch.gather(input_neuron, 0, index_neuron)
+            assert_op_runs_on_neuron("aten::gather")
+
+        # index_neuron is not contiguous
+        # .contiguous and .gather trigger kernel
+        if use_mlir_aten_ops():
+            assert (
+                mock_compiler.call_count == initial_count + 2
+            ), "Compiler was not called as expected"
+        else:
+            assert (
+                mock_compiler.call_count == initial_count + 1
+            ), "Compiler was not called as expected"
 
     def test_gather_nki_kernel_runs_on_neuron(self):
         """Verify gather runs on Neuron for 2D tensors with dim=0."""

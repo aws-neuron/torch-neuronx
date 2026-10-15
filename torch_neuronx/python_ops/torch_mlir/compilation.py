@@ -10,46 +10,31 @@ logger = logging.getLogger(__name__)
 
 
 class TorchMlirCompiler:
-    """Compile PyTorch functions to StableHLO through torch-mlir."""
+    """Compiles PyTorch functions to StableHLO via torch-mlir."""
 
     def compile(self, torch_fn, op_name, args, kwargs):
-        """Compile a PyTorch function to a StableHLO MLIR module.
+        """Compile PyTorch function to StableHLO MLIR module.
 
         Args:
-            torch_fn (Callable): PyTorch function to compile.
-            op_name (str): Operation name accepted but not used.
-            args (tuple): Example positional inputs for tracing.
-            kwargs (dict): Example keyword inputs for tracing.
+            torch_fn: PyTorch function to compile
+            op_name: Operation name for function naming
+            args: Example input arguments
+            kwargs: Example keyword arguments
 
         Returns:
-            Any: StableHLO MLIR module after dtype conversion.
+            MLIR module in StableHLO dialect
         """
         from torch_mlir import fx
         from torch_mlir.compiler_utils import OutputType
 
         # Wrap function with kwargs
         class OpWrapper(torch.nn.Module):
-            """Bind keyword arguments to a PyTorch operation for export.
-
-            Args:
-                op_fn (Callable): PyTorch operation to invoke.
-                op_kwargs (dict): Keyword arguments bound to the operation.
-            """
-
             def __init__(self, op_fn, op_kwargs):
                 super().__init__()
                 self.op_fn = op_fn
                 self.op_kwargs = op_kwargs
 
             def forward(self, *inputs):
-                """Invoke the wrapped operation with bound keyword arguments.
-
-                Args:
-                    *inputs: Positional operation inputs.
-
-                Returns:
-                    Any: Result returned by the wrapped operation.
-                """
                 return self.op_fn(*inputs, **self.op_kwargs)
 
         wrapper = OpWrapper(torch_fn, kwargs)
@@ -67,12 +52,12 @@ class TorchMlirCompiler:
         return stablehlo_module
 
     def export_to_hlo(self, mlir_module) -> str:
-        """Serialize a StableHLO MLIR module as text.
+        """Export StableHLO MLIR module to text format.
 
         Args:
-            mlir_module (Any): StableHLO MLIR module to serialize.
+            mlir_module: MLIR module in StableHLO dialect
 
         Returns:
-            str: String representation of the StableHLO MLIR module.
+            StableHLO MLIR text (compiler supports StableHLO directly)
         """
         return str(mlir_module)

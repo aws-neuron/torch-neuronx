@@ -22,18 +22,9 @@ _TRIP_SBUF_BUDGET = 128 * 1024
 
 
 def free_dim_tiles(hidden, dtype):
-    """Split a hidden dimension into this program's compile-time tiles.
-
-    Args:
-        hidden (int): Width of each input row.
-        dtype (object): NKI element dtype used to determine the byte-limited tile width.
-
-    Returns:
-        tuple: Lists of tile start offsets and corresponding widths.
-
-    Note:
-        The free dimension, rather than rows, is split so runtime row counts remain unpadded;
-        unequal per-program trip counts can hang the Neuron device.
+    """(h_starts, h_widths) for this program's slice of a ``hidden``-wide row: full tiles plus
+    a final short one, resolved at trace time since H is compile-time. Splitting the FREE dim
+    (not rows) is what keeps M unpadded -- unequal per-program trip counts hang the device.
     """
     num_progs = nl.num_programs(axes=0)
     prog_id = nl.program_id(axis=0)
@@ -56,19 +47,9 @@ def free_dim_tiles(hidden, dtype):
 
 
 def unroll_factor(h_widths, live_bytes_per_element):
-    """Choose a power-of-two unroll factor using the SBUF budget.
-
-    Args:
-        h_widths (Sequence): Compile-time widths of the hidden-dimension segments.
-        live_bytes_per_element (int): Bytes held per element for operands, output, and scratch.
-
-    Returns:
-        tuple: Selected unroll factor and its base-two logarithm.
-
-    Note:
-        Only compile-time values participate, so every program selects the same factor. The
-        base factor remains one even when a single slot exceeds the trip budget.
-    """
+    """Largest power-of-two unroll whose live tiles fit the budget. ``live_bytes_per_element``
+    counts every tile one (slot, h-segment) holds: operands, destination, scratch. Depends only
+    on compile-time values, so both programs pick the same factor (NCC_IXGM002)."""
     per_slot = len(h_widths) * max(h_widths) * live_bytes_per_element
     unroll, log2_unroll = 1, 0
     while unroll * 2 <= _UNROLL_MAX and (unroll * 2) * per_slot <= _TRIP_SBUF_BUDGET:
@@ -78,18 +59,9 @@ def unroll_factor(h_widths, live_bytes_per_element):
 
 
 def trip_stages(unroll, log2_unroll):
-    """Build the staged loop widths, shifts, and masks for an unroll factor.
-
-    Args:
-        unroll (int): Power-of-two maximum number of row tiles per trip.
-        log2_unroll (int): Base-two logarithm of ``unroll``.
-
-    Returns:
-        list: ``(width, shift, mask)`` tuples for full trips, leftover bits, and mop-up.
-
-    Note:
-        Each stage pays a loop-entry fence even for zero trips, so the cascade stops at width
-        four before a width-one mop-up.
+    """[(width, shift, mask)], one fori_loop per stage: ``n >> log2(unroll)`` full-width trips,
+    then one trip per leftover bit, then a width-1 mop-up. Loop entry costs a fence even at
+    zero trips, so the cascade stops at width 4 rather than continuing to 2.
     """
     if unroll == 1:
         return [(1, 0, 0)]
@@ -105,17 +77,8 @@ def trip_stages(unroll, log2_unroll):
 
 
 def loop_control(ctrl):
-    """Load runtime row-loop controls and initialize the row cursor.
-
-    Args:
-        ctrl (nl.NkiTensor): ``[2, 1]`` int32 tensor containing the full-tile count and tail row.
-
-    Returns:
-        tuple: SBUF tensors for the full-tile count, tail row, and zeroed row cursor.
-
-    Note:
-        Keeping these values runtime-driven prevents the row count from being baked into the NEFF.
-    """
+    """Whole-tile count (M // 128), tail row offset (M - 128) and the row cursor, read out of
+    the [2, 1] int32 ``ctrl`` operand. Runtime values: that is what keeps M out of the NEFF."""
     num_full_sbuf = nl.ndarray((1, 1), nl.int32, buffer=nl.sbuf)
     nisa.dma_copy(dst=num_full_sbuf, src=ctrl[0])
 
@@ -128,19 +91,8 @@ def loop_control(ctrl):
 
 
 def row_cursors(m_tile_start, unroll):
-    """Allocate one runtime row cursor for each unrolled slot.
-
-    Args:
-        m_tile_start (nl.NkiTensor): Cursor for the first row-tile slot.
-        unroll (int): Number of cursors to return.
-
-    Returns:
-        list: The original cursor followed by allocated cursors for later slots.
-
-    Note:
-        Later slots require runtime scalars because a traced compile-time ``offset`` cannot
-        leave its extent.
-    """
+    """Per-slot row cursors. Slot k > 0 needs its own scalar: a compile-time ``offset=``
+    cannot leave the traced extent, so only a runtime cursor addresses later tiles."""
     cursors = [m_tile_start]
     for k in range(1, unroll):
         cursors.append(nl.ndarray((1, 1), nl.int32, buffer=nl.sbuf, name=f"row_start_{k}"))
@@ -148,17 +100,7 @@ def row_cursors(m_tile_start, unroll):
 
 
 def stage_count_reg(num_full_sbuf, shift, mask, tag):
-    """Load a shifted and masked stage trip count into a register.
-
-    Args:
-        num_full_sbuf (nl.NkiTensor): Runtime count of full row tiles.
-        shift (int): Right-shift applied before loading the count.
-        mask (int): Bit mask applied after shifting.
-        tag (object): Identifier used to name intermediate tensors.
-
-    Returns:
-        nisa.VirtualRegister: Register containing the stage trip count.
-    """
+    """This stage's trip count as a loop register, shifted and masked on device."""
     count_sbuf = num_full_sbuf
     if shift > 0:
         shifted = nl.ndarray((1, 1), nl.int32, buffer=nl.sbuf, name=f"n_shr{tag}")
@@ -212,26 +154,12 @@ def emit_trip(
     aux=None,
     column=None,
 ):
-    """Emit loads, computation, and stores for consecutive row tiles.
+    """Emit ``width`` consecutive 128-row tiles: every load, then every compute, then every
+    store. Per-slot ordering instead lets the SBUF allocator fold the slots onto one buffer
+    pair, which caps pipelining at 2-deep. ``column`` is an optional [m_static, 1] operand
+    broadcast along the free dim.
 
-    Args:
-        width (int): Number of 128-row slots in the trip.
-        row_start (Sequence): Runtime row cursor for each slot.
-        inputs (Sequence): Full-width source tensors.
-        result (nl.NkiTensor): Destination tensor in shared HBM modified in place.
-        out_dtype (object): NKI dtype for destination tiles.
-        hidden (int): Full hidden width and row stride.
-        h_starts (Sequence): Hidden-segment start offsets.
-        h_widths (Sequence): Hidden-segment widths.
-        compute (Callable): Module-level function that fills one destination tile.
-        aux (object, optional): Auxiliary value passed to ``compute``. Defaults to ``None``.
-        column (nl.NkiTensor, optional): Column operand broadcast over the free dimension.
-            Defaults to ``None``.
-
-    Note:
-        All slots load before any compute or store so buffers remain independently
-        pipelineable. Plain loops avoid NKI parser rejection of comprehensions and starred
-        unpacking.
+    Plain loops only: NKI's parser rejects comprehensions and starred unpacking in a kernel.
     """
     in_tiles = []
     for slot in range(width):
@@ -288,27 +216,10 @@ def run_dynamic_m_loop(
     aux=None,
     column=None,
 ):
-    """Process every row for a runtime-sized leading dimension.
-
-    Args:
-        ctrl (nl.NkiTensor): Runtime full-tile count and tail-row control tensor.
-        inputs (Sequence): Full-width source tensors.
-        result (nl.NkiTensor): Destination tensor in shared HBM modified in place.
-        out_dtype (object): NKI dtype for destination tiles.
-        hidden (int): Full hidden width and row stride.
-        h_starts (Sequence): Hidden-segment start offsets.
-        h_widths (Sequence): Hidden-segment widths.
-        compute (Callable): Module-level function that fills one destination tile.
-        live_bytes_per_element (int): Per-element live storage used to choose unroll.
-        aux (object, optional): Auxiliary value passed to ``compute``. Defaults to ``None``.
-        column (nl.NkiTensor, optional): Column operand broadcast over the free dimension.
-            Defaults to ``None``.
-
-    Note:
-        The unconditional tail starts at ``M - 128``; exact multiples idempotently rewrite
-        the last tile. Every access stays within ``[0, M)``, so no padding is required and
-        ``out=`` can back ``result``.
-    """
+    """Walk every row of a runtime M. The tail tile runs unconditionally at row M - 128: it
+    covers the remainder, and when M % 128 == 0 it just rewrites the last tile (these ops are
+    idempotent). Every access stays inside [0, M), so nothing is padded and ``out=`` can back
+    the result."""
     unroll, log2_unroll = unroll_factor(h_widths, live_bytes_per_element)
     num_full_sbuf, tail_row, m_tile_start = loop_control(ctrl)
     row_start = row_cursors(m_tile_start, unroll)
@@ -320,13 +231,6 @@ def run_dynamic_m_loop(
 
         # width default-bound, not captured: later stages rebind it.
         def body(_i, width=width):
-            """Emit one staged trip and advance the shared row cursor.
-
-            Args:
-                _i (int): Loop iteration index supplied by ``nl.fori_loop``; unused.
-                width (int, optional): Number of row-tile slots emitted by this stage.
-                    Defaults to the current stage width.
-            """
             for slot in range(1, width):
                 nisa.tensor_scalar(
                     dst=row_start[slot],

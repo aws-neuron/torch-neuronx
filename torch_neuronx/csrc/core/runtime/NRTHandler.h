@@ -45,12 +45,6 @@ class NRTHandler {
     ExecutionConfig(int dev_id, int cores) : device_id(dev_id), num_cores(cores) {}
   };
 
-  struct TensorCastOperand {
-    nrt_tensor_t* tensor;
-    uint64_t offset_elements;
-    c10::ScalarType dtype;
-  };
-
   // Delete constructors - this is a static utility class
   NRTHandler() = delete;
   ~NRTHandler() = delete;
@@ -76,10 +70,6 @@ class NRTHandler {
       NRT_STATUS* nrt_status = nullptr, nrt::SequenceId* sequence_id = nullptr,
       c10::StreamId stream_id = 0, const std::vector<std::string>& input_names = {},
       const std::vector<std::string>& output_names = {});
-
-  static NRT_STATUS ScheduleTensorCast(const TensorCastOperand& src, const TensorCastOperand& dst,
-                                       uint64_t num_elements, int lnc_idx, int queue,
-                                       NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id);
 
   /**
    * Get or load model from cache

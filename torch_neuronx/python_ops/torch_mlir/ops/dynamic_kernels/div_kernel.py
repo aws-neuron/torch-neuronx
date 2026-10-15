@@ -40,19 +40,8 @@ def _div_baked_column(dst, in_tiles, aux, h_width):
 
 @nki.jit()
 def div_tensor_kernel(input_a, input_b, ctrl):
-    """Divide a tensor by a same-shaped tensor over dynamic rows.
-
-    Args:
-        input_a (tensor): Dividend with shape ``[m_static, hidden]``.
-        input_b (tensor): Same-dtype divisor with shape ``[m_static, hidden]``.
-        ctrl (tensor): Full-tile count and backward-aligned tail row.
-
-    Returns:
-        tensor: Elementwise quotient with the dividend shape and dtype.
-
-    Note:
-        The kernel is traced at 128 rows and supports runtime row counts of at least 128.
-    """
+    """Two [m_static, hidden] operands of one dtype, traced at 128 rows, run at any M >= 128.
+    ctrl: [[full tiles], [tail row = M - 128]]."""
     m_static, hidden = input_a.shape
     h_starts, h_widths = free_dim_tiles(hidden, input_a.dtype)
     result = nl.ndarray((m_static, hidden), input_a.dtype, nl.shared_hbm)
@@ -74,16 +63,7 @@ def div_tensor_kernel(input_a, input_b, ctrl):
 
 @nki.jit()
 def div_row_kernel(input_a, divisor, ctrl):
-    """Divide each tensor row by a same-dtype column value.
-
-    Args:
-        input_a (tensor): Dividend with shape ``[m_static, hidden]``.
-        divisor (tensor): Same-dtype ``[m_static, 1]`` column broadcast across hidden.
-        ctrl (tensor): Full-tile count and backward-aligned tail row.
-
-    Returns:
-        tensor: Elementwise quotient with the dividend shape and dtype.
-    """
+    """divisor is [m_static, 1] of the same dtype, broadcast along the free dim."""
     m_static, hidden = input_a.shape
     h_starts, h_widths = free_dim_tiles(hidden, input_a.dtype)
     result = nl.ndarray((m_static, hidden), input_a.dtype, nl.shared_hbm)
@@ -106,19 +86,7 @@ def div_row_kernel(input_a, divisor, ctrl):
 
 @nki.jit()
 def div_scalar_kernel(input_a, divisor, ctrl):
-    """Divide a tensor by a host-replicated scalar.
-
-    Args:
-        input_a (tensor): Dividend with shape ``[m_static, hidden]``.
-        divisor (tensor): Float32 ``[128, 1]`` replication of a Python scalar.
-        ctrl (tensor): Full-tile count and backward-aligned tail row.
-
-    Returns:
-        tensor: Elementwise quotient with the dividend shape and dtype.
-
-    Note:
-        The reciprocal is computed once in float32 for the whole kernel.
-    """
+    """divisor is the host's [128, 1] fp32 replication of a Python scalar."""
     m_static, hidden = input_a.shape
     h_starts, h_widths = free_dim_tiles(hidden, input_a.dtype)
     result = nl.ndarray((m_static, hidden), input_a.dtype, nl.shared_hbm)

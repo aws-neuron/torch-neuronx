@@ -38,22 +38,28 @@ from torch_neuronx import _C
 
 
 def is_enabled() -> bool:
-    """Check whether metrics collection is enabled process-wide.
+    """Check if metrics collection is currently enabled.
 
     Returns:
-        bool: ``True`` when metrics are being collected.
+        True if metrics are being collected, False otherwise.
     """
     return _C._neuron_metrics_enabled()
 
 
 def set_enabled(enabled: bool) -> None:
-    """Enable or disable process-wide metrics collection at runtime.
+    """Enable or disable metrics collection at runtime.
+
+    When disabled, metrics calls become no-ops with minimal overhead.
+    This can be useful for performance-critical sections of code.
 
     Args:
-        enabled (bool): Whether to collect metrics.
+        enabled: True to enable metrics collection, False to disable.
 
-    Note:
-        Disabled metric-recording calls are no-ops with minimal overhead.
+    Example:
+        >>> import torch_neuronx.metrics as met
+        >>> met.set_enabled(False)  # Disable metrics
+        >>> # ... performance-critical code ...
+        >>> met.set_enabled(True)   # Re-enable metrics
     """
     _C._neuron_set_metrics_enabled(enabled)
 
@@ -64,93 +70,49 @@ def set_enabled(enabled: bool) -> None:
 
 
 def get_counter_names() -> list[str]:
-    """Return counter names registered in the process-wide metrics arena.
-
-    Returns:
-        list[str]: Registered counter names, including counters cleared to zero.
-    """
+    """Get list of all counter names that have data."""
     return _C._neuron_counter_names()
 
 
 def get_counter_value(name: str) -> int | None:
-    """Return the value of a named counter.
-
-    Args:
-        name (str): Counter name to query.
-
-    Returns:
-        int or None: Counter value, or ``None`` when the counter does not exist.
-    """
+    """Get the value of a specific counter."""
     return _C._neuron_counter_value(name)
 
 
 def get_metric_names() -> list[str]:
-    """Return sampled-metric names registered in the process-wide arena.
-
-    Returns:
-        list[str]: Registered metric names, including metrics whose samples were cleared.
-    """
+    """Get list of all metric names that have data."""
     return _C._neuron_metric_names()
 
 
 def get_metric_data(name: str) -> dict[str, Any] | None:
-    """Return detailed data for a sampled metric.
-
-    Args:
-        name (str): Metric name to query.
-
-    Returns:
-        dict or None: Dictionary with exactly ``accumulator`` (sum across all samples
-            since the last clear), ``total_samples`` (count across all such samples),
-            ``repr`` (formatted accumulator), and ``samples`` (bounded circular history
-            in chronological order). Each retained sample has exactly ``timestamp_ns``
-            and ``value``. Raw accumulator and value units are nanoseconds for time
-            metrics, bytes for byte metrics, and metric-defined for generic metrics.
-            Timestamps use a steady clock, not wall time, and are not comparable across
-            processes. Returns ``None`` when the metric is not registered.
-    """
+    """Get detailed data for a specific metric."""
     return _C._neuron_metric_data(name)
 
 
 def report() -> str:
-    """Generate a report of positive counters and sampled metrics with data.
-
-    Returns:
-        str: Formatted metrics report.
-    """
+    """Generate a comprehensive metrics report."""
     return _C._neuron_metrics_report()
 
 
 def report_filtered(
     counter_names: list[str] | None = None, metric_names: list[str] | None = None
 ) -> str:
-    """Generate a report for selected counters and sampled metrics.
-
-    Args:
-        counter_names (list[str], optional): Exact counter names to include. Defaults to
-            ``None``, which selects no counters.
-        metric_names (list[str], optional): Exact metric names to include. Defaults to
-            ``None``, which selects no sampled metrics.
-
-    Returns:
-        str: Formatted report containing selected metrics with samples and selected
-            counters with positive values.
-    """
+    """Generate a filtered metrics report."""
     return _C._neuron_metrics_report_filtered(counter_names or [], metric_names or [])
 
 
 def clear_counters() -> None:
-    """Clear all counter values from the process-wide metrics arena."""
+    """Clear all counter values."""
     _C._neuron_clear_counters()
 
 
 def clear_metrics() -> None:
-    """Clear all sampled metric data from the process-wide metrics arena."""
+    """Clear all metric data."""
     _C._neuron_clear_metrics()
 
 
 def clear_all() -> None:
-    """Clear all counters and sampled metrics from the process-wide arena."""
+    """Clear all counters and metrics."""
     _C._neuron_clear_counters()
     _C._neuron_clear_metrics()
 
@@ -158,12 +120,15 @@ def clear_all() -> None:
 def set_concatenation_profiling_enabled(enabled: bool) -> None:
     """Enable or disable detailed per-type concatenation profiling.
 
-    Args:
-        enabled (bool): Whether to record per-invocation concatenation details.
+    This is a debug feature that records per-invocation merge times and
+    group sizes for each unique concatenation type. It uses unbounded
+    memory (vectors grow with each invocation), so it should only be
+    enabled for analysis, not in production.
 
-    Note:
-        This debug feature records merge times and group sizes in unbounded vectors. Use it
-        only for analysis. ``TORCH_NEURONX_CONCATENATION_PROFILING=1`` also enables it.
+    Can also be enabled via env var: TORCH_NEURONX_CONCATENATION_PROFILING=1
+
+    Args:
+        enabled: True to enable profiling, False to disable.
     """
     _C._set_concatenation_profiling_enabled(enabled)
 
@@ -174,14 +139,27 @@ def set_concatenation_profiling_enabled(enabled: bool) -> None:
 
 
 def get_metrics_dict(prefix: str | None = None) -> dict[str, Any]:
-    """Return counters and sampled metrics as a structured dictionary.
+    """Get all metrics as a structured dictionary, optionally filtered by prefix.
+
+    Returns counters as integer values and metrics as dicts with
+    accumulator, total_samples, and formatted fields. This is the
+    structured-data counterpart to report() and report_filtered().
 
     Args:
-        prefix (str, optional): Name substring to include. Defaults to ``None`` for all names.
+        prefix: Optional prefix to filter metrics by (e.g., "Concatenation",
+                "CompilationCache"). If None, returns all metrics.
 
     Returns:
-        dict[str, Any]: Counter integers and metric dictionaries containing ``accumulator``,
-            ``total_samples``, and ``formatted`` fields.
+        Dictionary mapping metric/counter names to their values.
+
+    Example:
+        >>> import torch_neuronx.metrics as met
+        >>> met.set_enabled(True)
+        >>> # ... run model ...
+        >>> torch.neuron.synchronize()
+        >>> all_metrics = met.get_metrics_dict()
+        >>> concat_metrics = met.get_metrics_dict("Concatenation")
+        >>> compilation_metrics = met.get_metrics_dict("CompilationCache")
     """
     result = {}
     for name in get_counter_names():

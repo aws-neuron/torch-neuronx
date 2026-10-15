@@ -67,7 +67,7 @@ existing `neuron.internal_compute` label, gets the storage bucket and key-prefix
 env vars injected into the pod (their names are the `STORAGE_BUCKET_ENV` /
 `STORAGE_PREFIX_ENV` constants in `runner/persistent_cache.py`), pointing at this
 repo's isolated cache. `read` grants read; `write` grants read + write.
-`_reusable-upstream-tests.yml` adds this label automatically from the workflow inputs
+`_upstream-tests.yml` adds this label automatically from the workflow inputs
 (`:write` when the run uploads, else `:read`). Cache entries auto-expire after 7
 days, so treat it as a reconstructible cache, not a source of truth.
 
@@ -88,14 +88,15 @@ and each shard owns its own prefix:
 
 `<job_name>` is derived internally from the run's items + shard (the same stem
 used for report artifacts), so it is unique per matrix node across the full
-suite (no need to thread it in from the workflow). Nightly, Dependency Guard,
-and Merge Queue use the same shard names. Each workflow can reuse the cache.
+suite (no need to thread it in from the workflow). Nightly and the merge-queue
+gate run the same shard names, so a nightly seed is directly reusable.
 
 **Who reads vs writes.** Reads are on by default (`download-neff-cache: true`),
 so the merge-queue gate and dependency-guard hydrate the seeded cache with no
-extra config. Main Nightly and main Dependency Guard set
-`refresh-neff-cache: true`. The runner permits uploads only from `main`.
-PR and Merge Queue runs only read the shared cache.
+extra config. Only nightly sets `refresh-neff-cache: true`, and the runner
+further refuses to upload unless the branch is `main`, so a queued PR, a
+dependency bump, or a nightly run on a custom branch can never write to the
+shared cache.
 
 Each job drops a `cache_metrics.json` sidecar (download/upload bytes + seconds,
 NEFF count before/after, `persistent_cache_present`) that the aggregator folds
@@ -104,7 +105,7 @@ stamped onto `run_metrics`.
 
 To bring up or verify S3 access on a small subset, dispatch
 `manual-upstream-tests.yml` with `download-neff-cache: true`. Manual runs read
-the cache but never upload. Main Nightly and main Dependency Guard seed it.
+the cache but never upload (only nightly seeds).
 
 ## Skip/Xfail Registry
 

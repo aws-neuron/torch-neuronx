@@ -439,13 +439,8 @@ Block* NeuronSegmentPool::AllocateSegment(size_t size, bool is_small) {
   // Record cache miss on successful allocation
   at::neuron::metrics::RecordAllocatorCacheMiss(device_id_);
   // Track physical device memory reserved from NRT.
-  // Trace-only: emit SEGMENT_ALLOC with NRT trace correlation ID. The correlation
-  // id is only needed by the snapshot, so only query it (an NRT call) when memory
-  // recording is enabled, matching the rest of the snapshot code.
-  uint64_t trace_id = c10_neuron::NeuronMemorySnapshot::IsRecordingEnabled()
-                          ? at::neuron::nrt::GetTensorTraceId(raw_tensor)
-                          : 0;
-  at::neuron::metrics::RecordSegmentReserve(device_id_, base_addr, segment_size, trace_id);
+  // Trace-only: emit SEGMENT_ALLOC. No-op when memory history recording disabled.
+  at::neuron::metrics::RecordSegmentReserve(device_id_, base_addr, segment_size);
 
   TORCH_NEURONX_ALLOCATOR_DEBUG("Allocated new segment block, size=", segment_size);
 

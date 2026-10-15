@@ -6,9 +6,7 @@ standard ATen operations that torch-mlir can handle.
 """
 
 import logging
-import math
 import operator
-from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -17,91 +15,47 @@ from torch.fx import Node
 from torch.fx.passes.infra.pass_base import PassResult
 from torch.fx.passes.shape_prop import TensorMetadata
 
-from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import NeuronFXPass
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
+    NeuronFXPass,
+    NeuronFXPassState,
+)
 
 logger = logging.getLogger(__name__)
-
-# The flex_attention HOP returns the log-sum-exp in log2 scale, and takes its gradient in
-# that same scale.
-_LOG2_E = 1.0 / math.log(2.0)
 
 
 @dataclass
 class AttentionShapes:
-    """Store dimensions used by flex-attention graph rewrites.
-
-    Args:
-        B (int): Batch size.
-        H_q (int): Number of query heads.
-        H_kv (int): Number of key/value heads.
-        L (int): Query sequence length.
-        S (int): Key/value sequence length.
-        E_qk (int): Query/key head dimension.
-        E_v (int): Value head dimension.
-    """
+    """Container for attention tensor shapes."""
 
     B: int  # batch size
     H_q: int  # query heads
     H_kv: int  # key/value heads (may differ from H_q in GQA)
     L: int  # query sequence length
     S: int  # key/value sequence length
-    E_qk: int  # query/key head dimension (d_head_qk)
-    E_v: int  # value head dimension (d_head_v), which can be different from E_qk
-
-
-def decomposition_unsupported_reason(node: Node, backward: bool, has_score_mod: bool) -> str | None:
-    """Return why a flex-attention node cannot be decomposed.
-
-    Args:
-        node (Node): Flex-attention node to inspect.
-        backward (bool): Whether ``node`` is a backward operator.
-        has_score_mod (bool): Whether the operator has a score modification.
-
-    Returns:
-        str | None: Unsupported reason, or ``None`` when decomposition is valid.
-
-    Note:
-        The NKI lowering uses this check before choosing the decomposition path.
-    """
-    min_args = 11 if backward else 9
-    if len(node.args) < min_args:
-        return f"the node has {len(node.args)} arguments, and the minimum is {min_args}"
-    query, key, value = node.args[:3]
-    if any("val" not in arg.meta for arg in (query, key, value)):
-        return "the query, the key or the value has no shape metadata"
-    q_shape = query.meta["val"].shape
-    k_shape = key.meta["val"].shape
-    if q_shape[0] != k_shape[0]:
-        return (
-            f"the batch sizes are not equal: query={q_shape[0]}, key={k_shape[0]}. The "
-            "decomposition gives the key and the value gradients the query batch size."
-        )
-    if k_shape[1] == 0 or q_shape[1] % k_shape[1] != 0:
-        return f"the key head count {k_shape[1]} does not divide the query head count {q_shape[1]}"
-    if backward and has_score_mod and node.args[8] is None:
-        return "the backward operator has a score modification and no joint graph"
-    return None
+    E: int  # head dimension
 
 
 class FlexAttentionLegalization(NeuronFXPass):
-    """Decompose flex-attention higher-order operators into ATen operations.
+    """Flex Attention Legalization Pass for PyTorch FX Graphs.
 
-    Args:
-        state (NeuronFXPassState | None, optional): Shared state used for pass artifact
-            dumping. Defaults to ``None``.
+    This pass legalizes flex_attention higher-order operators by decomposing
+    them into standard ATen operations that torch-mlir can handle.
 
-    Note:
-        AOTAutograd does not legalize these higher-order operators through its
-        standard decomposition table, so this pass handles them explicitly.
+    Higher-order operators like flex_attention are not legalized through the
+    standard decomposition table mechanism in AOTAutograd, so this pass
+    handles them explicitly.
     """
+
+    def __init__(self, state: NeuronFXPassState | None = None):
+        super().__init__(state)
+        self._forward_score_mod_name: str | None = None
+        self._forward_score_mod_module: fx.GraphModule | None = None
+        self._forward_mask_mod_module: fx.GraphModule | None = None
+        self._forward_score_mod_other_buffers: tuple = ()
+        self._forward_mask_mod_other_buffers: tuple = ()
 
     @property
     def name(self) -> str:
-        """Return the pass name.
-
-        Returns:
-            str: The ``flex_attention_legalization`` identifier.
-        """
         return "flex_attention_legalization"
 
     # =========================================================================
@@ -160,56 +114,9 @@ class FlexAttentionLegalization(NeuronFXPass):
             and node.target.__name__ == "flex_attention_backward"
         )
 
-    @staticmethod
-    def _resolve_subgraph(gm: fx.GraphModule, node) -> tuple[str | None, fx.GraphModule | None]:
-        """Resolve a subgraph argument (a get_attr node) to its name and module on ``gm``."""
-        if node is None or not hasattr(node, "target"):
-            return None, None
-        return node.target, getattr(gm, node.target, None)
-
-    @classmethod
-    def _resolve_mask_mod(
-        cls, gm: fx.GraphModule, block_mask
-    ) -> tuple[str | None, fx.GraphModule | None]:
-        """Resolve the mask_mod subgraph carried by a block_mask tuple argument.
-
-        mask_mod is always the last element: index 12 in PT2.12, index 16 in PT2.13.
-        """
-        if not isinstance(block_mask, tuple) or len(block_mask) < 13:
-            return None, None
-        return cls._resolve_subgraph(gm, block_mask[-1])
-
     # =========================================================================
     # GQA (Grouped Query Attention) Helpers
     # =========================================================================
-
-    def _expand_heads(
-        self, graph: fx.Graph, tensor: fx.Node, head_dim: int, shapes: AttentionShapes
-    ) -> fx.Node:
-        """Expand the heads of one key or value tensor to the query head count.
-
-        `head_dim` is the last dimension of this tensor. The key uses E_qk and the value
-        uses E_v, and the two can be different.
-        """
-        repeat_factor = shapes.H_q // shapes.H_kv
-        dtype = tensor.meta["val"].dtype
-
-        unsqueezed = graph.call_function(torch.ops.aten.unsqueeze.default, args=(tensor, 2))
-        self._add_metadata_to_node(
-            unsqueezed, shape=[shapes.B, shapes.H_kv, 1, shapes.S, head_dim], dtype=dtype
-        )
-
-        expand_shape = [shapes.B, shapes.H_kv, repeat_factor, shapes.S, head_dim]
-        expanded = graph.call_function(
-            torch.ops.aten.expand.default, args=(unsqueezed, expand_shape)
-        )
-        self._add_metadata_to_node(expanded, shape=expand_shape, dtype=dtype)
-
-        reshape_shape = [shapes.B, shapes.H_q, shapes.S, head_dim]
-        final = graph.call_function(torch.ops.aten.reshape.default, args=(expanded, reshape_shape))
-        self._add_metadata_to_node(final, shape=reshape_shape, dtype=dtype)
-
-        return final
 
     def _expand_kv_for_gqa(
         self, graph: fx.Graph, key: fx.Node, value: fx.Node, shapes: AttentionShapes
@@ -227,32 +134,48 @@ class FlexAttentionLegalization(NeuronFXPass):
 
         logger.debug(f"Handling GQA: expanding H_kv={shapes.H_kv} to H_q={shapes.H_q}")
 
-        return (
-            self._expand_heads(graph, key, shapes.E_qk, shapes),
-            self._expand_heads(graph, value, shapes.E_v, shapes),
-        )
-
-    def _reduce_heads(
-        self,
-        graph: fx.Graph,
-        grad: fx.Node,
-        head_dim: int,
-        shapes: AttentionShapes,
-        dtype: torch.dtype,
-    ) -> fx.Node:
-        """Add the gradients of the heads that GQA expanded, for one key or value."""
         repeat_factor = shapes.H_q // shapes.H_kv
-        grouped_shape = [shapes.B, shapes.H_kv, repeat_factor, shapes.S, head_dim]
+        key_dtype = key.meta["val"].dtype
+        value_dtype = value.meta["val"].dtype
 
-        reshaped = graph.call_function(torch.ops.aten.reshape.default, args=(grad, grouped_shape))
-        self._add_metadata_to_node(reshaped, shape=grouped_shape, dtype=dtype)
-
-        summed = graph.call_function(torch.ops.aten.sum.dim_IntList, args=(reshaped, [2], False))
+        key_unsqueezed = graph.call_function(torch.ops.aten.unsqueeze.default, args=(key, 2))
         self._add_metadata_to_node(
-            summed, shape=[shapes.B, shapes.H_kv, shapes.S, head_dim], dtype=dtype
+            key_unsqueezed,
+            shape=[shapes.B, shapes.H_kv, 1, shapes.S, shapes.E],
+            dtype=key_dtype,
         )
 
-        return summed
+        expand_shape = [shapes.B, shapes.H_kv, repeat_factor, shapes.S, shapes.E]
+        key_expanded = graph.call_function(
+            torch.ops.aten.expand.default, args=(key_unsqueezed, expand_shape)
+        )
+        self._add_metadata_to_node(key_expanded, shape=expand_shape, dtype=key_dtype)
+
+        reshape_shape = [shapes.B, shapes.H_q, shapes.S, shapes.E]
+        key_final = graph.call_function(
+            torch.ops.aten.reshape.default, args=(key_expanded, reshape_shape)
+        )
+        self._add_metadata_to_node(key_final, shape=reshape_shape, dtype=key_dtype)
+
+        # Expand value: same transformation
+        value_unsqueezed = graph.call_function(torch.ops.aten.unsqueeze.default, args=(value, 2))
+        self._add_metadata_to_node(
+            value_unsqueezed,
+            shape=[shapes.B, shapes.H_kv, 1, shapes.S, shapes.E],
+            dtype=value_dtype,
+        )
+
+        value_expanded = graph.call_function(
+            torch.ops.aten.expand.default, args=(value_unsqueezed, expand_shape)
+        )
+        self._add_metadata_to_node(value_expanded, shape=expand_shape, dtype=value_dtype)
+
+        value_final = graph.call_function(
+            torch.ops.aten.reshape.default, args=(value_expanded, reshape_shape)
+        )
+        self._add_metadata_to_node(value_final, shape=reshape_shape, dtype=value_dtype)
+
+        return key_final, value_final
 
     def _reduce_gqa_gradients(
         self,
@@ -268,10 +191,55 @@ class FlexAttentionLegalization(NeuronFXPass):
 
         logger.debug(f"Reducing gradients for GQA: H_q={shapes.H_q} to H_kv={shapes.H_kv}")
 
-        return (
-            self._reduce_heads(graph, grad_key, shapes.E_qk, shapes, dtype),
-            self._reduce_heads(graph, grad_value, shapes.E_v, shapes, dtype),
+        repeat_factor = shapes.H_q // shapes.H_kv
+
+        # Reshape and sum grad_key
+        grad_key_reshaped = graph.call_function(
+            torch.ops.aten.reshape.default,
+            args=(
+                grad_key,
+                [shapes.B, shapes.H_kv, repeat_factor, shapes.S, shapes.E],
+            ),
         )
+        self._add_metadata_to_node(
+            grad_key_reshaped,
+            shape=[shapes.B, shapes.H_kv, repeat_factor, shapes.S, shapes.E],
+            dtype=dtype,
+        )
+
+        grad_key_final = graph.call_function(
+            torch.ops.aten.sum.dim_IntList, args=(grad_key_reshaped, [2], False)
+        )
+        self._add_metadata_to_node(
+            grad_key_final,
+            shape=[shapes.B, shapes.H_kv, shapes.S, shapes.E],
+            dtype=dtype,
+        )
+
+        # Reshape and sum grad_value
+        grad_value_reshaped = graph.call_function(
+            torch.ops.aten.reshape.default,
+            args=(
+                grad_value,
+                [shapes.B, shapes.H_kv, repeat_factor, shapes.S, shapes.E],
+            ),
+        )
+        self._add_metadata_to_node(
+            grad_value_reshaped,
+            shape=[shapes.B, shapes.H_kv, repeat_factor, shapes.S, shapes.E],
+            dtype=dtype,
+        )
+
+        grad_value_final = graph.call_function(
+            torch.ops.aten.sum.dim_IntList, args=(grad_value_reshaped, [2], False)
+        )
+        self._add_metadata_to_node(
+            grad_value_final,
+            shape=[shapes.B, shapes.H_kv, shapes.S, shapes.E],
+            dtype=dtype,
+        )
+
+        return grad_key_final, grad_value_final
 
     # =========================================================================
     # Attention Computation Helpers
@@ -330,27 +298,17 @@ class FlexAttentionLegalization(NeuronFXPass):
         return b_idx, h_idx, q_idx, kv_idx
 
     def _compute_softmax(
-        self,
-        graph: fx.Graph,
-        scores: fx.Node,
-        shapes: AttentionShapes,
-        dtype: torch.dtype,
-        defer_normalization: bool = False,
-    ) -> tuple[fx.Node, fx.Node, fx.Node | None]:
+        self, graph: fx.Graph, scores: fx.Node, shapes: AttentionShapes, dtype: torch.dtype
+    ) -> tuple[fx.Node, fx.Node]:
         """Compute numerically stable softmax over the last dimension.
 
         Computes in the wider of the scores' actual dtype and `dtype` (a score_mod
         may promote, e.g. bf16 -> f32 for alibi), then casts attn_weights back to
         `dtype` so the caller gets weights matching the original Q/K/V dtype.
 
-        With `defer_normalization` the caller divides the [B, H_q, L, E_v] output instead.
-        The denominator is constant along the contracted axis, so the value is the same and
-        no score-shaped quotient is built.
-
         Returns:
-            (weights, logsumexp, denom) where weights has the caller's `dtype` and is
-            unnormalized when normalization was deferred, logsumexp is always float32 with
-            shape [B, H, L] in log2 scale, and denom is the deferred division, else None.
+            (attn_weights, logsumexp) where attn_weights has the caller's `dtype`
+            and logsumexp is always float32 with shape [B, H, L].
         """
         from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -416,20 +374,11 @@ class FlexAttentionLegalization(NeuronFXPass):
             denom, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=compute_dtype
         )
 
-        # A promoting score_mod narrows the quotient afterwards, so deferring past that cast
-        # would divide in the narrower dtype. Unnormalized weights also grow the matmul output
-        # by up to S, which overflows float16 above finfo.max / S.
-        has_exponent_headroom = torch.finfo(dtype).max >= torch.finfo(torch.bfloat16).max
-        defer_normalization = (
-            defer_normalization and compute_dtype == dtype and has_exponent_headroom
+        # attn_weights = exp_scores / denom
+        attn_weights = graph.call_function(torch.ops.aten.div.Tensor, args=(exp_scores, denom))
+        self._add_metadata_to_node(
+            attn_weights, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=compute_dtype
         )
-        if defer_normalization:
-            attn_weights = exp_scores
-        else:
-            attn_weights = graph.call_function(torch.ops.aten.div.Tensor, args=(exp_scores, denom))
-            self._add_metadata_to_node(
-                attn_weights, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=compute_dtype
-            )
 
         # Cast attn_weights back to caller dtype if we computed in a wider type
         if compute_dtype != dtype:
@@ -461,18 +410,13 @@ class FlexAttentionLegalization(NeuronFXPass):
             lse_keepdim, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=torch.float32
         )
 
-        lse_keepdim = graph.call_function(torch.ops.aten.mul.Scalar, args=(lse_keepdim, _LOG2_E))
-        self._add_metadata_to_node(
-            lse_keepdim, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=torch.float32
-        )
-
         # Squeeze to [B, H, L]
         logsumexp = graph.call_function(torch.ops.aten.squeeze.dim, args=(lse_keepdim, -1))
         self._add_metadata_to_node(
             logsumexp, shape=[shapes.B, shapes.H_q, shapes.L], dtype=torch.float32
         )
 
-        return attn_weights, logsumexp, (denom if defer_normalization else None)
+        return attn_weights, logsumexp
 
     def _compute_attention_scores(
         self,
@@ -484,10 +428,10 @@ class FlexAttentionLegalization(NeuronFXPass):
         dtype: torch.dtype,
     ) -> fx.Node:
         """Compute scaled attention scores: Q @ K^T * scale."""
-        # K^T: [B, H, S, E_qk] -> [B, H, E_qk, S]
+        # K^T: [B, H, S, E] -> [B, H, E, S]
         key_t = graph.call_function(torch.ops.aten.transpose.int, args=(key, -2, -1))
         self._add_metadata_to_node(
-            key_t, shape=[shapes.B, shapes.H_q, shapes.E_qk, shapes.S], dtype=dtype
+            key_t, shape=[shapes.B, shapes.H_q, shapes.E, shapes.S], dtype=dtype
         )
 
         # scores = Q @ K^T
@@ -689,7 +633,7 @@ class FlexAttentionLegalization(NeuronFXPass):
                 continue
 
             if sub_node.op == "output":
-                result = self._map_node_args((sub_node.args[0],), value_map)[0]
+                result = value_map[sub_node.args[0]]
                 break
 
             new_args = tuple(self._map_node_args(sub_node.args, value_map))
@@ -728,70 +672,6 @@ class FlexAttentionLegalization(NeuronFXPass):
         )
         return result if result is not None else scaled_scores
 
-    def _apply_joint_graph(
-        self,
-        graph: fx.Graph,
-        gm: fx.GraphModule,
-        joint_graph_name: str,
-        joint_graph_module: fx.GraphModule,
-        scaled_scores: fx.Node,
-        grad_post_mod_scores: fx.Node,
-        index_tensors: tuple[fx.Node, fx.Node, fx.Node, fx.Node],
-        shapes: AttentionShapes,
-        dtype: torch.dtype,
-        other_buffers: tuple = (),
-        mask: fx.Node | None = None,
-    ) -> fx.Node:
-        """Change the gradient of the modified scores into the gradient of the scaled scores.
-
-        ``joint_graph`` gives the derivative of score_mod. It takes the scaled scores before
-        the modification, the index tensors, the gradient of the modified scores and the
-        captured buffers. It returns a list. The first item of that list is the gradient of
-        the scaled scores. The other items are the gradients of the captured buffers, and
-        this pass does not return them.
-
-        ``mask`` is the mask_mod result. The derivative reads the scores of a masked position,
-        which the mask never made finite, so a modification such as a square root gives a nan
-        there. That position contributes no gradient, so the result is zeroed on it.
-        """
-        result = self._inline_submodule(
-            graph,
-            gm,
-            joint_graph_module,
-            joint_graph_name,
-            [scaled_scores, *index_tensors, grad_post_mod_scores, *other_buffers],
-        )
-        if isinstance(result, list | tuple):
-            result = result[0]
-        if not isinstance(result, fx.Node):
-            logger.warning(
-                "joint_graph gave no score gradient. The pass keeps the softmax gradient, "
-                "which is correct only if the score modification has a unit derivative."
-            )
-            return grad_post_mod_scores
-
-        result_dtype = result.meta["val"].dtype if "val" in result.meta else dtype
-        if result_dtype != dtype:
-            result = graph.call_function(
-                torch.ops.aten._to_copy.default, args=(result,), kwargs={"dtype": dtype}
-            )
-            self._add_metadata_to_node(
-                result, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=dtype
-            )
-
-        if mask is not None:
-            zero = graph.call_function(
-                torch.ops.aten.full_like.default, args=(result,), kwargs={"fill_value": 0.0}
-            )
-            self._add_metadata_to_node(
-                zero, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=dtype
-            )
-            result = graph.call_function(torch.ops.aten.where.self, args=(mask, result, zero))
-            self._add_metadata_to_node(
-                result, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=dtype
-            )
-        return result
-
     def _apply_combined_mask_score_mod(
         self,
         graph: fx.Graph,
@@ -801,7 +681,7 @@ class FlexAttentionLegalization(NeuronFXPass):
         index_tensors: tuple[fx.Node, fx.Node, fx.Node, fx.Node],
         shapes: AttentionShapes,
         other_buffers: tuple = (),
-    ) -> tuple[fx.Node, fx.Node | None]:
+    ) -> fx.Node:
         """Apply mask_mod by combining it with score using torch.where pattern."""
         mask_result = self._inline_submodule(
             graph,
@@ -831,10 +711,10 @@ class FlexAttentionLegalization(NeuronFXPass):
                 dtype=scores.meta["val"].dtype,
             )
 
-            return masked_scores, mask_result
+            return masked_scores
 
         logger.warning("mask_mod produced no result, returning original scores")
-        return scores, None
+        return scores
 
     # =========================================================================
     # Forward Pass Legalization
@@ -842,6 +722,11 @@ class FlexAttentionLegalization(NeuronFXPass):
 
     def _legalize_flex_forward(self, graph: fx.Graph, gm: fx.GraphModule, node: fx.Node) -> bool:
         """Legalize a flex_attention forward node."""
+        # Use local variables to avoid state carryover between nodes
+        forward_score_mod_name = None
+        forward_score_mod_module = None
+        forward_mask_mod_module = None
+
         if len(node.args) < 9:
             logger.warning(f"Unexpected number of args: {len(node.args)}, skipping")
             return False
@@ -850,38 +735,49 @@ class FlexAttentionLegalization(NeuronFXPass):
         query = node.args[0]
         key = node.args[1]
         value = node.args[2]
+        score_mod_node = node.args[3]
+        block_mask_node = node.args[4]
         scale = node.args[5]
-
-        score_mod_name, score_mod_module = self._resolve_subgraph(gm, node.args[3])
-        _, mask_mod_module = self._resolve_mask_mod(gm, node.args[4])
 
         # external buffers (free variable buffers)
         score_mod_other_buffers = node.args[7] if len(node.args) > 7 else ()
         mask_mod_other_buffers = node.args[8] if len(node.args) > 8 else ()
 
+        # Get score_mod info
+        if score_mod_node is not None and hasattr(score_mod_node, "target"):
+            forward_score_mod_name = score_mod_node.target
+            forward_score_mod_module = getattr(gm, forward_score_mod_name, None)
+
+        # Get mask_mod from block_mask if present
+        # mask_mod is always the last element: index 12 in PT2.12, index 16 in PT2.13
+        if (
+            isinstance(block_mask_node, tuple)
+            and len(block_mask_node) >= 13
+            and hasattr(block_mask_node[-1], "target")
+        ):
+            mask_fn_node = block_mask_node[-1]
+            forward_mask_mod_module = getattr(gm, mask_fn_node.target, None)
+
         # Get shape information
-        if "val" not in query.meta or "val" not in key.meta or "val" not in value.meta:
+        if "val" not in query.meta or "val" not in key.meta:
             logger.warning("Missing shape metadata, cannot legalize flex_attention")
             return False
 
         q_shape = query.meta["val"].shape
         k_shape = key.meta["val"].shape
-        v_shape = value.meta["val"].shape
         shapes = AttentionShapes(
             B=q_shape[0],
             H_q=q_shape[1],
             H_kv=k_shape[1],
             L=q_shape[2],
             S=k_shape[2],
-            E_qk=q_shape[3],
-            E_v=v_shape[3],
+            E=q_shape[3],
         )
         query_dtype = query.meta["val"].dtype
 
         logger.debug(
             f"Legalizing flex_attention: B={shapes.B}, H_q={shapes.H_q}, "
-            f"H_kv={shapes.H_kv}, L={shapes.L}, S={shapes.S}, "
-            f"E_qk={shapes.E_qk}, E_v={shapes.E_v}"
+            f"H_kv={shapes.H_kv}, L={shapes.L}, S={shapes.S}, E={shapes.E}"
         )
 
         with graph.inserting_before(node):
@@ -900,12 +796,12 @@ class FlexAttentionLegalization(NeuronFXPass):
             final_scores = scaled_scores
 
             # Apply score_mod first if provided
-            if score_mod_module is not None:
+            if forward_score_mod_module is not None:
                 final_scores = self._inline_score_mod(
                     graph,
                     gm,
-                    score_mod_name,
-                    score_mod_module,
+                    forward_score_mod_name,
+                    forward_score_mod_module,
                     final_scores,
                     index_tensors,
                     shapes,
@@ -913,11 +809,11 @@ class FlexAttentionLegalization(NeuronFXPass):
                 )
 
             # Apply mask_mod by combining it with score_mod pattern
-            if mask_mod_module is not None:
-                final_scores, _ = self._apply_combined_mask_score_mod(
+            if forward_mask_mod_module is not None:
+                final_scores = self._apply_combined_mask_score_mod(
                     graph,
                     gm,
-                    mask_mod_module,
+                    forward_mask_mod_module,
                     final_scores,
                     index_tensors,
                     shapes,
@@ -925,8 +821,8 @@ class FlexAttentionLegalization(NeuronFXPass):
                 )
 
             # Compute softmax
-            attn_weights, logsumexp, denom = self._compute_softmax(
-                graph, final_scores, shapes, query_dtype, defer_normalization=True
+            attn_weights, logsumexp = self._compute_softmax(
+                graph, final_scores, shapes, query_dtype
             )
 
             # Compute output: attn_weights @ value
@@ -935,17 +831,17 @@ class FlexAttentionLegalization(NeuronFXPass):
             )
             self._add_metadata_to_node(
                 output,
-                shape=[shapes.B, shapes.H_q, shapes.L, shapes.E_v],
+                shape=[shapes.B, shapes.H_q, shapes.L, shapes.E],
                 dtype=query_dtype,
             )
 
-            if denom is not None:
-                output = graph.call_function(torch.ops.aten.div.Tensor, args=(output, denom))
-                self._add_metadata_to_node(
-                    output,
-                    shape=[shapes.B, shapes.H_q, shapes.L, shapes.E_v],
-                    dtype=query_dtype,
-                )
+        # Store for backward pass only at the end after successful legalization
+        # This ensures we only store the most recent forward pass info
+        self._forward_score_mod_name = forward_score_mod_name
+        self._forward_score_mod_module = forward_score_mod_module
+        self._forward_mask_mod_module = forward_mask_mod_module
+        self._forward_score_mod_other_buffers = score_mod_other_buffers
+        self._forward_mask_mod_other_buffers = mask_mod_other_buffers
 
         # Replace users of the flex_attention node
         self._replace_flex_forward_users(graph, node, output, logsumexp)
@@ -1011,32 +907,22 @@ class FlexAttentionLegalization(NeuronFXPass):
         key = node.args[1]
         value = node.args[2]
         grad_out = node.args[5]
-        grad_logsumexp = node.args[6]
         scale = node.args[10]
 
-        score_mod_name, score_mod_module = self._resolve_subgraph(gm, node.args[7])
-        joint_graph_name, joint_graph_module = self._resolve_subgraph(gm, node.args[8])
-        _, mask_mod_module = self._resolve_mask_mod(gm, node.args[9])
-
-        score_mod_other_buffers = node.args[12] if len(node.args) > 12 else ()
-        mask_mod_other_buffers = node.args[13] if len(node.args) > 13 else ()
-
         # Get shape information
-        if "val" not in query.meta or "val" not in key.meta or "val" not in value.meta:
+        if "val" not in query.meta or "val" not in key.meta:
             logger.warning("Missing shape metadata, cannot legalize flex_attention_backward")
             return False
 
         q_shape = query.meta["val"].shape
         k_shape = key.meta["val"].shape
-        v_shape = value.meta["val"].shape
         shapes = AttentionShapes(
             B=q_shape[0],
             H_q=q_shape[1],
             H_kv=k_shape[1],
             L=q_shape[2],
             S=k_shape[2],
-            E_qk=q_shape[3],
-            E_v=v_shape[3],
+            E=q_shape[3],
         )
         query_dtype = query.meta["val"].dtype
 
@@ -1056,60 +942,32 @@ class FlexAttentionLegalization(NeuronFXPass):
             final_scores = scaled_scores
 
             # Apply score_mod first if available
-            if score_mod_module is not None:
+            if self._forward_score_mod_module is not None:
                 final_scores = self._inline_score_mod(
                     graph,
                     gm,
-                    score_mod_name,
-                    score_mod_module,
+                    self._forward_score_mod_name,
+                    self._forward_score_mod_module,
                     final_scores,
                     index_tensors,
                     shapes,
-                    other_buffers=score_mod_other_buffers,
+                    other_buffers=self._forward_score_mod_other_buffers,
                 )
 
             # Apply mask_mod if available
-            mask = None
-            if mask_mod_module is not None:
-                final_scores, mask = self._apply_combined_mask_score_mod(
+            if self._forward_mask_mod_module is not None:
+                final_scores = self._apply_combined_mask_score_mod(
                     graph,
                     gm,
-                    mask_mod_module,
+                    self._forward_mask_mod_module,
                     final_scores,
                     index_tensors,
                     shapes,
-                    other_buffers=mask_mod_other_buffers,
+                    other_buffers=self._forward_mask_mod_other_buffers,
                 )
 
             # Recompute softmax
-            attn_weights, _, _ = self._compute_softmax(graph, final_scores, shapes, query_dtype)
-
-            apply_score_mod_grad = None
-            if joint_graph_module is not None:
-
-                def apply_score_mod_grad(grad_post_mod_scores: fx.Node) -> fx.Node:
-                    """Apply the joint score-modification graph to a score gradient.
-
-                    Args:
-                        grad_post_mod_scores (fx.Node): Gradient after the score modification.
-
-                    Returns:
-                        fx.Node: Score gradient returned by the joint graph, or the unchanged
-                            post-modification gradient when no score-gradient node is produced.
-                    """
-                    return self._apply_joint_graph(
-                        graph,
-                        gm,
-                        joint_graph_name,
-                        joint_graph_module,
-                        scaled_scores,
-                        grad_post_mod_scores,
-                        index_tensors,
-                        shapes,
-                        query_dtype,
-                        other_buffers=score_mod_other_buffers,
-                        mask=mask,
-                    )
+            attn_weights, _ = self._compute_softmax(graph, final_scores, shapes, query_dtype)
 
             # Backward through attention
             grad_query, grad_key_expanded, grad_value_expanded = self._compute_attention_backward(
@@ -1122,8 +980,6 @@ class FlexAttentionLegalization(NeuronFXPass):
                 scale,
                 shapes,
                 query_dtype,
-                grad_logsumexp=grad_logsumexp,
-                apply_score_mod_grad=apply_score_mod_grad,
             )
 
             # Handle GQA gradient reduction
@@ -1134,39 +990,6 @@ class FlexAttentionLegalization(NeuronFXPass):
         # Replace users of the backward node
         self._replace_flex_backward_users(graph, node, grad_query, grad_key_final, grad_value_final)
         return True
-
-    def _subtract_grad_logsumexp_term(
-        self,
-        graph: fx.Graph,
-        row: fx.Node,
-        grad_logsumexp: fx.Node,
-        shapes: AttentionShapes,
-        dtype: torch.dtype,
-    ) -> fx.Node:
-        """Fold the log-sum-exp gradient into the row term of the softmax backward.
-
-        The bracket subtracts the row term, so the term enters with a minus sign. This keeps
-        the whole conversion on a [B, H, L, 1] tensor instead of the score matrix.
-        """
-        lse_dtype = (
-            grad_logsumexp.meta["val"].dtype if "val" in grad_logsumexp.meta else torch.float32
-        )
-
-        term = graph.call_function(torch.ops.aten.mul.Scalar, args=(grad_logsumexp, _LOG2_E))
-        self._add_metadata_to_node(term, shape=[shapes.B, shapes.H_q, shapes.L], dtype=lse_dtype)
-
-        term = graph.call_function(torch.ops.aten.unsqueeze.default, args=(term, -1))
-        self._add_metadata_to_node(term, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=lse_dtype)
-
-        if lse_dtype != dtype:
-            term = graph.call_function(
-                torch.ops.aten._to_copy.default, args=(term,), kwargs={"dtype": dtype}
-            )
-            self._add_metadata_to_node(term, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=dtype)
-
-        row = graph.call_function(torch.ops.aten.sub.Tensor, args=(row, term))
-        self._add_metadata_to_node(row, shape=[shapes.B, shapes.H_q, shapes.L, 1], dtype=dtype)
-        return row
 
     def _compute_attention_backward(
         self,
@@ -1179,8 +1002,6 @@ class FlexAttentionLegalization(NeuronFXPass):
         scale: float,
         shapes: AttentionShapes,
         dtype: torch.dtype,
-        grad_logsumexp: fx.Node | None = None,
-        apply_score_mod_grad: Callable[[fx.Node], fx.Node] | None = None,
     ) -> tuple[fx.Node, fx.Node, fx.Node]:
         """Compute gradients for attention backward pass."""
         # grad_value = attn_weights^T @ grad_out
@@ -1195,13 +1016,13 @@ class FlexAttentionLegalization(NeuronFXPass):
             torch.ops.aten.matmul.default, args=(attn_weights_t, grad_out)
         )
         self._add_metadata_to_node(
-            grad_value, shape=[shapes.B, shapes.H_q, shapes.S, shapes.E_v], dtype=dtype
+            grad_value, shape=[shapes.B, shapes.H_q, shapes.S, shapes.E], dtype=dtype
         )
 
         # grad_attn_weights = grad_out @ value^T
         value_t = graph.call_function(torch.ops.aten.transpose.int, args=(value, -2, -1))
         self._add_metadata_to_node(
-            value_t, shape=[shapes.B, shapes.H_q, shapes.E_v, shapes.S], dtype=dtype
+            value_t, shape=[shapes.B, shapes.H_q, shapes.E, shapes.S], dtype=dtype
         )
 
         grad_attn_weights = graph.call_function(
@@ -1221,21 +1042,17 @@ class FlexAttentionLegalization(NeuronFXPass):
             dtype=dtype,
         )
 
-        row_term = graph.call_function(
+        sum_grad_attn_times_attn = graph.call_function(
             torch.ops.aten.sum.dim_IntList, args=(grad_attn_times_attn, [-1], True)
         )
         self._add_metadata_to_node(
-            row_term,
+            sum_grad_attn_times_attn,
             shape=[shapes.B, shapes.H_q, shapes.L, 1],
             dtype=dtype,
         )
-        if isinstance(grad_logsumexp, fx.Node):
-            row_term = self._subtract_grad_logsumexp_term(
-                graph, row_term, grad_logsumexp, shapes, dtype
-            )
 
         grad_attn_minus_sum = graph.call_function(
-            torch.ops.aten.sub.Tensor, args=(grad_attn_weights, row_term)
+            torch.ops.aten.sub.Tensor, args=(grad_attn_weights, sum_grad_attn_times_attn)
         )
         self._add_metadata_to_node(
             grad_attn_minus_sum,
@@ -1250,42 +1067,35 @@ class FlexAttentionLegalization(NeuronFXPass):
             grad_scores, shape=[shapes.B, shapes.H_q, shapes.L, shapes.S], dtype=dtype
         )
 
-        # The score modification is between the scaled scores and the softmax. Thus its
-        # derivative applies after the softmax gradient and before the scale.
-        if apply_score_mod_grad is not None:
-            grad_scores = apply_score_mod_grad(grad_scores)
-
-        # A scalar commutes with the matmul, so scaling each [B, H_q, *, E_qk] output instead
-        # of grad_scores reaches the same gradients without a second score-shaped tensor.
-        grad_query_unscaled = graph.call_function(
-            torch.ops.aten.matmul.default, args=(grad_scores, key)
+        # Apply scale
+        grad_scaled_scores = graph.call_function(
+            torch.ops.aten.mul.Scalar, args=(grad_scores, scale)
         )
         self._add_metadata_to_node(
-            grad_query_unscaled, shape=[shapes.B, shapes.H_q, shapes.L, shapes.E_qk], dtype=dtype
+            grad_scaled_scores,
+            shape=[shapes.B, shapes.H_q, shapes.L, shapes.S],
+            dtype=dtype,
         )
+
+        # grad_query = grad_scores @ K
         grad_query = graph.call_function(
-            torch.ops.aten.mul.Scalar, args=(grad_query_unscaled, scale)
+            torch.ops.aten.matmul.default, args=(grad_scaled_scores, key)
         )
         self._add_metadata_to_node(
-            grad_query, shape=[shapes.B, shapes.H_q, shapes.L, shapes.E_qk], dtype=dtype
+            grad_query, shape=[shapes.B, shapes.H_q, shapes.L, shapes.E], dtype=dtype
         )
 
+        # grad_key = grad_scores^T @ Q
         grad_scores_t = graph.call_function(
-            torch.ops.aten.transpose.int, args=(grad_scores, -2, -1)
+            torch.ops.aten.transpose.int, args=(grad_scaled_scores, -2, -1)
         )
         self._add_metadata_to_node(
             grad_scores_t, shape=[shapes.B, shapes.H_q, shapes.S, shapes.L], dtype=dtype
         )
 
-        grad_key_unscaled = graph.call_function(
-            torch.ops.aten.matmul.default, args=(grad_scores_t, query)
-        )
+        grad_key = graph.call_function(torch.ops.aten.matmul.default, args=(grad_scores_t, query))
         self._add_metadata_to_node(
-            grad_key_unscaled, shape=[shapes.B, shapes.H_q, shapes.S, shapes.E_qk], dtype=dtype
-        )
-        grad_key = graph.call_function(torch.ops.aten.mul.Scalar, args=(grad_key_unscaled, scale))
-        self._add_metadata_to_node(
-            grad_key, shape=[shapes.B, shapes.H_q, shapes.S, shapes.E_qk], dtype=dtype
+            grad_key, shape=[shapes.B, shapes.H_q, shapes.S, shapes.E], dtype=dtype
         )
 
         return grad_query, grad_key, grad_value
@@ -1373,17 +1183,13 @@ class FlexAttentionLegalization(NeuronFXPass):
     # =========================================================================
 
     def call(self, gm: fx.GraphModule) -> PassResult:
-        """Legalize flex-attention nodes in an FX graph.
+        """Execute the flex attention legalization pass.
 
         Args:
-            gm: Graph module to transform in place.
+            gm: The GraphModule to transform.
 
         Returns:
-            PassResult: The graph module and whether any flex-attention node changed.
-
-        Raises:
-            ValueError: If grouped-query attention head counts are incompatible.
-            TypeError: If an inlined score-modifier node has a non-callable target.
+            PassResult with modified=True if any transformations were made.
         """
         graph = gm.graph
         modified = False

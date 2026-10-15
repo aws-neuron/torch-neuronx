@@ -118,35 +118,6 @@ class TestMemorySnapshotAPI:
 
         del x
 
-    def test_snapshot_includes_clock_domain_offset(self):
-        """Test that the snapshot reports the clock domain offset."""
-        snapshot = memory._snapshot()
-
-        assert "clock_domain_offset_us" in snapshot
-        assert isinstance(snapshot["clock_domain_offset_us"], int)
-
-    def test_alloc_trace_entries_have_trace_id(self):
-        """Test that ALLOC trace entries carry the runtime trace id for correlation."""
-        memory._record_memory_history(True, context="alloc", max_entries=100)
-
-        x = torch.randn(1024, device="neuron")
-        sync()
-
-        snapshot = memory._snapshot()
-        alloc_entries = [
-            t for traces in snapshot["device_traces"] for t in traces if t.get("action") == "alloc"
-        ]
-        assert len(alloc_entries) > 0
-
-        # The trace id is only stamped when the runtime returns a nonzero id.
-        # When present it must be a positive integer that tooling can correlate.
-        for entry in alloc_entries:
-            if "trace_id" in entry:
-                assert isinstance(entry["trace_id"], int)
-                assert entry["trace_id"] > 0
-
-        del x
-
     def test_context_parameter_validation(self):
         """Test that invalid context parameter raises ValueError."""
         with pytest.raises(ValueError):

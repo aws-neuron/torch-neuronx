@@ -50,18 +50,11 @@ def _get_target() -> str:
 
 
 class HiloInferGoldensExecutor:
-    """Run StableHLO through the HILO frontend and XLAInferGoldens pipeline.
+    """Executor that runs stablehlo through neuronx-cc frontend + XLAInferGoldens.
 
-    Args:
-        stablehlo_mlir (Module): StableHLO module to print and pass to ``neuronx-cc``.
-        io_spec (FunctionIO): Specifications used to read and type the golden outputs.
-        cast_spec (Sequence[TensorSpec] or None): Output specifications for final casts,
-            or ``None`` to preserve the dtypes in ``io_spec``.
-
-    Note:
-        This executor checks the ``neuronx-cc`` frontend transformation and XLA reference
-        outputs. It targets Trainium 2 and preserves its work directory when
-        ``TORCH_NEURONX_PRESERVE_HILO_WORKDIR=1``.
+    This tests that the neuronx-cc frontend correctly transforms
+    the StableHLO produced by torch-neuronx and that XLA's reference
+    interpreter produces correct golden outputs.
     """
 
     def __init__(self, stablehlo_mlir, io_spec: FunctionIO, cast_spec):

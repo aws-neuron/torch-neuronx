@@ -5,14 +5,12 @@ Tests the wrap-serialize approach where artifacts are collected just-in-time
 when save_cache_artifacts() is called.
 """
 
-import os
 import uuid
 
 import pytest
 import torch
 
 import torch_neuronx
-from tests.neuron_dynamo_backend.compile_only_utils import run_in_subprocess
 
 # Enable metrics for cache statistics in tests.
 torch_neuronx._C._neuron_set_metrics_enabled(True)
@@ -64,7 +62,7 @@ def simple_model():
 @pytest.fixture
 def simple_input():
     """Simple input tensor on neuron device."""
-    return torch.randn(1, 4).to("neuron")
+    return torch.randn(1, 4, device="neuron")
 
 
 # =============================================================================
@@ -252,93 +250,3 @@ class TestMegaCacheEndToEnd:
         torch.compiler.load_cache_artifacts(artifacts)
         for key in saved_keys:
             assert torch_neuronx._C.get_neff_cache(key) is not None
-
-
-# =============================================================================
-# Cross-session Tests
-# =============================================================================
-
-
-_SESSION_1 = """
-import os
-import torch, torch_neuronx
-torch_neuronx._C._neuron_set_metrics_enabled(True)
-model = torch.nn.Linear(4, 4).to("neuron")
-torch.compile(model, backend="neuron")(torch.randn(1, 4, device="neuron"))
-artifacts, info = torch.compiler.save_cache_artifacts()
-assert artifacts is not None, "save_cache_artifacts returned nothing"
-assert "neuron_neff" in info.artifacts, "no neuron_neff artifact"
-open(os.environ["MC_BLOB"], "wb").write(artifacts)
-torch.save(model.state_dict(), os.environ["MC_WEIGHTS"])
-print("RESULT:" + str(len(info.artifacts["neuron_neff"])))
-"""
-
-_SESSION_2 = """
-import os
-import torch, torch_neuronx
-torch_neuronx._C._neuron_set_metrics_enabled(True)
-torch.compiler.load_cache_artifacts(open(os.environ["MC_BLOB"], "rb").read())
-model = torch.nn.Linear(4, 4).to("neuron")
-model.load_state_dict(torch.load(os.environ["MC_WEIGHTS"]))
-x = torch.randn(1, 4, device="neuron")
-# Settle the eager ops that moving the weights and the input triggers. MegaCache carries
-# only the torch.compile NEFF, so eager compiles must not count against it.
-torch.neuron.synchronize()
-before = torch_neuronx._C._get_compilation_cache_stats()
-out = torch.compile(model, backend="neuron")(x)
-torch.neuron.synchronize()
-after = torch_neuronx._C._get_compilation_cache_stats()
-compiles = after["total_compilations"] - before["total_compilations"]
-hits = after["persistent_hits"] - before["persistent_hits"]
-print("RESULT:" + str(out.shape[-1]) + "," + str(compiles) + "," + str(hits))
-"""
-
-
-def _result_line(proc, label):
-    """Return the RESULT payload the child printed.
-
-    Scan every line: torch.compile can log after the print, so the RESULT line is not
-    always last.
-    """
-    for line in proc.stdout.splitlines():
-        if line.startswith("RESULT:"):
-            return line.split("RESULT:", 1)[1].strip()
-    raise AssertionError(
-        f"{label} printed no RESULT line:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
-    )
-
-
-@pytest.mark.skipif(
-    os.environ.get("NEURON_LAUNCH_BLOCKING") == "1",
-    reason="Async pipeline persistent caching test",
-)
-class TestMegaCacheCrossSession:
-    """MegaCache must survive a real interpreter boundary.
-
-    TestMegaCacheEndToEnd only clears the in-process cache and never re-executes, so it
-    cannot catch an artifact that fails to restore or a NEFF that silently recompiles.
-    """
-
-    def test_session_2_executes_without_recompiling(self, tmp_path):
-        def env_for(cache_dir):
-            return {
-                "TORCH_NEURONX_NEFF_CACHE_DIR": str(tmp_path / cache_dir),
-                "TORCH_NEURONX_METRICS_ENABLED": "1",
-                "MC_BLOB": str(tmp_path / "megacache.bin"),
-                "MC_WEIGHTS": str(tmp_path / "weights.pt"),
-            }
-
-        first = run_in_subprocess(_SESSION_1, env_overrides=env_for("neff_session_1"))
-        assert first.returncode == 0, f"session 1 failed:\n{first.stdout}\n{first.stderr}"
-        assert int(_result_line(first, "session 1")) >= 1
-
-        # Session 2 gets its own empty cache directory. A shared directory would let it hit
-        # the persistent cache that session 1 wrote, so the restore would prove nothing.
-        second = run_in_subprocess(_SESSION_2, env_overrides=env_for("neff_session_2"))
-        assert second.returncode == 0, f"session 2 failed:\n{second.stdout}\n{second.stderr}"
-
-        width, compiles, hits = _result_line(second, "session 2").split(",")
-        assert int(width) == 4, "session 2 produced the wrong output shape"
-        # The point of the test: the restored NEFF must serve the run, not a recompile.
-        assert int(compiles) == 0, f"session 2 recompiled {compiles} graphs after a MegaCache load"
-        assert int(hits) >= 1, "session 2 did not read the restored NEFF from the persistent cache"

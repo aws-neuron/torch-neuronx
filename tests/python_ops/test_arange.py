@@ -135,26 +135,6 @@ class TestArange:
             result_neuron.dtype == result_cpu.dtype
         ), f"dtype mismatch: neuron={result_neuron.dtype}, cpu={result_cpu.dtype}"
 
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int32, torch.int64])
-    def test_arange_out_noncontiguous_narrow(self, dtype):
-        """A strided out= view is scattered respecting its stride and offset.
-
-        The [4] result must land in the view's two columns, giving
-        ((0, 0, 1), (0, 2, 3)), NOT be written contiguously from the view's
-        storage offset (which gave ((0, 0, 1), (2, 3, 0))).
-        """
-        x = torch.zeros(2, 3, device="neuron", dtype=dtype)
-        torch.arange(4, out=x.narrow(1, 1, 2), dtype=dtype)
-        expected = torch.tensor(((0, 0, 1), (0, 2, 3)), dtype=dtype)
-        torch.testing.assert_close(x.cpu(), expected, atol=0, rtol=0)
-
-    def test_arange_out_noncontiguous_permuted(self):
-        """A permuted out= view receives values in logical order."""
-        res = torch.zeros(3, 3, device="neuron").t()  # non-contiguous [3,3]
-        torch.arange(9, out=res, dtype=torch.float32)
-        expected = torch.arange(9, dtype=torch.float32).reshape(3, 3)
-        torch.testing.assert_close(res.cpu(), expected, atol=0, rtol=0)
-
     def test_arange_base_overload(self):
         """Test aten::arange base overload (end only) dispatches correctly."""
         device = "neuron"

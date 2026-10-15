@@ -103,10 +103,3 @@ class TestPdistForward:
             assert_op_runs_on_neuron("aten::_pdist_forward.out")
         torch.testing.assert_close(result.cpu(), expected, rtol=self._RTOL, atol=self._ATOL)
         torch.testing.assert_close(out_n.cpu(), expected, rtol=self._RTOL, atol=self._ATOL)
-
-    @pytest.mark.parametrize("p", [0.0, float("inf")])
-    def test_nan_propagation(self, p):
-        """inf - inf = NaN; the pairwise distance must be NaN, not a number."""
-        x = torch.full((2, 2), float("inf"), device="neuron")
-        result = torch.ops.aten._pdist_forward(x, p)
-        assert result.cpu().isnan().all(), f"pdist(inf, p={p}) should be NaN, got {result.cpu()}"

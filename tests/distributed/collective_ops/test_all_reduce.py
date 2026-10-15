@@ -4,9 +4,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-import torch_neuronx
 from tests.utils.neuron_test_utils import assert_raises
-from torch_neuronx.utils import is_host_cc_enabled, is_streams_enabled
 
 from .base_collective_op import BaseCollectiveOpTest
 
@@ -356,72 +354,3 @@ class TestAllReduceWorldSize4(BaseCollectiveOpTest):
             partial_group=partial_group,
             expected_output=expected_output,
         )
-
-
-def run_collective_ordering(rank, world_size, kwargs):
-    assert not is_host_cc_enabled()
-    streams = [torch.neuron.Stream(), torch.neuron.Stream()]
-    for iteration in range(4):
-        stream = streams[iteration % len(streams)]
-        assert (stream != torch_neuronx.default_stream()) == is_streams_enabled()
-        with torch.neuron.stream(stream):
-            tensor = torch.ones(1024, device="neuron") * (rank + iteration + 1)
-            if kwargs["collective"] == "all_reduce":
-                output = tensor
-                work = dist.all_reduce(tensor, async_op=kwargs["async_op"])
-            elif kwargs["collective"] == "reduce_scatter":
-                output = torch.empty(1024 // world_size, device="neuron")
-                work = dist.reduce_scatter_tensor(output, tensor, async_op=kwargs["async_op"])
-            else:
-                output = torch.empty(1024 * world_size, device="neuron")
-                work = dist.all_gather_into_tensor(output, tensor, async_op=kwargs["async_op"])
-            if kwargs["async_op"]:
-                work.wait()
-            result = output * 2
-            if kwargs["collective"] == "all_gather":
-                expected = torch.arange(1, world_size + 1, dtype=torch.float32)
-                expected = (expected + iteration).repeat_interleave(1024) * 2
-            else:
-                expected = torch.full(
-                    output.shape, world_size * (world_size + 1 + 2 * iteration), dtype=torch.float32
-                )
-            done = stream.record_event()
-        torch_neuronx.default_stream().wait_event(done)
-        torch.testing.assert_close(result.cpu(), expected)
-
-
-def run_collective_failure(rank, world_size, kwargs):
-    assert not is_host_cc_enabled()
-    tensor = torch.ones(1024, device="neuron")
-    torch.neuron.synchronize()
-    stream = torch.neuron.Stream()
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setenv("NEURON_CC_FLAGS", "--verbose not_a_valid_arg")
-        with pytest.raises(RuntimeError, match="(?i)compilation failed"):
-            with torch.neuron.stream(stream):
-                work = dist.all_reduce(tensor, async_op=True)
-                work.wait()
-            stream.synchronize()
-
-    with torch.neuron.stream(stream):
-        healthy = torch.ones(513, device="neuron") * (rank + 1)
-        dist.all_reduce(healthy)
-    stream.synchronize()
-    expected = torch.full((513,), world_size * (world_size + 1) / 2)
-    torch.testing.assert_close(healthy.cpu(), expected)
-
-
-class TestNondefaultCollectivesWithoutHostCC(BaseCollectiveOpTest):
-    @pytest.mark.parametrize("collective", ["all_reduce", "all_gather", "reduce_scatter"])
-    @pytest.mark.parametrize("async_op", [False, True])
-    def test_collective_ordering(self, distributed_tester, collective, async_op):
-        distributed_tester.run_test(
-            run_collective_ordering, collective=collective, async_op=async_op
-        )
-
-    @pytest.mark.skipif(
-        os.environ.get("NEURON_LAUNCH_BLOCKING") == "1",
-        reason="requires asynchronous execution",
-    )
-    def test_collective_failure(self, distributed_tester):
-        distributed_tester.run_test(run_collective_failure)

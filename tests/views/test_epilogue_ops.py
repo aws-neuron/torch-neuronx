@@ -470,7 +470,7 @@ class TestEpilogueOutSliceOps:
     )
     def test_mul_out_slice_no_copy_back(self):
         """torch.mul with out= slice view should not use copy-back."""
-        a = torch.randn(4, 8).to("neuron")
+        a = torch.randn(4, 8, device="neuron")
         base = torch.zeros(4, 8, device="neuron")
         out_view = base[:, :4]  # non-contiguous slice out=
         assert not out_view.is_contiguous()

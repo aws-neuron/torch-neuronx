@@ -16,13 +16,26 @@ Modes (unified taxonomy):
 Requires a Neuron device.
 """
 
+import os
+
 import pytest
 import torch
 
 import torch_neuronx
 
+# TORCH_NEURONX_CPP_DISPATCH is read once at module init on both the C++ and
+# Python sides, so it can't be toggled per-test. The python-dispatch
+# regression tests below must be skipped when the process runs with cpp dispatch.
+_CPP_DISPATCH = os.environ.get("TORCH_NEURONX_CPP_DISPATCH", "1") == "1"
+
 _NO_NEURON = not hasattr(torch, "neuron") or torch.neuron.device_count() == 0
 requires_neuron = pytest.mark.skipif(_NO_NEURON, reason="No Neuron device available")
+
+
+@pytest.fixture(params=["0", "1"], ids=["python_dispatch", "cpp_dispatch"])
+def dispatch_mode(request, monkeypatch):
+    monkeypatch.setenv("TORCH_NEURONX_CPP_DISPATCH", request.param)
+    return request.param
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -35,41 +48,41 @@ requires_neuron = pytest.mark.skipif(_NO_NEURON, reason="No Neuron device availa
 class TestNativeOpsInt64:
     """NATIVE ops produce correct int64 results on device (S64 / GPSIMD)."""
 
-    def test_add_int64(self):
+    def test_add_int64(self, dispatch_mode):
         a = torch.tensor([10, 20, 30, 40], dtype=torch.int64, device="neuron")
         b = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="neuron")
         result = a + b
         torch.neuron.synchronize()
         torch.testing.assert_close(result.cpu(), torch.tensor([11, 22, 33, 44], dtype=torch.int64))
 
-    def test_mul_int64(self):
+    def test_mul_int64(self, dispatch_mode):
         a = torch.tensor([10, 20, 30, 40], dtype=torch.int64, device="neuron")
         b = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="neuron")
         result = a * b
         torch.neuron.synchronize()
         torch.testing.assert_close(result.cpu(), torch.tensor([10, 40, 90, 160], dtype=torch.int64))
 
-    def test_sub_int64(self):
+    def test_sub_int64(self, dispatch_mode):
         a = torch.tensor([10, 20, 30, 40], dtype=torch.int64, device="neuron")
         b = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="neuron")
         result = a - b
         torch.neuron.synchronize()
         torch.testing.assert_close(result.cpu(), torch.tensor([9, 18, 27, 36], dtype=torch.int64))
 
-    def test_comparison_int64(self):
+    def test_comparison_int64(self, dispatch_mode):
         a = torch.tensor([10, 20, 30, 40], dtype=torch.int64, device="neuron")
         b = torch.tensor([10, 25, 25, 45], dtype=torch.int64, device="neuron")
         result = a == b
         torch.neuron.synchronize()
         torch.testing.assert_close(result.cpu(), torch.tensor([True, False, False, False]))
 
-    def test_sum_int64(self):
+    def test_sum_int64(self, dispatch_mode):
         a = torch.tensor([10, 20, 30, 40], dtype=torch.int64, device="neuron")
         result = a.sum()
         torch.neuron.synchronize()
         assert result.cpu().item() == 100
 
-    def test_int64_above_int32_max_is_exact(self):
+    def test_int64_above_int32_max_is_exact(self, dispatch_mode):
         """Native mode runs int64 on GPSIMD, so values beyond int32 are exact."""
         big = (1 << 40) + 7  # overflows int32
         a = torch.tensor([big, big, big], dtype=torch.int64, device="neuron")
@@ -86,13 +99,13 @@ class TestDowncastOpsInt64:
     """Non-native ops are demoted to int32 via the packed view; correct within
     int32 range."""
 
-    def test_pow_int64(self):
+    def test_pow_int64(self, dispatch_mode):
         a = torch.tensor([2, 3, 4, 5], dtype=torch.int64, device="neuron")
         result = torch.pow(a, 2)
         torch.neuron.synchronize()
         torch.testing.assert_close(result.cpu(), torch.tensor([4, 9, 16, 25], dtype=torch.int64))
 
-    def test_pow_int64_larger_values(self):
+    def test_pow_int64_larger_values(self, dispatch_mode):
         a = torch.tensor([100, 200, 300, 400], dtype=torch.int64, device="neuron")
         result = torch.pow(a, 2)
         torch.neuron.synchronize()
@@ -105,135 +118,13 @@ class TestDowncastOpsInt64:
 class TestUnsupportedOpsInt64:
     """matmul/conv int64 fall back to CPU and produce correct results."""
 
-    def test_matmul_int64_cpu_fallback(self):
+    def test_matmul_int64_cpu_fallback(self, dispatch_mode):
         a = torch.tensor([[1, 2], [3, 4]], dtype=torch.int64, device="neuron")
         b = torch.tensor([[5, 6], [7, 8]], dtype=torch.int64, device="neuron")
         result = torch.matmul(a, b)
         torch.neuron.synchronize()
         expected = torch.tensor([[19, 22], [43, 50]], dtype=torch.int64)
         torch.testing.assert_close(result.cpu(), expected)
-
-
-@requires_neuron
-@pytest.mark.int64_mode("native")
-class TestMixedDtypePromotionInt64:
-    """A mixed int32/int64 op widens its int32 operand on device.
-
-    This is a regression test for a fixed bug. NeuronSafeCast once gated the
-    on-device widening (materialize_from_i32) on the packed mode alone. Native
-    mode then took the generic 64-bit CPU round-trip, and the operand went to
-    the host and back only to be promoted. The results stayed correct, so these
-    tests check where the promotion runs, not only the values.
-    """
-
-    @staticmethod
-    def _track(fn):
-        """Run fn and report the ops it executed. Drains lazy work on both sides."""
-        torch.neuron.synchronize()
-        torch_neuronx.clear_op_tracking()
-        result = fn()
-        torch.neuron.synchronize()
-        return (
-            result,
-            set(torch_neuronx.get_executed_ops()),
-            set(torch_neuronx.get_fallback_ops()),
-        )
-
-    def test_promotion_does_not_round_trip_through_host(self):
-        a = torch.tensor([10, 20, 30, 40], dtype=torch.int64, device="neuron")
-        b = torch.tensor([10, 21, 30, 41], dtype=torch.int32, device="neuron")
-
-        result, executed, fallback = self._track(lambda: torch.eq(a, b))
-
-        # A host round-trip shows up in two ways. The widening records an
-        # aten::_to_copy fallback, and it reads the operand back to the host.
-        # The on-device path only uploads the 8-byte shift constant, so a
-        # device-to-host copy is the exact marker of the round-trip.
-        assert "aten::_to_copy" not in fallback, f"promotion fell back to CPU; fallback={fallback}"
-        assert (
-            "neuron::copy::neuron_to_cpu" not in executed
-        ), f"promotion copied the operand to the host; executed={executed}"
-        expected = torch.tensor([True, False, True, False])
-        torch.testing.assert_close(result.cpu(), expected)
-
-    def test_promotion_keeps_the_int64_high_word(self):
-        # 2**40 + 7 and 7 share their low 32 bits, so a low-word-only promotion
-        # reports the pair as equal. Only a full 64-bit widening says False.
-        a = torch.tensor([2**40 + 7, -(2**40) - 7, 7], dtype=torch.int64, device="neuron")
-        b = torch.tensor([7, -7, 7], dtype=torch.int32, device="neuron")
-
-        result, _, _ = self._track(lambda: torch.eq(a, b))
-
-        torch.testing.assert_close(result.cpu(), torch.tensor([False, False, True]))
-
-    def test_promotion_is_exact_in_arithmetic(self):
-        a = torch.tensor([2**40, -(2**40)], dtype=torch.int64, device="neuron")
-        b = torch.tensor([7, -7], dtype=torch.int32, device="neuron")
-
-        result, _, _ = self._track(lambda: a + b)
-
-        expected = torch.tensor([2**40 + 7, -(2**40) - 7], dtype=torch.int64)
-        assert result.dtype == torch.int64
-        torch.testing.assert_close(result.cpu(), expected)
-
-
-@requires_neuron
-@pytest.mark.int64_mode("native")
-class TestInt64CopyStaysOnDevice:
-    """A device-to-device int64 copy does not go through the host.
-
-    This is a regression test for a fixed bug. aten::copy_ had no on-device tier
-    for int64. IsCopyMlirDtypeSupported() rejects Long, so the copy reached the
-    last tier, which is the NRT CPU bounce. A same-dtype copy only moves bytes,
-    so it needs no dtype support in the compiler.
-    """
-
-    @staticmethod
-    def _host_read_backs(run):
-        """Run the copy and report the host read-backs.
-
-        A read back to the host marks the round-trip. An upload alone does not,
-        because a helper op can upload a scalar operand. The first synchronize
-        drains the lazy tensor creation, so only the copy is measured.
-        """
-        torch.neuron.synchronize()
-        torch_neuronx.clear_op_tracking()
-        run()
-        torch.neuron.synchronize()
-        return [op for op in torch_neuronx.get_executed_ops() if "neuron_to_cpu" in op]
-
-    def test_slice_assign_stays_on_device(self):
-        src = torch.tensor([11, 22, 33, 44], dtype=torch.int64, device="neuron")
-        dst = torch.zeros(8, dtype=torch.int64, device="neuron")
-
-        def run():
-            dst[: src.numel()] = src
-
-        host = self._host_read_backs(run)
-
-        assert not host, f"the copy went through the host; ops={host}"
-        expected = torch.tensor([11, 22, 33, 44, 0, 0, 0, 0], dtype=torch.int64)
-        torch.testing.assert_close(dst.cpu(), expected)
-
-    def test_copy_stays_on_device(self):
-        src = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="neuron")
-        dst = torch.zeros(4, dtype=torch.int64, device="neuron")
-
-        host = self._host_read_backs(lambda: dst.copy_(src))
-
-        assert not host, f"the copy went through the host; ops={host}"
-        torch.testing.assert_close(dst.cpu(), src.cpu())
-
-    def test_copy_keeps_the_high_word(self):
-        # A byte copy must hold values that need more than 32 bits.
-        values = [2**62, -(2**62), 2**40 + 7, -(2**40) - 7]
-        src = torch.tensor(values, dtype=torch.int64, device="neuron")
-        dst = torch.zeros(len(values), dtype=torch.int64, device="neuron")
-
-        dst.copy_(src)
-        torch.neuron.synchronize()
-
-        torch.testing.assert_close(dst.cpu(), torch.tensor(values, dtype=torch.int64))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -247,14 +138,14 @@ class TestPackedMode:
     """In packed mode all int64 ops run on device via the low-word packed view;
     correct within int32 range."""
 
-    def test_add_int64(self):
+    def test_add_int64(self, dispatch_mode):
         a = torch.tensor([10, 20, 30, 40], dtype=torch.int64, device="neuron")
         b = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="neuron")
         result = a + b
         torch.neuron.synchronize()
         torch.testing.assert_close(result.cpu(), torch.tensor([11, 22, 33, 44], dtype=torch.int64))
 
-    def test_pow_int64(self):
+    def test_pow_int64(self, dispatch_mode):
         a = torch.tensor([10, 20, 30, 40], dtype=torch.int64, device="neuron")
         result = torch.pow(a, 2)
         torch.neuron.synchronize()
@@ -273,14 +164,14 @@ class TestCpuBounceMode:
     """In cpu_bounce mode the framework casts int64→int32 via a CPU roundtrip;
     results stay correct within int32 range."""
 
-    def test_add_int64(self):
+    def test_add_int64(self, dispatch_mode):
         a = torch.tensor([10, 20, 30, 40], dtype=torch.int64, device="neuron")
         b = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="neuron")
         result = a + b
         torch.neuron.synchronize()
         torch.testing.assert_close(result.cpu(), torch.tensor([11, 22, 33, 44], dtype=torch.int64))
 
-    def test_pow_int64(self):
+    def test_pow_int64(self, dispatch_mode):
         """The dispatcher must downcast int64 before lowering; otherwise
         neuronx-cc sees S64 pow with no int64 flag and fails compilation."""
         x = torch.tensor([10, 20, 30, 40], dtype=torch.int64, device="neuron")
@@ -289,7 +180,7 @@ class TestCpuBounceMode:
         expected = torch.tensor([100, 400, 900, 1600], dtype=torch.int64)
         torch.testing.assert_close(result.cpu(), expected)
 
-    def test_pow_int64_out(self):
+    def test_pow_int64_out(self, dispatch_mode):
         """out= variant — exercises the write-aliased branch in DowncastArgs."""
         x = torch.tensor([10, 20, 30, 40], dtype=torch.int64, device="neuron")
         out = torch.zeros_like(x)
@@ -309,13 +200,13 @@ class TestCpuBounceMode:
 class TestNativeStrictMode:
     """In native_strict mode, non-native ops fall back to CPU (no truncation)."""
 
-    def test_pow_cpu_fallback(self):
+    def test_pow_cpu_fallback(self, dispatch_mode):
         a = torch.tensor([2, 3, 4, 5], dtype=torch.int64, device="neuron")
         result = torch.pow(a, 2)
         torch.neuron.synchronize()
         torch.testing.assert_close(result.cpu(), torch.tensor([4, 9, 16, 25], dtype=torch.int64))
 
-    def test_native_op_runs_on_neuron(self):
+    def test_native_op_runs_on_neuron(self, dispatch_mode):
         a = torch.tensor([10, 20, 30, 40], dtype=torch.int64, device="neuron")
         b = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="neuron")
         result = a + b
@@ -338,7 +229,7 @@ class TestCpuFallbackMode:
     reports a CPU fallback.
     """
 
-    def test_add_runs_on_cpu(self):
+    def test_add_runs_on_cpu(self, dispatch_mode):
         a = torch.tensor([10, 20, 30, 40], dtype=torch.int64, device="neuron")
         b = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="neuron")
         torch_neuronx.clear_op_tracking()
@@ -348,7 +239,7 @@ class TestCpuFallbackMode:
         assert any("add" in op for op in fb), f"add should CPU-fall-back in cpu_fallback; fb={fb}"
         torch.testing.assert_close(result.cpu(), torch.tensor([11, 22, 33, 44], dtype=torch.int64))
 
-    def test_int64_above_int32_max_is_exact(self):
+    def test_int64_above_int32_max_is_exact(self, dispatch_mode):
         # Running on CPU, full int64 precision is preserved regardless of compiler.
         big = (1 << 40) + 7
         a = torch.tensor([big, big, big], dtype=torch.int64, device="neuron")
@@ -360,20 +251,27 @@ class TestCpuFallbackMode:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CPU fallback aliasing contract
+#  Python-dispatch CPU fallback regressions
 #
-#  A CPU fallback must honor a caller's out= tensor, must mutate self for an
-#  inplace op, and must return multi-output results on the neuron device.
-#  at::native::cpu_fallback in NeuronDispatcher.cpp does all three; these pin
-#  it. They use ops that actually CPU-fall-back:
+#  These pin observable bugs in
+#  torch_neuronx/python_ops/torch_mlir/op_impl.py::TorchMlirOpImpl.__call__
+#  CPU-fallback branch (out= dropped, inplace not mutating self, multi-return
+#  tensors left on CPU). The C++ dispatcher (TORCH_NEURONX_CPP_DISPATCH=1) uses
+#  at::native::cpu_fallback, which handles all three correctly, so these are
+#  skipped on that path. They use ops that actually CPU-fall-back:
 #    * aten::mm (UNSUPPORTED) in native mode, and
 #    * non-native ops (pow, sort, max.dim) in native_strict mode.
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+@pytest.mark.skipif(
+    _CPP_DISPATCH,
+    reason="targets python-dispatch op_impl.py CPU fallback; "
+    "run with TORCH_NEURONX_CPP_DISPATCH=0 to exercise",
+)
 @requires_neuron
 @pytest.mark.int64_mode("native")
-class TestCpuFallbackOutKwarg:
+class TestPythonCpuFallbackOutKwarg:
     """CPU fallback must honor user-provided ``out=`` tensors. Uses ``mm.out``
     (mm is UNSUPPORTED), so the CPU fallback fires in native mode."""
 
@@ -397,9 +295,14 @@ class TestCpuFallbackOutKwarg:
         torch.testing.assert_close(out.cpu(), expected)
 
 
+@pytest.mark.skipif(
+    _CPP_DISPATCH,
+    reason="targets python-dispatch op_impl.py CPU fallback; "
+    "run with TORCH_NEURONX_CPP_DISPATCH=0 to exercise",
+)
 @requires_neuron
 @pytest.mark.int64_mode("native_strict")
-class TestCpuFallbackOutKwargNativeStrict:
+class TestPythonCpuFallbackOutKwargNativeStrict:
     """In native_strict, non-native ops fall back to CPU. The out= contract
     still applies (uses pow.out)."""
 
@@ -416,9 +319,14 @@ class TestCpuFallbackOutKwargNativeStrict:
         torch.testing.assert_close(out.cpu(), torch.tensor([4, 9, 16, 25], dtype=torch.int64))
 
 
+@pytest.mark.skipif(
+    _CPP_DISPATCH,
+    reason="targets python-dispatch op_impl.py CPU fallback; "
+    "run with TORCH_NEURONX_CPP_DISPATCH=0 to exercise",
+)
 @requires_neuron
 @pytest.mark.int64_mode("native_strict")
-class TestCpuFallbackInplace:
+class TestPythonCpuFallbackInplace:
     """In native_strict, a non-native inplace op (pow_) CPU-falls-back. It must
     still mutate ``self`` rather than returning a fresh tensor."""
 
@@ -439,9 +347,14 @@ class TestCpuFallbackInplace:
         torch.testing.assert_close(a.cpu(), torch.tensor([4, 9, 16, 25], dtype=torch.int64))
 
 
+@pytest.mark.skipif(
+    _CPP_DISPATCH,
+    reason="targets python-dispatch op_impl.py CPU fallback; "
+    "run with TORCH_NEURONX_CPP_DISPATCH=0 to exercise",
+)
 @requires_neuron
 @pytest.mark.int64_mode("native_strict")
-class TestCpuFallbackMultiReturn:
+class TestPythonCpuFallbackMultiReturn:
     """Multi-tensor-return ops (sort, max.dim) are non-native, so they CPU-fall-
     back in native_strict. Each output must land on the neuron device."""
 

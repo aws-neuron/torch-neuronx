@@ -18,25 +18,12 @@ if TYPE_CHECKING:
 
 @dataclass
 class CompileOptions:
-    """Configure compiler API behavior.
+    """Compilation options.
 
-    Args:
-        target (str, optional): Platform target override, such as ``"trn2"``.
-            Defaults to ``None``, which leaves platform discovery unchanged.
-        logical_nc (str, optional): Logical NeuronCore override. Defaults to
-            ``None``, which leaves logical-core discovery unchanged.
-        optimization_level (str, optional): Neuron compiler optimization level. Defaults
-            to ``"-O2"``.
-        model_name (str, optional): Name used for compilation artifacts. Defaults to
-            ``"model"``.
-        use_tensorizer (bool, optional): Whether to use tensorizer lowering. Defaults to
-            ``False``.
-        run_fx_passes (bool, optional): Whether to run the post-AOT FX passes. Defaults to
-            ``True``; set to ``False`` for an already processed graph.
-
-    Note:
-        Set both ``target`` and ``logical_nc`` to avoid live platform discovery.
-        Device-free NRT initialization also requires fake instance configuration.
+    `target` makes the platform a *compile input* rather than a live-hardware
+    query: when set (e.g. "trn2"), the compile path does not query NRT for the
+    instance type, so it runs on a host with no Neuron device. When None, the
+    behaviour is unchanged (live-instance query on hardware).
     """
 
     target: str | None = None  # "trn2" / "trn3" / "inf2"; None -> query live instance
@@ -50,12 +37,7 @@ class CompileOptions:
 
 @dataclass
 class TensorSpec:
-    """Describe a tensor shape and data type.
-
-    Args:
-        shape (tuple): Tensor dimensions, including dynamic or scalar shapes.
-        dtype (torch.dtype): Tensor data type.
-    """
+    """Tensor shape + dtype specification."""
 
     shape: tuple[int, ...]
     dtype: torch.dtype
@@ -63,16 +45,12 @@ class TensorSpec:
 
 @dataclass
 class InputOutputAlias:
-    """Describe one input-to-output storage alias.
+    """One input->output storage alias.
 
-    Args:
-        input_index (int): NEFF input position whose buffer is reused.
-        output_index (int): NEFF output position written into that input.
-
-    Note:
-        An output produced by an in-place input update, such as a returned KV
-        cache, shares storage with that input. The runtime should bind the output
-        to the input buffer instead of allocating a new tensor.
+    When an output is produced by writing in place into an input buffer (e.g. a
+    KV cache that the graph updates and returns), the two share storage. A
+    runtime should bind that output to the input's buffer instead of allocating
+    a fresh tensor.
     """
 
     input_index: int  # NEFF input position whose buffer is reused
@@ -81,15 +59,7 @@ class InputOutputAlias:
 
 @dataclass
 class IOSpec:
-    """Describe the ordered runtime IO handoff.
-
-    Args:
-        inputs (list, optional): Ordered NEFF input tensor specifications. Defaults to an
-            empty list.
-        outputs (list, optional): Ordered NEFF output tensor specifications. Defaults to an
-            empty list.
-        aliases (list, optional): Input-to-output storage aliases. Defaults to an empty list.
-    """
+    """Ordered input/output specs + aliases — the runtime handoff."""
 
     inputs: list[TensorSpec] = field(default_factory=list)
     outputs: list[TensorSpec] = field(default_factory=list)
@@ -98,27 +68,20 @@ class IOSpec:
 
 @dataclass
 class CompilationArtifact:
-    """Hold compilation outputs for one graph.
+    """Single artifact holding all compilation outputs for a graph.
 
-    Args:
-        io_spec (IOSpec): Ordered input, output, and alias metadata.
-        cache_key (str, optional): Submitted NEFF compilation cache key. Defaults to ``None``.
-        target (str, optional): Platform target used for compilation. Defaults to ``None``.
-        stablehlo (bytes, optional): Serialized StableHLO module. Defaults to ``None``.
-        neff (bytes, optional): Caller-populated compiled NEFF bytes. Defaults to ``None``.
-        has_collectives (bool, optional): Whether the graph contains collective operations.
-            Defaults to ``False``.
-        pass_mutations (list, optional): IO mutations introduced by graph passes. Defaults to an
-            empty list.
-        _mlir_module (object, optional): Process-local MLIR module. Defaults to ``None``.
-        _lowering (object, optional): Process-local lowering state. Defaults to ``None``.
+    `io_spec`, `target`, `stablehlo`, and `has_collectives` form the serializable
+    handoff. The underscore-prefixed fields are optional process-local state.
 
-    Note:
-        ``io_spec``, ``target``, ``stablehlo``, ``has_collectives``, and
-        ``pass_mutations`` form the detached handoff. Graph lowering populates
-        StableHLO and IO metadata; NEFF submission populates ``cache_key`` before
-        returning, while compilation completes asynchronously. After
-        synchronization, callers fetch and populate ``neff`` from the cache.
+    Progressively populated through the pipeline stages:
+    - After fx_to_stablehlo: stablehlo, io_spec set
+    - After fx_to_neff / stablehlo_to_neff: cache_key also set
+    - After synchronize + get_neff_info: neff bytes fetched by caller
+
+        artifacts = [fx_to_neff(gm, opts) for gm in graphs]
+        torch.neuron.synchronize()
+        for art in artifacts:
+            _, neff = torch_neuronx._C.get_neff_info(art.cache_key)
     """
 
     io_spec: IOSpec

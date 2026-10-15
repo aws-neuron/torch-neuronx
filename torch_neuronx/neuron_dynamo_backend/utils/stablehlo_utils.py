@@ -11,21 +11,25 @@ import torch
 
 
 def compute_cache_key(stablehlo_mlir) -> str:
-    """Compute a cache key from a StableHLO graph.
+    """Generate a cache key from a StableHLO graph.
+
+    Creates a SHA-256 hash from the StableHLO module text and I/O specifications.
+
+    Note: Non-deterministic attributes (e.g., torch.debug_dump_path) should be
+    stripped before calling this function.
 
     Args:
-        stablehlo_mlir (mlir.ir.Module): StableHLO MLIR module to hash.
+        stablehlo_mlir: Compiled StableHLO MLIR module.
 
     Returns:
-        str: 64-character SHA-256 hexadecimal digest.
+        str: 64-character hex cache key for C++ consumption.
 
     Raises:
-        RuntimeError: If printing or parsing the module fails.
+        RuntimeError: If cache key generation fails.
 
-    Note:
-        The hash includes module text without debug locations plus input and
-        output shapes and dtypes. Strip nondeterministic attributes such as
-        ``torch.debug_dump_path`` before calling this function.
+    Example:
+        >>> stablehlo_mlir = convert_fx_to_stablehlo(gm, example_inputs)
+        >>> cache_key = compute_cache_key(stablehlo_mlir)
     """
     try:
         hasher = hashlib.sha256()
@@ -78,13 +82,7 @@ if hasattr(torch, "float8_e8m0fnu"):
 
 @dataclass(frozen=True)
 class TensorSpec:
-    """Describe a tensor shape and dtype.
-
-    Args:
-        shape (tuple[int, ...]): Tensor dimensions, with negative values marking
-            dynamic dimensions.
-        dtype (torch.dtype): Tensor element dtype.
-    """
+    """Tensor shape and dtype specification."""
 
     shape: tuple[int, ...]
     dtype: torch.dtype
@@ -95,30 +93,15 @@ class TensorSpec:
         return f"<{shape_str}x{dtype_str}>" if shape_str else f"<{dtype_str}>"
 
     def to_torch_size(self) -> torch.Size:
-        """Convert the stored shape to a ``torch.Size``.
-
-        Returns:
-            torch.Size: Size containing the stored dimensions.
-        """
         return torch.Size(self.shape)
 
     def is_dynamic(self) -> bool:
-        """Check whether the shape contains a dynamic dimension.
-
-        Returns:
-            bool: ``True`` if any dimension is negative; otherwise ``False``.
-        """
         return any(d < 0 for d in self.shape)
 
 
 @dataclass(frozen=True)
 class FunctionIO:
-    """Store the input and output tensor specifications for a function.
-
-    Args:
-        inputs (tuple[TensorSpec, ...]): Input tensor specifications.
-        outputs (tuple[TensorSpec, ...]): Output tensor specifications.
-    """
+    """Input/Output specification for a function."""
 
     inputs: tuple[TensorSpec, ...]
     outputs: tuple[TensorSpec, ...]
@@ -160,19 +143,14 @@ def parse_module_io(
     module,
     func_name: str = "main",
 ) -> FunctionIO:
-    """Parse tensor specifications from a StableHLO module function.
+    """Parse input/output specs from a StableHLO module's function.
 
     Args:
-        module (mlir.ir.Module): StableHLO MLIR module to inspect.
-        func_name (str, optional): Target symbol name. Defaults to ``"main"``.
+        module: torch_mlir MLIR module
+        func_name: Target function name (default: "main")
 
     Returns:
-        FunctionIO | None: Parsed specifications when the first operation is the
-        target function, or ``None`` when the module has no operations.
-
-    Raises:
-        ValueError: If the first operation is not the target function or an
-            element dtype is unsupported.
+        FunctionIO with input and output TensorSpecs
     """
     for op in module.body.operations:
         if (
@@ -187,50 +165,43 @@ def parse_module_io(
 
 
 def get_input_specs(module, func_name: str = "main") -> list[TensorSpec]:
-    """Get input tensor specifications from a StableHLO module function.
+    """Get input tensor specifications from a StableHLO module.
 
     Args:
-        module (mlir.ir.Module): StableHLO MLIR module to inspect.
-        func_name (str, optional): Target symbol name. Defaults to ``"main"``.
+        module (ir.Module): MLIR module to parse.
+        func_name (str): Target function name. Defaults to "main".
 
     Returns:
-        list[TensorSpec]: Input tensor specifications in parameter order.
-
-    Raises:
-        ValueError: If the target function cannot be parsed.
-        AttributeError: If parsing returns no function data, including when the module has no
-            operations.
+        list[TensorSpec]: List of input tensor specifications.
     """
     return list(parse_module_io(module, func_name).inputs)
 
 
 def get_output_specs(module, func_name: str = "main") -> list[TensorSpec]:
-    """Get output tensor specifications from a StableHLO module function.
+    """Get output tensor specifications from a StableHLO module.
 
     Args:
-        module (mlir.ir.Module): StableHLO MLIR module to inspect.
-        func_name (str, optional): Target symbol name. Defaults to ``"main"``.
+        module (ir.Module): MLIR module to parse.
+        func_name (str): Target function name. Defaults to "main".
 
     Returns:
-        list[TensorSpec]: Output tensor specifications in result order.
-
-    Raises:
-        ValueError: If the target function cannot be parsed.
-        AttributeError: If the module has no operations.
+        list[TensorSpec]: List of output tensor specifications.
     """
     return list(parse_module_io(module, func_name).outputs)
 
 
 def shapes_match(shape1: TensorSpec, shape2: TensorSpec) -> bool:
-    """Check whether two tensor specifications match exactly.
+    """Check if two tensor specifications match exactly.
+
+    Compares both shape and dtype for equality. Used to validate
+    aliasing relationships where input and output must have identical specs.
 
     Args:
-        shape1 (TensorSpec | None): First tensor specification, or ``None``.
-        shape2 (TensorSpec | None): Second tensor specification, or ``None``.
+        shape1 (TensorSpec): First tensor specification.
+        shape2 (TensorSpec): Second tensor specification.
 
     Returns:
-        bool: ``True`` if both non-``None`` specifications have equal shapes
-            and dtypes; otherwise ``False``.
+        bool: True if both specs are non-None and equal, False otherwise.
     """
     if shape1 is None or shape2 is None:
         return False

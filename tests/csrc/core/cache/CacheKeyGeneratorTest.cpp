@@ -112,19 +112,6 @@ TEST_F(CacheKeyGeneratorTest, ZeroDimTensor) {
   EXPECT_NE(k.find("[]"), std::string::npos);
 }
 
-TEST_F(CacheKeyGeneratorTest, WrappedAndExplicitZeroDimTensorsHaveDifferentKeys) {
-  auto explicit_tensor = torch::tensor(5, torch::kInt64);
-  auto wrapped_tensor = explicit_tensor.clone();
-  wrapped_tensor.unsafeGetTensorImpl()->set_wrapped_number(true);
-
-  auto explicit_key = gen({torch::tensor(1, torch::kInt16), explicit_tensor, 1});
-  auto wrapped_key = gen({torch::tensor(1, torch::kInt16), wrapped_tensor, 1});
-
-  EXPECT_NE(explicit_key, wrapped_key);
-  EXPECT_EQ(explicit_key.find(":wrapped"), std::string::npos);
-  EXPECT_NE(wrapped_key.find(":wrapped"), std::string::npos);
-}
-
 TEST_F(CacheKeyGeneratorTest, EmptyTensor) {
   auto k = gen({torch::zeros({0, 3}), torch::zeros({2}), 1});
   EXPECT_NE(k.find("[0,3]"), std::string::npos);
@@ -161,22 +148,6 @@ TEST_F(CacheKeyGeneratorTest, NonStaticDoubleSameKey) {
 TEST_F(CacheKeyGeneratorTest, StaticDoubleDifferentKeys) {
   auto a = gen({torch::zeros({2}), torch::zeros({2}), 1.5}, {2});
   auto b = gen({torch::zeros({2}), torch::zeros({2}), 2.5}, {2});
-  EXPECT_NE(a, b);
-}
-
-// The key used the default ostream format, which keeps 6 significant digits, so
-// arange(0.0, -8.000001, -4.0) and arange(0.0, -8.0, -4.0) shared one entry.
-// Their output lengths differ (3 vs 2), so the first to compile returned its
-// length for both.
-TEST_F(CacheKeyGeneratorTest, StaticDoubleKeepsPrecisionBeyond6Digits) {
-  auto a = gen({torch::zeros({2}), torch::zeros({2}), -8.000001}, {2});
-  auto b = gen({torch::zeros({2}), torch::zeros({2}), -8.0}, {2});
-  EXPECT_NE(a, b);
-}
-
-TEST_F(CacheKeyGeneratorTest, StaticDoubleDistinguishesSignedZero) {
-  auto a = gen({torch::zeros({2}), torch::zeros({2}), 0.0}, {2});
-  auto b = gen({torch::zeros({2}), torch::zeros({2}), -0.0}, {2});
   EXPECT_NE(a, b);
 }
 
@@ -568,9 +539,7 @@ TEST(CacheKeyStaticArgTest, SumOptionalDimListKeepsValues) {
 
 // A positional scalar declared via static_argnames is baked into the graph, so its
 // value belongs in the key. Unlike a list, a scalar renders as either the value or a
-// bare type name, so asserting the type name is absent pins which one without a
-// hardware run. The exact rendering of a value is not pinned here: AppendDouble emits
-// raw bits, and StaticDoubleKeepsPrecisionBeyond6Digits covers that.
+// bare type name, so the substring assertions pin which one without a hardware run.
 TEST(CacheKeyStaticArgTest, PositionalScalarDeclaredByNameKeepsValue) {
   auto t = torch::zeros({4, 4});
   struct Case {
@@ -579,23 +548,23 @@ TEST(CacheKeyStaticArgTest, PositionalScalarDeclaredByNameKeepsValue) {
     const char* argname;
     std::vector<c10::IValue> args_a;
     std::vector<c10::IValue> args_b;
-    const char* type_placeholder;
+    const char* rendered_a;
   };
   // Each op declares the named positional arg via static_argnames.
   // histc/bins is the only scalar-level AppendInt case; the rest are AppendDouble.
   const std::vector<Case> cases = {
-      {"aten::leaky_relu", "", "negative_slope", {t, 0.01}, {t, 0.5}, "float"},
-      {"aten::celu", "", "alpha", {t, 1.5}, {t, 2.5}, "float"},
-      {"aten::logit", "", "eps", {t, 1e-5}, {t, 1e-6}, "float"},
-      {"aten::histc", "", "bins", {t, int64_t{100}}, {t, int64_t{64}}, "int"},
-      {"aten::add", "Scalar", "alpha", {t, 1.0, int64_t{2}}, {t, 1.0, int64_t{3}}, "int"},
+      {"aten::leaky_relu", "", "negative_slope", {t, 0.01}, {t, 0.5}, "d0.01"},
+      {"aten::celu", "", "alpha", {t, 1.5}, {t, 2.5}, "d1.5"},
+      {"aten::logit", "", "eps", {t, 1e-5}, {t, 1e-6}, "d1e-05"},
+      {"aten::histc", "", "bins", {t, int64_t{100}}, {t, int64_t{64}}, "i100"},
+      {"aten::add", "Scalar", "alpha", {t, 1.0, int64_t{2}}, {t, 1.0, int64_t{3}}, "i2"},
   };
   for (const auto& c : cases) {
     auto schema = c10::Dispatcher::singleton().findSchemaOrThrow(c.op, c.overload).schema();
     auto ka = CacheKeyGenerator::Generate(c.op, schema, c.args_a, {}, {c.argname});
     auto kb = CacheKeyGenerator::Generate(c.op, schema, c.args_b, {}, {c.argname});
     EXPECT_NE(ka, kb) << c.op << " shared a key across different " << c.argname;
-    EXPECT_EQ(ka.find(c.type_placeholder), std::string::npos)
+    EXPECT_NE(ka.find(c.rendered_a), std::string::npos)
         << c.op << " dropped the value of " << c.argname << "; key=" << ka;
   }
 }

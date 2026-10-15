@@ -26,15 +26,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ParsedArgs:
-    """Store parsed arguments for the ``neuronx-cc`` wrapper.
-
-    Args:
-        config (CompilerConfig): Parsed compiler configuration.
-        lnc_override (str | None): Logical NeuronCore override, if parsed.
-        input_file (str | None): Input HLO or MLIR file path, if parsed.
-        output_file (str | None): Output NEFF file path, if parsed.
-        workdir (str | None): Compiler working directory, if parsed.
-    """
+    """Parsed command-line arguments for neuronx-cc wrapper."""
 
     config: CompilerConfig
     lnc_override: str | None
@@ -44,21 +36,20 @@ class ParsedArgs:
 
 
 class NeuronxCCWrapper:
-    """Wrap cached compilation in a ``neuronx-cc`` command-line interface."""
+    """Command-line wrapper for the CompilerSubprocess caching system."""
 
     def __init__(self):
         """Initialize the wrapper."""
         self.compiler = CompilerSubprocess()
 
     def compile_with_caching(self, args: list[str]) -> int:
-        """Compile an input file through the NEFF cache.
+        """Main compilation method with caching support.
 
         Args:
-            args (list[str]): ``neuronx-cc`` command-line arguments.
+            args: Command line arguments
 
         Returns:
-            int: ``0`` on success and ``1`` for missing parsed paths, input-reading
-            errors, or handled cache and compilation failures.
+            Exit code (0 for success, non-zero for failure)
         """
         try:
             parsed = self._parse_neuronx_cc_args(args)
@@ -172,15 +163,10 @@ class NeuronxCCWrapper:
 
 
 def main(args=None):
-    """Run the cached ``neuronx-cc`` command-line wrapper.
+    """Main entry point for the neuronx_cc_wrapper.
 
     Args:
-        args (iterable[str], optional): Arguments to parse. Defaults to
-            ``sys.argv[1:]``.
-
-    Returns:
-        int: Status from ``compile_with_caching``: ``0`` on success or ``1`` for a
-            handled failure.
+        args: List of command line arguments to parse. If None, uses sys.argv.
     """
     args = sys.argv[1:] if args is None else list(args)
 

@@ -29,23 +29,21 @@ def assert_allclose(
     atol: float | None = 1e-5,
     check_dtype: bool = False,
 ):
-    """Assert matching values across overlapping recursively structured outputs.
+    """
+    Assert that an actual torch output is equal to the expected value.
+
+    Unlike normal torch equality checking, this recursively traverses
+    structured outputs to ensure that structures and their internal values are
+    equal.
 
     Args:
-        expected (list | tuple | torch.Tensor): Expected output structure.
-        actual (list | tuple | torch.Tensor): Actual output structure.
-        rtol (float, optional): Relative tensor tolerance. Defaults to ``1e-5``.
-        atol (float, optional): Absolute tensor tolerance. Defaults to ``1e-5``.
-        check_dtype (bool, optional): Whether tensor dtypes must match. Defaults to ``False``.
-
-    Returns:
-        None: This function returns when all compared values match.
+        expected: The expected network output.
+        actual: The actual network output.
+        rtol: Relative tolerance when checking result equality.
+        rtol: Absolute tolerance when checking result equality.
 
     Raises:
-        AssertionError: If corresponding types, tensor values, or scalar values differ.
-
-    Note:
-        List and tuple pairs are zipped, so unmatched trailing elements are not compared.
+        AssertionError: Error when either the type, shape, or values differ.
     """
     assert isinstance(expected, type(actual)), f"Type Mismatch {type(expected)} != {type(actual)}"
 
@@ -67,16 +65,6 @@ def assert_allclose(
 
 def get_divergence_idx(expected_sequences: torch.Tensor, actual_sequences: torch.Tensor) -> int:
     # get the index of the first divergent token across all batches
-    """Return the boundary containing the first divergent token column.
-
-    Args:
-        expected_sequences (torch.Tensor): Expected token sequences by batch and position.
-        actual_sequences (torch.Tensor): Actual token sequences by batch and position.
-
-    Returns:
-        int: One past the first differing column, or the shorter sequence length
-            when no compared token differs.
-    """
     min_seq_len = min(actual_sequences.shape[1], expected_sequences.shape[1])
     diff = torch.ne(actual_sequences[:, :min_seq_len], expected_sequences[:, :min_seq_len])
     if torch.sum(diff) == 0:
@@ -94,21 +82,33 @@ def preprocess_logits(
     tuple[torch.Tensor, torch.Tensor, float]
     | tuple[torch.Tensor, torch.Tensor, float, torch.Tensor]
 ):
-    """Remove negative-infinite entries and optionally correct a constant logit shift.
+    """
+    This function handles two preprocessing tasks: omitting -inf values and
+    removing the shift. -inf values sometimes appear in logits when a token is
+    prohibited, and they cause issues in some downstream tasks. This function
+    identifies indices at which either the actual or expected logits are -inf
+    and omits them. To return the indices of the removed values, enable
+    return_removed_indices.
 
-    Args:
-        expected_logits (torch.Tensor): Expected one-dimensional logits.
-        actual_logits (torch.Tensor): Actual one-dimensional logits.
-        remove_shift (bool): Whether to estimate and subtract a least-squares constant shift.
-        return_removed_indices (bool, optional): Whether to include removed indices. Defaults to
-            ``False``.
+    For instance, the input tensors:
+        actual = [1, -inf, 3, 4], expected = [5, 6, 7, -inf]
+    would be output as:
+        actual = [1, 3], expected = [5, 7]
 
-    Returns:
-        tuple: Filtered expected logits, filtered actual logits, estimated shift,
-            and optionally removed indices.
+    This function also optionally finds and removes a constant shift in the
+    logits by finding the least-squares approximation for p in the following
+    system of linear equations:
+        actual_logits = A @ p
+    where
+        A = [expected_logits | 1]
+        p = [slope, shift].T
+    In other words, it does a linear regression. Then, it subtracts the shift
+    from actual_logits.
 
-    Raises:
-        AssertionError: If the input tensors have different lengths.
+    For instance, the input tensors:
+        actual = [1, 2, 3, 4], expected = [5, 6, 7, 8]
+    would be output as:
+        actual = [5, 6, 7, 8], expected = [5, 6, 7, 8], shift = -4
     """
     # Omit indices at which logits are -inf
     vocab_size = len(expected_logits)
@@ -130,14 +130,6 @@ def preprocess_logits(
 
 
 def n_digits_past_decimal(x: float):
-    """Count decimal places represented by a floating-point value.
-
-    Args:
-        x (float): Value to inspect through its string representation.
-
-    Returns:
-        int: Decimal-place count, including places implied by a negative exponent.
-    """
     s = str(x)
     exponent = 0
     if "e" in s:
@@ -155,17 +147,6 @@ def custom_allclose(
 ) -> tuple[bool, float]:
     # equivalent to torch.allclose except rtol is multiplied by absolute max, not abs
     # this matches the behavior of the compiler's birsim-to-xla_infergoldens verification
-    """Compare tensors using maximum-magnitude-scaled relative error.
-
-    Args:
-        a (torch.Tensor): Actual tensor.
-        b (torch.Tensor): Expected tensor whose maximum magnitude scales the error.
-        atol (float): Absolute tolerance subtracted before scaling.
-        rtol (float): Relative threshold applied after decimal-place rounding.
-
-    Returns:
-        tuple[bool, float]: Whether every rounded error passes and the maximum unrounded error.
-    """
     error = (torch.abs(a - b) - atol) / torch.max(torch.abs(b))
     rtol_precision = n_digits_past_decimal(rtol)
     rounded_error = torch.round(error, decimals=rtol_precision)
@@ -201,16 +182,22 @@ def neuron_allclose(
     rtol: float | None = None,
     atol: float | None = None,
 ) -> AllCloseSummary:
-    """Compare tensors using maximum-magnitude-scaled relative error.
+    """
+    Checks whether two tensors are close.
+
+    This is equivalent to torch.allclose except rtol is multiplied by absolute max, not abs
+    This matches the behavior of the compiler's birsim-to-xla_infergoldens verification
+
+    Returns a named tuple that includes whether the tensors are close, the number of mismatches,
+    the greatest relative error, the greatest absolute error, and the index of each max error.
 
     Args:
-        actual (torch.Tensor): Actual tensor.
-        expected (torch.Tensor): Expected tensor that determines scaling and default tolerances.
-        rtol (float, optional): Relative tolerance. Defaults to ``None`` to use the dtype default.
-        atol (float, optional): Absolute tolerance. Defaults to ``None`` to use the dtype default.
-
-    Returns:
-        AllCloseSummary: Closeness result, mismatch count, maximum errors, and their indices.
+        actual: The actual tensor to compare.
+        expected: The expected tensor to compare.
+        rtol: The relative tolerance to use. Defaults to the dtype-specific
+            tolerance of the expected tensor.
+        atol: The absolute tolerance to use. Defaults to the dtype-specific
+            tolerance of the expected tensor.
     """
     if torch.equal(expected, actual):
         # All indices share the same error (zero), so we return the first value's
@@ -260,18 +247,6 @@ def _get_default_tolerances(tensor: torch.Tensor, rtol: float, atol: float):
 def validate_top_k_logits(
     expected_logits: torch.Tensor, actual_logits: torch.Tensor, top_k: int, atol: float, rtol: float
 ) -> tuple[bool, float]:
-    """Validate logits at the expected top-scoring indices.
-
-    Args:
-        expected_logits (torch.Tensor): Expected one-dimensional logits.
-        actual_logits (torch.Tensor): Actual one-dimensional logits.
-        top_k (int | None): Number of expected top logits to compare, or ``None`` for all logits.
-        atol (float): Absolute tolerance.
-        rtol (float): Relative tolerance.
-
-    Returns:
-        tuple[bool, float]: Validation result and maximum scaled error.
-    """
     if top_k is not None:  # filter only the top k most likely tokens
         top_k_result = torch.topk(expected_logits, top_k)
         expected_logits = top_k_result.values
@@ -287,24 +262,6 @@ def validate_single_token_logits(
     remove_shift: bool,
     actual_token_id: int | None = None,
 ) -> tuple[bool, dict, str]:
-    """Validate actual and expected logits for one token position.
-
-    Args:
-        expected_logits (torch.Tensor): Expected vocabulary logits.
-        actual_logits (torch.Tensor): Actual vocabulary logits.
-        tol_map (dict): Mapping from top-k values to ``(atol, rtol)`` pairs.
-        divergence_difference_tol (float): Exclusive upper bound on the score gap for divergent
-            tokens.
-        remove_shift (bool): Whether to correct a constant logit shift.
-        actual_token_id (int, optional): Sampled token ID. Defaults to ``None`` to use
-            ``argmax``.
-
-    Returns:
-        tuple[bool, dict, str]: Pass flag, detailed metrics, and status message.
-
-    Raises:
-        AssertionError: If logit lengths differ or a sampled token has a negative-infinite score.
-    """
     divergence_difference = 0
     status_msg = []
     error_map = {k: 0 for k in tol_map}
@@ -322,15 +279,6 @@ def validate_single_token_logits(
         assert actual_token_id is not None, "Provided actual token ID has -inf score"
 
     def get_top2_values_indices_diff(logits):
-        """Compute the two highest logits and their separation.
-
-        Args:
-            logits (torch.Tensor): One-dimensional logits containing at least two elements.
-
-        Returns:
-            tuple: Top values, top indices, absolute score difference, and its ratio to
-                the absolute top score. The ratio is zero when that score is at most ``1e-8``.
-        """
         top2_values, top2_indices = torch.topk(logits, 2)
         top1_top2_diff = top2_values[0] - top2_values[1]
         # Calculate relative difference between top1 and top2 logits (signed)
@@ -359,16 +307,6 @@ def validate_single_token_logits(
 
     # Relative error = (actual - expected) / |expected| for each top2 index (signed)
     def get_relative_error(actual_val, expected_val):
-        """Compute signed relative error with a near-zero fallback.
-
-        Args:
-            actual_val (torch.Tensor): Actual scalar value.
-            expected_val (torch.Tensor): Expected scalar value.
-
-        Returns:
-            torch.Tensor: Relative error, or absolute error when the expected
-                magnitude is at most ``1e-8``.
-        """
         return (
             ((actual_val - expected_val) / torch.abs(expected_val))
             if torch.abs(expected_val) > 1e-8
@@ -449,14 +387,15 @@ def validate_single_token_logits(
 
 
 def calculate_new_index(original_index, removed_indices):
-    """Translate an index after selected elements are removed.
+    """
+    Calculate new index after removing elements from a tensor.
 
     Args:
-        original_index (int): Index before removal.
-        removed_indices (torch.Tensor): Unique removed indices.
+        original_index: Index in original tensor
+        removed_indices: Tensor containing indices of removed elements (all items must be unique)
 
     Returns:
-        int | None: Shifted index, or ``None`` when the original element was removed.
+        new_index: Index in tensor after removal, or None if element was removed
     """
     if original_index in removed_indices:
         return None
@@ -472,20 +411,6 @@ def calculate_new_index(original_index, removed_indices):
 
 
 def to_padding_side(input, pad_token_id, padding_side):
-    """Repad token sequences on the requested side.
-
-    Args:
-        input (torch.Tensor): Batched padded token sequences.
-        pad_token_id (int): Token value treated as padding.
-        padding_side (str): ``"left"`` for left padding; any other value selects right padding.
-
-    Returns:
-        torch.Tensor: Repadded sequences allocated by ``torch.full`` on its default device.
-
-    Note:
-        The output does not inherit the input device or dtype; ``torch.full`` infers them from its
-        defaults and ``pad_token_id``.
-    """
     repadded = torch.full(input.shape, pad_token_id)
     for batch_idx, sequence in enumerate(input):
         mask = sequence != pad_token_id
@@ -509,11 +434,6 @@ DEFAULT_TOLERANCE_MAP = {
 
 def get_default_tolerance_map():
     # Returns a copy of DEFAULT_TOLERANCE_MAP. Use to avoid mutating the original
-    """Return an independent copy of the default tolerance mapping.
-
-    Returns:
-        dict: Shallow copy mapping top-k values to ``(atol, rtol)`` pairs.
-    """
     return DEFAULT_TOLERANCE_MAP.copy()
 
 
@@ -532,26 +452,51 @@ def logit_validation(
     pad_token_id: int | None = None,
     return_summary: bool = False,
 ) -> tuple[bool, dict, str]:
-    """Validate greedy logits, feeding expected tokens back after divergence.
+    """
+    Compares the output of the generate_fn to the expected_logits using the
+    following methodolody. This function assumes greedy sampling.
+    For each set of logits at each token position, it validates the top k
+    highest scoring tokens for many k's. The values of k and the tolerances
+    of the validation are given by tol_map (described in more detail below).
+    If the greedy next token (argmax) of the actual and expected logits differ
+    at any token position, then the difference between max(actual_logits) and
+    actual_logits[expected_next_token_idx] is taken and thresholded to
+    divergence_difference_tol. Also, since this divergence would cause the
+    downstream tokens to be different, this function will take copy output up
+    to the divergent index and feed it back to generate_fn as an input. Then,
+    it repeats the process above until it has validated every token position.
 
     Args:
-        input_ids (torch.Tensor): Encoded inputs shaped ``[batch, input_length]``.
-        generate_fn (Callable): Callable returning logits or ``(logits, sampled_token_ids)``.
-        expected_logits (torch.Tensor): Expected logits shaped ``[output_length, batch, vocab]``.
-        tol_map (dict, optional): Top-k tolerances. Defaults to ``None`` for the default map.
-        divergence_difference_tol (float, optional): Exclusive gap limit; ``None`` uses the default.
-        short_circuit (bool, optional): Whether to stop at the first failure. Defaults to ``False``.
-        remove_shift (bool, optional): Whether to correct constant shifts. Defaults to ``True``.
-        padding_side (str, optional): Input padding side. Defaults to ``"left"``.
-        pad_token_id (int, optional): Right-padding token. Defaults to ``None``.
-        return_summary (bool, optional): Include a summary on completion. Defaults to ``False``.
+        input_ids: Encoded inputs with shape [batch_size, input_length].
+        generate_fn: A function that accepts an argument input_ids, which is
+            a tensor with shape [batch_size, input_length]. It returns a tensor
+            of logits with shape [output_length, batch_size, vocab_size].
+            Alternatively, to support configurations with on-device sampling
+            (where the sampled token may differ when two top tokens have the
+            same score), you can return a tuple where the first item is
+            the logits tensor, and the second item is a tensor of token IDs with
+            shape [batch_size, output_length].
+        expected_logits: Expected logits with shape
+            [output_length, batch_size, vocab_size].
+        tol_map: A dict that maps from top k values to tuples (atol, rtol).
+            A k of None indicates that the entire set of logits should be
+            validated. Defaults to DEFAULT_TOLERANCE_MAP.
+        divergence_difference_tol: The tolerance allowed for the difference
+            between the score of the actual next token and the score of the
+            expected next token. Defaults to
+            DEFAULT_DIVERGENCE_DIFFERENCE_TOLERANCE.
+        short_circuit: Whether to end the test as soon as a failure is found.
+        remove_shift: Whether to calculate a constant shift value between the
+            actual and expected logits and correct for it before validation.
+        padding_side: The padding side of the input, one of "left" or "right".
+        pad_token_id: Must be provided if padding_side is "right".
 
     Returns:
-        tuple: Pass flag, results, status (list on early exit, else string), and optional summary.
-
-    Raises:
-        ValueError: If padding configuration is invalid.
-        AssertionError: If output shapes disagree or a sampled token has negative-infinite score.
+        A tuple (passed, results, status_msg) where passed is a boolean value
+            indicating whether or not the test passed, results is a 2D list of
+            dicts with the shape [batch_size, output_length] where each element
+            contains the validation results of that token, and status_msg is a
+            string summary of the test.
     """
     if padding_side not in ["left", "right"]:
         msg = (
@@ -744,17 +689,8 @@ def _format_logit_validation_results_summary(summary):
 
 
 class TensorMismatchInfo:
-    """Store error details for one pair of tensors.
-
-    Args:
-        actual (torch.Tensor): Actual tensor.
-        expected (torch.Tensor): Expected tensor.
-        pair_id (str): Location identifier for the pair.
-        num_mismatches (int): Number of elements outside tolerance.
-        max_rel_error (float): Greatest relative error.
-        max_abs_error (float): Greatest absolute error.
-        max_rel_error_index (tuple[torch.Tensor, ...]): Index of the greatest relative error.
-        max_abs_error_index (tuple[torch.Tensor, ...]): Index of the greatest absolute error.
+    """
+    Contains information about a pair of tensors that aren't close.
     """
 
     def __init__(
@@ -779,13 +715,8 @@ class TensorMismatchInfo:
 
 
 class TensorCloseAssertionError(AssertionError):
-    """Report aggregate closeness failures across tensor pairs.
-
-    Args:
-        tensor_mismatches (list[TensorMismatchInfo]): Mismatch details for failed pairs.
-        num_elements (int): Total number of compared elements.
-        rtol (float): Allowed relative tolerance.
-        atol (float): Allowed absolute tolerance.
+    """
+    Raised when tensors aren't close.
     """
 
     def __init__(
@@ -926,24 +857,29 @@ def assert_close(
     check_device: bool = True,
     check_dtype: bool = True,
 ):
-    """Assert closeness of tensors or equally nested tensor sequences.
+    """
+    Checks whether two tensors or tensor-likes are close.
+
+    This uses neuron_allclose to check closeness, where rtol is multipled by absolute max, not abs.
 
     Args:
-        actual (torch.Tensor | collections.abc.Sequence): Actual tensor or nested sequence.
-        expected (torch.Tensor | collections.abc.Sequence): Expected tensor or nested sequence.
-        rtol (float, optional): Relative tolerance. Defaults to ``None`` to use a dtype default.
-        atol (float, optional): Absolute tolerance. Defaults to ``None`` to use a dtype default.
-        check_device (bool, optional): Whether devices must match. Defaults to ``True``.
-        check_dtype (bool, optional): Whether dtypes must match. Defaults to ``True``.
-
-    Returns:
-        None: This function returns when every tensor pair is close.
+        actual: The tensor or tensor-like to check.
+        expected: The tensor or tensor-like to check against.
+        rtol: The relative tolerance to use. Defaults to the dtype-specific tolerance
+            of the expected tensor.
+        atol: The absolute tolerance to use. Defaults to the dtype-specific tolerance
+            of the expected tensor.
+        check_device: Whether to raise an error if the tensors are on different devices.
+        check_dtype: Whether to raise an error if the tensors have different dtypes.
 
     Raises:
-        ValueError: If sequence sizes differ or values are unsupported types.
-        AssertionError: If required devices or dtypes differ.
-        TensorCloseAssertionError: If any tensor values are outside tolerance.
+        ValueError: If the inputs are tensor-likes with different sizes.
+        ValueError: If the inputs are unsupported types for comparison.
+        AssertionError: If check_device=True and the inputs are on different devices.
+        AssertionError: If check_dtype=True and the inputs have different dtypes.
+        TensorCloseAssertionError: If the inputs aren't close.
     """
+
     mismatches = []
     num_elements = 0
     tensor_pairs = _get_tensor_pairs(actual, expected)
@@ -1061,14 +997,6 @@ def _logit_validation_tutorial():
 
     # 4. build your generate function
     def generate_fn(input_ids):
-        """Generate logits for the tutorial input.
-
-        Args:
-            input_ids (torch.Tensor): Encoded input token IDs.
-
-        Returns:
-            torch.Tensor: Stacked generation scores by output position.
-        """
         generation_result = model.generate(
             input_ids, do_sample=False, return_dict_in_generate=True, output_scores=True
         )

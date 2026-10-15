@@ -14,20 +14,16 @@ import nki.language as nl
 
 @nki.jit()
 def scatter_add_kernel(data, indices, output_buffer, num_m_tiles):
-    """Scatter-add source rows into an output buffer.
+    """
+    Scatter-add: output_buffer[indices[i], :] += data[i, :]
 
     Args:
-        data (nki.language.ndarray): Source rows with shape ``[T, H]``.
-        indices (nki.language.ndarray): Int32 target rows with shape ``[T, 1]``.
-        output_buffer (nki.language.ndarray): Buffer updated in place with shape ``[T, H]``.
-        num_m_tiles (nki.language.ndarray): Number of 128-row tiles to process.
-
+        data: [T, H] bf16 on HBM — source data (first num_tokens rows valid)
+        indices: [T, 1] int32 on HBM — target indices (first num_tokens valid)
+        output_buffer: [T, H] bf16 on HBM — accumulation target
+        num_m_tiles: [1, 1] int32
     Returns:
-        nki.language.ndarray: The same updated ``output_buffer``.
-
-    Note:
-        Target indices must be unique; duplicate targets within one tile are not
-        accumulated correctly.
+        output_buffer: [T, H] bf16 on HBM (updated)
     """
     _T, H = data.shape  # noqa: N806
 
@@ -56,11 +52,6 @@ def scatter_add_kernel(data, indices, output_buffer, num_m_tiles):
 
     def body(_i):
         # Load 128 indices
-        """Scatter-add one 128-row tile.
-
-        Args:
-            _i (int): Unused dynamic loop iteration index.
-        """
         idx_tile = nl.ndarray((tile_size_m, 1), nl.int32, nl.sbuf)
         nisa.dma_copy(
             dst=idx_tile[0:tile_size_m, 0:1],

@@ -84,9 +84,6 @@ class MockNRT {
   MOCK_METHOD(NRT_STATUS, nrta_tensor_copy,
               (nrt_tensor_t*, uint64_t, nrt_tensor_t*, uint64_t, uint64_t, int, int, NRT_STATUS*,
                nrta_seq_t*));
-  MOCK_METHOD(NRT_STATUS, nrta_tensor_cast,
-              (const nrt_compute_tensor_t*, const nrt_compute_tensor_t*, uint64_t, int, int,
-               NRT_STATUS*, nrta_seq_t*));
   MOCK_METHOD(NRT_STATUS, nrta_is_completed, (nrta_seq_t, bool*));
   MOCK_METHOD(NRT_STATUS, nrta_event_register_seq_id_completion, (nrta_seq_t, int));
   MOCK_METHOD(NRT_STATUS, nrta_execute_schedule,

@@ -26,39 +26,25 @@ try:
     # which may be deprecated
     wrapped_rand.has_side_effect = True
 
-    # ── Fake/meta kernels ──
-    # These four ops call a NKI kernel directly, so the real body cannot run on a
-    # meta tensor. Without an explicit fake, PyTorch registers the real body as
-    # the Fake kernel and any meta-dispatch path (test_meta, FakeTensorMode,
-    # torch.compile tracing) tries to compile the kernel and raises
-    # "failed to run: nki_kernels.set_rng_state.default(... device='meta' ...)".
-    # torch.manual_seed() reaches set_rng_state through the PrivateUse1 hook, so
-    # every random op inherited the failure. A fake only reports output metadata.
-
-    def _fake_get_rng_state() -> torch.Tensor:
-        return torch.empty(NUM_RNG_SEEDS, device="neuron", dtype=torch.uint32)
-
-    def _fake_set_rng_state(seed: torch.Tensor) -> None:
-        return None
-
-    @nki_op("nki_kernels::get_rng_state", mutates_args={}, fake_fn=_fake_get_rng_state)
+    @nki_op("nki_kernels::get_rng_state", mutates_args={})
     def get_rng_state() -> torch.Tensor:
-        """Return the current GPSIMD random-number-generator state.
+        """
+        Get RNG state from GPSIMD engine.
 
         Returns:
-            torch.Tensor: One-dimensional tensor containing ``NUM_RNG_SEEDS`` seed words.
+            Tensor of shape (1, NUM_RNG_SEEDS) with dtype uint32 containing the RNG seeds
         """
         state = torch.empty(1, NUM_RNG_SEEDS, device="neuron", dtype=torch.uint32)
         result = get_rng_state_gpsimd(state)
         return result.squeeze(0)
 
-    @nki_op("nki_kernels::set_rng_state", mutates_args={}, fake_fn=_fake_set_rng_state)
+    @nki_op("nki_kernels::set_rng_state", mutates_args={})
     def set_rng_state(seed: torch.Tensor) -> None:
-        """Set the GPSIMD random-number-generator state.
+        """
+        Set RNG state for GPSIMD engine.
 
         Args:
-            seed (torch.Tensor): Seed words with shape ``(1, NUM_RNG_SEEDS)`` and a
-                ``uint32`` bit pattern.
+            seed: Seed tensor of shape (1, NUM_RNG_SEEDS) with dtype uint32
         """
         set_rng_state_gpsimd(seed)
 
@@ -88,18 +74,15 @@ if not _has_nki_rng:
 def rand(
     ref: torch.Tensor, size: Sequence[int], dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
-    """Generate uniformly distributed values in the interval ``[0, 1)``.
+    """
+    Generate uniform random floats in [0, 1), matching torch.rand convention.
 
     Args:
-        ref (torch.Tensor): Tensor providing the output device and tracing context.
-        size (Sequence[int]): Output shape.
-        dtype (torch.dtype, optional): Output data type. Defaults to ``torch.float32``.
+        size: Shape of the output tensor
+        dtype: Output dtype (default: torch.float32)
 
     Returns:
-        torch.Tensor: Random values with the requested shape and data type.
-
-    Note:
-        Zero-element shapes return without launching the NKI random kernel.
+        Tensor of uniform random values in [0, 1)
     """
     raw = _generate_raw(ref, size)
     # Take lower 23 bits (float32 mantissa), OR with 0x3f800000 to get [1.0, 2.0), subtract 1.0
@@ -108,59 +91,29 @@ def rand(
     return result.to(dtype=dtype)
 
 
-def _fake_rand(
-    ref: torch.Tensor, size: Sequence[int], dtype: torch.dtype = torch.float32
-) -> torch.Tensor:
-    """Fake kernel for ``nki_kernels::rand``: metadata only, no NKI kernel."""
-    return torch.empty(tuple(size), dtype=dtype, device=ref.device)
-
-
-def _fake_randint(
-    ref: torch.Tensor,
-    low: int,
-    high: int,
-    size: Sequence[int],
-    dtype: torch.dtype = torch.int64,
-) -> torch.Tensor:
-    """Fake kernel for ``nki_kernels::randint``: metadata only, no NKI kernel."""
-    return torch.empty(tuple(size), dtype=dtype, device=ref.device)
-
-
-@nki_op("nki_kernels::rand", mutates_args={}, fake_fn=_fake_rand)
+@nki_op("nki_kernels::rand", mutates_args={})
 def eager_rand(
     ref: torch.Tensor, size: Sequence[int], dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
-    """Generate uniform random values through the eager NKI op wrapper.
-
-    Args:
-        ref (torch.Tensor): Tensor providing the output device and tracing context.
-        size (Sequence[int]): Output shape.
-        dtype (torch.dtype, optional): Output data type. Defaults to ``torch.float32``.
-
-    Returns:
-        torch.Tensor: Random values in ``[0, 1)`` with the requested shape and type.
-    """
     return rand(ref, size, dtype)
 
 
-@nki_op("nki_kernels::randint", mutates_args={}, fake_fn=_fake_randint)
+@nki_op("nki_kernels::randint", mutates_args={})
 def randint(
     ref: torch.Tensor, low: int, high: int, size: Sequence[int], dtype: torch.dtype = torch.int64
 ) -> torch.Tensor:
-    """Generate pseudorandom integers in the interval ``[low, high)``.
+    """
+    Generate uniform random integers in [low, high), matching torch.randint convention.
 
     Args:
-        ref (torch.Tensor): Tensor providing the output device and tracing context.
-        low (int): Inclusive lower bound.
-        high (int): Exclusive upper bound, which must exceed ``low``.
-        size (Sequence[int]): Output shape.
-        dtype (torch.dtype, optional): Output data type. Defaults to ``torch.int64``.
+        ref: Reference tensor (used for device/tracing context)
+        low: Inclusive lower bound
+        high: Exclusive upper bound
+        size: Shape of the output tensor
+        dtype: Output dtype (default: torch.int64)
 
     Returns:
-        torch.Tensor: Random integers with the requested shape and data type.
-
-    Note:
-        Values are derived by applying modulo reduction to raw random words.
+        Tensor of uniform random integers in [low, high)
     """
     raw = _generate_raw(ref, size).to(dtype=torch.int64)
     # Map to [low, high) using modulo

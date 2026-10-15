@@ -12,11 +12,6 @@ logger = logging.getLogger(__name__)
 
 
 def main():
-    """Run compiled Whisper generation on synthetic audio features.
-
-    Returns:
-        None: This function logs warmup timing, run timing, and decoded output.
-    """
     parser = argparse.ArgumentParser(description="Run Whisper on Neuron")
     parser.add_argument(
         "--model", type=str, default="openai/whisper-tiny", help="Whisper model name"

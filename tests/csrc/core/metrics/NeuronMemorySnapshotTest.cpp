@@ -1,7 +1,5 @@
 #include <gtest/gtest.h>
 
-#include <chrono>
-#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -361,57 +359,6 @@ TEST_F(NeuronMemorySnapshotTest, GetCurrentTimestampUs) {
   EXPECT_GT(ts1, 0);
   EXPECT_GT(ts2, 0);
   EXPECT_GE(ts2, ts1);
-}
-
-TEST_F(NeuronMemorySnapshotTest, ClockDomainOffsetAlignsTimestampToSystemClock) {
-  // Enabling recording computes the clock domain offset so memory timestamps
-  // align with the runtime system trace (both use system_clock).
-  RecordHistory(true, RecordContext::ALLOC, false, 100, true);
-
-  int64_t sys_now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                           std::chrono::system_clock::now().time_since_epoch())
-                           .count();
-  int64_t ts = GetCurrentTimestampUs();
-
-  // The offset shifts the steady-clock reading into the system-clock domain.
-  // Allow 1 second of slack for scheduling jitter.
-  EXPECT_NEAR(static_cast<double>(ts), static_cast<double>(sys_now_us), 1000000.0);
-}
-
-// =============================================================================
-// Trace ID Correlation Tests
-// =============================================================================
-
-TEST_F(NeuronMemorySnapshotTest, TraceEntryStoresTraceId) {
-  TraceEntry entry(TraceAction::ALLOC, 0, 0x1000, 4096, 0, 123, nullptr, 0, 4096, 0xDEADBEEF);
-  EXPECT_EQ(entry.trace_id, 0xDEADBEEFu);
-}
-
-TEST_F(NeuronMemorySnapshotTest, TraceEntryTraceIdDefaultsToZero) {
-  TraceEntry entry;
-  EXPECT_EQ(entry.trace_id, 0u);
-}
-
-TEST_F(NeuronMemorySnapshotTest, RecordTracePropagatesTraceId) {
-  EXPECT_CALL(*mock_nrt_, nrt_get_visible_vnc_count(_))
-      .WillRepeatedly(DoAll(SetArgPointee<0>(1), Return(NRT_SUCCESS)));
-
-  RecordHistory(true, RecordContext::ALLOC, false, 100, true);
-
-  const uint64_t kTraceId = 0xABCDEF;
-  RecordTrace(TraceAction::ALLOC, 0, 0x3000, 4096, 0, nullptr, 0, 4096, kTraceId);
-
-  auto snap = snapshot();
-  ASSERT_GE(snap.device_traces.size(), 1u);
-
-  bool found = false;
-  for (const auto& entry : snap.device_traces[0]) {
-    if (entry.addr == 0x3000u) {
-      EXPECT_EQ(entry.trace_id, kTraceId);
-      found = true;
-    }
-  }
-  EXPECT_TRUE(found);
 }
 
 }  // namespace

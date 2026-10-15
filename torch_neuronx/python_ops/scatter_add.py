@@ -41,7 +41,7 @@ def _can_handle_scatter_add(input, dim, index, src) -> bool:
 
 @neuron_op("aten::scatter_add", priority=60)
 class ScatterAddNKIImpl(TorchMlirOpImpl):
-    """Implement out-of-place scatter-add with an NKI kernel."""
+    """NKI implementation of scatter_add (out-of-place) — dispatched via C++ DispatchImpl."""
 
     def __init__(self):
         super().__init__(
@@ -51,30 +51,9 @@ class ScatterAddNKIImpl(TorchMlirOpImpl):
         )
 
     def can_handle(self, input, dim, index, src) -> bool:
-        """Check whether the NKI scatter-add kernel supports the inputs.
-
-        Args:
-            input (torch.Tensor): Destination values to which updates are added.
-            dim (int): Dimension along which to scatter updates.
-            index (torch.Tensor): Indices that select destination elements.
-            src (torch.Tensor): Values to add at the selected indices.
-
-        Returns:
-            bool: ``True`` when inputs are two-dimensional, ``dim`` is zero, ``input``
-                is a supported Neuron floating dtype, and ``index.stride(1)`` is zero.
-        """
         return _can_handle_scatter_add(input, dim, index, src)
 
     def execute(self, *args, **kwargs) -> ExecutionResult:
-        """Execute out-of-place scatter-add with the NKI kernel.
-
-        Args:
-            *args (Any): Positional ATen arguments in ``input``, ``dim``, ``index``, ``src`` order.
-            **kwargs (Any): Ignored; required arguments must be positional.
-
-        Returns:
-            ExecutionResult: Successful kernel output or a captured error message.
-        """
         try:
             from torch_neuronx.utils import convert_for_neuron
 
@@ -91,7 +70,7 @@ class ScatterAddNKIImpl(TorchMlirOpImpl):
 
 @neuron_op("aten::scatter_add_", priority=60)
 class ScatterAddInplaceNKIImpl(TorchMlirOpImpl):
-    """Implement in-place scatter-add with an NKI kernel."""
+    """NKI implementation of scatter_add_ (inplace) — dispatched via C++ DispatchImpl."""
 
     def __init__(self):
         super().__init__(
@@ -101,30 +80,9 @@ class ScatterAddInplaceNKIImpl(TorchMlirOpImpl):
         )
 
     def can_handle(self, input, dim, index, src) -> bool:
-        """Check whether the in-place NKI scatter-add kernel supports the inputs.
-
-        Args:
-            input (torch.Tensor): Tensor to update in place.
-            dim (int): Dimension along which to scatter updates.
-            index (torch.Tensor): Indices that select destination elements.
-            src (torch.Tensor): Values to add at the selected indices.
-
-        Returns:
-            bool: ``True`` when inputs are two-dimensional, ``dim`` is zero, ``input``
-                is a supported Neuron floating dtype, and ``index.stride(1)`` is zero.
-        """
         return _can_handle_scatter_add(input, dim, index, src)
 
     def execute(self, *args, **kwargs) -> ExecutionResult:
-        """Execute in-place scatter-add with the NKI kernel.
-
-        Args:
-            *args (Any): Positional ATen arguments in ``input``, ``dim``, ``index``, ``src`` order.
-            **kwargs (Any): Ignored; required arguments must be positional.
-
-        Returns:
-            ExecutionResult: Success with the mutated first input, or a captured error message.
-        """
         try:
             from torch_neuronx.utils import convert_for_neuron
 
@@ -141,50 +99,35 @@ class ScatterAddInplaceNKIImpl(TorchMlirOpImpl):
 
 
 class ScatterAddOp(Operation):
-    """Dispatch out-of-place scatter-add through its registered implementation."""
+    """Scatter add operation (out-of-place)"""
 
     def _setup_implementations(self):
         self._implementations.append(ScatterAddMLIRImpl())
 
     @property
     def op_name(self) -> str:
-        """Return the out-of-place scatter-add operation name.
-
-        Returns:
-            str: ``"scatter_add"``.
-        """
         return "scatter_add"
 
 
 class ScatterAddInplaceOp(Operation):
-    """Dispatch in-place scatter-add through its registered implementation."""
+    """Scatter add operation (in-place)"""
 
     def _setup_implementations(self):
         self._implementations.append(ScatterAddInplaceMLIRImpl())
 
     @property
     def op_name(self) -> str:
-        """Return the in-place scatter-add operation name.
-
-        Returns:
-            str: ``"scatter_add_"``.
-        """
         return "scatter_add_"
 
 
 class ScatterAddOutOp(Operation):
-    """Dispatch scatter-add with an output tensor."""
+    """Scatter add operation with out parameter (scatter_add.out)"""
 
     def _setup_implementations(self):
         self._implementations.append(ScatterAddOutMLIRImpl())
 
     @property
     def op_name(self) -> str:
-        """Return the output-variant scatter-add operation name.
-
-        Returns:
-            str: ``"scatter_add.out"``.
-        """
         return "scatter_add.out"
 
 
@@ -194,46 +137,15 @@ _scatter_add_out_op = ScatterAddOutOp()
 
 
 def scatter_add_neuron(input, dim, index, src):
-    """Dispatch out-of-place scatter-add for Neuron tensors.
-
-    Args:
-        input (torch.Tensor): Destination values to which updates are added.
-        dim (int): Dimension along which to scatter updates.
-        index (torch.Tensor): Indices that select destination elements.
-        src (torch.Tensor): Values to add at the selected indices.
-
-    Returns:
-        torch.Tensor: Tensor containing the accumulated updates.
-    """
+    """Neuron implementation of scatter_add (out-of-place)"""
     return _scatter_add_op(input, dim, index, src)
 
 
 def scatter_add_inplace_neuron(input, dim, index, src):
-    """Dispatch in-place scatter-add for Neuron tensors.
-
-    Args:
-        input (torch.Tensor): Tensor to update in place.
-        dim (int): Dimension along which to scatter updates.
-        index (torch.Tensor): Indices that select destination elements.
-        src (torch.Tensor): Values to add at the selected indices.
-
-    Returns:
-        torch.Tensor: The mutated ``input`` tensor.
-    """
+    """Neuron implementation of scatter_add_ (in-place)"""
     return _scatter_add_inplace_op(input, dim, index, src)
 
 
 def scatter_add_out_neuron(input, dim, index, src, *, out=None):
-    """Dispatch scatter-add into a supplied output tensor.
-
-    Args:
-        input (torch.Tensor): Destination values to which updates are added.
-        dim (int): Dimension along which to scatter updates.
-        index (torch.Tensor): Indices that select destination elements.
-        src (torch.Tensor): Values to add at the selected indices.
-        out (torch.Tensor, optional): Tensor written with the result. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: ``out`` after accumulation when supplied; otherwise the produced tensor.
-    """
+    """Neuron implementation of scatter_add.out"""
     return _scatter_add_out_op(input, dim, index, src, out=out)

@@ -279,7 +279,7 @@ class TestTorchCompileIntegration:
 
         @nki.jit
         def add_one_kernel(x, y):
-            import nki.language as nl
+            import neuronxcc.nki.language as nl
 
             x_tile = nl.load(x[0:128])
             y_tile = x_tile + 1.0

@@ -14,31 +14,19 @@ logger = logging.getLogger(__name__)
 
 
 class BaseOutputHandler:
-    """Manage output tensor writes for operation results."""
+    """Manages output tensor creation and in-place operations."""
 
     def handle_output_parameter(
         self, result: torch.Tensor | tuple, out_param: torch.Tensor | None
     ) -> torch.Tensor | tuple:
-        """Write operation results into an optional output parameter.
+        """Handle 'out' parameter for in-place operations.
 
         Args:
-            result (torch.Tensor or tuple): Computed result tensor or tensors.
-            out_param (torch.Tensor or tuple or None): Destination tensor or tensors.
+            result: Computed result tensor(s)
+            out_param: Optional output tensor for in-place operation
 
         Returns:
-            torch.Tensor or tuple: Result structure with destination tensors substituted,
-            or the original result when ``out_param`` is ``None``.
-
-        Raises:
-            RuntimeError: If a native copy violates device, contiguity, byte-count, or
-                storage-bound requirements.
-            TypeError: If an up-to-32-bit cast targets a noncontiguous Neuron
-                destination.
-
-        Note:
-            Supplied destination tensors are mutated in place and resized to the
-            corresponding result shapes when needed. Neuron copies use the current
-            stream and may complete asynchronously under the native lifetime policy.
+            Result with 'out' parameter handled
         """
         if out_param is None:
             return result
@@ -62,15 +50,14 @@ class BaseOutputHandler:
     def extract_output_params(
         self, kwargs: dict, output_param_names: tuple
     ) -> torch.Tensor | tuple | None:
-        """Extract output tensors from keyword arguments.
+        """Extract output tensors from kwargs.
 
         Args:
-            kwargs (dict): Operation keyword arguments.
-            output_param_names (tuple): Names of output parameters to collect.
+            kwargs: Keyword arguments
+            output_param_names: Names of output parameters
 
         Returns:
-            torch.Tensor or tuple or None: Present named output tensors, the universal
-            ``out`` value as a fallback, or ``None`` if no output is present.
+            Output tensor(s) if found, None otherwise
         """
         if not output_param_names:
             # Check for universal 'out' parameter

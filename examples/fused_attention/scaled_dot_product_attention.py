@@ -11,15 +11,8 @@ import torch_neuronx
 
 
 def run_attention_example(device):
-    """Run scaled dot-product attention forward and backward passes.
+    """Run scaled_dot_product_attention example with forward and backward passes"""
 
-    Args:
-        device (torch.device or str): Device on which to allocate all tensors.
-
-    Note:
-        Query, key, and value use ``(batch, head, sequence, feature)`` layout
-        with shape ``(2, 8, 2048, 128)``.
-    """
     # Model configuration
     batch_size = 2
     num_heads = 8
@@ -65,11 +58,6 @@ def run_attention_example(device):
 
 def main():
     # Check if Neuron device is available
-    """Run the attention example when a Neuron device is available.
-
-    Returns:
-        None: This example does not return a value.
-    """
     if not torch.neuron.is_available():
         print("\nError: Neuron device not available.")
         print("Please run this example on an instance with Neuron device.")

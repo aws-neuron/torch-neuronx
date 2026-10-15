@@ -196,10 +196,6 @@ fi
 # Add the dynamic LD_LIBRARY_PATH to the test environment
 BAZEL_CMD="$BAZEL_CMD --test_env=LD_LIBRARY_PATH=\"$DYNAMIC_LD_LIBRARY_PATH\""
 
-# Standalone C++ tests do not import torch_neuronx, so seed the package-default cell.
-BAZEL_CMD="$BAZEL_CMD --test_env=TORCH_NEURONX_ENABLE_STREAMS=1"
-BAZEL_CMD="$BAZEL_CMD --test_env=TORCH_NEURONX_ENABLE_HOST_CC=0"
-
 # Set PYTHONHOME for tests that embed Python via Py_Initialize()
 if [ -d "$PYTHONHOME" ]; then
     BAZEL_CMD="$BAZEL_CMD --test_env=PYTHONHOME=$PYTHONHOME"

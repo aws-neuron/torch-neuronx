@@ -1,57 +1,49 @@
 # Testing
 
-The matrix spans Python pytest, C++ gtest, native upstream PyTorch tests,
+The matrix spans Python pytest, C++ gtest, wrapped upstream PyTorch tests,
 HuggingFace model tests, and vertical op-coverage tests.
 
 > **Navigation → codegraph.** For the `tests/` tree layout, the per-subsystem
 > test directories, and the `tools/` driver scripts as source, ask codegraph
 > (or just `ls tests/`):
-> `codegraph_explore "run_upstream_tests neuron_test_registry conftest distribution_config"`.
+> `codegraph_explore "run_upstream_tests neuron_test_registry conftest run-test-parallel"`.
 > This doc keeps the orchestration semantics, the marker/fixture contracts,
 > the xfail-registry rules, and authority routing — the parts not obvious
 > from the tree.
 
 ## Driver orchestration (contract)
 
-`tools/run-test` (sequential), `run-cpp-test` (Bazel gtest), `run-cpp-test-cmake`,
-`run-block-test`, `build-and-test`. Upstream PyTorch tests and the internal CI
-nodes use `tests/pytorch_tests_native/runner/run_upstream_tests.py`. Flags + report
-paths are in `CONTRIBUTING.md` (authoritative). Orchestration not documented there:
+`tools/run-test` (sequential), `run-test-parallel` (xdist), `run-cpp-test`
+(Bazel gtest), `run-cpp-test-cmake`, `run-block-test`, `build-and-test[-parallel]`.
+Flags + report paths are in `CONTRIBUTING.md` (authoritative). Orchestration
+not documented there:
 
-- **`run_upstream_tests.py --node <id>`** runs the entries of one node of
-  `tests/pytorch_tests_native/internal_test_distribution_config.json` in series,
-  the same way PR Checks, the nightly, and `manual-unit-tests.yml` do. Each entry
-  sets its pytest items, ignores, worker count, `forked`, and env. The
-  `aten-unit-tests` entry has `"root": true`. It runs `tests/`, but not
-  `tests/tmp`, `tests/huggingface`, `tests/pytorch_tests*`, `tests/vertical`, and
-  the items of the other entries. Thus a new test file runs in CI with no config
-  change. An entry with `"also_in_root": true` also runs in the root run, for
-  example to run the same file with a different env. The C++, MLIR LIT, and op
-  accuracy tests are steps of their own CI job.
-- **Retry contract:** a run exiting code 1 (test failures — not timeouts or
+- **`run-test-parallel`** defaults to `tests/` but **ignores** `tests/tmp`,
+  `tests/huggingface`, `tests/pytorch_tests`, `tests/cpu_fallback`,
+  `tests/vertical`. Sets `NEURON_LAUNCH_BLOCKING=0`. After the main suite it
+  runs extra groups: distributed (fewer workers), multi-device (1 worker),
+  LNC=1 all-cores, CPU fallback, host-CC multi-stream, vertical (opt-in),
+  pinned malloc, streams, upstream-distributed.
+- **Retry contract:** a group exiting code 1 (test failures — not timeouts or
   worker crashes) gets **one `--last-failed` retry pass**; marked passed if
-  all previously-failing tests pass on retry. `NUM_WORKERS_RETRY` (default 4).
-  `RETRY_TIMEOUT` (default 1800 s) is the retry pass's outer wall-clock budget,
-  not a per-test timeout. A non-distributed pass keeps `TEST_TIMEOUT` as its
-  per-test ceiling; a forked pass has no pytest per-test timeout. The ATen node
-  runs at 64 workers, and each run has some runtime-contention failures that the
-  retry clears.
-- **`forked: false` (process sharing):** with `forked: true`, every test's call phase runs
+  all previously-failing tests pass on retry. `NUM_WORKERS_RETRY` (default 4),
+  `RETRY_TIMEOUT` (default 1800 s).
+- **`--no-forked` (process sharing):** by default every test's call phase runs
   in its own forked child (`--forked`), which re-pays Neuron runtime init per
-  test. An entry with `forked: false` drops that so each xdist worker initializes once and
+  test. `--no-forked` drops that so each xdist worker initializes once and
   shares the process across its tests, and adds a per-test `--timeout`
   (`pytest-timeout` cannot be combined with `pytest-forked`, so the shared run
   is the only place a timeout can apply). See the process-isolation contract
   below for the tests this does not apply to.
-- **`tools/run-block-test`** sweeps blocks with/without
+- **`run-block-test`** sweeps blocks with/without
   `TORCH_NEURONX_ENABLE_CONCATENATION`; `--profile`, `--metrics`.
 
 ## Pytest config contracts (root `conftest.py`)
 
 - **Markers:** `slow` (deselect `-m "not slow"`), `multi_device`,
   `needs_process_isolation` (see below).
-- **Filename conventions (load-bearing):** `_lnc1` -> needs LNC=1; `_all_cores`
-  -> all cores visible. Name a test wrong and it runs in the wrong core config.
+- **Filename conventions (load-bearing):** `_lnc1` → needs LNC=1; `_all_cores`
+  → all cores visible. Name a test wrong and it runs in the wrong core config.
 - **`ensure_neuron_initialized`** (session) sets `NEURON_RT_NUM_CORES=1` for
   non-distributed tests; **`reset_dynamo`** (function) calls
   `torch._dynamo.reset()` before each test; xdist hook assigns each worker a
@@ -59,9 +51,9 @@ paths are in `CONTRIBUTING.md` (authoritative). Orchestration not documented the
 
 ### Process isolation (`needs_process_isolation`)
 
-`forked: false` shares one process per xdist worker. Tests that cannot tolerate that
-carry the marker. An entry with `isolated_pass: true` runs them in a second `--forked`
-pass at 4 workers (`ISOLATED_NUM_WORKERS` in `runner/run_upstream_tests.py`):
+`--no-forked` shares one process per xdist worker. Tests that cannot tolerate that
+carry the marker and run in a second `--forked` pass at 4 workers
+(`NO_FORKED_ISOLATED_WORKERS` in `tools/run-test-parallel`):
 
 ```python
 @pytest.mark.needs_process_isolation(
@@ -72,7 +64,7 @@ def test_hard_oom_records_counters(self): ...
 ```
 
 `reason` is required. **Mark sparingly**: 40 tests out of ~12,000 today, because
-marked tests leave the fast path and a large set rebuilds the cost `forked: false`
+marked tests leave the fast path and a large set rebuilds the cost `--no-forked`
 removes. Mark only for a crash that kills the worker (device OOM, SIGABRT), an
 assertion about process-global state ("first op in this process", "this stream is
 empty"), or a setting latched at first read. Mark the whole family rather than the
@@ -87,72 +79,63 @@ worker.
 Two traps:
 
 - **`@pytest.mark.forked` cannot do this.** `neuron_init()`
-  (`torch_neuronx/csrc/core/NeuronBindings.cpp`) installs a `pthread_atfork` handler that poisons
+  (`csrc/core/NeuronBindings.cpp`) installs a `pthread_atfork` handler that poisons
   inherited runtime state, so boxing is only safe from a process that has not yet
   initialized the runtime. Fork a worker that has already touched the device and
   every later device op in the child raises `Neuron runtime should not be used
-  after fork()`.
-- **A latched setting cannot be toggled per test.** `GetStreamConfig`
-  (`torch_neuronx/csrc/core/streams/StreamConfig.h`) parses `TORCH_NEURONX_ENABLE_STREAMS` and
-  `TORCH_NEURONX_ENABLE_HOST_CC` once, then keeps both values for the life of
-  the process. Set both flags before Python starts. Use a fresh process for each configuration.
-  An environment change after initialization cannot update the runtime consistently.
-  Use `requires_nrt_streams` when a test only needs a stream separate from the default
-  stream. Use `requires_nrt_streams_with_host_cc` only when a test asserts HostCC
-  behavior, such as which copy path runs on a non-default stream; HostCC costs kernel
-  performance, so do not enable it otherwise. Apply the decorator directly to a
-  collected pytest test. The setup hook sets the flags before initialization fixtures
-  run. Mark the test with `needs_process_isolation`. The `nrt_stream_config` marker
-  sets the flags. The decorator also verifies them. A module that applies the marker
-  through `pytestmark` must assert the expected flags.
+  after fork()`. `pytest-isolate` is the same mechanism and fails the same way.
+- **A latched setting cannot be toggled per test.** `IsNonDefaultStreamWithHostCC`
+  (`csrc/core/dispatch/NeuronDispatcher.cpp`) reads `TORCH_NEURONX_ENABLE_HOST_CC`
+  into a `static const bool` at the first copy it dispatches, then keeps that value
+  for the life of the process. An early test latches it to off; a later test sets it
+  to `1`; `is_host_cc_enabled()` (`lru_cache`) and `NeuronStream.cpp` (`getenv` per
+  call) now report on while the dispatcher still reports off. The test gets a real
+  non-default stream while the dispatcher routes its copies down the default-stream
+  path, and the worker aborts. Clearing the `lru_cache` makes this worse: it flips
+  the two readers that re-read and leaves the latched one alone.
 
 ## Upstream PyTorch tests (contract)
 
+- **Wrapper-based** (`tests/pytorch_tests/`): imports PyTorch's own test files
+  via `utils.py`; `failing_test_methods/` holds xfail lists;
+  `distributed/neuron_patch.py` patches NCCL→Neuron.
 - **Native** (`tests/pytorch_tests_native/`): runs device-agnostic upstream
-  tests directly. Skip and xfail entries live in files matching
-  `tests/pytorch_tests_native/skip_registry/*_registry.py`; each `SkipGroup` is
-  tied to one root cause and should be deleted when fixed.
-  `tests/pytorch_tests_native/neuron_test_registry.py` loads those registries
-  and applies their markers. The runner is
-  `tests/pytorch_tests_native/runner/run_upstream_tests.py`.
+  tests directly. **`neuron_test_registry.py` is the single skip/xfail source
+  of truth — each `SkipGroup` is tied to one root cause; delete the group when
+  fixed.** Runner is Python (`runner/run_upstream_tests.py`; `.sh` is a shim).
   **One retry pass** on code 1 (re-runs failures via `--last-failed`, emits
   `*_retry.json`); timeouts/internal errors surface without retry
-  (`tests/pytorch_tests_native/runner/run_upstream_tests.py::should_retry`). `tests/pytorch_tests_native/runner/convert_reports.py::apply_retry_outcomes` merges retries;
+  (`should_retry`). `convert_reports.py:apply_retry_outcomes` merges retries;
   retry-only passes get `passed_on_retry` status (flakiness tracking).
 
 ## Other suites
 
-- **Compatibility suite** (`tests/huggingface/`): excluded by default. The run
-  command is in `CONTRIBUTING.md`.
-- **Vertical** (`tests/vertical/`): ATen op coverage and performance use
+- **HuggingFace** (`tests/huggingface/`): ~50 CausalLM models, excluded by
+  default (~1h); run command in `CONTRIBUTING.md`.
+- **Vertical** (`tests/vertical/`): ~1362 ATen ops for coverage/perf via
   `NeuronOpInfo` shape registry; opt-in `--include-vertical`. Two drivers over
-  the same op set - `test_target_ops_coverage.py` (eager) and
+  the same op set — `test_target_ops_coverage.py` (eager) and
   `test_target_ops_compile_coverage.py` (compile, emits roofline columns from
-  `tests/vertical/internal/roofline.py`). Per-worker NeuronCore pinning via the directory's
-  `tests/vertical/conftest.py`. Register new shapes in `tests/vertical/internal/neuron_shape_registry.py`.
+  `internal/roofline.py`). Per-worker NeuronCore pinning via the directory's
+  `conftest.py`. Register new shapes in `internal/neuron_shape_registry.py`.
 
 ## Writing a new test (recipe)
 
-- **Python op:** `tests/python_ops/`, compare `.to("neuron")`
+- **Python op:** `tests/python_ops/test_<op>.py`, compare `.to("neuron")`
   result against CPU via `torch.testing.assert_close`.
-- **Dynamo:** `tests/neuron_dynamo_backend/unit/`,
-  `tests/neuron_dynamo_backend/component/`, or
-  `tests/neuron_dynamo_backend/e2e/`.
+- **Dynamo:** `tests/neuron_dynamo_backend/{unit,component,e2e}/`.
 - **Distributed:** inherit `tests/distributed/utils.py`, mark `@pytest.mark.multi_device`.
-- **C++:** add `*Test.cpp` under `tests/csrc/` and register it with
-  `torch_neuronx_cc_test()` in `tests/csrc/BUILD.bazel`.
+- **C++:** `*Test.cpp` under `tests/csrc/...` + `neuron_cc_test()` in `BUILD.bazel`.
 
 ## Authoritative human docs (cite, don't restate)
 
-- Run commands, flags, coverage, compatibility suites, and high-level CI
-  expectations are in `CONTRIBUTING.md`. The current required-check and job
-  inventory is not maintained there.
-- C++ test invocation and Bazel targets are in `BAZEL_BUILD.md`.
-- Repository automation and the current required-check configuration are
-  maintained outside the published source tree.
+- Run commands, flags, coverage, HuggingFace, CI expectations → `CONTRIBUTING.md`.
+- C++ test invocation + Bazel targets → `BAZEL_BUILD.md`.
+- CI workflow files live in `.github/workflows/` (`lint`, `pull`, `merge`,
+  `nightly`, `_upstream-tests`, `_block-perf`).
 
 ## See also
 
-- `docs/AI-build-infra.md` - build system + `tools/` depth.
-- `docs/AI-csrc.md` - C++ tree the gtest suite mirrors.
-- `docs/AI-dynamo-backend.md` / `docs/AI-python-ops.md` - subsystems under test.
+- `AI-build-infra.md` — build system + `tools/` depth.
+- `AI-csrc.md` — C++ tree the gtest suite mirrors.
+- `AI-dynamo-backend.md` / `AI-python-ops.md` — subsystems under test.

@@ -3,9 +3,11 @@
 ``try_dynamic_nki_dispatch`` is the single, ``self``-free implementation of the
 dynamic-NKI fast path. It is called two ways:
 
-- from C++ ``NeuronDispatcher::DispatchImpl``, as a guarded pre-check before the
-  standard lower/compile/execute; and
-- from Python ``TorchMlirKernel._call_impl``, via a thin wrapper.
+- from C++ ``NeuronDispatcher::DispatchImpl`` (the production path, default
+  ``TORCH_NEURONX_CPP_DISPATCH=1``), as a guarded pre-check before the standard
+  lower/compile/execute; and
+- from Python ``TorchMlirKernel._call_impl`` (reached only when
+  ``TORCH_NEURONX_CPP_DISPATCH=0``), via a thin wrapper.
 
 Both share this one code path so the compile/execute logic has a single source
 of truth. Returns the result tensor(s) if the op was handled, else ``None`` (the
@@ -75,26 +77,13 @@ def _deliver(result, dest):
 
 
 def try_dynamic_nki_dispatch(op_name, args, kwargs=None):
-    """Try to execute an operation through its registered dynamic NKI path.
+    """Execute ``op_name`` via a pre-compiled dynamic NKI NEFF, if registered.
 
-    Args:
-        op_name (str): Operation name used to resolve the dynamic NKI entry.
-        args (Iterable): Raw positional operation arguments.
-        kwargs (Mapping, optional): Raw keyword operation arguments. Defaults to ``None``.
+    Compile once per compile_key (dims baked into the NEFF), then execute at the
+    actual runtime shape via ``execute_compiled_graph`` (bypasses IO-size
+    validation). ``args``/``kwargs`` are the raw op arguments.
 
-    Returns:
-        torch.Tensor | tuple | None: Handled result, or ``None`` to use default lowering.
-            When a destination is supplied, it is updated and returned.
-
-    Raises:
-        RuntimeError: If tensors are noncontiguous, off the Neuron device, or span device IDs.
-        TypeError: If forwarded operation keywords are incompatible with the adapter.
-
-    Note:
-        Compilation is memoized per compile key, then execution is submitted to the current
-        Neuron stream through ``execute_compiled_graph`` without I/O-size validation. Reusable
-        destination kwargs alias output buffers; otherwise the result is copied back. Destination
-        kwargs do not enter the compile key, and framework-specific kwargs are dropped.
+    Returns the result tensor (or tuple) if handled, else ``None``.
     """
     short_name = _short_name(op_name)
     args = tuple(args)

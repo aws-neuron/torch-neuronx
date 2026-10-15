@@ -144,8 +144,7 @@ bool NeuronHooksInterface::hasPrimaryContext(c10::DeviceIndex device_index) cons
 }
 
 // Get default generator for the device
-const at::Generator& NeuronHooksInterface::getDefaultGenerator(
-    c10::DeviceIndex device_index) const {
+at::Generator NeuronHooksInterface::getDefaultGenerator(c10::DeviceIndex device_index) {
   return getDefaultNeuronGenerator(device_index);
 }
 

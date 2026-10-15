@@ -19,25 +19,24 @@ def scaled_dot_product_attention_backward_kernel(
     scale: float | None = None,
     seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute scaled dot-product attention gradients with the NKI kernel, transposing ATen layouts.
+    """
+    Wrapper for the NKI flash attention backward kernel.
 
     Args:
-        grad_out (torch.Tensor): Output gradient with shape ``(B, Hq, L, E)``.
-        q (torch.Tensor): Query tensor with shape ``(B, Hq, L, E)``.
-        k (torch.Tensor): Key tensor with shape ``(B, Hkv, S, E)``.
-        v (torch.Tensor): Value tensor with shape ``(B, Hkv, S, E)``.
-        out (torch.Tensor): Forward output with shape ``(B, Hq, L, E)``.
-        lse (torch.Tensor): Log-sum-exp in ``(B, Hq, L)`` or ``(B, Hq, 128, L // 128)`` form.
-        is_causal (bool, optional): Whether to apply causal masking. Defaults to ``False``.
-        dropout_p (float, optional): Ignored dropout probability. Defaults to ``0.0``.
-        scale (float | None, optional): Softmax scale. Defaults to ``None`` (derive from ``E``).
-        seed (int | None, optional): Ignored dropout seed. Defaults to ``None``.
+        grad_out: Gradient of output (batch, heads, seq_len, embed_dim)
+        q: Query tensor in ATen format (batch, heads, seq_len, embed_dim)
+        k: Key tensor in ATen format (batch, heads, seq_len, embed_dim)
+        v: Value tensor in ATen format (batch, heads, seq_len, embed_dim)
+        out: Forward output (batch, heads, seq_len, embed_dim)
+        lse: Log-sum-exp from forward (batch, heads, B_P_SIZE, n_tiles)
+        is_causal: Whether causal masking was used
+        dropout_p: Dropout probability
+        scale: Softmax scale factor
+        seed: Random seed for dropout
 
-    Returns:
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Gradients for ``q``, ``k``, and ``v``.
-
-    Raises:
-        ValueError: If a three-dimensional ``lse`` has ``L`` not divisible by 128.
+    Note:
+        - Inputs are in ATen format; transpose to NKI format is done by
+          _compute_attention_backward_nki
     """
     return _compute_attention_backward_nki(
         grad_out,

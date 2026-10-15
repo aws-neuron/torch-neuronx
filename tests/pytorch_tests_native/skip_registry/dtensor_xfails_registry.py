@@ -11,6 +11,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
         ),
         tests=[
             "test_StridedShard_to_replicate",
+            "test_replicate_to_StridedShard",
             "test_replicate_to_shard_forward_backward",
         ],
     ),
@@ -21,6 +22,7 @@ XFAIL_GROUPS: list[SkipGroup] = [
             " SUM, AVG, MAX, MIN — not PRODUCT"
         ),
         tests=[
+            "test_split_on_partial",
             "test_math_ops.py::DistMathOpsTest::test_linear_op_reductions",
         ],
     ),
@@ -186,6 +188,18 @@ XFAIL_GROUPS: list[SkipGroup] = [
             "test_dtensor_processgroup_backward",
             "test_dtensor_processgroup_deduplication",
             "test_dtensor_processgroup_extraction",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Neuron's per-device stream pool is lazily initialized during eager"
+            " tensor ops, but the compile async-collective tangent path goes"
+            " straight from AOTAutograd's FX graph to NEFF execution setup and"
+            " schedules ops before the pool exists, producing"
+            " 'Stream pool not initialized for device 0'."
+        ),
+        tests=[
+            "test_dtensor_compile.py::TestDTensorCompile::test_unwrap_async_collective_tensor_tangent",
         ],
     ),
     SkipGroup(

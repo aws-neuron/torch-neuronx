@@ -4,11 +4,7 @@ from .base import ReductionOperation
 
 
 class ReductionOp(ReductionOperation):
-    """Provide a named reduction operation with XLA output-shape handling.
-
-    Args:
-        op_name (str): ATen operation name exposed by the instance.
-    """
+    """Base class for reduction operations with XLA implementation."""
 
     def __init__(self, op_name):
         self._op_name = op_name
@@ -16,9 +12,4 @@ class ReductionOp(ReductionOperation):
 
     @property
     def op_name(self) -> str:
-        """Return the configured ATen operation name.
-
-        Returns:
-            str: Operation name supplied during initialization.
-        """
         return self._op_name

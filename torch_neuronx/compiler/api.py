@@ -34,26 +34,14 @@ from torch_neuronx.compiler.api_models import (
 
 @contextlib.contextmanager
 def compile_only(options: CompileOptions | None = None):
-    """Compile to a NEFF without executing on a Neuron device.
+    """Compile to NEFF without device execution.
 
-    Args:
-        options (CompileOptions, optional): Cross-compilation settings. Defaults
-            to ``None``.
+        with torch_neuronx.compiler.compile_only():
+            model = Model().to("neuron")
+            torch.compile(model, backend="neuron")(x)
 
-    Yields:
-        None: Activates compile-only mode for the context lifetime.
-
-    Example::
-
-        >>> with torch_neuronx.compiler.compile_only():  # doctest: +SKIP
-        ...     compiled = torch.compile(model, backend="neuron")(x)
-
-    Note:
-        This context sets a process-wide flag and restores its previous value,
-        including when an exception occurs. When supplied, ``options`` also
-        temporarily overrides the target, logical NeuronCore configuration,
-        and compiler optimization level. Device-free operation requires
-        ``NEURON_RT_FAKE_INSTANCE_TYPE`` to be set externally.
+    Pass `options` to cross-compile for a specific target without a live device.
+    Device-free operation requires NEURON_RT_FAKE_INSTANCE_TYPE set externally.
     """
     import torch_neuronx
 
@@ -69,17 +57,12 @@ def compile_only(options: CompileOptions | None = None):
 
 
 def get_neuron_decompositions() -> dict:
-    """Return the Neuron decomposition table for FX graph tracing.
+    """Return the Neuron decomposition table.
 
-    Returns:
-        dict: Decompositions for composite operations supported by lowering.
-
-    Note:
-        Pass this table as ``decompositions=`` to AOTAutograd, or as
-        ``decomp_table=`` to ``ExportedProgram.run_decompositions``. It replaces
-        device-conditional composite operations, such as the overrideable SDPA
-        overload, with primitives that torch-mlir can legalize; otherwise opaque
-        operations can fail during lowering.
+    Pass this as `decompositions=` to `torch.export` / AOTAutograd when tracing
+    the FX graph you hand to `fx_to_neff`. It lowers device-conditional composite
+    ops (e.g. SDPA's overrideable overload) into primitives torch-mlir can
+    legalize; without it the graph carries opaque ops that fail at lowering.
     """
     from torch_neuronx.neuron_dynamo_backend.decompositions import (
         get_compile_decomposition_table,
@@ -185,26 +168,16 @@ def fx_to_stablehlo(
     example_inputs,
     options: CompileOptions | None = None,
 ) -> CompilationArtifact:
-    """Lower an FX graph module to StableHLO MLIR.
+    """Lower an FX GraphModule to StableHLO MLIR (stage 1 of the compile).
 
-    Args:
-        gm (torch.fx.GraphModule): FX graph module carrying Neuron semantics.
-        example_inputs (object): Example inputs used to derive graph inputs.
-        options (CompileOptions, optional): Compilation settings. Defaults to
-            ``None``.
+    Runs the SAME front half of the lowering core (`_lower_fx_to_stablehlo`) as
+    `fx_to_neff` and `torch.compile(backend="neuron")` — including the post-AOT FX
+    passes — so the StableHLO matches the production path. Pair with
+    `stablehlo_to_neff` to finish the NEFF.
 
-    Returns:
-        CompilationArtifact: Stage-one artifact containing StableHLO and IO
-        metadata, without a NEFF cache key.
-
-    Raises:
-        Exception: If FX-to-StableHLO conversion fails.
-
-    Note:
-        This runs the same post-AOT passes and lowering core as ``fx_to_neff``
-        and the Dynamo backend. Operations lower by schema, so tensor device
-        tags need not be ``neuron``; trace composite operations with
-        ``get_neuron_decompositions`` before calling this function.
+    Ops are lowered by schema; the tensor device tag need not be `neuron` (a
+    meta-tagged graph lowers identically), but the graph must carry Neuron op
+    semantics — trace with `get_neuron_decompositions()`.
     """
     from torch_neuronx.neuron_dynamo_backend.backend import _lower_fx_to_stablehlo
     from torch_neuronx.neuron_dynamo_backend.compile import _serialize_mlir_module
@@ -238,26 +211,14 @@ def stablehlo_to_neff(
     artifact: CompilationArtifact,
     options: CompileOptions | None = None,
 ) -> CompilationArtifact:
-    """Compile a StableHLO artifact to a NEFF.
+    """Compile a StableHLO artifact (from `fx_to_stablehlo`) to a NEFF.
 
-    Args:
-        artifact (CompilationArtifact): Artifact to compile and update in place.
-        options (CompileOptions, optional): Settings; defaults to artifact target.
-
-    Returns:
-        CompilationArtifact: The supplied artifact with its cache key and
-        compilation metadata populated and ``neff`` reset to ``None``.
-
-    Raises:
-        ValueError: If neither lowering state nor StableHLO exists, or detached
-            tensorizer lowering is requested.
-
-    Note:
-        In-process artifacts resume the shared lowering core; reconstructed
-        artifacts compile from canonical StableHLO bytes. Compilation is
-        asynchronous, so call ``torch.neuron.synchronize`` before fetching NEFF
-        bytes. Detached artifacts cannot use the tensorizer path because it
-        requires the in-process MLIR module.
+    In process, resumes the shared lowering core carried by `fx_to_stablehlo`.
+    A reconstructed artifact without private lowering state compiles directly
+    from its canonical StableHLO bytes. Populates and returns the supplied
+    artifact with cache_key set; await bytes via synchronize(). Detached
+    artifacts using the tensorizer path are not supported because that path
+    requires the in-process MLIR module.
     """
     options = options or CompileOptions(target=artifact.target)
 
@@ -305,26 +266,24 @@ def fx_to_neff(
     *,
     pre_processing_analysis_info: dict | None = None,
 ) -> CompilationArtifact:
-    """Compile an FX graph module directly to a NEFF.
+    """Compile an FX GraphModule directly to a NEFF.
 
-    Args:
-        gm (torch.fx.GraphModule): Post-AOT graph with shapes in ``node.meta['val']``.
-        options (CompileOptions, optional): Compilation settings. Defaults to ``None``.
-        pre_processing_analysis_info (dict, optional): Caller analysis supplying
-            pre-AOT mutations or all bookkeeping when passes are skipped. Defaults to ``None``.
+    The entry point most consumers want: hand it the FX graph (traced with the
+    neuron decompositions) and an optional target, get a NEFF back.
 
-    Returns:
-        CompilationArtifact: Artifact with an asynchronous cache key and IO metadata.
+        from torch_neuronx.compiler import fx_to_neff, CompileOptions, get_neuron_decompositions
+        artifact = fx_to_neff(gm, CompileOptions(target="trn2"))
 
-    Raises:
-        Exception: If FX-to-StableHLO conversion fails.
+    Shapes come from `node.meta['val']` (populated by torch.export / AOTAutograd),
+    not sample tensors — so no `example_inputs`.
 
-    Note:
-        No example inputs are accepted because shapes come from graph metadata.
-        Pass ``preprocess_graph`` analysis to preserve pre-AOT aliases. With
-        ``options.run_fx_passes=False``, also supply post-pass alias bookkeeping.
-        The lowering core and cache key match the Dynamo backend; synchronize
-        before fetching NEFF bytes from the cache.
+    `pre_processing_analysis_info` carries the pre-AOT `{"aliasing_analysis": ...}`
+    from `preprocess_graph`; when set, it becomes the `mhlo.input_output_alias` so
+    the compiler donates in-place-mutated buffers (e.g. KV cache). A caller using
+    its own backend must run `preprocess_graph` and thread the result here.
+
+    Runs the SAME core (`_lower_fx_to_neff`) as `torch.compile(backend="neuron")`
+    — same passes, same cache key — so the API and backend cannot diverge.
     """
     from torch_neuronx.neuron_dynamo_backend.backend import _lower_fx_to_neff
 

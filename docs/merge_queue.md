@@ -7,7 +7,7 @@ Neuron hardware before a PR is allowed to merge.
 The implementation lives in
 [`.github/workflows/merge-queue.yml`](../.github/workflows/merge-queue.yml) and
 delegates the actual test run to the reusable workflow
-[`.github/workflows/_reusable-upstream-tests.yml`](../.github/workflows/_reusable-upstream-tests.yml).
+[`.github/workflows/_upstream-tests.yml`](../.github/workflows/_upstream-tests.yml).
 
 ## Why the gate runs on two events
 
@@ -57,7 +57,7 @@ pull_request event:
 merge_group event:
   build-tests-image (Build Main Test Image)
         ↓ main_image
-  pytorch-upstream-tests (Merge Queue Gate (smoke))   ← calls _reusable-upstream-tests.yml
+  pytorch-upstream-tests (Merge Queue Gate (smoke))   ← calls _upstream-tests.yml
         ↓ gate_passed / failure_count
   merge-queue-gate (Merge Queue Gate Status)          ← REQUIRED check, gates merge
 ```
@@ -71,7 +71,7 @@ merge_group event:
 
 ### `pytorch-upstream-tests` (the smoke run)
 - Runs only on `merge_group` and only if the image build succeeded.
-- Calls `_reusable-upstream-tests.yml` with:
+- Calls `_upstream-tests.yml` with:
   - `dist-config: upstream_pytorch_test_distribution_config.smoke.json` — the
     1-node smoke subset (dynamo), not the full suite.
   - `max-failures: "0"` — **zero** failing tests allowed.
@@ -124,17 +124,17 @@ groups never batch multiple PRs. Only non-failing PRs are merged.
 > `timeout-minutes` values inside the workflows (e.g. `build-tests-image`'s
 > 60-minute timeout and the reusable suite's 360-minute per-node default).
 
-## The reusable suite (`_reusable-upstream-tests.yml`)
+## The reusable suite (`_upstream-tests.yml`)
 
 The smoke run reuses the same workflow that nightly uses, just with
 a smaller dist-config and a failure-count gate. Its internal job graph:
 
 ```
-compute-pytorch-upstream-matrix (Neuron gate runner)
+compute-pytorch-upstream-matrix (ubuntu-latest)
       ↓ matrix
 pytorch-upstream-test-suite (parallel trn2 nodes)
       ↓ per-node artifacts
-aggregate-pytorch-upstream (Neuron gate runner)
+aggregate-pytorch-upstream (ubuntu-latest)
       ↓ failure_count / gate_passed outputs + GH job summary
 ```
 

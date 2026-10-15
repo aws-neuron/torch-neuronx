@@ -13,18 +13,14 @@ import nki.language as nl
 
 @nki.jit()
 def sum_kernel(input_tensor, num_m_tiles):
-    """Sum each input row over its free dimension.
+    """
+    Free-dim sum: output[i, 0] = sum_j input[i, j]
 
     Args:
-        input_tensor (nki.language.ndarray): Input with shape ``[m_static, hidden]``.
-        num_m_tiles (nki.language.ndarray): Number of 128-row tiles to reduce.
-
+        input_tensor: [m_static, hidden] bf16 on HBM
+        num_m_tiles: [1, 1] int32 — number of 128-row tiles to reduce
     Returns:
-        nki.language.ndarray: Row sums with shape ``[m_static, 1]`` in the input dtype.
-
-    Note:
-        Segment partials accumulate in fp32 before conversion to the input dtype.
-        Rows after the requested tiles are not initialized.
+        output: [m_static, 1] bf16 on HBM
     """
     m_static, hidden = input_tensor.shape
 
@@ -55,11 +51,6 @@ def sum_kernel(input_tensor, num_m_tiles):
 
     def body(_i):
         # fp32 accumulator over the free-dim segments for this 128-row tile.
-        """Reduce one 128-row tile over the free dimension.
-
-        Args:
-            _i (int): Dynamic loop iteration index, accepted but not inspected.
-        """
         acc = nl.ndarray((tile_size_m, 1), nl.float32, nl.sbuf)
         nisa.memset(acc, 0.0)
         for seg in range(len(h_starts)):

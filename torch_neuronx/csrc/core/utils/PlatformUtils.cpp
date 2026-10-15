@@ -110,7 +110,7 @@ std::string GetCompilerVersion() {
 
 bool IsHloContentKeyEnabled() {
   const char* v = std::getenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO");
-  return !v || std::string(v) != "0";
+  return v && std::string(v) == "1";
 }
 
 }  // namespace utils

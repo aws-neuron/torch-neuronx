@@ -34,8 +34,8 @@ class TestPersistentCachingE2E:
 
         torch_neuronx._C._clear_compilation_cache()
 
-        a1 = torch.randn(4, 8, dtype=torch.float32).to("neuron")
-        b1 = torch.randn(8, 4, dtype=torch.float32).to("neuron")
+        a1 = torch.randn(4, 8, dtype=torch.float32, device="neuron")
+        b1 = torch.randn(8, 4, dtype=torch.float32, device="neuron")
         result1 = torch.matmul(a1, b1)
         torch.neuron.synchronize()
 
@@ -46,8 +46,8 @@ class TestPersistentCachingE2E:
 
         torch_neuronx._C._clear_compilation_memory_cache()
 
-        a2 = torch.randn(4, 8, dtype=torch.float32).to("neuron")
-        b2 = torch.randn(8, 4, dtype=torch.float32).to("neuron")
+        a2 = torch.randn(4, 8, dtype=torch.float32, device="neuron")
+        b2 = torch.randn(8, 4, dtype=torch.float32, device="neuron")
         result2 = torch.matmul(a2, b2)
         torch.neuron.synchronize()
 
@@ -65,13 +65,13 @@ class TestPersistentCachingE2E:
 
         torch_neuronx._C._clear_compilation_cache()
 
-        a1 = torch.randn(4, 8, dtype=torch.float32).to("neuron")
-        b1 = torch.randn(8, 4, dtype=torch.float32).to("neuron")
+        a1 = torch.randn(4, 8, dtype=torch.float32, device="neuron")
+        b1 = torch.randn(8, 4, dtype=torch.float32, device="neuron")
         torch.matmul(a1, b1)
         torch.neuron.synchronize()
 
-        a2 = torch.randn(8, 16, dtype=torch.float32).to("neuron")
-        b2 = torch.randn(16, 8, dtype=torch.float32).to("neuron")
+        a2 = torch.randn(8, 16, dtype=torch.float32, device="neuron")
+        b2 = torch.randn(16, 8, dtype=torch.float32, device="neuron")
         torch.matmul(a2, b2)
         torch.neuron.synchronize()
 
@@ -80,13 +80,13 @@ class TestPersistentCachingE2E:
 
         torch_neuronx._C._clear_compilation_memory_cache()
 
-        a3 = torch.randn(4, 8, dtype=torch.float32).to("neuron")
-        b3 = torch.randn(8, 4, dtype=torch.float32).to("neuron")
+        a3 = torch.randn(4, 8, dtype=torch.float32, device="neuron")
+        b3 = torch.randn(8, 4, dtype=torch.float32, device="neuron")
         torch.matmul(a3, b3)
         torch.neuron.synchronize()
 
-        a4 = torch.randn(8, 16, dtype=torch.float32).to("neuron")
-        b4 = torch.randn(16, 8, dtype=torch.float32).to("neuron")
+        a4 = torch.randn(8, 16, dtype=torch.float32, device="neuron")
+        b4 = torch.randn(16, 8, dtype=torch.float32, device="neuron")
         torch.matmul(a4, b4)
         torch.neuron.synchronize()
 
@@ -102,8 +102,8 @@ class TestPersistentCachingE2E:
 
         neff_files_before = _list_neff_files(cache_dir)
 
-        a = torch.randn(13, 17, dtype=torch.float32).to("neuron")
-        b = torch.randn(17, 11, dtype=torch.float32).to("neuron")
+        a = torch.randn(13, 17, dtype=torch.float32, device="neuron")
+        b = torch.randn(17, 11, dtype=torch.float32, device="neuron")
         torch.matmul(a, b)
         torch.neuron.synchronize()
 
@@ -138,8 +138,8 @@ class TestPersistentCachingE2E:
 
         num_iterations = 5
         for _ in range(num_iterations):
-            a = torch.randn(10, 20, dtype=torch.float32).to("neuron")
-            b = torch.randn(20, 15, dtype=torch.float32).to("neuron")
+            a = torch.randn(10, 20, dtype=torch.float32, device="neuron")
+            b = torch.randn(20, 15, dtype=torch.float32, device="neuron")
             torch.matmul(a, b)
             torch.neuron.synchronize()
 

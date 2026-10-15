@@ -31,10 +31,11 @@ def get_compiled_cache_keys(artifact_type: ArtifactType) -> frozenset[str]:
     """Return cache keys tracked for a specific MegaCache artifact type.
 
     Args:
-        artifact_type (ArtifactType): Artifact category whose keys are requested.
+        artifact_type: The artifact type to get keys for (e.g., ArtifactType.NEURON_NEFF).
 
     Returns:
-        frozenset[str]: Thread-safe immutable snapshot of tracked cache keys.
+        Immutable snapshot of cache keys. Thread-safe: returns a copy to avoid
+        races with concurrent modifications.
     """
     with _cache_keys_lock:
         return frozenset(_compiled_cache_keys[artifact_type])
@@ -44,7 +45,7 @@ def clear_compiled_cache_keys(artifact_type: ArtifactType | None = None) -> None
     """Clear tracked cache keys.
 
     Args:
-        artifact_type (ArtifactType, optional): Category to clear, or ``None`` for all.
+        artifact_type: Specific type to clear, or None to clear all types.
     """
     with _cache_keys_lock:
         if artifact_type is None:
@@ -86,7 +87,7 @@ def _serialize_mlir_module(mlir, *, use_tensorizer: bool = False) -> bytes:
 
 def _content_key(mlir_bytes: bytes) -> str:
     """Compute the NEFF content key for serialized MLIR."""
-    if os.environ.get("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "1") != "0":
+    if os.environ.get("TORCH_NEURONX_NEFF_KEY_FROM_HLO") == "1":
         return hashlib.sha256(mlir_bytes).hexdigest()
 
     from torch_neuronx.utils import global_version_hash
@@ -151,21 +152,9 @@ def _compile_stablehlo_bytes(
 
 
 class CompileGraph:
-    """Submit StableHLO MLIR for asynchronous NEFF compilation.
-
-    Args:
-        mlir (Module | bytes | bytearray): Live StableHLO module or canonical serialized MLIR.
-        model_name (str): Model name used for logging.
-        segment_id (str): Segment identifier retained as caller metadata.
-        graph_name (str): Graph name retained as caller metadata.
-        has_collectives (bool, optional): Whether the graph contains collective operations.
-            Defaults to ``False``.
-        use_tensorizer (bool, optional): Whether to lower through the tensorizer path.
-            Defaults to ``False``.
-
-    Note:
-        ``segment_id`` and ``graph_name`` do not participate in compilation or cache keying.
-        Canonical bytes bypass serialization and cannot use the tensorizer path.
+    """
+    Takes MLIR, compiles it to NEFF, and returns cache key.
+    Supports both the default compilation path and the tensorizer path.
     """
 
     def __init__(
@@ -198,33 +187,24 @@ class CompileGraph:
         self.graph_name = graph_name
 
     def serialize(self) -> bytes:
-        """Return the exact bytes that ``compile()`` submits to the compiler.
+        """Return the exact bytes `compile()` would submit to the compiler.
 
-        Returns:
-            bytes: Canonical serialized MLIR bytes.
-
-        Note:
-            Serializing a live module strips nondeterministic attributes in place and, for
-            the tensorizer path, legalizes the module to Linalg in place. For non-WLO modules,
-            passing the returned bytes back to ``CompileGraph`` produces the live module's
-            NEFF key; WLO-annotated canonical bytes are rejected by ``compile()``.
+        Lets a caller persist the serialized MLIR (e.g. into the HLO cache) and
+        later hand those bytes back to `CompileGraph`, producing the same NEFF key
+        as compiling the live module would have.
         """
         if isinstance(self.mlir, bytes | bytearray):
             return bytes(self.mlir)
         return _serialize_mlir_module(self.mlir, use_tensorizer=self.use_tensorizer)
 
     def compile(self) -> str:
-        """Submit the configured MLIR for asynchronous NEFF compilation.
+        """Compile MLIR to NEFF.
+
+        Serializes the MLIR module to bytecode and invokes the
+        C++ compilation backend.
 
         Returns:
-            str: Execution handle (cache key) for the submitted graph.
-
-        Raises:
-            ValueError: If serialized MLIR is used with the tensorizer path.
-            RuntimeError: If canonical bytes contain a WLO annotation.
-
-        Note:
-            WLO submission also defers sidecar parsing until executor construction.
+            str: Execution handle (cache key) for the compiled graph.
         """
         logger.debug(f"CompileGraph.compile() called: model={self.model_name}")
 

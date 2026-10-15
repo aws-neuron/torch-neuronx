@@ -24,16 +24,7 @@ def _warn_dtype_cast_once(dtype_name: str) -> None:
 
 
 class DtypeAutocastContext:
-    """Configure dtype autocasting for Neuron operations.
-
-    Args:
-        cast_float64 (bool, optional): Cast ``float64`` tensors to ``float32``.
-            Defaults to ``True``.
-        cast_int64 (bool, optional): Cast ``int64`` tensors to ``int32``. Defaults to
-            ``True``.
-        cast_dtype_params (bool, optional): Cast standalone ``torch.dtype`` arguments.
-            Defaults to ``False``.
-    """
+    """Context for handling unsupported dtypes (float64, int64) on Neuron hardware"""
 
     def __init__(
         self, cast_float64: bool = True, cast_int64: bool = True, cast_dtype_params: bool = False
@@ -110,23 +101,16 @@ class DtypeAutocastContext:
     def process_args(
         self, args: tuple, kwargs: dict, output_params: tuple[str, ...] | None = None
     ) -> tuple[tuple, dict, dict[str, bool]]:
-        """Cast unsupported input dtypes and record the original dtype families.
+        """
+        Process arguments: cast unsupported dtypes and track what we had.
+        Returns: (new_args, new_kwargs, dtype_info)
 
         Args:
-            args (tuple): Positional arguments to process.
-            kwargs (dict): Keyword arguments to process.
-            output_params (tuple[str, ...] | None, optional): Keyword output names to
-                exclude from casting. Defaults to ``None``.
+            args: Positional arguments
+            kwargs: Keyword arguments
+            output_params: Names of output parameters to exclude from casting
 
-        Returns:
-            tuple[tuple, dict, dict[str, bool]]: Processed positional arguments,
-            processed keyword arguments, and ``had_float64``/``had_int64`` flags.
-
-        Note:
-            Named output parameters retain their original dtypes only when passed by keyword;
-            positional arguments are processed without signature binding. Top-level scalar
-            tensors remain unchanged, while tensor elements of an immediate tuple or list are
-            cast regardless of rank.
+        Note: Output parameters are never cast - they keep their original dtypes.
         """
         dtype_info = {"had_float64": False, "had_int64": False}
 
@@ -163,15 +147,7 @@ class DtypeAutocastContext:
         return tuple(new_args), new_kwargs, dtype_info
 
     def restore_dtypes(self, output: Any) -> Any:
-        """Restore output dtypes using the recorded dtype requirements.
-
-        Args:
-            output (Any): Tensor or tensor collection produced after dtype conversion.
-
-        Returns:
-            Any: Eligible tensors, including immediate tensor members of a tuple or list,
-                restored to ``float64`` or ``int64``; other values are returned unchanged.
-        """
+        """Restore output dtypes based on PyTorch promotion rules"""
         if output is None:
             return output
 
@@ -200,17 +176,9 @@ class DtypeAutocastContext:
         return output
 
     def validate_output_dtypes(self, original_kwargs: dict) -> None:
-        """Validate the keyword ``out`` dtype against the autocast configuration.
+        """Check that unsupported output dtypes are only requested with matching inputs.
 
-        Args:
-            original_kwargs (dict): Original keyword arguments before input processing.
-
-        Raises:
-            TypeError: If an unsupported ``float64`` output cannot be autocast.
-
-        Note:
-            Call this with the original keyword arguments. Eligible ``out`` tensors set the
-            recorded dtype flags so later output restoration copies back at that dtype.
+        This should be called with the ORIGINAL kwargs before processing, not after.
         """
         out = original_kwargs.get("out")
         if out is not None:
@@ -244,18 +212,26 @@ class DtypeAutocastContext:
 def autocast_neuron(
     cast_float64: bool = True, cast_int64: bool = True, cast_dtype_params: bool = False
 ):
-    """Yield a context for explicit Neuron device dtype conversion.
+    """
+    Context manager for handling unsupported dtypes on Neuron hardware.
 
     Args:
-        cast_float64 (bool, optional): Cast ``float64`` tensors to ``float32``.
-            Defaults to ``True``.
-        cast_int64 (bool, optional): Cast ``int64`` tensors to ``int32``. Defaults to
-            ``True``.
-        cast_dtype_params (bool, optional): Cast standalone ``torch.dtype`` arguments.
-            Defaults to ``False``.
+        cast_float64: If True, cast float64 to float32 (default: True)
+        cast_int64: If True, cast int64 to int32 (default: True)
+        cast_dtype_params: If True, cast dtype parameters (default: False)
 
-    Yields:
-        DtypeAutocastContext: Context used to process inputs and restore outputs.
+    Example:
+        with autocast_neuron():
+            # Both float64 and int64 are handled
+            result = torch.matmul(tensor_f64, tensor_i64)
+
+        with autocast_neuron(cast_int64=False):
+            # Only float64 is handled, int64 will error if unsupported
+            result = some_op(tensor_f64)
+
+        with autocast_neuron(cast_dtype_params=True):
+            # Also cast dtype parameters (needed for MLIR path)
+            result = some_op(tensor_f64, dtype=torch.int64)
     """
     context = DtypeAutocastContext(
         cast_float64=cast_float64, cast_int64=cast_int64, cast_dtype_params=cast_dtype_params

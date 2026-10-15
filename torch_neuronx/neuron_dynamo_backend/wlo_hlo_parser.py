@@ -24,20 +24,6 @@ else:
 
 
 def parse_transforms(hlo_path: str) -> list[dict]:
-    """Extract validated WLO weight transforms from a wrapped NEFF HLO module.
-
-    Args:
-        hlo_path (str): Path to a serialized ``HloModuleProto``.
-
-    Returns:
-        list[dict]: Transform dictionaries linked to transposable entry-call weights, or
-            an empty list when no entry or linked transpose computation is found.
-
-    Raises:
-        RuntimeError: If a transform computation lacks the required reshape or has other
-            than exactly one transpose.
-        WLOContractError: If an extracted transform violates the WLO contract.
-    """
     hlo = hlo_pb2.HloModuleProto()
     with open(hlo_path, "rb") as f:
         hlo.ParseFromString(f.read())

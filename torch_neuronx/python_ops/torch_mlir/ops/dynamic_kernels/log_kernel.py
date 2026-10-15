@@ -51,11 +51,6 @@ def _run_log_loop(
     """
 
     def body(_i):
-        """Process one unrolled logarithm loop iteration.
-
-        Args:
-            _i (int): Loop index supplied by ``nl.fori_loop`` and otherwise ignored.
-        """
         for slot in range(1, tiles_per_trip):
             nisa.tensor_scalar(
                 dst=row_start[slot],
@@ -126,18 +121,14 @@ def _run_log_loop(
 
 @nki.jit()
 def log_kernel(input_tensor, num_m_tiles):
-    """Compute logarithms over a runtime-dynamic row dimension.
+    """
+    Log activation: output = log(input)
 
     Args:
-        input_tensor (tensor): ``[m_static, hidden]`` HBM input.
-        num_m_tiles (tensor): Int32 ``[1, 1]`` count of 128-row tiles to process.
-
+        input_tensor: [m_static, hidden] bf16 on HBM
+        num_m_tiles: [1, 1] int32 — number of 128-row tiles to process
     Returns:
-        tensor: Output buffer with the input shape and dtype in HBM.
-
-    Note:
-        Only the first ``128 * num_m_tiles`` rows are written; remaining rows in
-        the statically shaped output are left unwritten.
+        output: [m_static, hidden] bf16 on HBM
     """
     m_static, hidden = input_tensor.shape
 

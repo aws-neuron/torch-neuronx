@@ -28,31 +28,16 @@ _INDEX_OPS = {
 
 
 class LegalizeIndexIndices(NeuronFXPass):
-    """Legalize empty and negative indices in ``index`` and ``index_put`` operations.
+    """Legalize indices in indexing ops (index and index_put).
 
-    Args:
-        state (NeuronFXPassState, optional): Shared FX-pass state used for artifact
-            dumping. Defaults to ``None``.
-
-    Note:
-        Replaces ``index_put`` with its input and ``index`` with an empty tensor when an
-        integer index has a zero-sized dimension. Otherwise, normalizes negative integer
-        indices when input fake-tensor metadata is available; indices whose input metadata is
-        absent are left unchanged.
+    - If any integer index has a 0-sized dimension, the op is a no-op:
+      index_put is replaced with its input tensor, index is replaced with
+      an empty tensor matching the expected output shape.
+    - Otherwise, normalizes negative integer indices to positive equivalents
+      via: idx = torch.where(idx < 0, idx + dim_size, idx)
     """
 
     def call(self, gm: torch.fx.GraphModule) -> PassResult:
-        """Legalize indexing nodes in an FX graph.
-
-        Args:
-            gm (torch.fx.GraphModule): FX graph module to update.
-
-        Returns:
-            PassResult: Graph module and whether any indexing node changed.
-
-        Raises:
-            ValueError: If required index or output fake-tensor metadata is missing.
-        """
         graph = gm.graph
         modified = False
 

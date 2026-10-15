@@ -28,29 +28,12 @@ def _warn_trace_cache_once() -> None:
 
 
 def return_types_of(config: FrameworkConfig) -> list[tuple]:
-    """Extract output dtype and shape pairs from an NKI framework configuration.
-
-    Args:
-        config (FrameworkConfig): Compiled NKI framework configuration.
-
-    Returns:
-        list[tuple]: ``(dtype, shape)`` pair for each output specification.
-    """
+    """Extract (dtype, shape) tuples from FrameworkConfig.output_specs."""
     return [(s.dtype, s.shape) for s in config.output_specs]
 
 
 def backend_config_str(config: FrameworkConfig) -> str:
-    """Convert an NKI framework configuration's ASCII payload to text.
-
-    Args:
-        config (FrameworkConfig): Configuration containing an ASCII payload.
-
-    Returns:
-        str: ASCII text stored in ``backend_config_b64``.
-
-    Raises:
-        UnicodeDecodeError: If the payload contains non-ASCII bytes.
-    """
+    """Decode backend_config_b64 to a plain string."""
     return config.backend_config_b64.decode("ascii")
 
 
@@ -64,23 +47,18 @@ def _get_config_cache(kernel: CompileKernel) -> dict | None:
 
 
 def get_config(kernel: CompileKernel, **kwargs: Any) -> FrameworkConfig:
-    """Compile an NKI kernel and return its framework configuration.
+    """Compile a NKI kernel and return a FrameworkConfig.
 
-    Args:
-        kernel (CompileKernel): NKI kernel specialization to compile.
-        **kwargs (Any): Kernel arguments and metadata forwarded to NKI.
+    This is the single entry-point used by the HOP dispatch layer
+    and by flex-attention lowering.  Usage::
 
-    Returns:
-        FrameworkConfig: Configuration returned by ``kernel.compile``.
+        config = get_config(kernel[grid], **meta_args)
 
-    Note:
-        This serves the HOP and flex-attention lowering paths. It checks an
-        in-memory cache first, then uses a cache-keyed cross-rank file lock so
-        waiters can reuse NKI's persistent compilation cache. However,
-        ``kernel.get_cache_key`` may itself compile before the lock; the lock
-        serializes only the subsequent ``kernel.compile`` call in that case.
-        A process warning describes stale trace-cache risks when
-        ``NKI_ENABLE_TRACE_CACHE=1``.
+    Caching layers (checked in order):
+    1. In-memory cache keyed by NKI's cache_key.
+    2. Cross-rank file lock so only one rank compiles per unique key; the
+       rest wait on the lock and pick up the on-disk compilation cache that
+       kernel.compile() maintains internally.
     """
     _warn_trace_cache_once()
 

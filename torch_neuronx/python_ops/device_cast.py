@@ -23,17 +23,10 @@ def _mlir_cast_fn(x, out_dtype=None, out=None):
 
 
 class DeviceCastMLIRImpl:
-    """Perform dtype casts on a Neuron device through an MLIR kernel."""
+    """MLIR implementation for device casting."""
 
     @staticmethod
     def cast(src_prepared, dst_prepared):
-        """Cast a prepared source tensor into a prepared destination tensor.
-
-        Args:
-            src_prepared (torch.Tensor): Contiguous source tensor on a Neuron device.
-            dst_prepared (torch.Tensor): Contiguous destination tensor overwritten with
-                the cast values.
-        """
         kernel = get_or_create_mlir_kernel(
             mlir_fn=_mlir_cast_fn,
             op_name="aten::copy_",
@@ -43,21 +36,14 @@ class DeviceCastMLIRImpl:
 
 
 def device_cast_neuron_to_neuron(src: torch.Tensor, dst: torch.Tensor) -> None:
-    """Cast a tensor into a destination on a Neuron device without CPU bounce.
+    """Cast `src` into `dst` on Neuron device without CPU bounce for <=32-bit dtypes.
+
+    - If dtypes match, performs a direct device-to-device copy.
+    - Otherwise, uses a tiny MLIR kernel to cast on device and write into `dst`.
 
     Args:
-        src (torch.Tensor): Source tensor on a Neuron device.
-        dst (torch.Tensor): Shape-compatible destination tensor on a Neuron device.
-
-    Raises:
-        RuntimeError: If either tensor is not on a Neuron device, or a native copy
-            uses different Neuron cores, a noncontiguous destination, or unequal byte counts.
-
-    Note:
-        Matching dtypes enqueue a raw native copy on the current Neuron stream and do
-        not interpret source strides. Other dtype changes first make the source contiguous
-        and use MLIR, including ``int64`` and ``uint64``; casts to or from ``float64``
-        are unsupported. The MLIR path does not update an original noncontiguous ``dst``.
+        src: Source Neuron tensor
+        dst: Destination Neuron tensor (already allocated with target dtype)
     """
     import torch_neuronx._C as _C
 

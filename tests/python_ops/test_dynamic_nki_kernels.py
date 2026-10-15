@@ -2336,25 +2336,20 @@ class TestDynamicBlockStridedGather:
         torch.testing.assert_close(dst.cpu(), wide.cpu()[:, :1024].contiguous(), rtol=0, atol=0)
 
     def test_compile_once_varying_m(self):
-        """Compiles nki_strided_copy_ once and handles multiple M values without recompiling.
-
-        Source data is built on CPU and moved to device (a DMA, not a compiled NEFF) so the
-        compilation-cache delta measures only nki_strided_copy_ -- an on-device randn would
-        itself compile a new NEFF per shape and pollute the recompile count.
-        """
+        """Compiles once and handles multiple M values without recompiling."""
         import torch_neuronx._C as _C
 
-        # Warmup: compiles nki_strided_copy_ for (H=1024, row_stride=2048, bf16)
-        wide0 = torch.randn(200, 2048, dtype=torch.bfloat16).to("neuron")
+        # Warmup: compiles the kernel for (H=1024, row_stride=2048, bf16)
+        wide0 = torch.randn(200, 2048, dtype=torch.bfloat16, device="neuron")
         dst0 = torch.empty(200, 1024, dtype=torch.bfloat16, device="neuron")
         torch.ops.neuron.nki_strided_copy_(wide0[:, :1024], dst0)
         torch.neuron.synchronize()
 
         before = {e["cache_key"] for e in _C._get_compilation_cache_entries()}
 
-        # Multiple M values — all must reuse the same nki_strided_copy_ NEFF
+        # Multiple M values — all reuse the same NEFF
         for num_r in [211, 256, 275, 300, 400]:
-            wide = torch.randn(num_r, 2048, dtype=torch.bfloat16).to("neuron")
+            wide = torch.randn(num_r, 2048, dtype=torch.bfloat16, device="neuron")
             dst = torch.empty(num_r, 1024, dtype=torch.bfloat16, device="neuron")
             torch.ops.neuron.nki_strided_copy_(wide[:, :1024], dst)
             torch.neuron.synchronize()
@@ -2363,7 +2358,7 @@ class TestDynamicBlockStridedGather:
         after = {e["cache_key"] for e in _C._get_compilation_cache_entries()}
         new_keys = after - before
         assert len(new_keys) == 0, (
-            f"nki_strided_copy_ recompiled! {len(new_keys)} new entries: "
+            f"Dynamic kernel recompiled! {len(new_keys)} new entries: "
             f"{sorted(k[:80] for k in new_keys)}"
         )
 
@@ -2385,9 +2380,8 @@ class TestDynamicBlockStridedGather:
         )
 
 
-# grouped_mm ragged (pad-free) path. Enabled by TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS=1
-# and gated by ``ragged_grouped_mm_supported``; the aligned factory otherwise pads to
-# 128 and slices the padded output before returning.
+# grouped_mm ragged (pad-free) path. Unaligned offs by itself proves the ragged impl
+# ran: the aligned impls' validate_offs raises on unaligned rather than declining.
 _GMM_RAGGED_CASES = [
     # (r, d1, d2, g) -- r >= 128 is a kernel constraint
     (384, 256, 128, 4),
@@ -2603,21 +2597,23 @@ class TestGroupedMMRagged:
         [{"bias": True}, {"out_dtype": torch.float32}],
         ids=["bias", "out_dtype"],
     )
-    def test_grouped_mm_declines_unsupported_options(self, opts):
-        """The kernels add no bias and always return the input dtype, so a call
-        asking for either must raise rather than silently ignoring it."""
-        from torch_neuronx.python_ops.grouped_mm import torch_grouped_mm
+    def test_ragged_declines_unsupported_options(self, opts):
+        """The kernels add no bias and always return the input dtype, so a call asking
+        for either must fall through rather than silently ignoring it."""
+        from torch_neuronx.python_ops.grouped_mm import GroupedMMRaggedNKIImpl
 
         r, d1, d2, g = 384, 256, 128, 4
         a = torch.empty((r, d1), dtype=torch.bfloat16, device="meta")
         b = torch.empty((g, d1, d2), dtype=torch.bfloat16, device="meta")
         offs = torch.empty((g,), dtype=torch.int32, device="meta")
+        impl = GroupedMMRaggedNKIImpl()
+
+        assert impl.can_handle(a, b, offs), "baseline call must be accepted"
 
         kwargs = dict(opts)
         if kwargs.pop("bias", None):
             kwargs["bias"] = torch.empty((d2,), dtype=torch.bfloat16, device="meta")
-        with pytest.raises(NotImplementedError):
-            torch_grouped_mm(a, b, offs, **kwargs)
+        assert not impl.can_handle(a, b, offs, **kwargs)
 
     def test_ragged_no_recompile_across_routings(self):
         """Routing is data, not shape: offs values change every step at fixed shapes."""

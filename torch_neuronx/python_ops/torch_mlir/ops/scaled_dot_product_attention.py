@@ -5,8 +5,6 @@ import math
 import torch
 from torch._meta_registrations import alloc_with_matching_layout
 
-from torch_neuronx._sdpa_math import compute_attention, compute_attention_backward
-
 from ...base import AttentionOpImpl, ExecutionResult
 from ...tensor_layout_utils import match_layout
 from ..kernel import TorchMlirKernel
@@ -15,23 +13,6 @@ from ..kernel import TorchMlirKernel
 def generate_dropout_mask(
     dropout_mask_shape, dropout_p, device, philox_seed, philox_offset, backward=False
 ):
-    """Generate a dropout mask from the supplied Philox state.
-
-    Args:
-        dropout_mask_shape (tuple): Shape of the attention dropout mask.
-        dropout_p (float): Probability of dropping each attention weight.
-        device (torch.device): Device to receive the generated mask.
-        philox_seed (torch.Tensor): Serialized generator state used for sampling.
-        philox_offset (torch.Tensor): Philox offset accepted but unused for compatibility.
-        backward (bool, optional): Whether to preserve the process-wide CPU RNG state.
-            Defaults to ``False``.
-
-    Returns:
-        torch.Tensor or None: Boolean mask, or ``None`` when dropout is disabled.
-
-    Raises:
-        ValueError: If ``dropout_p`` is outside the interval ``[0, 1]``.
-    """
     if dropout_p < 0.0 or dropout_p > 1.0:
         raise ValueError(f"dropout probability has to be between 0 and 1, but got {dropout_p}")
 
@@ -53,18 +34,70 @@ def generate_dropout_mask(
     return dropout_mask
 
 
-class ScaledDotProductAttnMLIRImpl(AttentionOpImpl):
-    """Implement scaled dot-product attention with Torch-MLIR.
-
-    Args:
-        op_name (str): ATen operation name used to identify the compiled kernel.
+def compute_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_bias: torch.Tensor,
+    dropout_mask: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+    dropout_p: float,
+    mixed_precision: bool,
+):
     """
+    attention compute: softmax(Q @ K^T / sqrt(d)) @ V
+    """
+    orig_dtype = query.dtype
+    acc_dtype = torch.float32 if mixed_precision else orig_dtype
+
+    seq_len_q, seq_len_k = query.size(-2), key.size(-2)
+
+    logits = query @ key.transpose(-2, -1)
+    logits = logits.to(acc_dtype)
+    logits = logits * scale
+
+    if is_causal:
+        temp_mask = torch.ones(seq_len_q, seq_len_k, dtype=torch.bool, device=query.device).tril(
+            diagonal=0
+        )
+        logits = logits + torch.where(temp_mask, 0.0, float("-inf"))
+    elif attn_bias.numel() > 0:
+        logits = logits + attn_bias
+
+    # torch.logsumexp has MLIR lowering issues
+    max_logits = torch.max(logits, dim=-1, keepdim=True)[0]
+    # For queries where every key is masked, substitute 0 for the subtraction
+    # (so exp(-inf - 0) = 0) and 1 for the divisor, to avoid NaNs.
+    fully_masked = max_logits == float("-inf")
+    safe_max = torch.where(fully_masked, 0.0, max_logits)
+    exp_logits = torch.exp(logits - safe_max)
+    sum_exp = torch.sum(exp_logits, dim=-1, keepdim=True)
+    lse = max_logits.squeeze(-1) + torch.log(sum_exp.squeeze(-1))
+    safe_sum = torch.where(fully_masked, 1.0, sum_exp)
+    # softmax
+    probs = exp_logits / safe_sum
+
+    if dropout_p > 0.0 and dropout_mask.numel() > 0:
+        if dropout_p == 1.0:
+            probs = probs * dropout_mask
+        else:
+            probs = probs * dropout_mask / (1.0 - dropout_p)
+
+    probs = probs.to(orig_dtype)
+    output = probs @ value
+
+    return output, lse.to(torch.float32)
+
+
+class ScaledDotProductAttnMLIRImpl(AttentionOpImpl):
+    """Native torch attention decomposed"""
 
     def __init__(self, op_name: str):
         self.kernel = TorchMlirKernel(
             compute_attention,
             op_name,
-            static_argnums=(5, 6, 7),  # scale, is_causal, dropout_p
+            static_argnums=(5, 6, 7, 8),  # scale, is_causal, dropout_p, mixed_precision
         )
         self.op_name = op_name
 
@@ -79,27 +112,7 @@ class ScaledDotProductAttnMLIRImpl(AttentionOpImpl):
         return_debug_mask: bool = False,
         scale: float | None = None,
     ) -> bool:
-        """Check whether the forward MLIR implementation supports the inputs.
-
-        Args:
-            query (torch.Tensor): Query tensor to inspect.
-            key (torch.Tensor): Key tensor to inspect.
-            value (torch.Tensor): Value tensor to inspect.
-            attn_bias (torch.Tensor, optional): Additive bias. Defaults to ``None``.
-            dropout_p (float, optional): Requested dropout probability. Defaults to ``0.0``.
-            is_causal (bool, optional): Whether causal masking is requested. Defaults to
-                ``False``.
-            return_debug_mask (bool, optional): Whether a debug mask is requested. Defaults
-                to ``False``.
-            scale (float, optional): Scaling factor. Defaults to ``None``.
-
-        Returns:
-            bool: ``True`` when the base predicate accepts the request and query, key,
-            and value are same-dtype, four-dimensional Neuron device tensors.
-
-        Raises:
-            RuntimeError: If query heads are not divisible by key/value heads.
-        """
+        """Check if MLIR implementation can handle inputs"""
         if not super().can_handle(
             query, key, value, attn_bias, dropout_p, is_causal, return_debug_mask, scale
         ):
@@ -168,6 +181,7 @@ class ScaledDotProductAttnMLIRImpl(AttentionOpImpl):
                 scale,
                 is_causal,
                 dropout_p,
+                True,  # mixed_precision
             )
 
             # Match output layout to query, same as
@@ -195,11 +209,7 @@ class ScaledDotProductAttnMLIRImpl(AttentionOpImpl):
             return ExecutionResult(success=False, error_msg=str(e))
 
     def get_lower_func(self):
-        """Return the MLIR SDPA forward lowering callable.
-
-        Returns:
-            Callable: Function that lowers C++ dispatch inputs to a lowering result.
-        """
+        """Return a lower function for C++ dispatch of MLIR SDPA forward."""
 
         def _mlir_sdpa_fwd_traceable(
             query,
@@ -255,6 +265,7 @@ class ScaledDotProductAttnMLIRImpl(AttentionOpImpl):
                 scale,
                 is_causal,
                 dropout_p,
+                True,
             )
 
             # Match the 7-element tuple format expected by DispatchNkiImpl
@@ -279,15 +290,6 @@ class ScaledDotProductAttnMLIRImpl(AttentionOpImpl):
         )
 
         def mlir_sdpa_fwd_lower(*args, **kwargs):
-            """Lower SDPA forward inputs or emit an empty meta result.
-
-            Args:
-                *args (Any): Positional SDPA forward arguments.
-                **kwargs (Any): Keyword SDPA forward arguments.
-
-            Returns:
-                LoweringResult: Lowered StableHLO metadata for the forward operation.
-            """
             query = args[0] if args else kwargs.get("query")
             if query.device.type == "meta":
                 return LoweringResult(
@@ -301,18 +303,94 @@ class ScaledDotProductAttnMLIRImpl(AttentionOpImpl):
         return mlir_sdpa_fwd_lower
 
 
-class ScaledDotProductAttnBackwardMLIRImpl(AttentionOpImpl):
-    """Implement scaled dot-product attention backward with Torch-MLIR.
+def compute_attention_backward(
+    grad_out: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_bias: torch.Tensor,
+    dropout_mask: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+    dropout_p: float,
+    mixed_precision: bool,
+):
+    orig_dtype = query.dtype
+    acc_dtype = torch.float32 if mixed_precision else orig_dtype
 
-    Args:
-        op_name (str): ATen operation name used to identify the compiled kernel.
-    """
+    grad_out = grad_out.to(acc_dtype)
+    query = query.to(acc_dtype)
+    key = key.to(acc_dtype)
+    value = value.to(acc_dtype)
+    out = out.to(acc_dtype)
+    lse = lse.to(acc_dtype)
+    if attn_bias is not None:
+        attn_bias = attn_bias.to(acc_dtype)
+
+    logits = query @ key.transpose(-2, -1) * scale
+
+    if is_causal:
+        seq_len_q, seq_len_k = logits.shape[-2:]
+        temp_mask = torch.ones(seq_len_q, seq_len_k, dtype=torch.bool, device=query.device).tril(
+            diagonal=0
+        )
+        logits = logits.masked_fill(temp_mask.logical_not(), float("-inf"))
+    elif attn_bias is not None:
+        logits = logits + attn_bias
+
+    # For queries where every key is masked, lse is -inf and logits is -inf,
+    # so (logits - lse) would be NaN. Substitute 0 for the lse and zero out
+    # probs on those rows to avoid NaNs (mirrors the forward path).
+    fully_masked = lse == float("-inf")
+    safe_lse = torch.where(fully_masked, 0.0, lse)
+    probs = torch.exp(logits - safe_lse.unsqueeze(-1))
+    probs = torch.where(fully_masked.unsqueeze(-1), 0.0, probs)
+
+    if dropout_p > 0.0 and dropout_mask.numel() > 1:
+        if dropout_p == 1.0:
+            probs = probs * dropout_mask
+        else:
+            probs = probs * dropout_mask / (1.0 - dropout_p)
+
+    grad_v = probs.transpose(-2, -1) @ grad_out
+    grad_out_v = grad_out @ value.transpose(-2, -1)
+    # Preserve the full-context reduction order while adding contributions
+    # from other ring/CP blocks through the global output residual.
+    local_out = probs @ value
+    sum_reduction = (grad_out_v * probs).sum(dim=-1, keepdim=True) + (
+        grad_out * (out - local_out)
+    ).sum(dim=-1, keepdim=True)
+    ds = probs * (grad_out_v - sum_reduction) * scale
+
+    if is_causal:
+        seq_len_q, seq_len_k = ds.shape[-2:]
+        temp_mask = torch.ones(seq_len_q, seq_len_k, dtype=torch.bool, device=query.device).tril(
+            diagonal=0
+        )
+        ds = ds.masked_fill(temp_mask.logical_not(), 0.0)
+
+    grad_q = ds @ key
+    grad_k = ds.transpose(-2, -1) @ query
+
+    grad_attn_bias = ds.to(orig_dtype) if attn_bias is not None else None
+
+    grad_q = grad_q.to(orig_dtype)
+    grad_k = grad_k.to(orig_dtype)
+    grad_v = grad_v.to(orig_dtype)
+
+    return grad_q, grad_k, grad_v, grad_attn_bias
+
+
+class ScaledDotProductAttnBackwardMLIRImpl(AttentionOpImpl):
+    """Attention backward compute"""
 
     def __init__(self, op_name: str):
         self.kernel = TorchMlirKernel(
             compute_attention_backward,
             op_name,
-            static_argnums=(8, 9, 10),  # scale, is_causal, dropout_p
+            static_argnums=(8, 9, 10, 11),  # scale, is_causal, dropout_p, mixed_precision
         )
         self.op_name = op_name
 
@@ -336,33 +414,7 @@ class ScaledDotProductAttnBackwardMLIRImpl(AttentionOpImpl):
         philox_offset: torch.Tensor | None = None,
         scale: float | None = None,
     ) -> bool:
-        """Return whether the backward MLIR implementation supports the inputs.
-
-        Args:
-            grad_out (torch.Tensor): Attention-output gradient to inspect.
-            query (torch.Tensor): Query passed to the base support predicate.
-            key (torch.Tensor): Key passed to the base support predicate.
-            value (torch.Tensor): Value passed to the base support predicate.
-            attn_bias (torch.Tensor): Compatibility argument; not inspected.
-            grad_input_mask (list[bool]): Compatibility argument; not inspected.
-            out (torch.Tensor): Forward attention output to inspect.
-            logsumexp (torch.Tensor): Forward log-sum-exp tensor to inspect.
-            cum_seq_q (torch.Tensor): Compatibility argument; not inspected.
-            cum_seq_k (torch.Tensor): Compatibility argument; not inspected.
-            max_q (int): Compatibility argument; not inspected.
-            max_k (int): Compatibility argument; not inspected.
-            dropout_p (float, optional): Unused. Defaults to ``0.0``.
-            is_causal (bool, optional): Unused. Defaults to ``False``.
-            philox_seed (torch.Tensor, optional): Unused. Defaults to ``None``.
-            philox_offset (torch.Tensor, optional): Unused. Defaults to ``None``.
-            scale (float, optional): Unused. Defaults to ``None``.
-
-        Returns:
-            bool: Whether all base, device, dtype, rank, and shape checks pass.
-
-        Raises:
-            RuntimeError: If query heads are not divisible by key/value heads.
-        """
+        """Check if MLIR backward can handle inputs."""
         if not super().can_handle(query, key, value):
             return False
 
@@ -447,6 +499,7 @@ class ScaledDotProductAttnBackwardMLIRImpl(AttentionOpImpl):
                 scale,
                 is_causal,
                 dropout_p,
+                True,  # mixed_precision
             )
 
             # Reduce GQA gradients
@@ -465,11 +518,7 @@ class ScaledDotProductAttnBackwardMLIRImpl(AttentionOpImpl):
             return ExecutionResult(success=False, error_msg=str(e))
 
     def get_lower_func(self):
-        """Return the MLIR SDPA backward lowering callable.
-
-        Returns:
-            Callable: Function that lowers C++ dispatch inputs to a lowering result.
-        """
+        """Return a lower function for C++ dispatch of MLIR SDPA backward."""
 
         def _mlir_sdpa_bwd_traceable(
             grad_out,
@@ -519,6 +568,7 @@ class ScaledDotProductAttnBackwardMLIRImpl(AttentionOpImpl):
                 scale,
                 is_causal,
                 dropout_p,
+                True,
             )
 
             if q_heads != kv_heads:
@@ -545,15 +595,6 @@ class ScaledDotProductAttnBackwardMLIRImpl(AttentionOpImpl):
         )
 
         def mlir_sdpa_bwd_lower(*args, **kwargs):
-            """Lower SDPA backward inputs or emit an empty meta result.
-
-            Args:
-                *args (Any): Positional SDPA backward arguments.
-                **kwargs (Any): Keyword SDPA backward arguments.
-
-            Returns:
-                LoweringResult: Lowered StableHLO metadata for the backward operation.
-            """
             query = args[1] if len(args) > 1 else kwargs.get("query")
             if query.device.type == "meta":
                 return LoweringResult(

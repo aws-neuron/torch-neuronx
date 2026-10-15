@@ -125,7 +125,6 @@ def _reshape_output(outputs, original_args):
 
 
 def register():
-    """Register the dynamic boolean and floating-point logical-AND adapter."""
     register_dynamic_nki(
         "logical_and",
         DynamicNkiEntry(

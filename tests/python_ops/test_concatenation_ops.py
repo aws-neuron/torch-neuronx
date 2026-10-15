@@ -503,7 +503,8 @@ class TestConcatenationNullTensorPtrRegression:
 
     Validates that IrNodeManager::CreateNodeFromOperationContext properly
     propagates TensorDataRef (including NeuronTensorPtr) so concatenated
-    kernels have valid tensor backing.
+    kernels have valid tensor backing for both lazy-alloc and non-lazy-alloc
+    execution paths.
     """
 
     @skip_if_concatenation_disabled()

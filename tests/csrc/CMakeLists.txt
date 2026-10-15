@@ -20,6 +20,7 @@ add_library(test_mocks STATIC
     mocks/MockCopyUtils.cpp
     mocks/MockCopyUtils.h
     mocks/MockNRTHandler.cpp
+    mocks/MockPythonUtils.cpp
     mocks/MockOperationExecutionEngine.h
     mocks/MockStreamImpl.h
 )

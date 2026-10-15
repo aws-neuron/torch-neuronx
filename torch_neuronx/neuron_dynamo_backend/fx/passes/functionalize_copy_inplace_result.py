@@ -73,15 +73,17 @@ class _CopyInplaceMutation(NamedTuple):
 
 
 class FunctionalizeCopyInplacePass(NeuronFXPass):
-    """Functionalize input ``copy_`` operations and record output aliases.
+    """
+    Pass that detects and records input-output mutation relationships.
 
-    Args:
-        state (NeuronFXPassState, optional): Shared FX-pass state used to record output
-            mutations. Defaults to ``None``.
+    Handles copy_ pattern: removes copy_ ops and adds an output for each
+    mutation result the graph does not already return.
 
-    Note:
-        Removes ``copy_`` nodes whose destination is an input, prepends unreturned mutation
-        results, and records pass-through and mutation outputs for buffer reuse.
+    Records mutation info mapping outputs to their source inputs,
+    enabling compiler buffer optimizations (e.g., buffer reuse).
+
+    Note: "Mutation lineage" is tracked, not strict aliasing. A clone breaks
+    aliasing but we still track that the output derives from mutating the input.
     """
 
     def __init__(self, state: NeuronFXPassState | None = None):
@@ -91,14 +93,6 @@ class FunctionalizeCopyInplacePass(NeuronFXPass):
         self.added_mutation_output_indices: list[int] = []
 
     def call(self, gm: GraphModule) -> PassResult:
-        """Functionalize input copies and collect graph output relationships.
-
-        Args:
-            gm (GraphModule): Graph module to inspect and potentially modify.
-
-        Returns:
-            PassResult: The graph module and whether any ``copy_`` node was removed.
-        """
         self.mutation_info = AliasingInfo()
         self.passthrough_info = AliasingInfo()
         self.added_mutation_output_indices = []
@@ -412,17 +406,9 @@ class FunctionalizeCopyInplacePass(NeuronFXPass):
         return None
 
     def get_mutation_info(self) -> AliasingInfo:
-        """Return detected input-mutation output relationships.
-
-        Returns:
-            AliasingInfo: Mutation aliases collected by the latest pass invocation.
-        """
+        """Return the detected mutation information."""
         return self.mutation_info
 
     def get_passthrough_info(self) -> AliasingInfo:
-        """Return detected input pass-through output relationships.
-
-        Returns:
-            AliasingInfo: Pass-through aliases collected by the latest pass invocation.
-        """
+        """Return the detected pass-through information."""
         return self.passthrough_info

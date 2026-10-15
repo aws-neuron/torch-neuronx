@@ -37,30 +37,6 @@ module {
     %0 = torch.aten.silu %arg0 : !torch.vtensor<[4,5],f32> -> !torch.vtensor<[4,5],f32>
     return %0 : !torch.vtensor<[4,5],f32>
   }
-
-  // CHECK-LABEL:   func.func @test_neuron_erf(
-  // CHECK-SAME:                    %[[VAL_0:.*]]: !torch.vtensor<[4,5],f32>) -> !torch.vtensor<[4,5],f32> {
-  // CHECK:           %[[VAL_1:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[4,5],f32> -> tensor<4x5xf32>
-  // CHECK:           %[[VAL_2:.*]] = stablehlo.custom_call @AwsNeuronErf(%[[VAL_1]]) : (tensor<4x5xf32>) -> tensor<4x5xf32>
-  // CHECK:           %[[VAL_3:.*]] = torch_c.from_builtin_tensor %[[VAL_2]] : tensor<4x5xf32> -> !torch.vtensor<[4,5],f32>
-  // CHECK:           return %[[VAL_3]] : !torch.vtensor<[4,5],f32>
-  // CHECK:         }
-  func.func @test_neuron_erf(%arg0: !torch.vtensor<[4,5],f32>) -> !torch.vtensor<[4,5],f32> {
-    %0 = torch.aten.erf %arg0 : !torch.vtensor<[4,5],f32> -> !torch.vtensor<[4,5],f32>
-    return %0 : !torch.vtensor<[4,5],f32>
-  }
-
-  // bf16 is the dtype that matters here: it is what the hand-rolled GELU in the
-  // vision encoders feeds to erf.
-  // CHECK-LABEL:   func.func @test_neuron_erf_bf16(
-  // CHECK:           %[[VAL_1:.*]] = torch_c.to_builtin_tensor %{{.*}} : !torch.vtensor<[4,5],bf16> -> tensor<4x5xbf16>
-  // CHECK:           %[[VAL_2:.*]] = stablehlo.custom_call @AwsNeuronErf(%[[VAL_1]]) : (tensor<4x5xbf16>) -> tensor<4x5xbf16>
-  // CHECK:           %[[VAL_3:.*]] = torch_c.from_builtin_tensor %[[VAL_2]] : tensor<4x5xbf16> -> !torch.vtensor<[4,5],bf16>
-  // CHECK:           return %[[VAL_3]] : !torch.vtensor<[4,5],bf16>
-  func.func @test_neuron_erf_bf16(%arg0: !torch.vtensor<[4,5],bf16>) -> !torch.vtensor<[4,5],bf16> {
-    %0 = torch.aten.erf %arg0 : !torch.vtensor<[4,5],bf16> -> !torch.vtensor<[4,5],bf16>
-    return %0 : !torch.vtensor<[4,5],bf16>
-  }
 }
 
 // -----

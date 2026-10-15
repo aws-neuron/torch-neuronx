@@ -325,15 +325,3 @@ class TestAddCompositeOp:
         t = torch.ones(5, device=device, dtype=torch.int32)
         with pytest.raises(RuntimeError):
             t.addcdiv_(t, t, value=1)
-
-    @pytest.mark.parametrize("value", [0.5, 0.1, 2.0])
-    @pytest.mark.parametrize("dtype", [torch.int32, torch.int16])
-    def test_addcmul_integer_dtype_float_value(self, value, dtype):
-        """addcmul with integer tensors and float value keeps integer dtype."""
-        x = torch.tensor([1, 2, 3], dtype=dtype, device="neuron")
-        t1 = torch.tensor([4, 5, 6], dtype=dtype, device="neuron")
-        t2 = torch.tensor([7, 8, 9], dtype=dtype, device="neuron")
-        r_n = torch.addcmul(x, t1, t2, value=value)
-        r_c = torch.addcmul(x.cpu(), t1.cpu(), t2.cpu(), value=value)
-        assert r_n.dtype == r_c.dtype, f"dtype: {r_n.dtype} vs {r_c.dtype}"
-        torch.testing.assert_close(r_n.cpu(), r_c)

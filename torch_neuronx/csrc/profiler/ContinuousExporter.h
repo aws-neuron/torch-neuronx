@@ -2,50 +2,12 @@
 
 #include <nrt/nrt_status.h>
 
-#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
-#include <optional>
 #include <thread>
 
 namespace at::neuron {
-
-// Immutable inputs copied from the session config into its export worker.
-struct TimeExportConfig {
-  std::chrono::nanoseconds interval{};
-  uint32_t mask{0};
-};
-
-// Tracks periodic request opportunities on a monotonic clock. Missed ticks coalesce.
-// The worker owns this value and guards its deadline with the existing export mutex.
-class TimeExportPolicy {
- public:
-  using Clock = std::chrono::steady_clock;
-  using TimePoint = std::chrono::time_point<Clock, std::chrono::nanoseconds>;
-
-  // Copies the interval and mask. start() establishes the first deadline.
-  explicit TimeExportPolicy(const TimeExportConfig& config);
-  // Arms a fresh schedule at now + interval. Invalid deadlines disable the timer.
-  void start(const TimePoint& now);
-  // An absent deadline means automatic scheduling is disabled.
-  const std::optional<TimePoint>& nextDeadline() const { return nextDeadline_; }
-  /**
-   * Update the timer schedule and pending work.
-   * Advance to the next future deadline. Merge expired ticks before clearing completed bits.
-   * @param now Monotonic timestamp used to skip directly to the next future deadline.
-   * @param pendingMask Requests already held by the worker.
-   * @param completedMask Bits covered by the completed attempt, or zero before an attempt.
-   * @return Pending bits that still need an export attempt.
-   */
-  uint32_t updateScheduleAndPendingMask(const TimePoint& now, uint32_t pendingMask,
-                                        uint32_t completedMask = 0);
-
- private:
-  std::chrono::nanoseconds interval_;
-  uint32_t mask_;
-  std::optional<TimePoint> nextDeadline_;
-};
 
 // Captures the status export-request-submission - the async version.
 // Keep members and values in lock-step with torch_neuronx.profiling.ExportStatus.
@@ -61,18 +23,13 @@ enum class ExportStatus {
 // NRT's nrt_inspect_export_mask_t (ContinuousExporter.cpp); keep members in lock-step
 // with torch_neuronx.profiling.InspectExportMask. When adding a bit, also widen
 // kSupportedInspectExportMask if the async path accepts it.
-// System export writes part files. Device export stages HBM notifications in host
-// memory; NRT writes the NTFF at session end.
 enum class InspectExportMask : uint32_t {
   SystemProfile = 1U,
-  DeviceProfile = 2U,
-  All = SystemProfile | DeviceProfile,
 };
 
 // container for parsed from custom_profiler_config, specific to profile export API.
 struct ExportConfig {
   bool enabled{false};  // continuous_export:true — construct + start the async worker
-  std::optional<TimeExportConfig> timePolicy;
 };
 
 // Owns the background export thread that services asynchronous drain requests.
@@ -85,8 +42,6 @@ struct ExportConfig {
 class ContinuousExporter {
  public:
   ContinuousExporter() = default;
-  // Copies an optional timer config; the session keeps no shared scheduling state.
-  explicit ContinuousExporter(const ExportConfig& config);
   virtual ~ContinuousExporter();
 
   ContinuousExporter(const ContinuousExporter&) = delete;
@@ -129,8 +84,6 @@ class ContinuousExporter {
   };
 
   void exportLoop();
-  // Requires exportMutex_. Fold timer ticks and completed bits into the request latch.
-  void updatePendingRequests(uint32_t completedMask = 0);
 
   // Background thread running exportLoop(); joined by stop().
   std::thread exportThread_;
@@ -146,7 +99,6 @@ class ContinuousExporter {
   bool exportRequested_{false};
   // Accumulated mask bits (OR of all latched requests); drained and cleared with the latch.
   uint32_t pendingMask_{0};
-  std::optional<TimeExportPolicy> timePolicy_;  // guarded by exportMutex_
 };
 
 // Process-global bridge between the Python bindings and the (single) active session.
@@ -161,7 +113,5 @@ ExportStatus requestActiveExport(uint32_t mask);
 // status verbatim. NRT owns mask validation, the no-session no-op, and serialization
 // against begin/stop/other exports (its internal global_lock).
 NRT_STATUS exportNow(uint32_t mask);
-// True for a nonzero mask accepted by this build's asynchronous worker.
-bool isSupportedInspectExportMask(uint32_t mask);
 
 }  // namespace at::neuron

@@ -330,20 +330,10 @@ def _reshape_contiguous_output(outputs, original_args):
 # ── shared compile path ──────────────────────────────────────────────────────
 def _make_compile_fn(graph_prefix):
     def compile_fn(compile_key) -> tuple[bytes, str]:
-        """Compile a cast or strided-copy NEFF for a compile key.
+        """Compile at [128, H] for one (H, src_dtype, dst_dtype); M dynamic.
 
-        Args:
-            compile_key (tuple): Kernel kind and baked shape and dtype values.
-
-        Returns:
-            tuple[bytes, str]: Serialized HLO bytes and the compilation cache key.
-
-        Note:
-            The graph name carries the target dtype because the NEFF cache key uses
-            only the graph name and input specifications; omitting it would collide
-            ``bf16``-to-``fp16`` and ``bf16``-to-``fp32`` entries. Contiguous casts
-            compile at ``[128, H]`` while the runtime row count remains dynamic.
-        """
+        graph_name carries the target dtype because the NEFF cache key is graph_name +
+        INPUT specs only: without it bf16->fp16 and bf16->fp32 get identical keys."""
         from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
 
         from .. import wrappers
@@ -383,7 +373,6 @@ def _make_compile_fn(graph_prefix):
 
 
 def register():
-    """Register dynamic cast, contiguous, and in-place copy adapters."""
     register_dynamic_nki(
         "_to_copy",
         DynamicNkiEntry(

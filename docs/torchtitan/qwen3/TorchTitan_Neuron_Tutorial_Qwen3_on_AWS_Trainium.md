@@ -6,14 +6,13 @@ TorchTitan on AWS Trainium (Trn2) instances.
 ## Setup TorchTitan
 
 ```shell
-cd /workspace
+cd ~
 git clone https://github.com/pytorch/torchtitan.git
 cd torchtitan
 git checkout 8d4f65a3167861dcc98c59343cdf00d8fe055c4d
-git apply /workspace/torch_neuron_eager/docs/torchtitan/neuron_attention_patch.diff
-pip install -r requirements.txt
-pip install -e .
-pip install --no-deps triton  # needed for the CPU build of torch
+git apply ~/torch-neuronx/docs/torchtitan/neuron_attention_patch.diff
+uv pip install --system -r requirements.txt
+uv pip install -e .
 ```
 
 The patch adds a `force_local_contiguous` workaround in the SDPA attention path for the PyTorch issue [#173041](https://github.com/pytorch/pytorch/issues/173041) so DTensor local shards are made contiguous under `torch.compile`. See

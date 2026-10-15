@@ -201,28 +201,20 @@ def _blob_key(cache_key: str, suffix: str) -> str:
 
 @dataclass
 class CachedHLO:
-    """Store serialized HLO and metadata required to resume compilation.
+    """One cache entry: the serialized HLO plus the metadata to resume compilation.
 
-    Args:
-        hlo_bytes (bytes): Eager StableHLO text, compile-mode MLIR bytecode, or
-            ``b""`` for an eager pure-input passthrough.
-        io_spec (object, optional): Input and output specification. Defaults to ``None``.
-        kept_input_indices (list, optional): Retained eager input indices. Defaults to ``[]``.
-        kept_output_indices (list, optional): Retained eager output indices. Defaults to ``[]``.
-        downcasted_outputs (object, optional): Eager downcast output metadata. Defaults to ``None``.
-        original_outputs (object, optional): Eager original output metadata. Defaults to ``None``.
-        passthrough_mappings (dict, optional): Eager output mappings. Defaults to ``{}``.
-        cast_spec (tuple, optional): Compile-mode cast specification. Defaults to ``()``.
-        has_collectives (bool, optional): Whether compile HLO has collectives.
-            Defaults to ``False``.
-        alias_buffer_map (dict, optional): Compile output-to-input aliases. Defaults to ``{}``.
-        pass_mutations (list, optional): Ordered compile-mode I/O mutations. Defaults to ``[]``.
+    Shared by both entry points. ``hlo_bytes`` is the serialized StableHLO exactly
+    as that mode's compiler consumes it (text for eager, bytecode for compile),
+    handed back verbatim, so a reader needs no MLIR bindings.
 
-    Note:
-        Fields unused by a mode retain their defaults. Eager metadata rebuilds the Python
-        calling convention; compile metadata resumes at the NEFF stage.
-        ``alias_buffer_map`` is also encoded as ``mhlo.input_output_alias`` but remains
-        structured for runtimes that do not parse IR.
+    The remaining fields are the union of what each path needs; a path leaves the
+    ones it does not use at their defaults. Eager populates the output-signature
+    fields (``kept_*_indices``, ``downcasted_outputs``, ``original_outputs``,
+    ``passthrough_mappings``) used to rebuild the Python calling convention.
+    torch.compile populates ``cast_spec``, ``has_collectives``,
+    ``alias_buffer_map`` and ``pass_mutations``; ``alias_buffer_map`` is also baked
+    into ``hlo_bytes`` as ``mhlo.input_output_alias`` but is surfaced as structured
+    data so a third-party runtime need not parse the IR to recover it.
     """
 
     hlo_bytes: bytes
@@ -243,18 +235,13 @@ class CachedHLO:
 
 
 def cache_enabled(*, compile_mode: bool) -> bool:
-    """Determine whether persistent HLO caching is enabled for a mode.
+    """Whether the cache is on for this mode.
 
-    Args:
-        compile_mode (bool): Select the ``torch.compile`` cache instead of the eager cache.
-
-    Returns:
-        bool: ``True`` when the selected cache is enabled and caching is not disabled.
-
-    Note:
-        Eager caching defaults on through ``TORCH_NEURONX_HLO_CACHE``, while
-        compile caching defaults off through ``TORCH_NEURONX_HLO_COMPILE_CACHE``; both
-        flags are captured at import. ``TORCH_NEURONX_NEFF_DISABLE_CACHE`` overrides them.
+    Both modes honour the shared TORCH_NEURONX_NEFF_DISABLE_CACHE kill switch,
+    then their own flag: TORCH_NEURONX_HLO_CACHE (eager, on by default) or
+    TORCH_NEURONX_HLO_COMPILE_CACHE (compile, off by default). Both flags are
+    snapshotted at import; a test toggles the module-level `_enabled` /
+    `_compile_enabled` directly.
     """
     if is_caching_disabled():
         return False
@@ -262,18 +249,12 @@ def cache_enabled(*, compile_mode: bool) -> bool:
 
 
 def get(cache_key: str, *, compile_mode: bool = False) -> CachedHLO | None:
-    """Load a persistent HLO cache entry.
+    """Load a cache entry from disk. Returns None on miss or any error.
 
-    Args:
-        cache_key (str): Base key identifying the cache entry.
-        compile_mode (bool, optional): Read compile-mode metadata. Defaults to ``False``.
-
-    Returns:
-        CachedHLO or None: Restored entry, or ``None`` when disabled or unavailable.
-
-    Note:
-        Stored HLO bytes are returned verbatim without MLIR bindings. Missing blobs,
-        integrity failures, and all read or deserialization errors are treated as misses.
+    Populates whichever CachedHLO fields the stored manifest carries, so an eager
+    entry comes back with the output-signature metadata and a compile entry with
+    the NEFF-resume metadata. ``hlo_bytes`` is returned verbatim; no MLIR bindings
+    are needed to read an entry.
     """
     if not cache_enabled(compile_mode=compile_mode):
         return None
@@ -315,18 +296,11 @@ def get(cache_key: str, *, compile_mode: bool = False) -> CachedHLO | None:
 
 
 def put(cache_key: str, entry: CachedHLO, *, compile_mode: bool = False) -> None:
-    """Store a persistent HLO cache entry using first-writer-wins semantics.
+    """Store a cache entry to disk. First-writer-wins.
 
-    Args:
-        cache_key (str): Base key identifying the cache entry.
-        entry (CachedHLO): Serialized HLO and metadata to store.
-        compile_mode (bool, optional): Store compile-mode metadata. Defaults to ``False``.
-
-    Note:
-        Only metadata used by the selected mode is serialized, so eager and compile modes
-        produce different manifests under one schema. Disabled caching or an existing
-        manifest returns without writing. Serialization and storage exceptions are
-        swallowed, although a storage failure can leave one of the two blobs behind.
+    Serializes only the fields the given mode populates, so an eager entry and a
+    compile entry produce different manifests under the same schema. Failures are
+    swallowed: a cache write must not fail a lowering that already succeeded.
     """
     if not cache_enabled(compile_mode=compile_mode):
         return
@@ -406,25 +380,26 @@ def compute_fx_cache_key(
     alias_fingerprint: str = "",
     use_tensorizer: bool = False,
 ) -> str:
-    """Compute a cache key for the StableHLO produced by lowering an FX graph.
+    """Base cache key for the StableHLO that lowering ``gm`` would produce.
 
-    Args:
-        gm (torch.fx.GraphModule): FX graph whose lowering is cached.
-        run_fx_passes (bool, optional): Include whether FX passes run. Defaults to ``True``.
-        alias_fingerprint (str, optional): Caller aliasing contribution. Defaults to ``""``.
-        use_tensorizer (bool, optional): Include tensorizer legalization. Defaults to ``False``.
+    Covers everything that changes the lowered StableHLO:
 
-    Returns:
-        str: SHA-256 key for the expected StableHLO bytes.
+    * the FX graph and its lifted constants, via ``_graph_hash`` (torch's
+      ``compiled_fx_graph_hash``),
+    * ``run_fx_passes``,
+    * the platform target and logical NC count. The FX passes read these while
+      lowering -- flex-attention bakes ``grid: [lnc]`` into the graph -- so the
+      StableHLO is target-specific even though the C++ CompilationCacheKey also
+      folds them into the downstream NEFF key,
+    * ``alias_fingerprint``, the caller's aliasing contribution: it becomes
+      ``mhlo.input_output_alias`` on the module, and with ``run_fx_passes=False``
+      it is the only source of aliasing,
+    * ``use_tensorizer``, which legalizes StableHLO to Linalg and so changes the
+      lowered bytes,
+    * the source/package version hash.
 
-    Note:
-        The key covers its schema version, graph and lifted constants, FX-pass setting,
-        platform target, logical Neuron core count, alias fingerprint, tensorizer setting,
-        and source package version. FX passes can bake the target and core count into HLO,
-        although the downstream NEFF key also includes them. ``alias_fingerprint`` becomes
-        ``mhlo.input_output_alias`` and is the only alias source when passes are disabled.
-        Tensorizer legalization changes HLO to Linalg. Hashing the output instead would
-        perform the lowering this cache skips.
+    Keying on the StableHLO output instead would require the very lowering this
+    cache skips.
     """
     from torch_neuronx.utils import (
         get_logical_neuron_cores,

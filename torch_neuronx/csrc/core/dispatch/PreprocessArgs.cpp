@@ -1,11 +1,8 @@
 #include "torch_neuronx/csrc/core/dispatch/PreprocessArgs.h"
 
-#include <cstdint>
-
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/NeuronOpsApi.h"
-#include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
 #include "torch_neuronx/csrc/core/dispatch/Int64Policy.h"
 
@@ -62,26 +59,13 @@ static bool PreprocessSingleTensor(at::Tensor& t, const torch::Device& target_de
                                  " CPU 0-dim scalar tensor → create on device",
                                  " dtype=", src_dtype, " target_device=", target_device.str());
 
-    // Try the scalar device cache first — avoids allocation + H2D write on hit.
-    // Returns nullopt for oversized scalars, falling through to the copy path.
-    auto cached = c10_neuron::NeuronCachingAllocator::createCachedScalarTensor(
-        t.data_ptr(), t.element_size(), src_dtype, target_device.index());
-    if (cached.has_value()) {
-      t = std::move(*cached);
-      return true;
-    }
-
-    // Fallback: create on CPU then move to device.
+    // Extract scalar value and create on CPU first, then move to device.
     auto cpu_opts = torch::TensorOptions().dtype(src_dtype);
     auto scalar = t.item();
     if (scalar.isBoolean()) {
       t = torch::tensor(scalar.toBool(), cpu_opts).to(target_device);
     } else if (scalar.isIntegral(/*includeBool=*/false)) {
       t = torch::tensor(scalar.toLong(), cpu_opts).to(target_device);
-    } else if (scalar.isComplex()) {
-      // toDouble() throws on a complex scalar. cpu_opts already carries the
-      // complex dtype, so keep both the real and the imaginary part.
-      t = torch::tensor(scalar.toComplexDouble(), cpu_opts).to(target_device);
     } else {
       t = torch::tensor(scalar.toDouble(), cpu_opts).to(target_device);
     }
@@ -193,13 +177,6 @@ void PreprocessArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& s
       bool use_int64 = SupportsNativeInt64(op_name);
       auto val = arg.toInt();
       auto int_dtype = use_int64 ? torch::kInt64 : torch::kInt32;
-      size_t elem_sz = (int_dtype == torch::kInt64) ? sizeof(int64_t) : sizeof(int32_t);
-      auto cached = c10_neuron::NeuronCachingAllocator::createCachedScalarTensor(
-          &val, elem_sz, int_dtype, target_device.index());
-      if (cached.has_value()) {
-        args[i] = c10::IValue(std::move(*cached));
-        continue;
-      }
       auto t = torch::tensor(val, torch::TensorOptions().dtype(int_dtype)).to(target_device);
       args[i] = c10::IValue(std::move(t));
       TORCH_NEURONX_DISPATCH_DEBUG("[PreprocessArgs] ", debug_label, " int scalar → ", int_dtype,
@@ -208,13 +185,6 @@ void PreprocessArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& s
     }
     if (arg.isDouble() && convert_scalar) {
       auto val = arg.toDouble();
-      float fval = static_cast<float>(val);
-      auto cached = c10_neuron::NeuronCachingAllocator::createCachedScalarTensor(
-          &fval, sizeof(float), torch::kFloat32, target_device.index());
-      if (cached.has_value()) {
-        args[i] = c10::IValue(std::move(*cached));
-        continue;
-      }
       auto t = torch::tensor(val, torch::TensorOptions().dtype(torch::kFloat32)).to(target_device);
       args[i] = c10::IValue(std::move(t));
       TORCH_NEURONX_DISPATCH_DEBUG("[PreprocessArgs] ", debug_label,
@@ -230,41 +200,13 @@ void PreprocessArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& s
       auto scalar = arg.toScalar();
       torch::Tensor t;
       if (scalar.isBoolean()) {
-        bool bval = scalar.toBool();
-        auto cached = c10_neuron::NeuronCachingAllocator::createCachedScalarTensor(
-            &bval, sizeof(bool), torch::kBool, target_device.index());
-        if (cached.has_value()) {
-          args[i] = c10::IValue(std::move(*cached));
-          continue;
-        }
-        t = torch::tensor(bval, torch::TensorOptions().dtype(torch::kBool));
+        t = torch::tensor(scalar.toBool(), torch::TensorOptions().dtype(torch::kBool));
       } else if (scalar.isIntegral(/*includeBool=*/false)) {
         bool use_int64 = SupportsNativeInt64(op_name);
         auto int_dtype = use_int64 ? torch::kInt64 : torch::kInt32;
-        auto val = scalar.toLong();
-        size_t elem_sz = (int_dtype == torch::kInt64) ? sizeof(int64_t) : sizeof(int32_t);
-        auto cached = c10_neuron::NeuronCachingAllocator::createCachedScalarTensor(
-            &val, elem_sz, int_dtype, target_device.index());
-        if (cached.has_value()) {
-          args[i] = c10::IValue(std::move(*cached));
-          continue;
-        }
-        t = torch::tensor(val, torch::TensorOptions().dtype(int_dtype));
-      } else if (scalar.isComplex()) {
-        // A complex scalar has no real-valued tensor form. toDouble() throws here,
-        // so make a complex tensor and let the op handler validate or reject it.
-        t = torch::tensor(scalar.toComplexDouble(),
-                          torch::TensorOptions().dtype(torch::kComplexFloat));
+        t = torch::tensor(scalar.toLong(), torch::TensorOptions().dtype(int_dtype));
       } else {
-        auto val = scalar.toDouble();
-        float fval = static_cast<float>(val);
-        auto cached = c10_neuron::NeuronCachingAllocator::createCachedScalarTensor(
-            &fval, sizeof(float), torch::kFloat32, target_device.index());
-        if (cached.has_value()) {
-          args[i] = c10::IValue(std::move(*cached));
-          continue;
-        }
-        t = torch::tensor(val, torch::TensorOptions().dtype(torch::kFloat32));
+        t = torch::tensor(scalar.toDouble(), torch::TensorOptions().dtype(torch::kFloat32));
       }
       t = t.to(target_device);
       args[i] = c10::IValue(std::move(t));

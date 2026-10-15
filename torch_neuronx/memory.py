@@ -25,26 +25,29 @@ def _get_device_index(device: int | torch.device | None = None) -> int:
 
 
 def memory_stats(device: int | torch.device | None = None) -> dict[str, Any]:
-    """Return flat memory allocator statistics for a Neuron device.
+    """
+    Return a dictionary of memory allocator statistics for a device.
 
     Args:
-        device (int or torch.device, optional): Device to query. Defaults to the current device.
+        device: Device to get statistics for. Defaults to current device.
 
     Returns:
-        dict: Byte values at ``{allocated_bytes,reserved_bytes,active_bytes}.``
-            ``{all,large_pool,small_pool}.{current,peak,allocated,freed}``; allocator,
-            deferred-allocation, and scalar-cache counters; scalar cache size; and optional
-            per-category byte values at ``usage.<category>``.
+        Dictionary containing flat dot-separated keys:
+        - allocated_bytes.{pool}.{metric}: Total memory obtained from NRT
+        - reserved_bytes.{pool}.{metric}: Memory held in cache for reuse
+        - active_bytes.{pool}.{metric}: Memory in active use by tensors
+        - num_alloc_retries: Count of OOM retries after cache flush
+        - num_ooms: Count of final OOM failures
+        - num_tensor_frees: Count of tensor deallocations
+        - allocation_requests: Total allocation requests
+        - num_alloc_deferred: Count of kAllocs parked as Deferred after an OOM
+        - num_alloc_drain_retry_ok: Deferred kAllocs that succeeded on retry after
+          the stream drained
+        - num_alloc_drain_retry_fail: Deferred kAllocs whose retry also OOM'd and
+          escalated to cache-drain recovery.
 
-
-    Raises:
-        TypeError: If the runtime returns a non-dictionary byte category.
-
-    Note:
-        The binding provides only ``all`` totals; current pool values are derived
-        from snapshots. Other ``large_pool`` values mirror ``all`` and ``small_pool``
-        values are zero. ``num_allocator_cache_hits``, ``num_allocator_cache_misses``,
-        ``num_splits``, and ``num_merges`` from the binding are omitted.
+        Where pool is one of: all, large_pool, small_pool
+        and metric is one of: current, peak, allocated, freed
     """
     from torch_neuronx import _C
 
@@ -81,35 +84,32 @@ def memory_stats(device: int | torch.device | None = None) -> dict[str, Any]:
         "num_alloc_deferred",
         "num_alloc_drain_retry_ok",
         "num_alloc_drain_retry_fail",
-        "num_scalar_cache_hits",
-        "num_scalar_cache_misses",
-        "scalar_cache_size",
     ):
         flat[key] = raw.get(key, 0)
-
-    # Per-category HBM usage breakdown from the runtime
-    try:
-        breakdown = _C._nrt_get_memory_usage_breakdown(device_index)
-        for category, bytes_used in breakdown:
-            flat[f"usage.{category}"] = bytes_used
-    except Exception as e:
-        # The older runtime does not have this API. Skip the breakdown.
-        logger.debug(f"memory usage breakdown not available for device {device_index}: {e}")
 
     return flat
 
 
 def memory_stats_as_nested_dict(device: int | torch.device | None = None) -> dict[str, Any]:
-    """Return memory allocator statistics grouped into nested dictionaries.
+    """
+    Return memory statistics as a nested dictionary.
+
+    Same data as :func:`memory_stats` but organized hierarchically::
+
+        {
+            "allocated_bytes": {
+                "all": {"current": ..., "peak": ..., "allocated": ..., "freed": ...},
+                "large_pool": {...},
+                "small_pool": {...},
+            },
+            ...
+        }
 
     Args:
-        device (int or torch.device, optional): Device to query. Defaults to the
-            current device.
+        device: Device to get statistics for. Defaults to current device.
 
     Returns:
-        dict: Byte values nested by category, pool, and state; allocator,
-            deferred-allocation, and scalar-cache counters; scalar cache size; and an optional
-            ``usage`` mapping of runtime categories to byte values.
+        Nested dictionary of memory statistics.
     """
     flat = memory_stats(device)
     nested: dict[str, Any] = {}
@@ -133,17 +133,8 @@ def memory_stats_as_nested_dict(device: int | torch.device | None = None) -> dic
         "num_alloc_deferred",
         "num_alloc_drain_retry_ok",
         "num_alloc_drain_retry_fail",
-        "num_scalar_cache_hits",
-        "num_scalar_cache_misses",
-        "scalar_cache_size",
     ):
         nested[key] = flat.get(key, 0)
-
-    # Per-category HBM usage breakdown. The runtime supplies the categories.
-    # A key is present only on a runtime that supports the breakdown API.
-    for key, value in flat.items():
-        if key.startswith("usage."):
-            nested.setdefault("usage", {})[key[len("usage.") :]] = value
 
     return nested
 
@@ -194,70 +185,77 @@ def _compute_per_pool_current(device_index: int) -> dict[str, int]:
 
 
 def memory_allocated(device: int | torch.device | None = None) -> int:
-    """Return bytes currently occupied by allocated memory blocks.
+    """
+    Return current memory occupied by tensors in bytes.
+
+    This is the total memory currently held by the allocator,
+    including both active tensors and cached blocks.
 
     Args:
-        device (int or torch.device, optional): Device to query. Defaults to the
-            current device.
+        device: Device to query. Defaults to current device.
 
     Returns:
-        int: Current ``allocated_bytes.all`` value.
+        Current allocated bytes as an integer.
     """
     stats = memory_stats(device)
     return stats["allocated_bytes.all.current"]
 
 
 def max_memory_allocated(device: int | torch.device | None = None) -> int:
-    """Return peak allocated memory in bytes since the last reset.
+    """
+    Return peak memory occupied by tensors in bytes since last reset.
 
     Args:
-        device (int or torch.device, optional): Device to query. Defaults to the
-            current device.
+        device: Device to query. Defaults to current device.
 
     Returns:
-        int: Peak ``allocated_bytes.all`` value.
+        Peak allocated bytes as an integer.
     """
     stats = memory_stats(device)
     return stats["allocated_bytes.all.peak"]
 
 
 def memory_reserved(device: int | torch.device | None = None) -> int:
-    """Return bytes currently reserved by the caching allocator.
+    """
+    Return current memory held in the cache in bytes.
+
+    Note: Currently always returns 0 as caching is not implemented.
 
     Args:
-        device (int or torch.device, optional): Device to query. Defaults to the
-            current device.
+        device: Device to query. Defaults to current device.
 
     Returns:
-        int: Current ``reserved_bytes.all`` value.
+        Current reserved (cached) bytes as an integer.
     """
     stats = memory_stats(device)
     return stats["reserved_bytes.all.current"]
 
 
 def max_memory_reserved(device: int | torch.device | None = None) -> int:
-    """Return peak reserved memory in bytes since the last reset.
+    """
+    Return peak memory held in the cache in bytes since last reset.
+
+    Note: Currently always returns 0 as caching is not implemented.
 
     Args:
-        device (int or torch.device, optional): Device to query. Defaults to the
-            current device.
+        device: Device to query. Defaults to current device.
 
     Returns:
-        int: Peak ``reserved_bytes.all`` value.
+        Peak reserved (cached) bytes as an integer.
     """
     stats = memory_stats(device)
     return stats["reserved_bytes.all.peak"]
 
 
 def reset_peak_memory_stats(device: int | torch.device | None = None) -> None:
-    """Reset peak memory statistics to their current values.
+    """
+    Reset the peak memory statistics for a device.
+
+    After calling this, max_memory_allocated() and max_memory_reserved()
+    will return values relative to this point in time.
 
     Args:
-        device (int or torch.device, optional): Device whose peak statistics to
-            reset. Defaults to the current device.
-
-    Note:
-        Subsequent peak allocated and reserved values are measured from this point.
+        device: Device to reset stats for. Defaults to current device.
     """
     from torch_neuronx import _C
 
@@ -266,16 +264,13 @@ def reset_peak_memory_stats(device: int | torch.device | None = None) -> None:
 
 
 def reset_accumulated_memory_stats(device: int | torch.device | None = None) -> None:
-    """Reset accumulated memory allocator counters.
+    """
+    Reset the accumulated memory statistics for a device.
+
+    This resets counters like num_alloc_retries and num_ooms.
 
     Args:
-        device (int or torch.device, optional): Device whose counters to reset.
-            Defaults to the current device.
-
-    Note:
-        This resets all event counters, the scalar cache size, and the historical
-        ``allocated`` and ``freed`` totals, but leaves ``current`` and ``peak`` byte
-        values unchanged.
+        device: Device to reset stats for. Defaults to current device.
     """
     from torch_neuronx import _C
 
@@ -284,25 +279,19 @@ def reset_accumulated_memory_stats(device: int | torch.device | None = None) -> 
 
 
 def peak_memory_stats(device: int | torch.device | None = None) -> dict[str, Any]:
-    """Return the allocator snapshot captured at the allocation peak.
-
-    Args:
-        device (int or torch.device, optional): Device to query. Defaults to the
-            current device.
+    """
+    Return the memory stats snapshot captured at the moment allocated_bytes
+    last exceeded its previous peak. Automatically dumped on OOM.
 
     Returns:
-        dict: ``valid``; ``timestamp_ns`` in steady-clock nanoseconds; byte-valued
-            ``allocated_bytes``, ``reserved_bytes``, and ``active_bytes`` dictionaries
-            with ``current``, ``peak``, ``allocated``, and ``freed``; byte-valued
-            ``internal_fragmentation``; and counters ``num_alloc_retries``, ``num_ooms``,
-            ``num_tensor_frees``, ``allocation_requests``, ``num_allocator_cache_hits``,
-            ``num_allocator_cache_misses``, ``num_splits``, ``num_merges``,
-            ``num_alloc_deferred``, ``num_alloc_drain_retry_ok``, and
-            ``num_alloc_drain_retry_fail``.
-
-    Note:
-        The snapshot updates when allocated bytes exceed their previous peak, survives
-        ``reset_peak_memory_stats``, and is logged via ``TORCH_WARN`` on OOM.
+        Dictionary containing:
+        - valid: Whether a peak snapshot has been captured
+        - timestamp_ns: When the peak was recorded
+        - allocated_bytes: Block sizes at peak (dict with current/peak/allocated/freed)
+        - reserved_bytes: Segment sizes at peak
+        - active_bytes: Requested sizes at peak
+        - internal_fragmentation: allocated_bytes.current - active_bytes.current at peak
+        - num_alloc_retries, num_ooms, num_tensor_frees, allocation_requests
     """
     from torch_neuronx import _C
 
@@ -311,31 +300,36 @@ def peak_memory_stats(device: int | torch.device | None = None) -> dict[str, Any
 
 
 def memory_summary(device: int | torch.device | None = None, abbreviated: bool = False) -> str:
-    """Format a human-readable memory summary for a Neuron device.
+    """
+    Return a human-readable summary of memory usage for a device.
 
     Args:
-        device (int or torch.device, optional): Device to summarize. Defaults to the
-            current device.
-        abbreviated (bool, optional): Request abbreviated output. Currently has no
-            effect. Defaults to ``False``.
+        device: Device to summarize. Defaults to current device.
+        abbreviated: If True, return a shorter summary (not yet implemented).
 
     Returns:
-        str: Table of allocated, reserved, and active memory in binary units for
-            current, peak, allocated, and freed totals, plus allocation requests,
-            tensor frees, OOMs, allocation retries, and deferred-retry outcomes.
+        Formatted string showing memory statistics.
+
+    Example output::
+
+        ===========================================================================
+          Neuron Memory Summary, Device 0
+        ===========================================================================
+          Allocations: 1,234  |  Frees: 1,200
+          OOMs: 0  |  Alloc Retries: 0
+        ===========================================================================
+          Metric              | Current    | Peak       | Allocated  | Freed
+        ---------------------------------------------------------------------------
+          Allocated Memory   |   512 MiB  |   1.0 GiB  |   2.0 GiB  |   1.5 GiB
+          Reserved Memory    |   640 MiB  |   1.2 GiB  |   2.5 GiB  |   1.9 GiB
+          Active Memory      |   480 MiB  |   980 MiB  |   1.8 GiB  |   1.3 GiB
+        ===========================================================================
     """
     device_index = _get_device_index(device)
     stats = memory_stats(device_index)
 
     def format_bytes(b: int) -> str:
-        """Format a byte count using a binary unit.
-
-        Args:
-            b (int): Byte count to format.
-
-        Returns:
-            str: Byte count scaled from bytes through pebibytes.
-        """
+        """Format bytes with appropriate unit."""
         for unit in ["B", "KiB", "MiB", "GiB", "TiB"]:
             if abs(b) < 1024:
                 return f"{b:,.0f} {unit}"
@@ -469,27 +463,50 @@ def _record_memory_history_impl(
 
 
 def _snapshot(device: int | torch.device | None = None) -> dict[str, Any]:
-    """Capture current allocator segments and memory-event traces.
+    """
+    Capture a snapshot of the current memory state.
+
+    Returns a dictionary containing:
+    - segments: List of memory segments with their blocks
+    - device_traces: Per-device list of trace entries (if recording enabled)
+
+    Each segment contains:
+    - device: Device index
+    - address: Memory address
+    - total_size: Total segment size in bytes
+    - allocated_size: Allocated portion size
+    - active_size: Active (in-use) portion size
+    - stream: Stream ID where segment was allocated
+    - blocks: List of blocks within the segment
+
+    Each block contains:
+    - size: Block size in bytes
+    - requested_size: Originally requested size
+    - address: Block address
+    - state: "active_allocated" or "inactive"
+    - frames: Stack trace frames (if context recording enabled)
+
+    Each trace entry contains:
+    - action: Event type (alloc, free_requested, free_completed, etc.)
+    - device: Device index
+    - addr: Memory address
+    - size: Allocation size
+    - stream: Stream ID
+    - time_us: Timestamp in microseconds
+    - frames: Stack trace frames (if context recording enabled)
 
     Args:
-        device (int or torch.device, optional): Device selector. Currently ignored;
-            the snapshot includes all devices.
+        device: Device to snapshot (currently returns all devices).
 
     Returns:
-        dict: Contains ``segments`` and per-device ``device_traces``. Each segment has
-            ``device``, ``address``, ``total_size``, ``allocated_size``, ``active_size``,
-            ``stream``, ``is_small``, and ``blocks``. Each block has ``size``,
-            ``requested_size``, ``address``, ``state``, and ``frames``; state is
-            ``"active_allocated"`` or ``"inactive"``. Each trace has ``action``,
-            ``device``, ``addr``, ``size``, ``block_size``, ``stream``, ``time_us``,
-            and ``frames``. Segment and block size fields, ``size``, and ``block_size``
-            are bytes; ``time_us`` is microseconds. Frames are present when context
-            recording is enabled.
+        Dictionary with segments and device_traces.
 
-    Note:
-        Trace actions include ``alloc``, ``free_requested``, and ``free_completed``.
-        An ``oom`` trace adds ``device_free`` in bytes and uses ``addr`` for the failed
-        requested byte size rather than a memory address.
+    Example:
+        >>> import torch_neuronx
+        >>> torch_neuronx.memory._record_memory_history(True)
+        >>> x = torch.zeros(1000, device='neuron')
+        >>> snapshot = torch_neuronx.memory._snapshot()
+        >>> print(f"Segments: {len(snapshot['segments'])}")
     """
     from torch_neuronx import _C
 
@@ -497,24 +514,14 @@ def _snapshot(device: int | torch.device | None = None) -> dict[str, Any]:
 
 
 def segment_pool_analysis(device: int | torch.device | None = None) -> dict[str, Any]:
-    """Compute segment-pool fragmentation and efficiency statistics.
+    """Compute segment pool fragmentation and efficiency stats from the memory snapshot.
 
-    Args:
-        device (int or torch.device, optional): Device to analyze. Defaults to the
-            current device.
-
-    Returns:
-        dict: Counts ``free_chunks`` and ``num_segments``; byte values
-            ``largest_free``, ``total_free``, ``nrt_free``, ``total_hbm``,
-            ``internal_fragmentation``, ``external_fragmentation``, ``cached_free``,
-            ``address_span``, ``allocated_bytes``, ``reserved_bytes``, and
-            ``active_bytes``; ratios ``fragmentation_index`` and ``memory_density``.
-
-    Note:
-        Device HBM is queried only when the runtime is initialized; otherwise
-        ``total_hbm`` is ``0`` and ``fragmentation_index`` is ``None``. Memory
-        density uses reserved bytes and the segment address span and remains
-        available without querying device HBM.
+    Pulls device totals from :func:`_neuron_getDeviceProperties` when the
+    runtime is initialized in this process; otherwise falls back to
+    ``total_hbm = 0`` and reports ``fragmentation_index = None`` (we can't
+    meaningfully compute the ratio without the device's HBM ceiling).
+    ``memory_density`` is unaffected because it depends only on snapshot
+    state, not the device total.
     """
     from torch_neuronx import _C, is_neuron_runtime_initialized
 
@@ -615,16 +622,7 @@ def segment_pool_analysis(device: int | torch.device | None = None) -> dict[str,
 
 
 def segment_pool_analysis_summary(device: int | torch.device | None = None) -> str:
-    """Format segment-pool analysis for a Neuron device.
-
-    Args:
-        device (int or torch.device, optional): Device to analyze. Defaults to the
-            current device.
-
-    Returns:
-        str: Table of allocator bytes, free chunks, fragmentation, density, address
-            span, and segment count.
-    """
+    """Return a formatted string of the segment pool analysis."""
     s = segment_pool_analysis(device)
     frag = s["fragmentation_index"]
     frag_str = (f"{frag:.4f}" if frag is not None else "n/a").rjust(14)
@@ -752,21 +750,23 @@ def _collect_allocator_stats_per_device() -> list[dict[str, Any]]:
 
 
 def dump_allocator_stats(out_dir: str | None = None) -> str | None:
-    """Write per-rank allocator statistics to disk.
+    """Write per-rank allocator stats to disk.
+
+    Captures ``memory_stats`` and ``segment_pool_analysis`` for every visible
+    Neuron device into ``{out_dir}/allocator_stats_rank{rank}.json``. Intended
+    to be called by the worker process near the end of training (while the
+    runtime is still alive) so post-run tooling can aggregate per-rank values.
+
+    No-op when ``torch_neuronx.metrics.is_enabled()`` returns False — callers
+    opt in via the same knob they already use to enable other Neuron metrics.
 
     Args:
-        out_dir (str, optional): Destination directory. Defaults to
-            ``$TORCH_NEURONX_METRICS_DIR`` and then ``/tmp``.
+        out_dir: Destination directory. Defaults to ``$TORCH_NEURONX_METRICS_DIR``,
+            falling back to ``/tmp``.
 
     Returns:
-        str or None: Written JSON path, or ``None`` when metrics are disabled,
-            directory creation fails, collection setup raises, or writing fails.
-
-    Note:
-        Call this near the end of training while the runtime remains alive. It
-        attempts to synchronize the current device and records ``memory_stats`` and
-        ``segment_pool_analysis`` for the current worker; per-device collection
-        failures are represented by empty device data or dictionaries.
+        The path of the file that was written, or ``None`` if metrics are
+        disabled or writing failed.
     """
     try:
         from torch_neuronx import metrics

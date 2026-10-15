@@ -2,10 +2,7 @@
 
 import torch
 
-from torch_neuronx.python_ops.nki_kernels.foreach_norm import (
-    _has_nki_norm_kernels,
-    check_norm_inputs,
-)
+from torch_neuronx.python_ops.nki_kernels.foreach_norm import _has_nki_norm_kernels
 
 if _has_nki_norm_kernels:
     from torch_neuronx.python_ops.nki_kernels.foreach_norm import foreach_norm_nki
@@ -34,7 +31,6 @@ from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
 )
 
 from ..operation_registry import Preprocessing, register_aten
-from ..validation import check_bool_sub, check_broadcast_shapes, check_lerp_dtype
 
 # --- Validation helpers ---
 
@@ -74,7 +70,22 @@ def _check_tensors_scalars(tensors, scalars):
         raise RuntimeError("Tensor list must have same number of elements as scalar list.")
 
 
-_check_broadcastable_shapes = check_broadcast_shapes
+def _check_broadcastable_shapes(t1, t2):
+    if t1.shape == t2.shape:
+        return
+    try:
+        torch.broadcast_shapes(t1.shape, t2.shape)
+    except RuntimeError:
+        for dim in range(max(t1.ndim, t2.ndim)):
+            d1 = t1.shape[-(dim + 1)] if dim < t1.ndim else 1
+            d2 = t2.shape[-(dim + 1)] if dim < t2.ndim else 1
+            if d1 != d2 and d1 != 1 and d2 != 1:
+                actual_dim = max(t1.ndim, t2.ndim) - 1 - dim
+                raise RuntimeError(
+                    f"The size of tensor a ({d1}) must match the size of "
+                    f"tensor b ({d2}) at non-singleton dimension {actual_dim}"
+                ) from None
+        raise
 
 
 def _check_tensors_tensors(tensors1, tensors2):
@@ -118,17 +129,6 @@ def _make_div_inplace_validator(variant):
     def validate(tensors, other, *args, **kwargs):
         # Keep this preprocessor validation pure: device normalization belongs
         # to the operation factory and must not mutate inputs before an error.
-        """Validate arguments for an in-place foreach division overload.
-
-        Args:
-            tensors (list[torch.Tensor]): Destination tensors to divide.
-            other (object): Scalar, scalar tensor, scalar list, or tensor list divisor.
-            *args (object): Additional overload arguments, which are ignored.
-            **kwargs (object): Additional overload keyword arguments, which are ignored.
-
-        Raises:
-            RuntimeError: If an argument shape, length, or dtype is invalid.
-        """
         if variant == "tensor":
             _check_scalar_tensor(other)
 
@@ -154,10 +154,15 @@ def _make_div_inplace_validator(variant):
     return validate
 
 
-def _check_bool_sub(op, *operands):
+def _check_bool_sub(op, *tensor_lists):
     """Match Tensor.sub's rejection of subtraction involving bool tensors."""
-    if op == "sub":
-        check_bool_sub(*operands)
+    if op != "sub":
+        return
+    if any(t.dtype == torch.bool for tensors in tensor_lists for t in tensors):
+        raise RuntimeError(
+            "Subtraction, the `-` operator, with two bool tensors is not supported. "
+            "Use the `^` or `logical_xor()` operator instead."
+        )
 
 
 _DTYPE_NAMES = {}
@@ -219,25 +224,6 @@ def _replace_empty_promoted(tensors, dtype=None, scalars=None):
         torch.empty(t.shape, dtype=_target(t, s), device=t.device) if t.numel() == 0 else t
         for t, s in zip(tensors, scalars, strict=False)
     ]
-
-
-def _promote_sqrt_inputs(tensors, *, empty_only=False):
-    """Promote an integral input to float32, as sqrt does. Keep float and complex.
-
-    Retype an empty tensor by allocation, not by a convert: the compiler rejects
-    a convert on a 0-size tensor (NCC_ISPP060).
-    """
-    out = []
-    for t in tensors:
-        keep = t.dtype.is_floating_point or t.dtype.is_complex
-        if t.numel() == 0:
-            dtype = t.dtype if keep else torch.float32
-            out.append(torch.empty(t.shape, dtype=dtype, device=t.device))
-        elif keep or empty_only:
-            out.append(t)
-        else:
-            out.append(t.float())
-    return out
 
 
 def _promote_inside(op, tensors, scalars=None):
@@ -366,25 +352,7 @@ def _make_scalar_op(op):
     is_div = op == "div"
 
     def fn(tensors, scalar, out=None):
-        """Prepare an out-of-place foreach scalar operation for backend dispatch.
-
-        Args:
-            tensors (list[torch.Tensor]): Tensors to process elementwise.
-            scalar (Number): Scalar operand shared by every tensor.
-            out (list[torch.Tensor], optional): Unused registry output placeholder.
-                Defaults to ``None``.
-
-        Returns:
-            tuple: Compute function, normalized arguments, output keywords, and postprocessor.
-
-        Raises:
-            RuntimeError: If inputs are empty, span devices, or use Boolean subtraction.
-
-        Note:
-            Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-        """
         _check_tensors(tensors)
-        _check_bool_sub(op, tensors, scalar)
         # NOTE: do NOT eagerly promote the (non-empty) tensors here. compute_fn
         # promotes in-graph and infer_outputs_from_meta runs compute_fn, so the
         # inferred output dtype is already correct (bool x float -> float, ...).
@@ -404,15 +372,6 @@ def _make_scalar_op(op):
             tensors = _replace_empty(tensors)
 
         def compute_fn(tensors, scalar):
-            """Execute the foreach scalar operation with dtype promotion.
-
-            Args:
-                tensors (list[torch.Tensor]): Tensors to process elementwise.
-                scalar (Number): Scalar operand shared by every tensor.
-
-            Returns:
-                tuple[torch.Tensor, ...]: Elementwise operation results.
-            """
             tensors = _promote_inside(op, tensors, scalar)
             return _cast_results(op, nki_fn(tensors, scalar))
 
@@ -426,25 +385,7 @@ def _make_scalar_inplace_op(op):
     nki_fn = NKI_SCALAR_FNS[op]
 
     def fn(tensors, scalar, out=None):
-        """Prepare an in-place foreach scalar operation for backend dispatch.
-
-        Args:
-            tensors (list[torch.Tensor]): Tensors to update elementwise.
-            scalar (Number): Scalar operand shared by every tensor.
-            out (object, optional): Unused registry placeholder. Defaults to ``None``.
-
-        Returns:
-            tuple: Compute function, normalized arguments, aliased outputs, and postprocessor.
-
-        Raises:
-            RuntimeError: If inputs are empty, span devices, use Boolean subtraction,
-                or cannot store the result dtype.
-
-        Note:
-            Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-        """
         _check_tensors(tensors)
-        _check_bool_sub(op, tensors, scalar)
         _check_div_inplace_dtype(op, tensors)
         _check_inplace_dtype_casting(tensors, scalar)
         # Keep the list full-length: replace each empty with a fresh empty
@@ -455,15 +396,6 @@ def _make_scalar_inplace_op(op):
         tensors = _replace_empty(tensors)
 
         def compute_fn(tensors, scalar):
-            """Compute replacement values for an in-place foreach scalar operation.
-
-            Args:
-                tensors (list[torch.Tensor]): Destination tensors supplying current values.
-                scalar (Number): Scalar operand shared by every tensor.
-
-            Returns:
-                tuple[torch.Tensor, ...]: Replacement elementwise tensor values.
-            """
             return nki_fn(tensors, scalar)
 
         return compute_fn, (tensors, scalar), {"out": tuple(tensors)}, _void_postprocess
@@ -478,25 +410,6 @@ def _make_list_op(op):
     is_div = op == "div"
 
     def fn(tensors1, tensors2, *args, out=None, alpha=1):
-        """Prepare an out-of-place foreach tensor-list operation for backend dispatch.
-
-        Args:
-            tensors1 (list[torch.Tensor]): Left-hand tensor operands.
-            tensors2 (list[torch.Tensor]): Right-hand tensor operands.
-            *args (object): Additional overload arguments, which are ignored.
-            out (list[torch.Tensor], optional): Output tensors. Defaults to ``None``.
-            alpha (Number, optional): Multiplier for add or subtract operands. Defaults to ``1``.
-
-        Returns:
-            tuple: Compute function, normalized arguments, keywords, and postprocessor.
-
-        Raises:
-            RuntimeError: If tensor lists have incompatible devices, lengths, shapes,
-                or bool subtraction.
-
-        Note:
-            Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-        """
         _check_tensors_tensors(tensors1, tensors2)
         _check_bool_sub(op, tensors1, tensors2)
         # Both operands are tensors, so cross-dtype promotion is traced
@@ -508,16 +421,6 @@ def _make_list_op(op):
             tensors1 = _replace_empty(tensors1)
 
         def compute_fn(tensors1, tensors2, **kwargs):
-            """Execute the foreach tensor-list operation.
-
-            Args:
-                tensors1 (list[torch.Tensor]): Left-hand tensor operands.
-                tensors2 (list[torch.Tensor]): Right-hand tensor operands.
-                **kwargs (object): Operation keywords, including ``alpha`` when supported.
-
-            Returns:
-                tuple[torch.Tensor, ...]: Pairwise elementwise operation results.
-            """
             if is_div:
                 tensors1, tensors2 = _promote_div_pairs(tensors1, tensors2)
             if has_alpha:
@@ -546,24 +449,6 @@ def _make_list_inplace_op(op):
     has_alpha = op in HAS_ALPHA
 
     def fn(tensors1, tensors2, *args, out=None, alpha=1):
-        """Prepare an in-place foreach tensor-list operation for backend dispatch.
-
-        Args:
-            tensors1 (list[torch.Tensor]): Left-hand tensors to update.
-            tensors2 (list[torch.Tensor]): Right-hand tensor operands.
-            *args (object): Additional overload arguments, which are ignored.
-            out (object, optional): Unused registry placeholder. Defaults to ``None``.
-            alpha (Number, optional): Multiplier for add or subtract operands. Defaults to ``1``.
-
-        Returns:
-            tuple: Compute function, normalized arguments, aliased outputs, and postprocessor.
-
-        Raises:
-            RuntimeError: If inputs are incompatible or the destination dtype cannot store results.
-
-        Note:
-            Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-        """
         _check_tensors_tensors(tensors1, tensors2)
         _check_bool_sub(op, tensors1, tensors2)
         _check_div_inplace_dtype(op, tensors1)
@@ -572,16 +457,6 @@ def _make_list_inplace_op(op):
         tensors1 = _replace_empty(tensors1)
 
         def compute_fn(tensors1, tensors2, **kwargs):
-            """Compute replacement values for an in-place foreach tensor-list operation.
-
-            Args:
-                tensors1 (list[torch.Tensor]): Destination tensors supplying left-hand values.
-                tensors2 (list[torch.Tensor]): Right-hand tensor operands.
-                **kwargs (object): Operation keywords, including ``alpha`` when supported.
-
-            Returns:
-                tuple[torch.Tensor, ...]: Replacement pairwise tensor values.
-            """
             if has_alpha:
                 return nki_fn(tensors1, tensors2, kwargs.get("alpha", 1))
             return nki_fn(tensors1, tensors2)
@@ -600,25 +475,7 @@ def _make_scalarlist_op(op):
     is_div = op == "div"
 
     def fn(tensors, scalars, out=None):
-        """Prepare an out-of-place foreach scalar-list operation for backend dispatch.
-
-        Args:
-            tensors (list[torch.Tensor]): Tensors to process elementwise.
-            scalars (list[Number]): Per-tensor scalar operands.
-            out (list[torch.Tensor], optional): Output tensors. Defaults to ``None``.
-
-        Returns:
-            tuple: Compute function, normalized arguments, output keywords, and postprocessor.
-
-        Raises:
-            RuntimeError: If tensors are empty, span devices, differ in length from scalars,
-                or a subtraction operand is Boolean.
-
-        Note:
-            Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-        """
         _check_tensors_scalars(tensors, scalars)
-        _check_bool_sub(op, tensors, scalars)
         # Promotion is per (tensor, scalar) pair. No eager outside branch as in
         # _make_scalar_op: scalars stay Python numbers into compute_fn, so
         # _promote_inside there already yields the CPU-matching output dtype.
@@ -628,15 +485,6 @@ def _make_scalarlist_op(op):
             tensors = _replace_empty_promoted(tensors, scalars=scalars)
 
         def compute_fn(tensors, scalars):
-            """Execute the foreach scalar-list operation with dtype promotion.
-
-            Args:
-                tensors (list[torch.Tensor]): Tensors to process elementwise.
-                scalars (list[Number]): Per-tensor scalar operands.
-
-            Returns:
-                tuple[torch.Tensor, ...]: Per-tensor elementwise operation results.
-            """
             tensors = _promote_inside(op, tensors, scalars)
             return _cast_results(op, nki_fn(tensors, scalars))
 
@@ -652,25 +500,7 @@ def _make_scalarlist_inplace_op(op):
     nki_fn = NKI_SCALARLIST_FNS[op]
 
     def fn(tensors, scalars, out=None):
-        """Prepare an in-place foreach scalar-list operation for backend dispatch.
-
-        Args:
-            tensors (list[torch.Tensor]): Tensors to update elementwise.
-            scalars (list[Number]): Per-tensor scalar operands.
-            out (object, optional): Unused registry placeholder. Defaults to ``None``.
-
-        Returns:
-            tuple: Compute function, normalized arguments, aliased outputs, and postprocessor.
-
-        Raises:
-            RuntimeError: If inputs are empty, span devices, differ in length, use Boolean
-                subtraction, or cannot store results.
-
-        Note:
-            Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-        """
         _check_tensors_scalars(tensors, scalars)
-        _check_bool_sub(op, tensors, scalars)
         _check_div_inplace_dtype(op, tensors)
         _check_inplace_dtype_casting(tensors, scalars)
         # Keep the list full-length (see _make_scalar_inplace_op). scalars stays
@@ -678,15 +508,6 @@ def _make_scalarlist_inplace_op(op):
         tensors = _replace_empty(tensors)
 
         def compute_fn(tensors, scalars):
-            """Compute replacement values for an in-place foreach scalar-list operation.
-
-            Args:
-                tensors (list[torch.Tensor]): Destination tensors supplying current values.
-                scalars (list[Number]): Per-tensor scalar operands.
-
-            Returns:
-                tuple[torch.Tensor, ...]: Replacement elementwise tensor values.
-            """
             return nki_fn(tensors, scalars)
 
         return (
@@ -706,28 +527,8 @@ def _make_tensor_op(op):
     is_div = op == "div"
 
     def fn(tensors, tensor, *args, out=None, alpha=1):
-        """Prepare an out-of-place foreach scalar-tensor operation for backend dispatch.
-
-        Args:
-            tensors (list[torch.Tensor]): Tensors to process elementwise.
-            tensor (torch.Tensor): Zero-dimensional tensor operand.
-            *args (object): Additional overload arguments, which are ignored.
-            out (list[torch.Tensor], optional): Output tensors. Defaults to ``None``.
-            alpha (Number, optional): Multiplier for add or subtract operands. Defaults to ``1``.
-
-        Returns:
-            tuple: Compute function, normalized arguments, output keywords, and postprocessor.
-
-        Raises:
-            RuntimeError: If tensors are empty, span devices, use Boolean subtraction,
-                or ``tensor`` is not zero-dimensional.
-
-        Note:
-            Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-        """
         _check_tensors(tensors)
         _check_scalar_tensor(tensor)
-        _check_bool_sub(op, tensors, tensor)
         # The 0-dim `tensor` plays the scalar's role for promotion (result_type
         # per list element against it), same as _make_scalar_op.
         if is_div:
@@ -737,15 +538,6 @@ def _make_tensor_op(op):
         effective_tensor = tensor * alpha if has_alpha else tensor
 
         def compute_fn(tensors, tensor):
-            """Execute the foreach scalar-tensor operation with dtype promotion.
-
-            Args:
-                tensors (list[torch.Tensor]): Tensors to process elementwise.
-                tensor (torch.Tensor): Effective zero-dimensional tensor operand.
-
-            Returns:
-                tuple[torch.Tensor, ...]: Elementwise operation results.
-            """
             tensors = _promote_inside(op, tensors, tensor)
             return _cast_results(op, nki_fn(tensors, tensor))
 
@@ -762,42 +554,14 @@ def _make_tensor_inplace_op(op):
     has_alpha = op in HAS_ALPHA
 
     def fn(tensors, tensor, *args, out=None, alpha=1):
-        """Prepare an in-place foreach scalar-tensor operation for backend dispatch.
-
-        Args:
-            tensors (list[torch.Tensor]): Tensors to update elementwise.
-            tensor (torch.Tensor): Zero-dimensional tensor operand.
-            *args (object): Additional overload arguments, which are ignored.
-            out (object, optional): Unused registry placeholder. Defaults to ``None``.
-            alpha (Number, optional): Multiplier for add or subtract operands. Defaults to ``1``.
-
-        Returns:
-            tuple: Compute function, normalized arguments, aliased outputs, and postprocessor.
-
-        Raises:
-            RuntimeError: If inputs are empty, span devices, or have an invalid operand or dtype.
-
-        Note:
-            Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-        """
         _check_tensors(tensors)
         _check_scalar_tensor(tensor)
-        _check_bool_sub(op, tensors, tensor)
         _check_div_inplace_dtype(op, tensors)
         # Keep the list full-length (see _make_scalar_inplace_op).
         tensors = _replace_empty(tensors)
         effective_tensor = tensor * alpha if has_alpha else tensor
 
         def compute_fn(tensors, tensor):
-            """Compute replacement values for an in-place foreach scalar-tensor operation.
-
-            Args:
-                tensors (list[torch.Tensor]): Destination tensors supplying current values.
-                tensor (torch.Tensor): Effective zero-dimensional tensor operand.
-
-            Returns:
-                tuple[torch.Tensor, ...]: Replacement elementwise tensor values.
-            """
             return nki_fn(tensors, tensor)
 
         return (
@@ -819,26 +583,11 @@ def _make_tensor_inplace_op(op):
     static_argnames=("dtype",),
 )
 def torch_foreach_norm(tensors, ord=2, dtype=None, out=None):
-    """Compute a vector norm for each tensor with an NKI kernel or MLIR fallback.
-
-    Args:
-        tensors (list[torch.Tensor]): Tensors whose flattened vector norms are computed.
-        ord (Number, optional): Vector norm order. NKI kernels support ``1``, ``2``,
-            and infinity. Defaults to ``2``.
-        dtype (torch.dtype, optional): Computation and result dtype. Defaults to ``None``.
-        out (object, optional): Unused registry placeholder. Defaults to ``None``.
-
-    Returns:
-        tuple[torch.Tensor, ...]: Scalar norm result for each input tensor.
-
-    Raises:
-        RuntimeError: If an input is integral or an empty tensor uses an infinite norm.
-    """
+    """Foreach norm operation using NKI kernel with MLIR fallback."""
     if _has_nki_norm_kernels:
         return foreach_norm_nki(tensors, ord=ord, dtype=dtype)
 
     # MLIR fallback
-    check_norm_inputs(tensors, ord)
     result = []
     for t in tensors:
         if t.numel() == 0:
@@ -853,79 +602,17 @@ def torch_foreach_norm(tensors, ord=2, dtype=None, out=None):
 # --- foreach_sqrt (unary) ---
 
 
-def _check_sqrt_inplace_dtype(tensors, *_args, **_kwargs):
-    """Reject an integral input for inplace sqrt, the same as Tensor.sqrt_ does.
-
-    sqrt promotes an integral input to the default dtype, which an integral
-    destination cannot hold. A complex destination holds a complex result.
-    """
-    for t in tensors:
-        if not (t.dtype.is_floating_point or t.dtype.is_complex):
-            raise RuntimeError(
-                f"result type {_get_dtype_name(torch.get_default_dtype())} can't be cast "
-                f"to the desired output type {_get_dtype_name(t.dtype)}"
-            )
-
-
 @register_aten(
     ["aten::_foreach_sqrt", "aten::_foreach_sqrt.out"], preprocessing=Preprocessing.SHAPE_ONLY
 )
 def torch_foreach_sqrt(tensors, out=None):
-    """Prepare an out-of-place foreach square-root operation for backend dispatch.
-
-    Args:
-        tensors (list[torch.Tensor]): Tensors whose elementwise square roots are computed.
-        out (object, optional): Unused registry placeholder. Defaults to ``None``.
-
-    Returns:
-        tuple: Compute function, normalized arguments, output keywords, and postprocessor.
-
-    Raises:
-        RuntimeError: If the tensor list is empty or spans devices.
-
-    Note:
-        Validation can replace zero-dimensional entries in ``tensors`` to align devices.
-    """
     _check_tensors(tensors)
-    # sqrt promotes an integral input to float. Retype the empties up front and
-    # the rest in-graph, the same as div (see _promote_inside).
-    tensors = _promote_sqrt_inputs(tensors, empty_only=True)
-
-    def compute_fn(tensors):
-        """Compute promoted elementwise square roots with NKI or MLIR fallback.
-
-        Args:
-            tensors (list[torch.Tensor]): Tensors to promote and process.
-
-        Returns:
-            tuple[torch.Tensor, ...]: Elementwise square-root results.
-        """
-        return foreach_sqrt_nki(_promote_sqrt_inputs(tensors))
-
-    return compute_fn, (tensors,), {}, None
+    tensors = _replace_empty(tensors)
+    return foreach_sqrt_nki, (tensors,), {}, None
 
 
-@register_aten(
-    ["aten::_foreach_sqrt_"],
-    preprocessing=Preprocessing.SHAPE_ONLY,
-    validate_static_inputs=_check_sqrt_inplace_dtype,
-)
+@register_aten(["aten::_foreach_sqrt_"], preprocessing=Preprocessing.VALUE_DEPENDENT)
 def torch_foreach_sqrt_inplace(tensors, out=None):
-    """Prepare an in-place foreach square-root operation for backend dispatch.
-
-    Args:
-        tensors (list[torch.Tensor]): Tensors to replace with their elementwise square roots.
-        out (object, optional): Unused registry placeholder. Defaults to ``None``.
-
-    Returns:
-        tuple: Square-root function, normalized arguments, aliased outputs, and postprocessor.
-
-    Raises:
-        RuntimeError: If inputs are empty, span devices, or have integral dtype.
-
-    Note:
-        Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-    """
     _check_tensors(tensors)
     # Keep the list full-length (see _make_scalar_inplace_op).
     tensors = _replace_empty(tensors)
@@ -966,58 +653,11 @@ def _check_three_tensor_lists(self, tensor1, tensor2):
                 raise
 
 
-def _check_addcop_dtypes(op, self, tensor1, tensor2):
-    """Reject the dtypes that Tensor.addcmul and Tensor.addcdiv also reject.
-
-    addcdiv rejects two integral divisors. See ``torch_addcdiv`` in
-    ``ops/binary.py`` for the single-tensor form of the same check.
-    """
-    if self and self[0].dtype == torch.bool:
-        raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
-    if op != "addcdiv":
-        return
-    if _all_integral(tensor1) and _all_integral(tensor2):
-        raise RuntimeError(
-            "Integer division with addcdiv is no longer supported, and in a future "
-            "release addcdiv will perform a true division of tensor1 and tensor2. "
-            "The historic addcdiv behavior can be implemented as "
-            "(input + value * torch.trunc(tensor1 / tensor2)).to(input.dtype) for "
-            "integer inputs and as (input + value * tensor1 / tensor2) for float inputs. "
-            "The future addcdiv behavior is just the latter implementation: "
-            "(input + value * tensor1 / tensor2), for all dtypes."
-        )
-
-
-def _all_integral(tensors):
-    """True when every tensor has an integral dtype. Bool counts as integral."""
-    return bool(tensors) and all(
-        not (t.dtype.is_floating_point or t.dtype.is_complex) for t in tensors
-    )
-
-
-def _make_addcop_scalar(nki_fn, op):
+def _make_addcop_scalar(nki_fn):
     def fn(self, tensor1, tensor2, value=1, out=None):
-        """Prepare an out-of-place fused foreach operation with one scalar value.
-
-        Args:
-            self (list[torch.Tensor]): Base tensors added to the scaled fused term.
-            tensor1 (list[torch.Tensor]): First multiplicative or dividend operands.
-            tensor2 (list[torch.Tensor]): Second multiplicative or divisor operands.
-            value (Number, optional): Shared scale for the fused term. Defaults to ``1``.
-            out (list[torch.Tensor], optional): Output tensors. Defaults to ``None``.
-
-        Returns:
-            tuple: Compute function, normalized arguments, output keywords, and postprocessor.
-
-        Raises:
-            RuntimeError: If lists are incompatible, ``self`` has bool dtype, or ``addcdiv``
-                receives two all-integral divisor lists.
-
-        Note:
-            Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-        """
         _check_three_tensor_lists(self, tensor1, tensor2)
-        _check_addcop_dtypes(op, self, tensor1, tensor2)
+        if self and self[0].dtype == torch.bool:
+            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
         if self and not self[0].dtype.is_floating_point:
             out_dtype = torch.result_type(self[0], value)
             self = [t.to(out_dtype) for t in self]
@@ -1026,17 +666,6 @@ def _make_addcop_scalar(nki_fn, op):
         self = _replace_empty(self)
 
         def compute_fn(self, tensor1, tensor2, value):
-            """Execute the fused foreach operation with one scalar value.
-
-            Args:
-                self (list[torch.Tensor]): Base tensors added to the scaled fused term.
-                tensor1 (list[torch.Tensor]): First multiplicative or dividend operands.
-                tensor2 (list[torch.Tensor]): Second multiplicative or divisor operands.
-                value (Number): Shared scale for the fused term.
-
-            Returns:
-                tuple[torch.Tensor, ...]: Fused addcmul or addcdiv results.
-            """
             return nki_fn(self, tensor1, tensor2, value)
 
         if out is not None:
@@ -1046,28 +675,11 @@ def _make_addcop_scalar(nki_fn, op):
     return fn
 
 
-def _make_addcop_scalar_inplace(nki_fn, op):
+def _make_addcop_scalar_inplace(nki_fn):
     def fn(self, tensor1, tensor2, value=1, out=None):
-        """Prepare an in-place fused foreach operation with one scalar value.
-
-        Args:
-            self (list[torch.Tensor]): Destination tensors for the fused add result.
-            tensor1 (list[torch.Tensor]): First multiplicative or dividend operands.
-            tensor2 (list[torch.Tensor]): Second multiplicative or divisor operands.
-            value (Number, optional): Shared scale for the fused term. Defaults to ``1``.
-            out (object, optional): Unused registry placeholder. Defaults to ``None``.
-
-        Returns:
-            tuple: Compute function, normalized arguments, aliased outputs, and postprocessor.
-
-        Raises:
-            RuntimeError: If inputs are incompatible or results cannot be stored in ``self``.
-
-        Note:
-            Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-        """
         _check_three_tensor_lists(self, tensor1, tensor2)
-        _check_addcop_dtypes(op, self, tensor1, tensor2)
+        if self and self[0].dtype == torch.bool:
+            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
         _check_inplace_dtype_casting(self, value)
         # Keep all three lists full-length (see _make_scalar_inplace_op): empties
         # become FX passthroughs that capture_backend drops, so self[i]/tensor1[i]/
@@ -1075,17 +687,6 @@ def _make_addcop_scalar_inplace(nki_fn, op):
         self = _replace_empty(self)
 
         def compute_fn(self, tensor1, tensor2, value):
-            """Compute replacement values for an in-place fused foreach operation.
-
-            Args:
-                self (list[torch.Tensor]): Base tensors added to the scaled fused term.
-                tensor1 (list[torch.Tensor]): First multiplicative or dividend operands.
-                tensor2 (list[torch.Tensor]): Second multiplicative or divisor operands.
-                value (Number): Shared scale for the fused term.
-
-            Returns:
-                tuple[torch.Tensor, ...]: Replacement addcmul or addcdiv tensor values.
-            """
             return nki_fn(self, tensor1, tensor2, value)
 
         return (
@@ -1098,30 +699,12 @@ def _make_addcop_scalar_inplace(nki_fn, op):
     return fn
 
 
-def _make_addcop_scalarlist(nki_fn, op):
+def _make_addcop_scalarlist(nki_fn):
     def fn(self, tensor1, tensor2, scalars, out=None):
-        """Prepare an out-of-place fused foreach operation with per-tensor scalars.
-
-        Args:
-            self (list[torch.Tensor]): Base tensors added to the scaled fused terms.
-            tensor1 (list[torch.Tensor]): First multiplicative or dividend operands.
-            tensor2 (list[torch.Tensor]): Second multiplicative or divisor operands.
-            scalars (list[Number]): Per-tensor scales for the fused terms.
-            out (list[torch.Tensor], optional): Output tensors. Defaults to ``None``.
-
-        Returns:
-            tuple: Compute function, normalized arguments, output keywords, and postprocessor.
-
-        Raises:
-            RuntimeError: If lists are incompatible, ``self`` has bool dtype, or ``addcdiv``
-                receives two all-integral divisor lists.
-
-        Note:
-            Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-        """
         _check_three_tensor_lists(self, tensor1, tensor2)
         _check_tensors_scalars(self, scalars)
-        _check_addcop_dtypes(op, self, tensor1, tensor2)
+        if self and self[0].dtype == torch.bool:
+            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
         if self and scalars and not self[0].dtype.is_floating_point:
             out_dtype = torch.result_type(self[0], scalars[0])
             self = [t.to(out_dtype) for t in self]
@@ -1130,17 +713,6 @@ def _make_addcop_scalarlist(nki_fn, op):
         self = _replace_empty(self)
 
         def compute_fn(self, tensor1, tensor2, scalars):
-            """Compute fused foreach results with per-tensor scalars.
-
-            Args:
-                self (list[torch.Tensor]): Base tensors added to the scaled fused terms.
-                tensor1 (list[torch.Tensor]): First multiplicative or dividend operands.
-                tensor2 (list[torch.Tensor]): Second multiplicative or divisor operands.
-                scalars (list[Number]): Per-tensor scales for the fused terms.
-
-            Returns:
-                tuple[torch.Tensor, ...]: Fused addcmul or addcdiv results.
-            """
             return nki_fn(self, tensor1, tensor2, scalars)
 
         if out is not None:
@@ -1150,46 +722,18 @@ def _make_addcop_scalarlist(nki_fn, op):
     return fn
 
 
-def _make_addcop_scalarlist_inplace(nki_fn, op):
+def _make_addcop_scalarlist_inplace(nki_fn):
     def fn(self, tensor1, tensor2, scalars, out=None):
-        """Prepare an in-place fused foreach operation with per-tensor scalars.
-
-        Args:
-            self (list[torch.Tensor]): Destination tensors for the fused add results.
-            tensor1 (list[torch.Tensor]): First multiplicative or dividend operands.
-            tensor2 (list[torch.Tensor]): Second multiplicative or divisor operands.
-            scalars (list[Number]): Per-tensor scales for the fused terms.
-            out (object, optional): Unused registry placeholder. Defaults to ``None``.
-
-        Returns:
-            tuple: Compute function, normalized arguments, aliased outputs, and postprocessor.
-
-        Raises:
-            RuntimeError: If lists are incompatible or results cannot be stored in ``self``.
-
-        Note:
-            Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-        """
         _check_three_tensor_lists(self, tensor1, tensor2)
         _check_tensors_scalars(self, scalars)
-        _check_addcop_dtypes(op, self, tensor1, tensor2)
+        if self and self[0].dtype == torch.bool:
+            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
         _check_inplace_dtype_casting(self, scalars)
         # Keep all lists full-length (see _make_scalar_inplace_op); scalars stays
         # paired 1:1 with self.
         self = _replace_empty(self)
 
         def compute_fn(self, tensor1, tensor2, scalars):
-            """Compute replacement values with per-tensor scalars.
-
-            Args:
-                self (list[torch.Tensor]): Base tensors added to the scaled fused terms.
-                tensor1 (list[torch.Tensor]): First multiplicative or dividend operands.
-                tensor2 (list[torch.Tensor]): Second multiplicative or divisor operands.
-                scalars (list[Number]): Per-tensor scales for the fused terms.
-
-            Returns:
-                tuple[torch.Tensor, ...]: Replacement addcmul or addcdiv tensor values.
-            """
             return nki_fn(self, tensor1, tensor2, scalars)
 
         return (
@@ -1202,46 +746,16 @@ def _make_addcop_scalarlist_inplace(nki_fn, op):
     return fn
 
 
-def _make_addcop_tensor(nki_scalarlist_fn, op):
+def _make_addcop_tensor(nki_scalarlist_fn):
     """Tensor variant: scalars is a 1-dim packed tensor with one value per tensor."""
 
     def fn(self, tensor1, tensor2, scalars, out=None):
-        """Prepare an out-of-place fused foreach operation with packed tensor scales.
-
-        Args:
-            self (list[torch.Tensor]): Base tensors added to the scaled fused terms.
-            tensor1 (list[torch.Tensor]): First multiplicative or dividend operands.
-            tensor2 (list[torch.Tensor]): Second multiplicative or divisor operands.
-            scalars (torch.Tensor): Packed scales whose rank and length are not validated.
-            out (list[torch.Tensor], optional): Output tensors. Defaults to ``None``.
-
-        Returns:
-            tuple: Compute function, normalized arguments, output keywords, and postprocessor.
-
-        Raises:
-            RuntimeError: If tensor lists are incompatible, ``self`` has bool dtype, or
-                ``addcdiv`` receives two all-integral divisor lists.
-
-        Note:
-            Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-            Scale pairing stops at the shortest input.
-        """
         _check_three_tensor_lists(self, tensor1, tensor2)
-        _check_addcop_dtypes(op, self, tensor1, tensor2)
+        if self and self[0].dtype == torch.bool:
+            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
         self = _replace_empty(self)
 
         def compute_fn(self, tensor1, tensor2, scalars):
-            """Compute fused foreach results with packed tensor scales.
-
-            Args:
-                self (list[torch.Tensor]): Base tensors added to the scaled fused terms.
-                tensor1 (list[torch.Tensor]): First multiplicative or dividend operands.
-                tensor2 (list[torch.Tensor]): Second multiplicative or divisor operands.
-                scalars (torch.Tensor): Packed per-tensor scales.
-
-            Returns:
-                tuple[torch.Tensor, ...]: Fused addcmul or addcdiv results.
-            """
             return nki_scalarlist_fn(self, tensor1, tensor2, scalars)
 
         if out is not None:
@@ -1256,7 +770,7 @@ def _make_addcop_tensor(nki_scalarlist_fn, op):
     return fn
 
 
-def _make_addcop_tensor_inplace(nki_scalarlist_fn, op):
+def _make_addcop_tensor_inplace(nki_scalarlist_fn):
     """Inplace tensor variant of _make_addcop_tensor (same scalars-as-tensor
     handling). The lists are kept full-length: empties become FX passthroughs
     that capture_backend drops, so list[i] still pairs with scalars[i] and no
@@ -1264,40 +778,12 @@ def _make_addcop_tensor_inplace(nki_scalarlist_fn, op):
     """
 
     def fn(self, tensor1, tensor2, scalars, out=None):
-        """Prepare an in-place fused foreach operation with packed tensor scales.
-
-        Args:
-            self (list[torch.Tensor]): Destination tensors for the fused add results.
-            tensor1 (list[torch.Tensor]): First multiplicative or dividend operands.
-            tensor2 (list[torch.Tensor]): Second multiplicative or divisor operands.
-            scalars (torch.Tensor): One-dimensional tensor containing one scale per tensor.
-            out (object, optional): Unused registry placeholder. Defaults to ``None``.
-
-        Returns:
-            tuple: Compute function, normalized arguments, aliased outputs, and postprocessor.
-
-        Raises:
-            RuntimeError: If tensor lists are incompatible or ``self`` has bool dtype.
-
-        Note:
-            Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-        """
         _check_three_tensor_lists(self, tensor1, tensor2)
-        _check_addcop_dtypes(op, self, tensor1, tensor2)
+        if self and self[0].dtype == torch.bool:
+            raise RuntimeError("addcmul/addcdiv not supported for Bool dtype")
         self = _replace_empty(self)
 
         def compute_fn(self, tensor1, tensor2, scalars):
-            """Compute replacement values with packed tensor scales.
-
-            Args:
-                self (list[torch.Tensor]): Base tensors added to the scaled fused terms.
-                tensor1 (list[torch.Tensor]): First multiplicative or dividend operands.
-                tensor2 (list[torch.Tensor]): Second multiplicative or divisor operands.
-                scalars (torch.Tensor): Packed per-tensor scales.
-
-            Returns:
-                tuple[torch.Tensor, ...]: Replacement addcmul or addcdiv tensor values.
-            """
             return nki_scalarlist_fn(self, tensor1, tensor2, scalars)
 
         return (
@@ -1337,19 +823,17 @@ for _op_name, _nki_fns in _ADDCOP_NKI_FNS.items():
         if _base == "tensor":
             _base = "scalarlist"
         _nki_fn = _nki_fns[_base]
-        _fn = _factory(_nki_fn, _op_name)
+        _fn = _factory(_nki_fn)
         _fn.__name__ = f"torch_foreach_{_op_name}_{_variant_name}"
         _aten_names = [f"aten::_foreach_{_op_name}{s}" for s in _suffixes]
-        register_aten(_aten_names, preprocessing=Preprocessing.SHAPE_ONLY)(_fn)
+        # shape_only for non-inplace Scalar variant only.
+        _prep = (
+            Preprocessing.SHAPE_ONLY if _variant_name == "scalar" else Preprocessing.VALUE_DEPENDENT
+        )
+        register_aten(_aten_names, preprocessing=_prep)(_fn)
 
 
 # --- foreach_lerp ---
-
-
-def _check_lerp_dtype(self, weight_is_tensor):
-    """Reject a bool tensor list for lerp, the same as Tensor.lerp."""
-    if self:
-        check_lerp_dtype(self[0], self[0] if weight_is_tensor else 0.0)
 
 
 @register_aten(
@@ -1357,39 +841,10 @@ def _check_lerp_dtype(self, weight_is_tensor):
     preprocessing=Preprocessing.SHAPE_ONLY,
 )
 def torch_foreach_lerp_scalar(self, tensors1, weight, out=None):
-    """Prepare out-of-place foreach interpolation with one scalar weight.
-
-    Args:
-        self (list[torch.Tensor]): Starting tensors.
-        tensors1 (list[torch.Tensor]): Ending tensors.
-        weight (Number): Interpolation weight shared by every tensor pair.
-        out (list[torch.Tensor], optional): Output tensors. Defaults to ``None``.
-
-    Returns:
-        tuple: Compute function, normalized arguments, output keywords, and postprocessor.
-
-    Raises:
-        RuntimeError: If inputs are empty, incompatible, or span devices.
-        NotImplementedError: If the first tensor in ``self`` has bool dtype.
-
-    Note:
-        Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-    """
     _check_tensors_tensors(self, tensors1)
-    _check_lerp_dtype(self, weight_is_tensor=False)
     self = _replace_empty(self)
 
     def compute_fn(self, tensors1, weight):
-        """Compute foreach interpolation with one scalar weight.
-
-        Args:
-            self (list[torch.Tensor]): Starting tensors.
-            tensors1 (list[torch.Tensor]): Ending tensors.
-            weight (Number): Shared interpolation weight.
-
-        Returns:
-            tuple[torch.Tensor, ...]: Interpolated tensor values.
-        """
         return foreach_lerp_scalar_nki(self, tensors1, weight)
 
     if out is not None:
@@ -1397,42 +852,13 @@ def torch_foreach_lerp_scalar(self, tensors1, weight, out=None):
     return compute_fn, (self, tensors1, weight), {}, None
 
 
-@register_aten(["aten::_foreach_lerp_.Scalar"], preprocessing=Preprocessing.SHAPE_ONLY)
+@register_aten(["aten::_foreach_lerp_.Scalar"], preprocessing=Preprocessing.VALUE_DEPENDENT)
 def torch_foreach_lerp_scalar_inplace(self, tensors1, weight, out=None):
-    """Prepare in-place foreach interpolation with one scalar weight.
-
-    Args:
-        self (list[torch.Tensor]): Starting tensors to replace with interpolated values.
-        tensors1 (list[torch.Tensor]): Ending tensors.
-        weight (Number): Interpolation weight shared by every tensor pair.
-        out (object, optional): Unused registry placeholder. Defaults to ``None``.
-
-    Returns:
-        tuple: Compute function, normalized arguments, aliased outputs, and postprocessor.
-
-    Raises:
-        RuntimeError: If inputs are empty, incompatible, or span devices.
-        NotImplementedError: If the first tensor in ``self`` has bool dtype.
-
-    Note:
-        Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-    """
     _check_tensors_tensors(self, tensors1)
-    _check_lerp_dtype(self, weight_is_tensor=False)
     # Keep both lists full-length (see _make_scalar_inplace_op).
     self = _replace_empty(self)
 
     def compute_fn(self, tensors1, weight):
-        """Compute replacement values for in-place foreach interpolation.
-
-        Args:
-            self (list[torch.Tensor]): Starting tensors used as the base values.
-            tensors1 (list[torch.Tensor]): Ending tensors.
-            weight (Number): Shared interpolation weight.
-
-        Returns:
-            tuple[torch.Tensor, ...]: Replacement interpolated tensor values.
-        """
         return foreach_lerp_scalar_nki(self, tensors1, weight)
 
     return (
@@ -1448,40 +874,11 @@ def torch_foreach_lerp_scalar_inplace(self, tensors1, weight, out=None):
     preprocessing=Preprocessing.SHAPE_ONLY,
 )
 def torch_foreach_lerp_list(self, tensors1, weights, out=None):
-    """Prepare out-of-place foreach interpolation with tensor weights.
-
-    Args:
-        self (list[torch.Tensor]): Starting tensors.
-        tensors1 (list[torch.Tensor]): Ending tensors.
-        weights (list[torch.Tensor]): Per-element interpolation weights.
-        out (list[torch.Tensor], optional): Output tensors. Defaults to ``None``.
-
-    Returns:
-        tuple: Compute function, normalized arguments, output keywords, and postprocessor.
-
-    Raises:
-        RuntimeError: If inputs are empty, incompatible, or span devices.
-        NotImplementedError: If the first tensor in ``self`` has bool dtype.
-
-    Note:
-        Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-    """
     _check_tensors_tensors(self, tensors1)
     _check_tensors_tensors(self, weights)
-    _check_lerp_dtype(self, weight_is_tensor=True)
     self = _replace_empty(self)
 
     def compute_fn(self, tensors1, weights):
-        """Compute foreach interpolation with tensor weights.
-
-        Args:
-            self (list[torch.Tensor]): Starting tensors.
-            tensors1 (list[torch.Tensor]): Ending tensors.
-            weights (list[torch.Tensor]): Per-element interpolation weights.
-
-        Returns:
-            tuple[torch.Tensor, ...]: Interpolated tensor values.
-        """
         return foreach_lerp_list_nki(self, tensors1, weights)
 
     if out is not None:
@@ -1489,43 +886,14 @@ def torch_foreach_lerp_list(self, tensors1, weights, out=None):
     return compute_fn, (self, tensors1, weights), {}, None
 
 
-@register_aten(["aten::_foreach_lerp_.List"], preprocessing=Preprocessing.SHAPE_ONLY)
+@register_aten(["aten::_foreach_lerp_.List"], preprocessing=Preprocessing.VALUE_DEPENDENT)
 def torch_foreach_lerp_list_inplace(self, tensors1, weights, out=None):
-    """Prepare in-place foreach interpolation with tensor weights.
-
-    Args:
-        self (list[torch.Tensor]): Starting tensors to replace with interpolated values.
-        tensors1 (list[torch.Tensor]): Ending tensors.
-        weights (list[torch.Tensor]): Per-element interpolation weights.
-        out (object, optional): Unused registry placeholder. Defaults to ``None``.
-
-    Returns:
-        tuple: Compute function, normalized arguments, aliased outputs, and postprocessor.
-
-    Raises:
-        RuntimeError: If inputs are empty, incompatible, or span devices.
-        NotImplementedError: If the first tensor in ``self`` has bool dtype.
-
-    Note:
-        Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-    """
     _check_tensors_tensors(self, tensors1)
     _check_tensors_tensors(self, weights)
-    _check_lerp_dtype(self, weight_is_tensor=True)
     # Keep all three lists full-length (see _make_scalar_inplace_op).
     self = _replace_empty(self)
 
     def compute_fn(self, tensors1, weights):
-        """Compute replacement values for in-place foreach interpolation.
-
-        Args:
-            self (list[torch.Tensor]): Starting tensors used as the base values.
-            tensors1 (list[torch.Tensor]): Ending tensors.
-            weights (list[torch.Tensor]): Per-element interpolation weights.
-
-        Returns:
-            tuple[torch.Tensor, ...]: Replacement interpolated tensor values.
-        """
         return foreach_lerp_list_nki(self, tensors1, weights)
 
     return compute_fn, (self, tensors1, weights), {"out": tuple(self)}, _void_postprocess
@@ -1533,42 +901,14 @@ def torch_foreach_lerp_list_inplace(self, tensors1, weights, out=None):
 
 @register_aten(
     ["aten::_foreach_lerp.ScalarList", "aten::_foreach_lerp.ScalarList_out"],
-    preprocessing=Preprocessing.SHAPE_ONLY,
+    preprocessing=Preprocessing.VALUE_DEPENDENT,
 )
 def torch_foreach_lerp_scalarlist(self, tensors1, weight, out=None):
-    """Prepare out-of-place foreach interpolation with per-tensor scalar weights.
-
-    Args:
-        self (list[torch.Tensor]): Starting tensors.
-        tensors1 (list[torch.Tensor]): Ending tensors.
-        weight (list[Number]): Per-tensor interpolation weights.
-        out (list[torch.Tensor], optional): Output tensors. Defaults to ``None``.
-
-    Returns:
-        tuple: Compute function, normalized arguments, output keywords, and postprocessor.
-
-    Raises:
-        RuntimeError: If inputs are empty, incompatible, or span devices.
-
-    Note:
-        Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-    """
     _check_tensors_tensors(self, tensors1)
     _check_tensors_scalars(self, weight)
-    _check_lerp_dtype(self, weight_is_tensor=False)
     self = _replace_empty(self)
 
     def compute_fn(self, tensors1, weight):
-        """Compute foreach interpolation with per-tensor scalar weights.
-
-        Args:
-            self (list[torch.Tensor]): Starting tensors.
-            tensors1 (list[torch.Tensor]): Ending tensors.
-            weight (list[Number]): Per-tensor interpolation weights.
-
-        Returns:
-            tuple[torch.Tensor, ...]: Interpolated tensor values.
-        """
         return foreach_lerp_scalarlist_nki(self, tensors1, weight)
 
     if out is not None:
@@ -1576,44 +916,15 @@ def torch_foreach_lerp_scalarlist(self, tensors1, weight, out=None):
     return compute_fn, (self, tensors1, weight), {}, None
 
 
-@register_aten(["aten::_foreach_lerp_.ScalarList"], preprocessing=Preprocessing.SHAPE_ONLY)
+@register_aten(["aten::_foreach_lerp_.ScalarList"], preprocessing=Preprocessing.VALUE_DEPENDENT)
 def torch_foreach_lerp_scalarlist_inplace(self, tensors1, weight, out=None):
-    """Prepare in-place foreach interpolation with per-tensor scalar weights.
-
-    Args:
-        self (list[torch.Tensor]): Starting tensors to replace with interpolated values.
-        tensors1 (list[torch.Tensor]): Ending tensors.
-        weight (list[Number]): Per-tensor interpolation weights.
-        out (object, optional): Unused registry placeholder. Defaults to ``None``.
-
-    Returns:
-        tuple: Compute function, normalized arguments, aliased outputs, and postprocessor.
-
-    Raises:
-        RuntimeError: If inputs are empty, incompatible, or span devices.
-        NotImplementedError: If the first tensor in ``self`` has bool dtype.
-
-    Note:
-        Validation moves 0-D tensors to the first device and replaces zero-element tensors.
-    """
     _check_tensors_tensors(self, tensors1)
     _check_tensors_scalars(self, weight)
-    _check_lerp_dtype(self, weight_is_tensor=False)
     # Keep all lists full-length (see _make_scalar_inplace_op); weight (scalar
     # list) stays paired 1:1 with self.
     self = _replace_empty(self)
 
     def compute_fn(self, tensors1, weight):
-        """Compute replacement values for in-place foreach interpolation.
-
-        Args:
-            self (list[torch.Tensor]): Starting tensors used as the base values.
-            tensors1 (list[torch.Tensor]): Ending tensors.
-            weight (list[Number]): Per-tensor interpolation weights.
-
-        Returns:
-            tuple[torch.Tensor, ...]: Replacement interpolated tensor values.
-        """
         return foreach_lerp_scalarlist_nki(self, tensors1, weight)
 
     return compute_fn, (self, tensors1, weight), {"out": tuple(self)}, _void_postprocess
@@ -1642,9 +953,11 @@ for _op in ("add", "sub", "mul", "div"):
         _OP_REGISTRATIONS.append((_aten_names, _fn))
 
 for _aten_names, _fn in _OP_REGISTRATIONS:
+    # shape_only for non-inplace, non-div, non-scalarlist, non-scalar variants.
     _is_inplace = any("_." in n for n in _aten_names)
     _is_div = any("_foreach_div" in n for n in _aten_names)
     _is_scalarlist = any("ScalarList" in n for n in _aten_names)
+    _is_scalar = any(n.endswith(".Scalar") or n.endswith(".Scalar_out") for n in _aten_names)
     _validator_variant = (
         "scalarlist"
         if _is_scalarlist
@@ -1654,11 +967,16 @@ for _aten_names, _fn in _OP_REGISTRATIONS:
         if any(".Tensor" in n for n in _aten_names)
         else "scalar"
     )
+    _prep = (
+        Preprocessing.SHAPE_ONLY
+        if (not _is_inplace and not _is_div and not _is_scalarlist and not _is_scalar)
+        else Preprocessing.VALUE_DEPENDENT
+    )
     _validate = (
         _make_div_inplace_validator(_validator_variant) if (_is_inplace and _is_div) else None
     )
     register_aten(
         _aten_names,
-        preprocessing=Preprocessing.SHAPE_ONLY,
+        preprocessing=_prep,
         validate_static_inputs=_validate,
     )(_fn)

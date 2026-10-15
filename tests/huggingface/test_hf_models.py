@@ -5,7 +5,7 @@ import os
 import sys
 from pathlib import Path
 
-# Add the parent directory to the path to ensure we can import hf_model_manager
+# Add the parent directory to the path to ensure we can import hf_moduscope
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
@@ -13,7 +13,7 @@ if current_dir not in sys.path:
 # Standard imports
 import pytest
 import torch
-from hf_model_manager import run_fwd_bwd
+from hf_moduscope import run_fwd_bwd
 from transformers import AutoConfig, AutoModelForCausalLM
 
 import torch_neuronx

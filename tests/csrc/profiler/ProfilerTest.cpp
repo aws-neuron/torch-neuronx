@@ -2,8 +2,6 @@
 #include <gtest/gtest.h>
 #include <libkineto.h>
 
-#include <cstdlib>
-
 #include "tests/csrc/mocks/MockNRT.h"
 #include "torch_neuronx/csrc/profiler/Profiler.h"
 
@@ -17,20 +15,13 @@ class ProfilerTest : public ::testing::Test {
     mock_nrt_ = torch_neuronx::testing::MockNRT::GetInstance();
   }
 
-  void TearDown() override {
-    mock_session_.reset();
-    for (const char* name :
-         {"TORCH_NEURONX_PROFILE_DEFAULT_SESSION", "TORCH_NEURONX_PROFILE_RANKS", "RANK"}) {
-      unsetenv(name);
-    }
-  }
+  void TearDown() override { mock_session_.reset(); }
 
   std::unique_ptr<torch_neuronx::testing::MockNRTSession> mock_session_;
   torch_neuronx::testing::MockNRT* mock_nrt_;
 };
 
-TEST_F(ProfilerTest, ConfigureReturnsNullptrWhenCustomConfigEmptyAndDefaultSessionOff) {
-  setenv("TORCH_NEURONX_PROFILE_DEFAULT_SESSION", "0", 1);
+TEST_F(ProfilerTest, ConfigureReturnsNullptrWhenCustomConfigEmpty) {
   NeuronActivityProfiler profiler;
 
   std::set<libkineto::ActivityType> activityTypes = {
@@ -44,8 +35,7 @@ TEST_F(ProfilerTest, ConfigureReturnsNullptrWhenCustomConfigEmptyAndDefaultSessi
   EXPECT_EQ(session, nullptr);
 }
 
-TEST_F(ProfilerTest, ConfigureReturnsNullptrWhenNoNeuronProfileKeyAndDefaultSessionOff) {
-  setenv("TORCH_NEURONX_PROFILE_DEFAULT_SESSION", "0", 1);
+TEST_F(ProfilerTest, ConfigureReturnsNullptrWhenNoNeuronProfileKey) {
   NeuronActivityProfiler profiler;
 
   std::set<libkineto::ActivityType> activityTypes = {
@@ -74,7 +64,6 @@ TEST_F(ProfilerTest, ConfigureReturnsSessionWhenNeuronProfileKeyPresent) {
 }
 
 TEST_F(ProfilerTest, AsyncConfigureDelegatesToSyncConfigure) {
-  setenv("TORCH_NEURONX_PROFILE_DEFAULT_SESSION", "0", 1);
   NeuronActivityProfiler profiler;
 
   std::set<libkineto::ActivityType> activityTypes = {
@@ -110,78 +99,6 @@ TEST_F(ProfilerTest, ConfigureReturnsSessionWhenNeuronProfileKeyWithExtraConfig)
   libkineto::Config config;
   std::string customConfig = "neuron_profile:device;max_events_per_nc:50000";
   config.handleOption("CUSTOM_CONFIG", customConfig);
-
-  auto session = profiler.configure(activityTypes, config);
-  EXPECT_NE(session, nullptr);
-}
-
-TEST_F(ProfilerTest, ConfigureReturnsDefaultSessionWithoutNeuronConfig) {
-  NeuronActivityProfiler profiler;
-
-  std::set<libkineto::ActivityType> activityTypes = {
-      libkineto::ActivityType::CONCURRENT_KERNEL,
-      libkineto::ActivityType::PRIVATEUSE1_RUNTIME,
-      libkineto::ActivityType::PRIVATEUSE1_DRIVER,
-  };
-  libkineto::Config config;
-
-  auto session = profiler.configure(activityTypes, config);
-  EXPECT_NE(session, nullptr);
-}
-
-TEST_F(ProfilerTest, ConfigureReturnsDefaultSessionWithCallerKeys) {
-  NeuronActivityProfiler profiler;
-
-  std::set<libkineto::ActivityType> activityTypes = {
-      libkineto::ActivityType::CONCURRENT_KERNEL,
-      libkineto::ActivityType::PRIVATEUSE1_RUNTIME,
-  };
-  libkineto::Config config;
-  std::string customConfig = "max_events_per_nc:100000";
-  config.handleOption("CUSTOM_CONFIG", customConfig);
-
-  auto session = profiler.configure(activityTypes, config);
-  EXPECT_NE(session, nullptr);
-}
-
-TEST_F(ProfilerTest, ConfigureReturnsNullptrForCpuOnlyProfiling) {
-  NeuronActivityProfiler profiler;
-
-  std::set<libkineto::ActivityType> activityTypes = {
-      libkineto::ActivityType::CPU_OP,
-      libkineto::ActivityType::PRIVATEUSE1_RUNTIME,
-      libkineto::ActivityType::PRIVATEUSE1_DRIVER,
-  };
-  libkineto::Config config;
-
-  auto session = profiler.configure(activityTypes, config);
-  EXPECT_EQ(session, nullptr);
-}
-
-TEST_F(ProfilerTest, ConfigureReturnsNullptrForRankNotSelected) {
-  setenv("RANK", "1", 1);
-  NeuronActivityProfiler profiler;
-
-  std::set<libkineto::ActivityType> activityTypes = {
-      libkineto::ActivityType::CONCURRENT_KERNEL,
-      libkineto::ActivityType::PRIVATEUSE1_RUNTIME,
-  };
-  libkineto::Config config;
-
-  auto session = profiler.configure(activityTypes, config);
-  EXPECT_EQ(session, nullptr);
-}
-
-TEST_F(ProfilerTest, ConfigureReturnsDefaultSessionForSelectedRank) {
-  setenv("RANK", "3", 1);
-  setenv("TORCH_NEURONX_PROFILE_RANKS", "0, 3", 1);
-  NeuronActivityProfiler profiler;
-
-  std::set<libkineto::ActivityType> activityTypes = {
-      libkineto::ActivityType::CONCURRENT_KERNEL,
-      libkineto::ActivityType::PRIVATEUSE1_RUNTIME,
-  };
-  libkineto::Config config;
 
   auto session = profiler.configure(activityTypes, config);
   EXPECT_NE(session, nullptr);

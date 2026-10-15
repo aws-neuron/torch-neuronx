@@ -113,61 +113,6 @@ TEST(CopyBackToOriginalTest, HandlesDtypeMismatch) {
   EXPECT_NEAR(orig[0][0].item<double>(), 1.0, 1e-6);
 }
 
-// A non-contiguous same-numel orig must keep its view shape, not resize. This
-// is the torch.arange(4, out=x.narrow(1, 1, 2)) case (a [4] result into a
-// strided [2,2] view). PyTorch scatters per the stride.
-TEST(CopyBackToOriginalTest, NonContiguousSameNumelKeepsViewShape) {
-  auto base = torch::zeros({2, 3});
-  auto orig = base.narrow(1, 1, 2);  // shape [2,2], stride [3,1], offset 1
-  ASSERT_FALSE(orig.is_contiguous());
-  auto result = torch::tensor({0.0f, 1.0f, 2.0f, 3.0f});  // shape [4]
-
-  CopyBackToOriginal(orig, result, "test");
-
-  EXPECT_EQ(orig.sizes(), (std::vector<int64_t>{2, 2}));
-  EXPECT_EQ(orig.strides(), (std::vector<int64_t>{3, 1}));
-  auto expected = torch::tensor({{0.0f, 0.0f, 1.0f}, {0.0f, 2.0f, 3.0f}});
-  EXPECT_TRUE(torch::equal(base, expected));
-}
-
-// A non-contiguous orig with a different numel still follows the resize contract.
-TEST(CopyBackToOriginalTest, NonContiguousDifferentNumelResizes) {
-  auto base = torch::zeros({2, 3});
-  auto orig = base.narrow(1, 1, 2);  // 4 elements
-  auto result = torch::ones({6});    // different numel -> resize
-
-  CopyBackToOriginal(orig, result, "test");
-
-  EXPECT_EQ(orig.sizes(), result.sizes());
-  EXPECT_TRUE(torch::allclose(orig, result));
-}
-
-// A contiguous orig keeps the ordinary resize behavior (the non-contiguous
-// branch must not capture it).
-TEST(CopyBackToOriginalTest, ContiguousSameNumelStillResizes) {
-  auto orig = torch::zeros({2, 2});
-  auto result = torch::ones({4});  // same numel, but orig is contiguous
-
-  CopyBackToOriginal(orig, result, "test");
-
-  EXPECT_EQ(orig.sizes(), result.sizes());  // resized to [4], not kept as [2,2]
-}
-
-// Non-contiguous orig plus a dtype mismatch: cast and stride-respecting scatter
-// must compose.
-TEST(CopyBackToOriginalTest, NonContiguousWithDtypeMismatch) {
-  auto base = torch::zeros({2, 3}, torch::kFloat64);
-  auto orig = base.narrow(1, 1, 2);
-  auto result = torch::tensor({0.0f, 1.0f, 2.0f, 3.0f}, torch::kFloat32);
-
-  CopyBackToOriginal(orig, result, "test");
-
-  EXPECT_EQ(orig.scalar_type(), c10::ScalarType::Double);
-  EXPECT_EQ(orig.sizes(), (std::vector<int64_t>{2, 2}));
-  auto expected = torch::tensor({{0.0, 0.0, 1.0}, {0.0, 2.0, 3.0}}, torch::kFloat64);
-  EXPECT_TRUE(torch::allclose(base, expected));
-}
-
 TEST(CopyBackToOriginalTest, UndefinedOrigSkipped) {
   auto orig = torch::Tensor();
   auto result = torch::ones({2, 3});

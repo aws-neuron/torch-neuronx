@@ -8,7 +8,6 @@
 #include <queue>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 #include "torch_neuronx/csrc/core/compilation/NeuronCompiler.h"
@@ -56,9 +55,6 @@ class NeuronCompilationService {
   std::queue<std::shared_ptr<CompileJob>> job_queue_;
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
-
-  std::mutex failed_compiles_mutex_;
-  std::unordered_map<std::string, std::string> failed_compiles_;
 
   void AcceptorLoop();
   void HandleClient(int client_fd);

@@ -1,7 +1,5 @@
 """Test script for foreach binary operations."""
 
-import re
-
 import pytest
 import torch
 
@@ -13,7 +11,6 @@ from tests.utils.neuron_test_utils import (
 )
 from torch_neuronx.python_ops.torch_mlir.ops.foreach_ops import (
     _make_div_inplace_validator,
-    _promote_sqrt_inputs,
 )
 
 
@@ -1529,74 +1526,3 @@ def test_foreach_list_cpu_parity(op_name, dtype_a, dtype_b):
                 r_neuron.dtype == r_cpu.dtype
             ), f"{op_name} list {dtype_a}x{dtype_b}: dtype {r_neuron.dtype} != CPU {r_cpu.dtype}"
             torch.testing.assert_close(r_neuron.cpu(), r_cpu, equal_nan=True)
-
-
-@pytest.mark.parametrize(
-    "dtype,expected",
-    [
-        (torch.complex64, torch.complex64),
-        (torch.complex128, torch.complex128),
-        (torch.float16, torch.float16),
-        (torch.float32, torch.float32),
-        (torch.int64, torch.float32),
-        (torch.bool, torch.float32),
-    ],
-)
-@pytest.mark.parametrize("numel", [4, 0])
-def test_promote_sqrt_inputs_dtype(dtype, expected, numel):
-    """sqrt promotes an integral input to float32 and keeps any other input.
-
-    The complex rows guard the predicate only. Neuron sends a complex foreach_sqrt
-    to the CPU fallback, so a complex input does not reach this helper today.
-    """
-    t = torch.zeros(numel, dtype=dtype)
-    assert _promote_sqrt_inputs([t])[0].dtype == expected
-
-
-def _foreach_norm_lists(device):
-    """Lists that pin the ATen error order. See foreach_tensor_norm_slow.
-
-    Each list holds one non-empty tensor. A list of only empty tensors never
-    reaches the Neuron op (see test_foreach_norm_all_empty_neg_inf).
-    """
-    i = torch.arange(1, 5, dtype=torch.int64, device=device)
-    f = torch.arange(1.0, 5.0, device=device)
-    empty_i = torch.empty(0, dtype=torch.int64, device=device)
-    empty_f = torch.empty(0, device=device)
-    return {
-        # An integral tensor before an empty tensor: the dtype error wins.
-        "int_then_empty_int": ([i, empty_i], float("inf")),
-        "int_then_empty_float": ([i, empty_f], float("inf")),
-        # An empty tensor first: the infinity-norm error wins.
-        "empty_float_then_int": ([empty_f, i], float("inf")),
-        "float_then_empty_float": ([f, empty_f], float("inf")),
-        # vector_norm checks the dtype before it checks the -inf identity.
-        "int_then_empty_int_neg_inf": ([i, empty_i], float("-inf")),
-        "float_then_empty_float_neg_inf": ([f, empty_f], float("-inf")),
-        # One tensor that is BOTH empty and integral pins the order inside a
-        # tensor. The cases above only pin the order across tensors, because the
-        # first tensor raises and the second one is never reached. The non-empty
-        # float keeps the list out of the all-empty dispatcher short-circuit.
-        "empty_int_then_float_pos_inf": ([empty_i, f], float("inf")),
-        "empty_int_then_float_neg_inf": ([empty_i, f], float("-inf")),
-    }
-
-
-@pytest.mark.parametrize("case", list(_foreach_norm_lists("cpu")))
-def test_foreach_norm_error_order_matches_cpu(case):
-    """Neuron must raise the same foreach_norm error that CPU raises.
-
-    ATen checks each tensor in list order. Inside one tensor the order is the
-    +inf check, then the dtype check, then the -inf check.
-    """
-    tensors_cpu, ord_ = _foreach_norm_lists("cpu")[case]
-    with pytest.raises(RuntimeError) as cpu_error:
-        torch._foreach_norm(tensors_cpu, ord_)
-
-    # assert_raises is a decorator, and the expected message is only known at run
-    # time, so use pytest.raises and synchronize to propagate an async error.
-    tensors_neuron, ord_ = _foreach_norm_lists("neuron")[case]
-    expected = re.escape(str(cpu_error.value).split("\n")[0])
-    with pytest.raises(RuntimeError, match=expected):
-        torch._foreach_norm(tensors_neuron, ord_)
-        torch.neuron.synchronize()

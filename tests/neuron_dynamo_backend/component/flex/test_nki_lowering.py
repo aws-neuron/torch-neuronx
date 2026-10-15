@@ -300,14 +300,12 @@ class TestFlexAttentionLowering:
     """End-to-end tests for FlexAttentionNKILowering pass."""
 
     @pytest.mark.parametrize(
-        "b,h,seq_len,s,qk_dim,v_dim",
+        "b,h,seq_len,s,e",
         [
-            pytest.param(1, 4, 1024, 2048, 32, 32, id="small"),
-            pytest.param(1, 4, 1024, 2048, 192, 128, id="qk192-v128"),
-            pytest.param(1, 4, 1024, 2048, 512, 512, id="max-head-dim"),
+            pytest.param(1, 4, 1024, 2048, 32, id="small"),
         ],
     )
-    def test_flex_attention_nki_lowering(self, b, h, seq_len, s, qk_dim, v_dim):
+    def test_flex_attention_nki_lowering(self, b, h, seq_len, s, e):
         """Test that FlexAttentionNKILowering pass processes flex_attention nodes."""
         from functorch.compile import aot_module
         from torch.fx.passes.pass_manager import PassManager
@@ -316,11 +314,10 @@ class TestFlexAttentionLowering:
         from torch_neuronx.neuron_dynamo_backend.fx.passes.flex_attention_nki_lowering import (
             FlexAttentionNKILowering,
         )
-        from torch_neuronx.nki_hop import nki_kernel_wrapper
 
-        query = torch.randn(b, h, seq_len, qk_dim)
-        key = torch.randn(b, h, s, qk_dim)
-        value = torch.randn(b, h, s, v_dim)
+        query = torch.randn(b, h, seq_len, e)
+        key = torch.randn(b, h, s, e)
+        value = torch.randn(b, h, s, e)
 
         captured_gm_holder = []
 
@@ -367,7 +364,6 @@ class TestFlexAttentionLowering:
 
         # Verify pass executed without errors
         assert result.modified
-        assert any(node.target is nki_kernel_wrapper for node in captured_gm.graph.nodes)
 
 
 class TestFreeVariableIndexLowering:
@@ -707,114 +703,3 @@ class TestNKILoweringPassFreeVariables:
         result = pm(captured_gm)
 
         assert result is not None
-
-
-class TestScoreModDtype:
-    """score_mod / joint_mod must be lowered on the same dtype the kernels use for the score tile.
-
-    torch traces score_mod with a placeholder of the query dtype, but the kernels hand it an fp32
-    tile. If the lowering trusts the traced dtype, every score_mod intermediate is sized in bf16 for
-    bf16 models, and a large additive bias such as `score + (q_idx - kv_idx)` gets rounded to bf16.
-    The kernel templates and the lowering both take the dtype from
-    kernel_rendering.SCORE_TILE_DTYPE.
-    """
-
-    @staticmethod
-    def _render(kind, monkeypatch):
-        """Lower a bf16 `rel` score_mod through the pass; return the rendered kernel source."""
-        from torch.nn.attention.flex_attention import flex_attention
-
-        from torch_neuronx.neuron_dynamo_backend.fx.passes.flex_attention_nki_lowering import (
-            FlexAttentionNKILowering,
-        )
-
-        B, H, L, E = 1, 2, 512, 64
-
-        def rel(score, b, h, q_idx, kv_idx):
-            return score + (q_idx - kv_idx)
-
-        block_mask = create_block_mask(
-            causal, B=None, H=None, Q_LEN=L, KV_LEN=L, BLOCK_SIZE=(128, 128), device="cpu"
-        )
-
-        class RelModule(torch.nn.Module):
-            def forward(self, q, k, v):
-                return flex_attention(q, k, v, score_mod=rel, block_mask=block_mask)
-
-        # Spy on the rendered kernel source (rendering happens before any kernel tracing).
-        rendered = {}
-        for which in ("fwd", "bwd"):
-            orig = getattr(FlexAttentionNKILowering, f"_render_{which}_kernel_template")
-
-            def spy(self, *args, _orig=orig, _which=which, **kwargs):
-                rendered[_which] = _orig(self, *args, **kwargs)
-                return rendered[_which]
-
-            monkeypatch.setattr(FlexAttentionNKILowering, f"_render_{which}_kernel_template", spy)
-
-        graphs = {}
-
-        def capture(which):
-            def compiler(gm, example_inputs):
-                graphs[which] = gm
-                return gm
-
-            return compiler
-
-        q, k, v = (
-            torch.randn(B, H, L, E, dtype=torch.bfloat16, requires_grad=True) for _ in range(3)
-        )
-        # Real (tiny) CPU tensors through dynamo + aot_autograd, like the neuron backend does; the
-        # bwd graph is only compiled once backward() actually runs.
-        backend = aot_autograd(fw_compiler=capture("fwd"), bw_compiler=capture("bwd"))
-        torch.compile(RelModule(), backend=backend)(q, k, v).sum().backward()
-
-        assert kind in graphs, f"{kind} graph not captured"
-        FlexAttentionNKILowering()(graphs[kind])
-        assert kind in rendered, f"{kind} kernel was not rendered"
-        return rendered[kind]
-
-    @staticmethod
-    def _score_tile_dtype(kind, src):
-        import re
-
-        pattern = {
-            "fwd": (
-                r"bufs\.mm1_copy_sb = allocator\.alloc_sbuf_tensor\("
-                r"\s*shape=\([^)]*\),\s*dtype=(nl\.\w+)"
-            ),
-            "bwd": r"pre_mod_scores = ndarray\(.*,\s*(nl\.\w+)\)",
-        }[kind]
-        found = re.findall(pattern, src)
-        assert len(found) == 1, f"expected exactly one score tile allocation in {kind}: {found}"
-        return found[0]
-
-    @staticmethod
-    def _score_mod_temp_dtypes(src):
-        import re
-
-        return re.findall(r"score_tmp_\d+ = .*?dtype=nl\.(\w+)", src)
-
-    @pytest.mark.parametrize("kind", ["fwd", "bwd"])
-    def test_score_tile_and_intermediates_are_fp32_for_bf16_query(
-        self, kind, monkeypatch, disable_flex_attention_device_check
-    ):
-        src = self._render(kind, monkeypatch)
-        assert self._score_tile_dtype(kind, src) == "nl.float32"
-        dtypes = self._score_mod_temp_dtypes(src)
-        assert dtypes, f"no score_mod intermediates found in rendered {kind} kernel"
-        assert "bfloat16" not in dtypes, f"score_mod intermediates lowered in bf16: {dtypes}"
-        assert "float32" in dtypes, f"expected fp32 score_mod intermediates: {dtypes}"
-
-    @pytest.mark.parametrize("kind", ["fwd", "bwd"])
-    def test_kernel_and_lowering_follow_the_same_constant(
-        self, kind, monkeypatch, disable_flex_attention_device_check
-    ):
-        """Changing SCORE_TILE_DTYPE moves the kernel tile and the lowered temporaries together."""
-        from torch_neuronx.neuron_dynamo_backend.flex_attention import kernel_rendering
-
-        monkeypatch.setattr(kernel_rendering, "SCORE_TILE_DTYPE", torch.bfloat16)
-        src = self._render(kind, monkeypatch)
-        assert self._score_tile_dtype(kind, src) == "nl.bfloat16"
-        assert "float32" not in self._score_mod_temp_dtypes(src)
-        assert "bfloat16" in self._score_mod_temp_dtypes(src)

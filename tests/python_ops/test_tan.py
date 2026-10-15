@@ -55,9 +55,13 @@ class TestTan:
             assert_op_runs_on_neuron("aten::tan")
 
     def test_tan_out_dtype_mismatch_raises(self, device):
-        """A non-float out= dtype for a float op must raise RuntimeError."""
+        """Test an out= tensor with the wrong dtype raises, matching CPU.
+
+        The Neuron dispatch path skips PyTorch's structured-kernel unsafe-cast
+        guard, so the lowering validates this itself.
+        """
         x = torch.tensor([0.0, 1.0], device=device)
-        out = torch.empty(2, dtype=torch.int32, device=device)
+        out = torch.empty(2, dtype=torch.float16, device=device)
         with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
             torch.tan(x, out=out)
 

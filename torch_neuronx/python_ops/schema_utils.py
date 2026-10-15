@@ -24,19 +24,16 @@ def _inplace_from_name(op_name: str) -> bool:
 
 @functools.cache
 def is_inplace_op(aten_name: str) -> bool:
-    """Return whether an ATen operation writes through its first argument.
+    """Return True if `aten_name` writes through to its first argument.
 
-    Args:
-        aten_name (str): ATen name, with or without the ``"aten::"`` prefix.
+    Decided by the op's schema: an op is in-place when its first argument is
+    annotated as written (``Tensor(a!) self``). That distinguishes the
+    operator-form dunders, which are pure (``aten::__rshift__.Tensor``), from
+    their genuinely mutating counterparts (``aten::__irshift__.Tensor``) —
+    a distinction the trailing-underscore heuristic cannot make.
 
-    Returns:
-        bool: ``True`` when the schema marks the first argument writable or the fallback
-            heuristic identifies an in-place name.
-
-    Note:
-        Schema metadata takes precedence over the name heuristic. Names without a
-        resolvable schema use the trailing-underscore heuristic, which can misclassify
-        operator-form dunders as in-place.
+    Falls back to the name heuristic for names that don't resolve to a schema
+    (unqualified aliases like ``aten::bitwise_and`` and internal helpers).
     """
     name = _strip_aten_prefix(aten_name)
     base, _, overload = name.partition(".")

@@ -63,20 +63,6 @@ func.func @torch.aten.type_as$fold(%arg0: !torch.tensor<[?], f16>, %arg1: !torch
 
 // -----
 
-// CHECK-LABEL: func.func @torch.aten._to_copy$complex
-// CHECK:         torch.vtensor.literal(dense<0.000000e+00> : tensor<f64>)
-// CHECK-NOT:     torch.aten._to_copy
-// CHECK:         return
-func.func @torch.aten._to_copy$complex(%arg0: !torch.vtensor<[2,3],f32>) -> !torch.vtensor<[2,3],complex<f32>> {
-  %complex64 = torch.constant.int 9
-  %none = torch.constant.none
-  %false = torch.constant.bool false
-  %0 = torch.aten._to_copy %arg0, %complex64, %none, %none, %none, %false, %none : !torch.vtensor<[2,3],f32>, !torch.int, !torch.none, !torch.none, !torch.none, !torch.bool, !torch.none -> !torch.vtensor<[2,3],complex<f32>>
-  return %0 : !torch.vtensor<[2,3],complex<f32>>
-}
-
-// -----
-
 // CHECK-LABEL:   func.func @torch.aten.one_hot$fold(
 // CHECK-SAME:                                 %[[ARG_0:.*]]: !torch.vtensor<[3],si64>, %arg1: !torch.int) -> !torch.vtensor<[3,?],si64> {
 // CHECK:           %[[FALSE:.*]] = torch.constant.bool false
@@ -197,11 +183,11 @@ func.func @torch.aten.fmod_float(%arg0: !torch.vtensor<[?],f16>, %arg1: !torch.v
 
 // CHECK:   func.func @torch.aten.remainder_tensor(%[[ARG0:.+]]: !torch.vtensor<[?],f32>, %[[ARG1:.+]]: !torch.vtensor<[1],f32>) -> !torch.vtensor<[?],f32> {
 // CHECK:     %[[FLOAT1:.+]] = torch.constant.float 1.000000e+00
-// CHECK:     %[[STR:.+]] = torch.constant.str "floor"
-// CHECK:     %[[V0:.+]] = torch.aten.div.Tensor_mode %[[ARG0]], %[[ARG1]], %[[STR]] : !torch.vtensor<[?],f32>, !torch.vtensor<[1],f32>, !torch.str -> !torch.vtensor<[?],f32>
-// CHECK:     %[[V1:.+]] = torch.aten.mul.Tensor %[[V0]], %[[ARG1]] : !torch.vtensor<[?],f32>, !torch.vtensor<[1],f32> -> !torch.vtensor<[?],f32>
-// CHECK:     %[[V2:.+]] = torch.aten.sub.Tensor %[[ARG0]], %[[V1]], %[[FLOAT1]] : !torch.vtensor<[?],f32>, !torch.vtensor<[?],f32>, !torch.float -> !torch.vtensor<[?],f32>
-// CHECK:     return %[[V2]] : !torch.vtensor<[?],f32>
+// CHECK:     %[[V0:.+]] = torch.aten.div.Tensor %[[ARG0]], %[[ARG1]] : !torch.vtensor<[?],f32>, !torch.vtensor<[1],f32> -> !torch.vtensor<[?],f32>
+// CHECK:     %[[V1:.+]] = torch.aten.floor %[[V0]] : !torch.vtensor<[?],f32> -> !torch.vtensor<[?],f32>
+// CHECK:     %[[V2:.+]] = torch.aten.mul.Tensor %[[V1]], %[[ARG1]] : !torch.vtensor<[?],f32>, !torch.vtensor<[1],f32> -> !torch.vtensor<[?],f32>
+// CHECK:     %[[V3:.+]] = torch.aten.sub.Tensor %[[ARG0]], %[[V2]], %[[FLOAT1]] : !torch.vtensor<[?],f32>, !torch.vtensor<[?],f32>, !torch.float -> !torch.vtensor<[?],f32>
+// CHECK:     return %[[V3]] : !torch.vtensor<[?],f32>
 func.func @torch.aten.remainder_tensor(%arg0: !torch.vtensor<[?],f32>, %arg1: !torch.vtensor<[1],f32>) -> !torch.vtensor<[?],f32> {
     %0 = torch.aten.remainder.Tensor %arg0, %arg1 : !torch.vtensor<[?],f32>, !torch.vtensor<[1],f32> -> !torch.vtensor<[?],f32>
     return %0 : !torch.vtensor<[?],f32>
@@ -211,11 +197,11 @@ func.func @torch.aten.remainder_tensor(%arg0: !torch.vtensor<[?],f32>, %arg1: !t
 
 // CHECK:   func.func @torch.aten.remainder_scalar(%[[ARG0:.+]]: !torch.vtensor<[?],f32>, %[[ARG1:.+]]: !torch.float) -> !torch.vtensor<[?],f32> {
 // CHECK:     %[[FLOAT1:.+]] = torch.constant.float 1.000000e+00
-// CHECK:     %[[STR:.+]] = torch.constant.str "floor"
-// CHECK:     %[[V0:.+]] = torch.aten.div.Scalar_mode %[[ARG0]], %[[ARG1]], %[[STR]] : !torch.vtensor<[?],f32>, !torch.float, !torch.str -> !torch.vtensor<[?],f32>
-// CHECK:     %[[V1:.+]] = torch.aten.mul.Scalar %[[V0]], %[[ARG1]] : !torch.vtensor<[?],f32>, !torch.float -> !torch.vtensor<[?],f32>
-// CHECK:     %[[V2:.+]] = torch.aten.sub.Tensor %[[ARG0]], %[[V1]], %[[FLOAT1]] : !torch.vtensor<[?],f32>, !torch.vtensor<[?],f32>, !torch.float -> !torch.vtensor<[?],f32>
-// CHECK:     return %[[V2]] : !torch.vtensor<[?],f32>
+// CHECK:     %[[V0:.+]] = torch.aten.div.Scalar %[[ARG0]], %[[ARG1]] : !torch.vtensor<[?],f32>, !torch.float -> !torch.vtensor<[?],f32>
+// CHECK:     %[[V1:.+]] = torch.aten.floor %[[V0]] : !torch.vtensor<[?],f32> -> !torch.vtensor<[?],f32>
+// CHECK:     %[[V2:.+]] = torch.aten.mul.Scalar %[[V1]], %[[ARG1]] : !torch.vtensor<[?],f32>, !torch.float -> !torch.vtensor<[?],f32>
+// CHECK:     %[[V3:.+]] = torch.aten.sub.Tensor %[[ARG0]], %[[V2]], %[[FLOAT1]] : !torch.vtensor<[?],f32>, !torch.vtensor<[?],f32>, !torch.float -> !torch.vtensor<[?],f32>
+// CHECK:     return %[[V3]] : !torch.vtensor<[?],f32>
 func.func @torch.aten.remainder_scalar(%arg0: !torch.vtensor<[?],f32>, %arg1: !torch.float) -> !torch.vtensor<[?],f32> {
     %0 = torch.aten.remainder.Scalar %arg0, %arg1 : !torch.vtensor<[?],f32>, !torch.float -> !torch.vtensor<[?],f32>
     return %0 : !torch.vtensor<[?],f32>
@@ -1356,107 +1342,4 @@ func.func @var_correction_dynamic(%arg0: !torch.vtensor<[?,8],f32>, %arg1: !torc
   %dims = torch.prim.ListConstruct %int1 : (!torch.int) -> !torch.list<int>
   %0 = torch.aten.var.correction %arg0, %dims, %arg1, %false : !torch.vtensor<[?,8],f32>, !torch.list<int>, !torch.int, !torch.bool -> !torch.vtensor<[?],f32>
   return %0 : !torch.vtensor<[?],f32>
-}
-
-// -----
-
-// Default (contiguous) stride decomposes to aten.empty.memory_format.
-// CHECK-LABEL:   func.func @new_empty_strided_default_stride(
-// CHECK-SAME:        %[[ARG0:.*]]: !torch.vtensor<[2,3],f32>) -> !torch.vtensor<[2,3],f32> {
-// CHECK:           %[[DTYPE:.*]] = torch.constant.int 6
-// CHECK:           %[[NONE:.*]] = torch.constant.none
-// CHECK:           %[[INT2:.*]] = torch.constant.int 2
-// CHECK:           %[[INT3:.*]] = torch.constant.int 3
-// CHECK:           %[[SIZE:.*]] = torch.prim.ListConstruct %[[INT2]], %[[INT3]] : (!torch.int, !torch.int) -> !torch.list<int>
-// CHECK:           %[[RES:.*]] = torch.aten.empty.memory_format %[[SIZE]], %[[DTYPE]], %[[NONE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.list<int>, !torch.int, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3],f32>
-// CHECK:           return %[[RES]] : !torch.vtensor<[2,3],f32>
-// CHECK-NOT:       torch.aten.new_empty_strided
-func.func @new_empty_strided_default_stride(%arg0: !torch.vtensor<[2,3],f32>) -> !torch.vtensor<[2,3],f32> {
-  %none = torch.constant.none
-  %int2 = torch.constant.int 2
-  %int3 = torch.constant.int 3
-  %int1 = torch.constant.int 1
-  %size = torch.prim.ListConstruct %int2, %int3 : (!torch.int, !torch.int) -> !torch.list<int>
-  %stride = torch.prim.ListConstruct %int3, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
-  %0 = torch.aten.new_empty_strided %arg0, %size, %stride, %none, %none, %none, %none : !torch.vtensor<[2,3],f32>, !torch.list<int>, !torch.list<int>, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3],f32>
-  return %0 : !torch.vtensor<[2,3],f32>
-}
-
-// -----
-
-// Non-default (transpose-style) stride must still decompose. AOTAutograd
-// functionalization of in-place ops on non-contiguous views emits this
-// pattern; StableHLO legalization has no path for the surviving stride
-// operands. The stride operand is dropped and the result is identical to the
-// default-stride case.
-// CHECK-LABEL:   func.func @new_empty_strided_non_default_stride(
-// CHECK-SAME:        %[[ARG0:.*]]: !torch.vtensor<[2,3],f32>) -> !torch.vtensor<[2,3],f32> {
-// CHECK:           %[[DTYPE:.*]] = torch.constant.int 6
-// CHECK:           %[[NONE:.*]] = torch.constant.none
-// CHECK:           %[[INT2:.*]] = torch.constant.int 2
-// CHECK:           %[[INT3:.*]] = torch.constant.int 3
-// CHECK:           %[[SIZE:.*]] = torch.prim.ListConstruct %[[INT2]], %[[INT3]] : (!torch.int, !torch.int) -> !torch.list<int>
-// CHECK:           %[[RES:.*]] = torch.aten.empty.memory_format %[[SIZE]], %[[DTYPE]], %[[NONE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.list<int>, !torch.int, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3],f32>
-// CHECK:           return %[[RES]] : !torch.vtensor<[2,3],f32>
-// CHECK-NOT:       torch.aten.new_empty_strided
-func.func @new_empty_strided_non_default_stride(%arg0: !torch.vtensor<[2,3],f32>) -> !torch.vtensor<[2,3],f32> {
-  %none = torch.constant.none
-  %int2 = torch.constant.int 2
-  %int3 = torch.constant.int 3
-  %int1 = torch.constant.int 1
-  %size = torch.prim.ListConstruct %int2, %int3 : (!torch.int, !torch.int) -> !torch.list<int>
-  %stride = torch.prim.ListConstruct %int1, %int2 : (!torch.int, !torch.int) -> !torch.list<int>
-  %0 = torch.aten.new_empty_strided %arg0, %size, %stride, %none, %none, %none, %none : !torch.vtensor<[2,3],f32>, !torch.list<int>, !torch.list<int>, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3],f32>
-  return %0 : !torch.vtensor<[2,3],f32>
-}
-
-// -----
-
-// aten.empty_strided is the factory form: same reasoning as
-// new_empty_strided, so the default-stride guard also drops.
-// CHECK-LABEL:   func.func @empty_strided_default_stride() -> !torch.vtensor<[2,3],f32> {
-// CHECK:           %[[NONE:.*]] = torch.constant.none
-// CHECK:           %[[DTYPE:.*]] = torch.constant.int 6
-// CHECK:           %[[INT2:.*]] = torch.constant.int 2
-// CHECK:           %[[INT3:.*]] = torch.constant.int 3
-// CHECK:           %[[SIZE:.*]] = torch.prim.ListConstruct %[[INT2]], %[[INT3]] : (!torch.int, !torch.int) -> !torch.list<int>
-// CHECK:           %[[RES:.*]] = torch.aten.empty.memory_format %[[SIZE]], %[[DTYPE]], %[[NONE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.list<int>, !torch.int, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3],f32>
-// CHECK:           return %[[RES]] : !torch.vtensor<[2,3],f32>
-// CHECK-NOT:       torch.aten.empty_strided
-func.func @empty_strided_default_stride() -> !torch.vtensor<[2,3],f32> {
-  %none = torch.constant.none
-  %int6 = torch.constant.int 6
-  %int2 = torch.constant.int 2
-  %int3 = torch.constant.int 3
-  %int1 = torch.constant.int 1
-  %size = torch.prim.ListConstruct %int2, %int3 : (!torch.int, !torch.int) -> !torch.list<int>
-  %stride = torch.prim.ListConstruct %int3, %int1 : (!torch.int, !torch.int) -> !torch.list<int>
-  %0 = torch.aten.empty_strided %size, %stride, %int6, %none, %none, %none : !torch.list<int>, !torch.list<int>, !torch.int, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3],f32>
-  return %0 : !torch.vtensor<[2,3],f32>
-}
-
-// -----
-
-// Non-default stride must still decompose: AOTAutograd emits factory
-// empty_strided on a non-contiguous view; the surviving stride list has
-// no StableHLO legalization path.
-// CHECK-LABEL:   func.func @empty_strided_non_default_stride() -> !torch.vtensor<[2,3],f32> {
-// CHECK:           %[[NONE:.*]] = torch.constant.none
-// CHECK:           %[[DTYPE:.*]] = torch.constant.int 6
-// CHECK:           %[[INT2:.*]] = torch.constant.int 2
-// CHECK:           %[[INT3:.*]] = torch.constant.int 3
-// CHECK:           %[[SIZE:.*]] = torch.prim.ListConstruct %[[INT2]], %[[INT3]] : (!torch.int, !torch.int) -> !torch.list<int>
-// CHECK:           %[[RES:.*]] = torch.aten.empty.memory_format %[[SIZE]], %[[DTYPE]], %[[NONE]], %[[NONE]], %[[NONE]], %[[NONE]] : !torch.list<int>, !torch.int, !torch.none, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3],f32>
-// CHECK:           return %[[RES]] : !torch.vtensor<[2,3],f32>
-// CHECK-NOT:       torch.aten.empty_strided
-func.func @empty_strided_non_default_stride() -> !torch.vtensor<[2,3],f32> {
-  %none = torch.constant.none
-  %int6 = torch.constant.int 6
-  %int2 = torch.constant.int 2
-  %int3 = torch.constant.int 3
-  %int1 = torch.constant.int 1
-  %size = torch.prim.ListConstruct %int2, %int3 : (!torch.int, !torch.int) -> !torch.list<int>
-  %stride = torch.prim.ListConstruct %int1, %int2 : (!torch.int, !torch.int) -> !torch.list<int>
-  %0 = torch.aten.empty_strided %size, %stride, %int6, %none, %none, %none : !torch.list<int>, !torch.list<int>, !torch.int, !torch.none, !torch.none, !torch.none -> !torch.vtensor<[2,3],f32>
-  return %0 : !torch.vtensor<[2,3],f32>
 }

@@ -8,18 +8,10 @@ import torch_neuronx  # Register neuron device
 
 
 class LlamaModel(nn.Module):
-    """Implement a Llama-style transformer language model.
-
-    Args:
-        vocab_size (int): Number of tokens in the vocabulary.
-        d_model (int): Hidden dimension of the model.
-        n_layers (int): Number of transformer blocks.
-        n_heads (int): Number of attention heads per block.
-        d_ff (int): Hidden dimension of each feed-forward network.
-        max_seq_length (int, optional): Maximum sequence length. Defaults to ``2048``.
-        dropout (float, optional): Dropout probability. Defaults to ``0.0``.
-        tie_embeddings (bool, optional): Reuse token embeddings for output projection.
-            Defaults to ``True``.
+    """
+    Complete Llama-style transformer model with embeddings and output layers.
+    Architecture:
+    Token Embeddings -> Positional Embeddings -> Transformer Blocks -> RMSNorm -> Output Projection
     """
 
     def __init__(
@@ -81,16 +73,6 @@ class LlamaModel(nn.Module):
             nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
 
     def forward(self, input_ids, attention_mask=None):
-        """Compute logits for a batch of token sequences.
-
-        Args:
-            input_ids (torch.Tensor): Token IDs with shape ``(batch_size, sequence_length)``.
-            attention_mask (torch.Tensor, optional): Additive mask broadcastable to attention
-                scores. Defaults to ``None``, which creates a causal mask.
-
-        Returns:
-            torch.Tensor: Logits with shape ``(batch_size, sequence_length, vocab_size)``.
-        """
         batch_size, seq_length = input_ids.shape
         device = input_ids.device
 
@@ -126,23 +108,7 @@ class LlamaModel(nn.Module):
         return logits
 
     def generate(self, input_ids, max_new_tokens=20, temperature=1.0, top_p=0.9):
-        """Generate tokens with nucleus sampling.
-
-        Args:
-            input_ids (torch.Tensor): Prompt token IDs with shape
-                ``(batch_size, sequence_length)``.
-            max_new_tokens (int, optional): Maximum number of tokens to append. Defaults to ``20``.
-            temperature (float, optional): Logit scaling temperature. Defaults to ``1.0``.
-            top_p (float, optional): Cumulative probability threshold for nucleus sampling.
-                Defaults to ``0.9``.
-
-        Returns:
-            torch.Tensor: Token IDs with the same batch size and up to ``max_new_tokens``
-                additional sequence positions.
-
-        Note:
-            This method switches the model to evaluation mode and does not restore its prior mode.
-        """
+        """Simple generation method for demonstration"""
         self.eval()
 
         with torch.no_grad():
@@ -184,15 +150,7 @@ class LlamaModel(nn.Module):
 
 
 def create_llama_config(size="small"):
-    """Create a predefined Llama model configuration.
-
-    Args:
-        size (str, optional): Configuration size to select. Defaults to ``"small"``; unknown
-            values also select the small configuration.
-
-    Returns:
-        dict: Model constructor arguments for the selected size.
-    """
+    """Create configuration for different model sizes"""
     configs = {
         "small": {
             "vocab_size": 32000,
@@ -223,7 +181,8 @@ def create_llama_config(size="small"):
 
 
 def demo_llama_model():
-    """Demonstrate Llama forward, backward, and generation on a Neuron device."""
+    """Demonstrate the complete Llama model"""
+
     # Use neuron device
     device = torch.device("neuron")
 

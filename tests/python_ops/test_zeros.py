@@ -52,19 +52,6 @@ class TestZerosRegistration:
             assert x.to("cpu").item() == 0
             assert_op_runs_on_neuron("aten::zeros")
 
-    @pytest.mark.parametrize("factory", [torch.zeros, torch.ones], ids=["zeros", "ones"])
-    @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
-    @pytest.mark.parametrize("shape", [(), (2, 3)])
-    def test_complex_constant_factories(self, factory, dtype, shape):
-        expected = factory(shape, dtype=dtype)
-        with track_neuron_ops():
-            actual = factory(shape, dtype=dtype, device="neuron")
-            assert actual.device.type == "neuron"
-            assert actual.dtype == dtype
-            assert actual.shape == expected.shape
-            assert torch.equal(actual.cpu(), expected)
-            assert_op_runs_on_neuron(f"aten::{factory.__name__}")
-
     @pytest.mark.parametrize(
         "size,expected_exception",
         [

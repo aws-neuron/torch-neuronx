@@ -19,7 +19,6 @@
 #include "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.h"
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
 #include "torch_neuronx/csrc/core/runtime/NRTHandler.h"
-#include "torch_neuronx/csrc/core/streams/StreamConfig.h"
 #include "torch_neuronx/csrc/core/utils/CPUFallbackExecutor.h"
 #include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 #include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
@@ -184,10 +183,6 @@ void StreamImpl::RemoveActiveOperation(const OperationContext* operation) {
     if (it == next_to_schedule_) {
       ++next_to_schedule_;
     }
-    if (operation->GetKernelType() == KernelTypeEnum::kBarrier &&
-        operation->nrt_async_state_.is_pending_signal && pending_barrier_count_ != 0) {
-      --pending_barrier_count_;
-    }
     to_destroy = std::move(*it);
     runtime_queue_.erase(it);
     // The removal may have drained the last running op; release any parked
@@ -344,13 +339,7 @@ void StreamImpl::HandleErrorWithCleanup(OperationContext* operation, const Excep
 
   OperationContextResult status;
   try {
-    // Flattened operations retain the caller's logical ID on the default implementation.
-    auto* error_stream =
-        stream_id == 0 && operation->stream_id != 0
-            ? NeuronStream(operation->stream_id, device_index, NeuronStream::UNCHECKED)
-                  .get_stream_impl()
-            : this;
-    status = error_stream->error_handler_->HandleOperationError(operation, e);
+    status = error_handler_->HandleOperationError(operation, e);
   } catch (...) {
     HandleErrorWithExceptionPtr(operation, std::current_exception());
     return;
@@ -380,12 +369,7 @@ template void StreamImpl::HandleErrorWithCleanup<torch_neuronx::ExecutionRuntime
 
 void StreamImpl::HandleErrorWithExceptionPtr(OperationContext* operation, std::exception_ptr eptr) {
   // Stash exception for rethrow on Synchronize() — don't call .what() here
-  auto* error_stream =
-      stream_id == 0 && operation->stream_id != 0
-          ? NeuronStream(operation->stream_id, device_index, NeuronStream::UNCHECKED)
-                .get_stream_impl()
-          : this;
-  error_stream->StashException(eptr);
+  StashException(eptr);
   auto& engine = NeuronResourceManager::Instance().GetOperationExecutionEngine();
   engine.DecrementExecutionQueueDepth(operation);
   operation->promise.set_value(
@@ -436,13 +420,13 @@ bool StreamImpl::IsScheduleGatedByPriorOp(OperationContext* op, KernelTypeEnum k
       }
     }
   }
-  // (d) HostCC cross-stream waits retain the consumer drain.
-  //     Without HostCC, ready producer events and eligible compute fences may run ahead.
+  // (d) Cross-stream event_wait while a prior op on this stream is still in
+  //     flight: the wait must not run ahead of the producer ordering. Same-
+  //     stream waits are implied by FIFO and never gate here.
   if (kernel_type == KernelTypeEnum::kEvent && prior_ops_in_flight) {
     auto& event_kernel = op->GetKernel<KernelTypeEnum::kEvent>();
     if (event_kernel.GetEventAction() == EventDirectKernelExecution::EventAction::kWait &&
-        event_kernel.GetSignalStreamImpl() != this &&
-        (config::IsHostCCEnabled() || (!event_kernel.IsReady() && GetComputeQueueFence(op) == 0))) {
+        event_kernel.GetEvent().recorded_stream_impl() != this) {
       return true;
     }
   }
@@ -461,14 +445,9 @@ OperationContext* StreamImpl::GetNextOperationToSchedule() {
   // in-band synchronize — preceding ops drain it (via ReleaseDeferredAllocGates)
   // and subsequent ops wait for the retry to resolve.
   auto& op = *next_to_schedule_;
-  // Wait bypasses can skip event completion, but must still wait for preparation.
-  if (!op->IsExecutionReady()) {
-    return nullptr;
-  }
   if (!op->IsSchedulable()) {
-    // Queue-ordered waits can run ahead while completion remains pending.
-    if ((IsSameStreamWaitBypass(op.get(), this) || GetComputeQueueFence(op.get()) != 0) &&
-        IsRunAheadMemorySafe(device_index)) {
+    // Same-stream kWait can run ahead if memory-safe.
+    if (IsSameStreamWaitBypass(op.get(), this) && IsRunAheadMemorySafe(device_index)) {
       return op.get();
     }
     return nullptr;
@@ -489,30 +468,6 @@ OperationContext* StreamImpl::GetNextOperationToSchedule() {
   }
 
   return op.get();
-}
-
-nrt::SequenceId StreamImpl::GetComputeQueueFence(OperationContext* op) const {
-  // The signal publishes a sequence only after the producer enters its compute queue.
-  // A nonzero result permits consumer compute to follow it on the same hardware queue.
-  // Import this sequence so later host and cross-XU work also waits for producer completion.
-  // Return zero when unavailable. Event retirement and memory checks remain in force.
-  if (op->GetKernelType() != KernelTypeEnum::kEvent || !op->IsExecutionReady() ||
-      pending_barrier_count_ != 0 || !last_scheduled_info_.valid ||
-      last_scheduled_info_.kind != LastKind::kDeviceXU ||
-      last_scheduled_info_.xu != NRTA_XU_COMPUTE) {
-    return 0;
-  }
-  auto& kernel = op->GetKernel<KernelTypeEnum::kEvent>();
-  const auto& event = kernel.GetEventImpl();
-  auto* producer = kernel.GetSignalStreamImpl();
-  if (kernel.GetEventAction() != EventDirectKernelExecution::EventAction::kWait ||
-      !event->allow_queue_ordering || producer == nullptr ||
-      producer->device_index != device_index ||
-      nrt::GetHardwareQueue(NRTA_XU_COMPUTE, producer->stream_id) !=
-          nrt::GetHardwareQueue(NRTA_XU_COMPUTE, stream_id)) {
-    return 0;
-  }
-  return event->queued_compute_sequence.load(std::memory_order_acquire);
 }
 
 bool StreamImpl::IsSameStreamWaitBypass(OperationContext* op, const StreamImpl* consumer) {
@@ -664,9 +619,16 @@ ScheduleResult StreamImpl::ScheduleDeviceOperation(OperationContext* op,
       return ScheduleResult::kAdvanced;
     }
 
-    // Dispatch handles failed merged compilations before device scheduling.
-    op = concat_op;
-    kernel_type = concat_op->GetKernelType();
+    if (!concat_op->GetCompilableKernel().HasCachedNeff()) {
+      TORCH_NEURONX_WARN("Concatenated op has no compiled NEFF, scheduling individual op",
+                         "concat_op:", concat_op->GetOpName(), "cascading_op:", op->GetOpName());
+      op->concatenation_state_ = nullptr;
+      kernel_type = op->GetKernelType();
+    } else {
+      // First cascading op needs to schedule the concat op - use concat op's kernel type
+      op = concat_op;
+      kernel_type = concat_op->GetKernelType();
+    }
   }
 
   // Authoritative cross-kind / cross-XU sync gate. Same predicate the runtime

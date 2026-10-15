@@ -6,7 +6,6 @@ from typing import Any
 
 import numpy as np
 import torch
-from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch_mlir import fx
 from torch_mlir import ir as mlir_ir
 from torch_mlir.extras.fx_importer import (
@@ -19,29 +18,26 @@ from torch_mlir.extras.fx_importer import (
 
 
 class CustomFxImporterHooks(fx.FxImporterHooks):
-    """Customize FX literal import for Neuron lowering."""
-
     def resolve_literal(
         self, gni: GraphNodeImporter, literal: Any, info: InputInfo | None
     ) -> mlir_ir.Value | None:
-        """Resolve tensor literals during FX-to-MLIR import.
+        """Create an MLIR value for a literal found in the FX graph
+
+        This function is called to translate a literal to an MLIR value, this particular
+        instance overrides handling of torch.Tensor literals and leaves handling of any others
+        to the default implementation by returning None.
+
+        torch.Tensor literals are converted to a torch.vtensor_literal containing an MLIR
+        DenseElementsAttr, the default implementation converts them to a DenseResourceElementsAttr
+        that XLA's HLO conversion utilities do not handle.
 
         Args:
-            gni (GraphNodeImporter): Importer responsible for converting FX nodes.
-            literal (Any): Literal value to convert.
-            info (InputInfo | None): Input metadata accepted but not used.
+            gni: The singleton responsible for converting FX nodes into MLIR
+            literal: The literal value to be converted
+            info: Optional extra metadata about input nodes
 
         Returns:
-            mlir_ir.Value | None: A ``torch.vtensor.literal`` result for tensors, or
-            ``None`` to delegate non-tensor literals to the default importer.
-
-        Raises:
-            AssertionError: If bfloat16 support is unavailable or the tensor dtype
-            has no supported NumPy representation.
-
-        Note:
-            Tensor data uses ``DenseElementsAttr`` because XLA HLO conversion does
-            not handle the default importer's ``DenseResourceElementsAttr``.
+            mlir.Value: The converted value
         """
         if isinstance(literal, torch.Tensor):
             tensor = literal
@@ -61,8 +57,7 @@ class CustomFxImporterHooks(fx.FxImporterHooks):
                 assert (
                     npy_dtype is not None
                 ), f"Can not create literal tensor for unsupported datatype: {tensor.dtype}"
-                with unset_fake_temporarily():
-                    np_tensor = np.array(tensor.cpu().tolist()).astype(npy_dtype)
+                np_tensor = np.array(tensor.cpu().tolist()).astype(npy_dtype)
 
                 element_type = TORCH_DTYPE_TO_MLIR_TYPE[tensor.dtype]()
 

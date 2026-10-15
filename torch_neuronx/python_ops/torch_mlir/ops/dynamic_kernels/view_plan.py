@@ -16,20 +16,12 @@ _TILE_M = 128
 
 @dataclass(frozen=True)
 class StridedPlan:
-    """Describe a runtime-varying strided tensor view.
+    """`rows` rows of `width` contiguous elements, `dyn_stride` apart, from element
+    `start`; each element optionally fanned out to `fanout` columns.
 
-    Args:
-        dyn_stride (int): Element stride between dynamic rows.
-        width (int): Number of contiguous elements in each row.
-        fanout (int): Number of columns receiving each source element.
-        tile_m (int): Number of rows processed per kernel tile.
-        rows (int): Runtime row count.
-        start (int): Runtime storage offset of the first element.
-        span (int): Required source-storage span in elements.
-
-    Note:
-        ``dyn_stride``, ``width``, ``fanout``, and ``tile_m`` bake into the NEFF;
-        ``rows``, ``start``, and ``span`` remain runtime values.
+    `dyn_stride`/`width`/`fanout`/`tile_m` are model constants and bake into the NEFF.
+    `rows`/`start`/`span` are runtime values, which is what lets one NEFF cover every row
+    count and every storage offset (the two `.chunk(2)` halves differ only in `start`).
     """
 
     dyn_stride: int
@@ -42,15 +34,7 @@ class StridedPlan:
 
 
 def strided_plan(t, rows) -> StridedPlan | None:
-    """Classify a tensor as a supported runtime-varying strided view.
-
-    Args:
-        t (torch.Tensor): Tensor view to classify.
-        rows (int): Runtime-varying extent expected on the outermost base dimension.
-
-    Returns:
-        StridedPlan | None: View metadata, or ``None`` when the layout is unsupported.
-    """
+    """Classify `t` as a strided view with `rows` as the varying extent."""
     if not isinstance(t, torch.Tensor) or t.dim() < 1 or t.numel() == 0:
         return None
 

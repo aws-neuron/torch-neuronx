@@ -17,4 +17,8 @@ RUNTIME_MISC_NO_REFS = [
     "test_ops.py::TestCommonNEURON::test_python_ref__refs_logspace_tensor_overload_neuron_int64",
     "test_ops.py::TestCommonNEURON::test_python_ref__refs_logspace_tensor_overload_neuron_int8",
     "test_ops.py::TestCommonNEURON::test_python_ref__refs_logspace_tensor_overload_neuron_uint8",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_randn_neuron_bfloat16",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_randn_neuron_float16",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_randn_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_randn_neuron_float64",
 ]

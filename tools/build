@@ -8,7 +8,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Supported Python versions
-SUPPORTED_VERSIONS="3.10 3.11 3.12 3.13 3.14"
+SUPPORTED_VERSIONS="3.10 3.11 3.12 3.13"
 
 # Parse arguments
 BUILD_WHEEL=0

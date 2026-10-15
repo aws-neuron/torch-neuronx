@@ -30,11 +30,6 @@ MASKED_SCATTER_CONFIGS = [
     pytest.param((2, 3, 4), (2, 3, 4), (24,), 10, torch.bfloat16, 5e-2, id="3d-partial-bf16"),
     pytest.param((3, 4), (1, 4), (12,), 4, torch.float32, 1e-4, id="bcast-lead-full-f32"),
     pytest.param((3, 4), (1, 4), (12,), 2, torch.float32, 1e-4, id="bcast-lead-partial-f32"),
-    # Guard a compiler mis-fold: a broadcast mask that feeds both the select
-    # condition and the gather index can collapse the True positions to source[0].
-    # Cover a leading- and a trailing-broadcast mask.
-    pytest.param((4, 3), (1, 3), (12,), 2, torch.float32, 1e-4, id="bcast-row-partial-f32"),
-    pytest.param((4, 3), (4, 1), (12,), 3, torch.float32, 1e-4, id="bcast-col-partial-f32"),
     pytest.param((4, 5), (4, 5), (20,), 0, torch.float32, 1e-4, id="empty-mask-f32"),
 ]
 

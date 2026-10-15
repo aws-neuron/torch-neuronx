@@ -83,8 +83,7 @@ def norms(actual: torch.Tensor, ref: torch.Tensor) -> dict[str, float]:
     return {
         "max_abs_err": float(diff.abs().max()) if diff.numel() else 0.0,
         "max_abs_ref": float(r.abs().max()) if r.numel() else 0.0,
-        # Frobenius (L2) norms for the frobenius-ratio metric -- raw/absolute,
-        # matching Neuron Model Suite's
+        # Frobenius (L2) norms for the frobenius-ratio metric -- raw/absolute, matching ModuScope's
         # check_3tensor_result gate (the shared ||ref|| cancels in the ratio). Not the L-inf
         # rel-err.
         "frobenius_abs_err": float(torch.linalg.vector_norm(diff)) if diff.numel() else 0.0,

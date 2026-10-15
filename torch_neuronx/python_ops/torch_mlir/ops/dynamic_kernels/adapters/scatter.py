@@ -224,7 +224,9 @@ def _can_handle_index_put(self, indices, values, accumulate=False, unsafe=False,
 
 
 def _index_put_compile_key(self, indices, values, accumulate=False, unsafe=False, **_):
-    """compile_key = (T, H, dtype) — same NEFF as scatter_add."""
+    """Unique path: (T, H, dtype). Combine path (n = T*top_k > T): the ("combine", T,
+    top_k, H, dtype) 5-tuple so _compile_scatter_add routes to the gather-reduce kernel
+    (same NEFF as scatter_add's combine path)."""
     T = int(self.shape[0])  # noqa: N806
     n = int(values.shape[0])
     if _is_combine_pattern(T, n):
@@ -256,7 +258,6 @@ def _prepare_index_put_io(self, indices, values, accumulate=False, unsafe=False,
 def register():
     # scatter_add_ is in-place (writes self); scatter_add is out-of-place (must
     # not alias self). Same kernel/keys; the combine prepare_io differs on in_place.
-    """Register dynamic scatter-add and accumulating index-put adapters."""
     import functools
 
     for _sa_name, _in_place in (("scatter_add_", True), ("scatter_add", False)):

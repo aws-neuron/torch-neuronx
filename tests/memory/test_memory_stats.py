@@ -13,10 +13,13 @@ from tests.utils.defer_retry_helpers import (
     floats_for_mib,
     n_chunks,
     oversize_mib,
+    requires_lazy_alloc,
     stage_pending_kdeallocs,
     staged_mib,
     vnc_hbm_mib,
 )
+
+_requires_lazy_alloc = requires_lazy_alloc
 
 
 @pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
@@ -47,9 +50,6 @@ class TestMemoryStats:
         assert "num_alloc_deferred" in stats
         assert "num_alloc_drain_retry_ok" in stats
         assert "num_alloc_drain_retry_fail" in stats
-        assert "num_scalar_cache_hits" in stats
-        assert "num_scalar_cache_misses" in stats
-        assert "scalar_cache_size" in stats
 
     def test_memory_stats_byte_fields_have_current_and_peak(self):
         """Test that byte stat fields have flat keys for all pools."""
@@ -78,34 +78,6 @@ class TestMemoryStats:
         assert "num_alloc_retries" in nested
         assert "num_ooms" in nested
 
-    def test_memory_stats_usage_breakdown_fields(self):
-        """Test that usage.* breakdown fields are non-negative ints when present.
-
-        The runtime supplies the categories. An older runtime omits the fields.
-        """
-        stats = torch_neuronx.memory_stats(device=0)
-
-        for key, value in stats.items():
-            if key.startswith("usage."):
-                assert isinstance(value, int), f"{key} must be an int"
-                assert value >= 0, f"{key} must be non-negative"
-
-    def test_memory_stats_as_nested_dict_includes_usage(self):
-        """Test that the nested dict mirrors the flat usage.* fields."""
-        flat = torch_neuronx.memory_stats(device=0)
-        nested = torch_neuronx.memory_stats_as_nested_dict(device=0)
-
-        usage_keys = [key for key in flat if key.startswith("usage.")]
-        if usage_keys:
-            assert isinstance(nested["usage"], dict)
-            for key in usage_keys:
-                category = key[len("usage.") :]
-                assert category in nested["usage"], f"nested usage missing '{category}'"
-                assert isinstance(nested["usage"][category], int)
-        else:
-            # An older runtime has no breakdown, so the key is absent.
-            assert "usage" not in nested
-
     def test_memory_allocated_returns_int(self):
         """Test that memory_allocated() returns an integer."""
         allocated = torch_neuronx.memory_allocated()
@@ -124,6 +96,7 @@ class TestMemoryStats:
         assert isinstance(max_reserved, int)
         assert max_reserved >= 0
 
+    @_requires_lazy_alloc
     def test_lazy_alloc_memory_stats_after_dealloc(self):
         """After alloc + dealloc + sync, the block is freed back to the segment pool.
 
@@ -144,6 +117,7 @@ class TestMemoryStats:
         assert torch_neuronx.memory_allocated() == 0
         assert torch_neuronx.memory_reserved() > 0
 
+    @_requires_lazy_alloc
     def test_empty_cache_frees_reserved_bytes(self):
         """empty_cache() releases unused segments, freeing reserved bytes to NRT."""
         x = torch.randn(1024, device="neuron")
@@ -163,6 +137,7 @@ class TestMemoryStats:
         assert stats["active_bytes.all.current"] == 0
         assert torch_neuronx.memory_reserved() == 0
 
+    @_requires_lazy_alloc
     def test_allocated_exceeds_active_for_rounded_up_size(self):
         """A request that does not hit a block boundary should show
         allocated_bytes > active_bytes.
@@ -316,135 +291,6 @@ class TestMemoryStats:
         assert stats["num_ooms"] == 0
         assert stats["num_tensor_frees"] == 0
         assert stats["allocation_requests"] == 0
-
-    def test_scalar_cache_keys_present_and_int(self):
-        """Scalar cache stat fields are present in flat and nested dicts."""
-        stats = torch_neuronx.memory_stats(device=0)
-        for key in ("num_scalar_cache_hits", "num_scalar_cache_misses", "scalar_cache_size"):
-            assert key in stats
-            assert isinstance(stats[key], int)
-
-        nested = torch_neuronx.memory_stats_as_nested_dict(device=0)
-        for key in ("num_scalar_cache_hits", "num_scalar_cache_misses", "scalar_cache_size"):
-            assert key in nested
-
-    def test_scalar_op_populates_cache(self):
-        """A scalar in a tensor op registers at least one cache miss + slot."""
-        x = torch.randn(8, device="neuron")
-        before = torch_neuronx.memory_stats(0)
-
-        _ = x + 1
-        torch_neuronx.synchronize()
-
-        after = torch_neuronx.memory_stats(0)
-        assert after["num_scalar_cache_misses"] > before["num_scalar_cache_misses"]
-        assert after["scalar_cache_size"] > before["scalar_cache_size"]
-        del x
-
-    def test_repeated_scalar_is_cache_hit(self):
-        """Reusing the same scalar value hits the cache without growing it."""
-        x = torch.randn(8, device="neuron")
-        _ = x + 2  # populate
-        torch_neuronx.synchronize()
-
-        size_after_first = torch_neuronx.memory_stats(0)["scalar_cache_size"]
-        hits_before = torch_neuronx.memory_stats(0)["num_scalar_cache_hits"]
-
-        for _ in range(20):
-            _ = x + 2
-        torch_neuronx.synchronize()
-
-        stats = torch_neuronx.memory_stats(0)
-        assert stats["num_scalar_cache_hits"] > hits_before
-        assert stats["scalar_cache_size"] == size_after_first
-        del x
-
-    def test_empty_cache_resets_scalar_cache_size(self):
-        """empty_cache() wipes cached scalars; size returns to 0."""
-        x = torch.randn(8, device="neuron")
-        _ = x + 3
-        torch_neuronx.synchronize()
-        assert torch_neuronx.memory_stats(0)["scalar_cache_size"] > 0
-
-        torch_neuronx.empty_cache()
-        assert torch_neuronx.memory_stats(0)["scalar_cache_size"] == 0
-        del x
-
-    def test_scalar_tensor_skips_cache(self):
-        """torch.scalar_tensor returns private memory, so it must not be cached.
-
-        A cached slot is shared by every tensor of that value, and the caller can
-        write this result in place.
-        """
-        size_before = torch_neuronx.memory_stats(0)["scalar_cache_size"]
-
-        t = torch.scalar_tensor(42.0, device="neuron")
-        torch_neuronx.synchronize()
-
-        assert t.device.type == "neuron"
-        assert float(t.cpu().item()) == pytest.approx(42.0)
-        assert torch_neuronx.memory_stats(0)["scalar_cache_size"] == size_before
-        del t
-
-    def test_scalar_tensor_results_do_not_alias(self):
-        """Two equal scalar_tensor results are independent; writing one is local."""
-        a = torch.scalar_tensor(5.0, device="neuron")
-        b = torch.scalar_tensor(5.0, device="neuron")
-
-        a.add_(1.0)
-        torch_neuronx.synchronize()
-
-        assert float(a.cpu().item()) == pytest.approx(6.0)
-        assert float(b.cpu().item()) == pytest.approx(5.0)
-        assert float(torch.scalar_tensor(5.0, device="neuron").cpu().item()) == pytest.approx(5.0)
-        del a, b
-
-    def test_zero_scalar_is_correct_at_every_width(self):
-        """One slot serves every width of 0; each dtype must still read 0."""
-        torch_neuronx.empty_cache()
-        size_before = torch_neuronx.memory_stats(0)["scalar_cache_size"]
-        x = torch.zeros(4, device="neuron")
-
-        # A CPU 0-dim arg is cached at its own element_size. Narrowest first: this
-        # order exposes a slot that holds only the low bytes.
-        for dtype in (torch.bool, torch.int32, torch.float32, torch.int64):
-            out = x + torch.zeros((), dtype=dtype)
-            torch_neuronx.synchronize()
-            assert torch.equal(out.cpu(), torch.zeros(4)), f"{dtype} read a non-zero cached scalar"
-
-        # All four pad to the same key, so they add one slot, not four.
-        assert torch_neuronx.memory_stats(0)["scalar_cache_size"] <= size_before + 1
-        del x
-
-    def test_cached_scalar_value_is_correct_on_hit(self):
-        """A repeated (cache-hit) scalar still produces correct results."""
-        x = torch.zeros(4, device="neuron")
-        y = x + 5
-        torch_neuronx.synchronize()
-        assert torch.allclose(y.cpu(), torch.full((4,), 5.0))
-
-        z = x + 5  # cache hit
-        torch_neuronx.synchronize()
-        assert torch.allclose(z.cpu(), torch.full((4,), 5.0))
-        del x, y, z
-
-    def test_scalar_cache_hits_and_size_consistency(self):
-        """3 distinct values each used twice -> 3 misses, 3 hits, 3 slots."""
-        # RNG-free setup tensor: on-device random ops (randn/normal_) draw via
-        # Box-Muller, whose structural constants occupy scalar-cache slots; use
-        # torch.empty so this test isolates the x+v scalar accounting it asserts.
-        x = torch.empty(8, device="neuron")
-
-        for v in (101, 103, 107):
-            _ = x + v
-            _ = x + v
-        torch_neuronx.synchronize()
-
-        stats = torch_neuronx.memory_stats(0)
-        assert stats["scalar_cache_size"] == 3
-        assert stats["num_scalar_cache_misses"] == 3
-        assert stats["num_scalar_cache_hits"] == 3
-        del x
 
     def test_multiple_allocations_accumulate(self):
         """Test that multiple allocations accumulate in active memory."""
@@ -643,6 +489,7 @@ class TestLazyAllocDeferRetry:
     release NRT memory, then retries. Sizing + staging helpers live in
     ``tests.utils.defer_retry_helpers``."""
 
+    @_requires_lazy_alloc
     def test_defer_retry_silent_recovery(self):
         """A pressure kAlloc with kDeallocs queued behind compute defers,
         recovers silently via stage-2 drain-retry or stage-3 cache-drain,
@@ -667,6 +514,7 @@ class TestLazyAllocDeferRetry:
         assert stage2_ok != stage3_ok, f"stages must be mutually exclusive: stats={stats}"
         del big
 
+    @_requires_lazy_alloc
     def test_defer_retry_counters_sync_baseline(self):
         """Negative control: synchronizing before the pressure alloc must
         not engage defer-retry, catching regressions that inflate counters
@@ -687,6 +535,7 @@ class TestLazyAllocDeferRetry:
         assert stats["num_ooms"] == 0, f"unexpected OOM: stats={stats}"
         del big
 
+    @_requires_lazy_alloc
     @pytest.mark.xfail(
         reason="Flaky signal-6 crash from a KaenaRuntime assertion (tdrv/db.c:235) in the "
         "OOM-report path under parallel CI; passes serially. Xfailing to unblock CI."
@@ -710,6 +559,11 @@ class TestLazyAllocDeferRetry:
         assert stats["num_alloc_retries"] == 1, f"stats={stats}"
         assert stats["num_ooms"] == 1, f"stats={stats}"
 
+    @_requires_lazy_alloc
+    @pytest.mark.xfail(
+        reason="Flaky signal-6 crash from a KaenaRuntime assertion (tdrv/db.c:235) in the "
+        "OOM-report path under parallel CI; passes serially. Xfailing to unblock CI."
+    )
     def test_hard_oom_records_counters(self):
         """Bottom of the funnel: defer → RetryReady → AttemptOOMRecovery →
         cache-drain → final failure on a request that exceeds total HBM."""
@@ -726,6 +580,7 @@ class TestLazyAllocDeferRetry:
         assert stats["num_alloc_retries"] >= 1, f"stats={stats}"
         assert stats["num_ooms"] == 1, f"stats={stats}"
 
+    @_requires_lazy_alloc
     def test_repeated_defer_retry_cycles(self):
         """Per-OperationContext AllocState must not leak across allocations:
         N pressure cycles must each defer once and recover silently."""
@@ -752,6 +607,7 @@ class TestLazyAllocDeferRetry:
             f"{stats['num_alloc_deferred']}"
         )
 
+    @_requires_lazy_alloc
     def test_synchronize_returns_when_deferred_alloc_completes(self):
         """synchronize() must return once a Deferred kAlloc completes or escalates."""
         stage_pending_kdeallocs()
@@ -763,6 +619,7 @@ class TestLazyAllocDeferRetry:
         assert big.shape[0] == floats_for_mib(big_mib())
         del big
 
+    @_requires_lazy_alloc
     def test_compute_behind_deferred_alloc_sees_bound_memory(self):
         """FIFO invariant: a compute op submitted behind a Deferred kAlloc
         must run against the bound buffer after retry, not before."""
@@ -789,6 +646,11 @@ class TestLazyAllocDeferRetry:
         ), f"FIFO violated: cpu[-1]={cpu[-1].item()} (expected {sentinel})"
         del big
 
+    @_requires_lazy_alloc
+    @pytest.mark.xfail(
+        reason="Flaky signal-6 crash from a KaenaRuntime assertion (tdrv/db.c:235) in the "
+        "OOM-report path under parallel CI; passes serially. Xfailing to unblock CI."
+    )
     def test_alone_on_stream_oom_surfaces_oom_error_first(self):
         """First-exception ordering: when an OOM'd kAlloc has a dependent
         compute behind it, the user-visible RuntimeError must describe the
@@ -810,6 +672,11 @@ class TestLazyAllocDeferRetry:
         assert stats["num_alloc_retries"] == 1, f"stats={stats}"
         assert stats["num_ooms"] == 1, f"stats={stats}"
 
+    @_requires_lazy_alloc
+    @pytest.mark.xfail(
+        reason="Flaky signal-6 crash from a KaenaRuntime assertion (tdrv/db.c:235) in the "
+        "OOM-report path under parallel CI; passes serially. Xfailing to unblock CI."
+    )
     def test_oom_report_fires_on_unrecoverable_oom(self):
         """Unrecoverable OOM should produce a detailed NRT diagnostic dump
         (log_dev_mem) for debugging, not just the basic nrt_infodump."""
@@ -836,6 +703,7 @@ class TestLazyAllocDeferRetry:
 
         assert "log_dev_mem" in captured, "Detailed OOM report should fire on unrecoverable OOM"
 
+    @_requires_lazy_alloc
     def test_oom_report_suppressed_on_recoverable_oom(self):
         """A recoverable OOM (defer-retry succeeds) must NOT produce a detailed
         NRT dump — only true terminal OOMs should report."""

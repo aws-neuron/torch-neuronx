@@ -111,17 +111,10 @@ def render_step_summary_markdown(items: Sequence[str], summary: dict | None) -> 
     Falls back to a "no report" message when ``summary`` is None so the
     panel isn't blank — gives the next person something to act on.
     """
-    # A node can run several files. Show the first and a count so the heading
-    # stays short.
-    if not items:
-        label = "(no items)"
-    elif len(items) == 1:
-        label = items[0]
-    else:
-        label = f"{items[0]} (+{len(items) - 1} more)"
+    label = " ".join(items) if items else "(no items)"
     if summary is None:
         return (
-            f"## Test results: {label}\n\n"
+            f"## PyTorch Upstream — {label}\n\n"
             "_No pytest JSON report was produced. Check the per-node `.log` "
             "artifact for evidence of a crash before test discovery._\n"
         )
@@ -132,7 +125,7 @@ def render_step_summary_markdown(items: Sequence[str], summary: dict | None) -> 
         return counts.get(key, 0)
 
     lines = [
-        f"## Test results: {label}",
+        f"## PyTorch Upstream — {label}",
         "",
         f"**Total:** {summary['total']}  •  "
         f"**Pass rate:** {summary['pass_rate']}  •  "
@@ -204,7 +197,6 @@ def write_node_step_summary(
     if output_dir is not None:
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
-            with open(output_dir / "step_summary.md", "a") as f:
-                f.write(markdown)
+            (output_dir / "step_summary.md").write_text(markdown)
         except Exception as e:
             print(f"WARNING: failed to persist step_summary.md to artifact: {e}")

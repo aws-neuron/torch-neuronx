@@ -13,27 +13,7 @@ from ..operation_registry import register_aten
     output_params=("out0", "out1"),
 )
 def torch_native_dropout(input, p: float, train: bool = True, out0=None, out1=None, **kwargs):
-    """Apply native dropout with on-device random masks.
-
-    Args:
-        input (torch.Tensor): Input tensor.
-        p (float): Probability of dropping each element.
-        train (bool, optional): Whether to apply dropout. Defaults to ``True``.
-        out0 (torch.Tensor, optional): Dispatcher output buffer for the result.
-            Defaults to ``None``.
-        out1 (torch.Tensor, optional): Dispatcher output buffer for the mask. Defaults to ``None``.
-        **kwargs (Any): Additional dispatcher keywords accepted and ignored by this body.
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor]: Scaled output and ``torch.bool`` retention mask.
-
-    Raises:
-        RuntimeError: If ``train`` is true and ``p`` is outside ``[0, 1]``.
-
-    Note:
-        The registered out variant copies the returned tensors into ``out0`` and ``out1``;
-        direct calls to this function do not use those buffers.
-    """
+    """Decompose native_dropout using on-device RNG."""
     if train and not (0.0 <= float(p) <= 1.0):
         raise RuntimeError(f"dropout probability has to be between 0 and 1, but got {p}")
 
@@ -59,14 +39,5 @@ def torch_native_dropout(input, p: float, train: bool = True, out0=None, out1=No
 
 @register_aten(["aten::native_dropout_backward"], static_argnums=(2,))
 def torch_native_dropout_backward(grad_output, mask, scale: float):
-    """Apply the dropout mask and scale to an output gradient.
-
-    Args:
-        grad_output (torch.Tensor): Gradient of the dropout output.
-        mask (torch.Tensor): ``torch.bool`` retention mask from the forward pass.
-        scale (float): Multiplicative scale for retained elements.
-
-    Returns:
-        torch.Tensor: Gradient of the dropout input.
-    """
+    """Backward for dropout: grad_input = grad_output * mask * scale."""
     return torch.ops.aten.native_dropout_backward(grad_output, mask, scale)

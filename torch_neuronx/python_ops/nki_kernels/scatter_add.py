@@ -12,23 +12,19 @@ from .klir_scatter_add import scatter_add
 def scatter_add_kernel(
     input: torch.Tensor, dim: int, index: torch.Tensor, src: torch.Tensor
 ) -> torch.Tensor:
-    """Scatter source rows into an input tensor with the NKI kernel.
+    """
+    Wrapper for NKI scatter_add kernel.
 
     Args:
-        input (torch.Tensor): Two-dimensional destination tensor modified in place.
-        dim (int): Scatter dimension, which must be ``0``.
-        index (torch.Tensor): One-dimensional destination row indices.
-        src (torch.Tensor): Two-dimensional source rows to add.
+        input: Input tensor (2D) - modified in-place
+        dim: Dimension (must be 0)
+        index: Index tensor (2D)
+        src: Source tensor (2D)
 
     Returns:
-        torch.Tensor: The modified ``input`` tensor.
-
-    Raises:
-        AssertionError: If shapes, ``dim``, or logical-core sharding are unsupported.
-
-    Note:
-        Indices within each 128-row source tile must be unique for correct accumulation.
+        input: Modified input tensor
     """
+
     logical_neuron_cores = int(get_logical_neuron_cores())
     grid = (logical_neuron_cores,)
     result = wrap_nki(scatter_add)[grid](input, dim, index, src)

@@ -49,8 +49,8 @@ Under the hood, the registration process involves several steps:
      into [\_PENDING_OPERATIONS](operation_registry.py#65) along with metadata such as
      `static_argnums` and `static_argnames`
 
-2. **Finalization**: `finalize_registrations_cpp` is called to register ATen operations on the
-   C++ NeuronDispatcher using `_C._register_neuron_op`
+2. **Finalization**: `finalize_registrations` is called to register ATen operations using
+   `aten_lib.impl`
 
 3. **Wrapper Creation**: An [`ImplementationWrapper(TorchMlirOpImpl)`](operation_registry.py#L120)
    object is created with the `torch_linear` function set as its [`torch_fn`](op_impl.py#L25)
@@ -230,11 +230,11 @@ data-dependent and dynamic.
 ```python
 @register_aten(
     [
+        "aten::repeat_interleave.self_Tensor",
     ],
     static_argnums=(2,),
     static_argnames=("output_size",),
-    # output_size is read from repeats, so the lowering cannot be cached
-    preprocessing=Preprocessing.VALUE_DEPENDENT,
+    uses_preprocessing=True,
 )
 def torch_repeat_interleave_self_tensor(input, repeats, dim=None, output_size=None):
     output_size = get_repeat_interleave_output_size(repeats, input, dim, output_size)
@@ -314,8 +314,8 @@ class TestYourOperation:
 
 ```bash
 # Run specific operation tests
-./tools/run-test tests/python_ops/test_linear.py
+./tools/run-test-parallel tests/python_ops/test_linear.py
 
 # Run all python_ops tests
-./tools/run-test tests/python_ops
+./tools/run-test-parallel
 ```

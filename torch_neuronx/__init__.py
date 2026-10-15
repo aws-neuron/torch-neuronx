@@ -1,18 +1,14 @@
 try:
-    from importlib.metadata import PackageNotFoundError
     from importlib.metadata import version as _pkg_version
 
     __version__ = _pkg_version("torch-neuronx")
-except PackageNotFoundError:
-    __version__ = "0.0.0"
+except Exception:
+    from torch_neuronx._version import __version__
 
 
-import importlib
 import os
 import sys
 import warnings
-
-_MODULE_AUTO_COMPILE_INTEGRATION = "torch_neuronx._module_auto_compile_integration"
 
 # Ensure the embedded torch_mlir is used instead of any standalone
 # neuron-torch-mlir wheel. For source builds, prepend the embedded path.
@@ -27,8 +23,6 @@ if os.path.isdir(_embedded_torch_mlir):
     sys.path.insert(0, _embedded_torch_mlir)
 
 import threading
-
-from packaging.version import Version
 
 # Global variable to track if module has been loaded
 _is_loaded = False
@@ -76,10 +70,6 @@ os.environ.setdefault(
 )
 
 os.environ.setdefault("TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION", "1")
-os.environ.setdefault(
-    "TORCH_NEURONX_COMPLEX_DECOMPOSE",
-    "1" if Version(torch.__version__) >= Version("2.13.0.dev0") else "0",
-)
 
 # Set default for aten ops lowering
 os.environ.setdefault("TORCH_NEURONX_MLIR_ATEN_OPS", DEFAULT_MLIR_ATEN_OPS)
@@ -96,48 +86,23 @@ os.environ.setdefault("NEURON_RT_DBG_ZEROCOPY", "1")
 # Set default for HBM mapping
 os.environ.setdefault("NEURON_RT_MAP_HBM", "1")
 
-
-def _read_boolean_environment(name, default):
-    value = os.environ.get(name) or default
-    if value not in ("0", "1"):
-        raise ValueError(f"{name} must be 0 or 1; got {value!r}")
-    return value == "1"
-
-
-_streams_enabled = _read_boolean_environment("TORCH_NEURONX_ENABLE_STREAMS", "1")
-_host_cc_enabled = _read_boolean_environment("TORCH_NEURONX_ENABLE_HOST_CC", "0")
-if _host_cc_enabled and not _streams_enabled:
-    raise RuntimeError("TORCH_NEURONX_ENABLE_HOST_CC=1 requires TORCH_NEURONX_ENABLE_STREAMS=1")
-
-os.environ["TORCH_NEURONX_ENABLE_STREAMS"] = "1" if _streams_enabled else "0"
-os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = "1" if _host_cc_enabled else "0"
-
-_dma_transpose_env = "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE"
-if _host_cc_enabled:
+# Set default for host-cc and apply bundled defaults when enabled.
+# When host-cc is enabled, NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE MUST be true.
+os.environ.setdefault("TORCH_NEURONX_ENABLE_HOST_CC", "0")
+if os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC") == "1":
     from torch_neuronx.utils import get_platform_target
 
     platform_target = get_platform_target()
     if platform_target in ("trn2", "trn3"):
-        if os.environ.get(_dma_transpose_env, "").lower() == "false":
+        if os.environ.get("NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE", "").lower() == "false":
             raise RuntimeError(
                 "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=false is incompatible with "
-                f"host collectives on {platform_target}. This "
+                f"TORCH_NEURONX_ENABLE_HOST_CC=1 on {platform_target}. This "
                 "combination can lead to a hang. Remove the "
-                "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=false setting or select a "
-                "configuration with TORCH_NEURONX_ENABLE_HOST_CC=0."
+                "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=false setting or disable host-cc."
             )
-        # HostCC hangs on these platforms without this NKI setting. The setting
-        # restricts every kernel to psum_banks=7, which costs kernel performance,
-        # so only HostCC turns it on.
-        os.environ.setdefault(_dma_transpose_env, "true")
+        os.environ.setdefault("NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE", "true")
     os.environ.setdefault("NEURON_RT_EXEC_TIMEOUT", "300")
-else:
-    if os.environ.get(_dma_transpose_env, "").lower() == "true":
-        raise RuntimeError(
-            "TORCH_NEURONX_ENABLE_HOST_CC=0 does not support "
-            "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE=true. Remove "
-            "NKI_DMA_TRANSPOSE_AS_PE_TRANSPOSE or set TORCH_NEURONX_ENABLE_HOST_CC=1."
-        )
 
 # Default to C++ NeuronBackend process group
 os.environ.setdefault("TORCH_NEURONX_CPP_PROCESS_GROUP", "1")
@@ -162,14 +127,14 @@ if "NEURONXCC_VERSION" not in os.environ:
 # Disable artifact preservation by default
 os.environ.setdefault("TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS", "0")
 
+# Lazy allocations by default.
+os.environ.setdefault("TORCH_NEURONX_ENABLE_LAZY_ALLOC", "1")
+
 # Enable NKI colz for intermediate NKI artifacts
 os.environ.setdefault("NKI_USE_COLZ", "1")
 
 # Enable NKI persistent cache
 os.environ.setdefault("NKI_ENABLE_TRACE_CACHE", "1")
-
-# Scalar device memory cache by default.
-os.environ.setdefault("TORCH_NEURONX_ENABLE_SCALAR_CACHE", "1")
 
 # Import and register neuron device
 try:
@@ -200,16 +165,6 @@ except ImportError as e:
     warnings.warn(f"Failed to import torch_neuronx C++ extensions: {e}", stacklevel=2)
     raise
 
-# Required for NKI LNC degree - NKI gives a kernel default LNC=1 when this
-# variable is not set.
-if "NEURON_LOGICAL_NC_CONFIG" not in os.environ:
-    try:
-        from torch_neuronx.utils import get_lnc_setting
-
-        os.environ["NEURON_LOGICAL_NC_CONFIG"] = str(get_lnc_setting())
-    except Exception:
-        pass
-
 # Import the neuron submodule
 # Import and register Python operations
 # Import profiling functionality
@@ -235,14 +190,7 @@ from .memory import (
 )
 
 # Import torch.compile metrics APIs
-from .neuron_dynamo_backend.fx.passes.complex_decomposition import (
-    apply_complex_decomposition_patches,
-)
 from .neuron_dynamo_backend.metrics import get_dynamo_metrics, reset_dynamo_metrics
-
-# Register the ComplexTensor new_full rule so the complex-decompose retrace
-# completes on Neuron. Idempotent and fail soft.
-apply_complex_decomposition_patches()
 
 # Import NKI kernel support
 from .nki_hop import nki_op, wrap_nki
@@ -253,7 +201,6 @@ from .profiling import (
     NeuronConfig,
     NeuronProfiler,
     ProfileMode,
-    TimeTrigger,
     export_now,
     request_export,
 )
@@ -281,7 +228,6 @@ _initialized = False
 _original_pid = 0
 _initialization_lock = threading.RLock()
 _is_in_bad_fork = False
-_parent_runtime_initialized_before_fork = False
 
 
 def _lazy_init():
@@ -317,34 +263,17 @@ def _lazy_init():
         _neuron_module._set_device_rng_seed(gen.initial_seed())
 
 
-def _snapshot_neuron_runtime_before_fork():
-    """Record whether the parent initialized Neuron before the OS clones it."""
-    global _parent_runtime_initialized_before_fork
-    # Direct C++ initialization can leave the Python flag false.
-    _parent_runtime_initialized_before_fork = _initialized or _C._is_neuron_runtime_initialized()
-
-
-def _handle_neuron_child_after_fork():
-    """Make inherited Neuron and AutoCompile state safe in a fork child."""
+def _after_fork():
+    """Mark that we're in a forked process where reinit is not allowed."""
     global _initialized, _is_in_bad_fork
     current_pid = os.getpid()
-    # A fork child inherits memory, but it cannot use the parent's Neuron runtime.
-    if _parent_runtime_initialized_before_fork and _original_pid != current_pid:
+    if _initialized and _original_pid != current_pid:
         _initialized = False
         _is_in_bad_fork = True
 
-    # AutoCompile locks and module records are also process-local. Let the
-    # integration reset them when the feature was loaded in the parent.
-    integration = sys.modules.get(_MODULE_AUTO_COMPILE_INTEGRATION)
-    if integration is not None:
-        integration.handle_child_after_fork(hard_disable=_is_in_bad_fork)
-
 
 # Register fork handler
-os.register_at_fork(
-    before=_snapshot_neuron_runtime_before_fork,
-    after_in_child=_handle_neuron_child_after_fork,
-)
+os.register_at_fork(after_in_child=_after_fork)
 
 # HLO persistent cache configuration (enabled by default, disable with TORCH_NEURONX_HLO_CACHE=0)
 os.environ.setdefault("TORCH_NEURONX_HLO_CACHE", "1")
@@ -372,91 +301,18 @@ from .random import _apply_fork_rng_patch
 
 _apply_fork_rng_patch()
 
-from .neuron_dynamo_backend.graph_break_ops import _apply_dynamo_graph_break_patch
-
-_apply_dynamo_graph_break_patch()
-
 
 def is_neuron_runtime_initialized():
-    """Return whether the Neuron runtime is initialized.
-
-    Returns:
-        bool: ``True`` if the Neuron runtime is initialized.
-    """
     return _C._is_neuron_runtime_initialized()
 
 
 def device_count() -> int:
-    """Return the number of Neuron devices exposed to PyTorch.
-
-    Returns:
-        int: Number of Neuron devices configured for PyTorch.
-
-    Note:
-        This query may initialize the Neuron runtime.
-    """
+    """Return the number of Neuron devices (Virtual Neuron Cores) available."""
     return _C._neuron_getDeviceCount()
 
 
-# Keep the default-off import path free of AutoCompile imports and mutations.
-def _module_auto_compile_requested_without_import() -> bool:
-    value = (os.environ.get("TORCH_NEURONX_MODULE_AUTO_COMPILE") or "").strip().lower()
-    return value in {"1", "true", "yes", "y", "on"}
-
-
-def _get_module_auto_compile_integration():
-    return sys.modules.get(_MODULE_AUTO_COMPILE_INTEGRATION)
-
-
-def _load_module_auto_compile_integration():
-    integration = _get_module_auto_compile_integration()
-    if integration is None:
-        integration = importlib.import_module(_MODULE_AUTO_COMPILE_INTEGRATION)
-    return integration
-
-
-def _module_auto_compile_patches_are_active() -> bool:
-    integration = _get_module_auto_compile_integration()
-    return bool(integration is not None and integration._module_auto_compile_patches_active)
-
-
-def _install_module_auto_compile_patches() -> None:
-    """Install AutoCompile only when the user enables it."""
-    if not _module_auto_compile_requested_without_import():
-        return
-    _load_module_auto_compile_integration().install()
-
-
-def _uninstall_module_auto_compile_patches() -> None:
-    """Remove AutoCompile process mutations for tests."""
-    integration = _get_module_auto_compile_integration()
-    if integration is not None:
-        integration.uninstall()
-
-
-try:
-    _install_module_auto_compile_patches()
-except Exception as _module_auto_compile_install_error:
-    # Private PyTorch APIs can change. Keep package import usable when setup fails.
-    integration = _get_module_auto_compile_integration()
-    if integration is None:
-        warnings.warn(
-            "Module AutoCompile setup failed. "
-            "AutoCompile is disabled: "
-            f"{type(_module_auto_compile_install_error).__name__}: "
-            f"{_module_auto_compile_install_error}",
-            stacklevel=2,
-        )
-    else:
-        integration.handle_install_failure(_module_auto_compile_install_error)
-
-
 def current_device() -> int:
-    """Return the current Neuron device index.
-
-    Returns:
-        int: Index of the current Neuron device.
-    """
+    """Return the current Neuron device index."""
     return _C._neuron_getCurrentDevice()
 
 
@@ -464,10 +320,7 @@ def set_device(device: int) -> None:
     """Set the current Neuron device.
 
     Args:
-        device (int): Device index to select.
-
-    Raises:
-        ValueError: If ``device`` is outside the available device range.
+        device: Device index to set as current
     """
     # Validate device ID
     if device < 0 or device >= device_count():
@@ -477,22 +330,15 @@ def set_device(device: int) -> None:
 
 
 def get_device_properties(device):
-    """Return the properties of a Neuron device.
+    """
+    Get the properties of a Neuron device.
 
     Args:
-        device (int or str): Device index or a ``neuron`` device string.
-
+        device: Device index (int) or torch device string like 'neuron:0'
     Returns:
-        object: Device properties with ``name`` and ``total_memory`` attributes;
-            ``total_memory`` is measured in bytes and is ``0`` if the VNC memory
-            query fails.
-
-    Raises:
-        ValueError: If the device type or index is invalid.
-        RuntimeError: If the runtime cannot initialize in a forked subprocess.
-
-    Note:
-        This initializes the Neuron runtime when needed.
+        Device properties object with attributes:
+        - name: Device name (str)
+        - total_memory: Total device memory in bytes (int)
     """
     if isinstance(device, str) and "neuron" in device:
         # Parse device string like 'neuron:0'
@@ -516,83 +362,91 @@ def get_device_properties(device):
 
 
 def empty_cache() -> None:
-    """Release all unused cached memory blocks to the Neuron runtime.
+    """
+    Releases all cached memory blocks in the caching allocator.
 
-    Note:
-        With lazy allocation, this synchronizes every visible Neuron device
-        before releasing cache segments. Allocated tensor memory is not released.
+    This will free all cached blocks back to the Neuron runtime, but
+    will not affect memory of allocated tensors.
     """
     _C.NeuronCachingAllocator.emptyCache()
 
 
 def get_fallback_ops() -> list:
-    """Return operations that used CPU fallback.
+    """
+    Get the list of operations that fell back to CPU.
 
     Returns:
-        list: Names of operations executed on CPU instead of a Neuron device.
+        List of operation names that were executed on CPU instead of Neuron.
     """
     return _C._get_fallback_ops()
 
 
 def get_executed_ops() -> list:
-    """Return operations executed on a Neuron device.
+    """
+    Get the list of operations that were executed on Neuron device.
 
     Returns:
-        list: Names of operations executed on a Neuron device.
+        List of operation names that were successfully executed on Neuron.
     """
     return _C._get_executed_ops()
 
 
 def clear_op_tracking() -> None:
-    """Clear tracked operations and concatenation profiles.
+    """
+    Clear fallback, executed, and concatenated operation tracking.
 
-    Note:
-        This resets process-wide fallback, executed, and concatenated operation
-        tracking together with detailed concatenation profiling data.
+    This resets the internal tracking of which operations have been
+    executed on Neuron vs CPU, and concatenated op mappings, useful for testing.
     """
     _C._clear_op_tracking()
 
 
 def get_concatenated_ops() -> dict:
-    """Return concatenated operations and their constituent operations.
+    """
+    Get mapping of concatenated op names to their original constituent op names.
+
+    When TORCH_NEURONX_ENABLE_CONCATENATION=1, operations may be merged into
+    concatenated groups. This function returns which original ops were merged
+    into each concatenated group.
 
     Returns:
-        dict: Mapping from concatenated operation names to lists of original operation
-            names, or an empty dictionary if no concatenation occurred.
-
-    Note:
-        When ``TORCH_NEURONX_ENABLE_CONCATENATION=1``, operations may be merged
-        into concatenated groups.
+        Dictionary mapping concatenated op name (str) to list of original op names (list[str]).
+        Empty dict if no concatenation has occurred.
     """
     return _C._get_concatenated_ops()
 
 
 def get_concatenated_op_execution_counts() -> dict:
-    """Return recorded creation counts for concatenated operation groups.
+    """
+    Get per-op execution counts for concatenated operations.
+
+    Each concatenated op's first execution requires compilation (uncached).
+    Subsequent executions of the same concatenated group are cache hits.
+    A count of 1 means the op was compiled but never re-executed from cache.
+    A count > 1 means (count - 1) cache hits occurred.
 
     Returns:
-        dict: Mapping from concatenated operation names to the number of recorded
-            group creations for each name, or an empty dictionary if no
-            concatenation occurred.
-
-    Note:
-        Counts describe concatenated-group creation and recording, not
-        compilation-cache outcomes or cache hits.
+        Dictionary mapping concatenated op name (str) to execution count (int).
+        Empty dict if no concatenation has occurred.
     """
     return _C._get_concatenated_op_execution_counts()
 
 
 def get_concatenation_profiles() -> dict:
-    """Return profiling data for each concatenation type.
+    """
+    Get per-concatenation-type profiling data.
+
+    Returns detailed merge time and group size data for each unique
+    concatenation type (identified by the pipe-separated op name).
 
     Returns:
-        dict: Mapping from pipe-separated concatenated operation names to profile
-            dictionaries. ``merge_times_ns`` contains per-invocation merge times in
-            nanoseconds; ``group_sizes`` contains operation counts per group;
-            ``invocation_count`` is the number of groups created;
-            ``avg_merge_time_ms`` is the mean merge time in milliseconds; and
-            ``avg_group_size`` is the mean operation count. Returns an empty
-            dictionary when no profiling data exists.
+        Dictionary mapping concat op name to profile dict with:
+        - merge_times_ns: list[float] — merge time per invocation in nanoseconds
+        - group_sizes: list[int] — number of ops per group per invocation
+        - invocation_count: int — total number of times this concat type was created
+        - avg_merge_time_ms: float — average merge time in milliseconds
+        - avg_group_size: float — average group size
+        Empty dict if no profiling data.
     """
     raw = _C._get_concatenation_profiles()
     result = {}
@@ -613,20 +467,25 @@ def get_concatenation_profiles() -> dict:
 
 
 def get_concatenation_status() -> dict:
-    """Report whether operation concatenation is active.
+    """
+    Diagnose whether op concatenation is actually working.
+
+    When TORCH_NEURONX_ENABLE_CONCATENATION=1, ops should be merged into
+    concatenated groups whose names contain "|" (e.g.,
+    "aten::add.Tensor|aten::linear_backward|...").
+
+    This function checks both the executed ops (for "|" marker) and the
+    ConcatenatedOpTracker (for explicit group recordings) to determine
+    if concatenation is actually producing merged ops at runtime.
 
     Returns:
-        dict: Diagnostic fields: ``enabled`` reports whether
-            ``TORCH_NEURONX_ENABLE_CONCATENATION`` equals ``"1"``;
-            ``concatenated_ops_in_executed`` and ``individual_ops_in_executed``
-            partition executed names by the ``|`` marker;
-            ``concatenated_groups_tracked`` is the tracker group count;
-            ``is_active`` reports whether either source found a group; and
-            ``diagnosis`` provides a human-readable explanation.
-
-    Note:
-        Concatenation is active when executed operation names contain ``|`` or the
-        concatenation tracker contains at least one group.
+        Dictionary with diagnostic fields:
+        - enabled: bool — whether the env var is set to "1"
+        - concatenated_ops_in_executed: list[str] — executed op names containing "|"
+        - individual_ops_in_executed: list[str] — executed op names without "|"
+        - concatenated_groups_tracked: int — number of groups in ConcatenatedOpTracker
+        - is_active: bool — True if concatenation produced at least one merged op
+        - diagnosis: str — human-readable explanation of the status
     """
     import re
 
@@ -695,16 +554,7 @@ def _get_device_index(device, optional=False, allow_cpu=False):
 
 
 def synchronize(device=None) -> None:
-    """Wait for all kernels in all streams on a Neuron device to complete.
-
-    Args:
-        device (int, str, or torch.device, optional): Device specification to
-            synchronize. Defaults to ``None`` (the current device).
-
-    Raises:
-        ValueError: If ``device`` is not a valid Neuron device specification.
-        RuntimeError: If the resolved device index is less than ``-1``.
-    """
+    """Wait for all kernels in all streams on a Neuron device to complete."""
     device_index = _get_device_index(device, optional=True)
     if device_index is None:
         device_index = -1
@@ -712,19 +562,7 @@ def synchronize(device=None) -> None:
 
 
 def current_stream(device=None) -> Stream:
-    """Return the currently selected stream for a Neuron device.
-
-    Args:
-        device (int, str, or torch.device, optional): Device specification to query.
-            Defaults to ``None`` (the current device).
-
-    Returns:
-        Stream: Currently selected stream.
-
-    Raises:
-        ValueError: If ``device`` is not a valid Neuron device specification.
-        RuntimeError: If the resolved device index is less than ``-1``.
-    """
+    """Return the currently selected Stream for a given device."""
     device_index = _get_device_index(device, optional=True)
     if device_index is None:
         device_index = -1
@@ -733,19 +571,7 @@ def current_stream(device=None) -> Stream:
 
 
 def default_stream(device=None) -> Stream:
-    """Return the default stream for a Neuron device.
-
-    Args:
-        device (int, str, or torch.device, optional): Device specification to query.
-            Defaults to ``None`` (the current device).
-
-    Returns:
-        Stream: Default stream for the device.
-
-    Raises:
-        ValueError: If ``device`` is not a valid Neuron device specification.
-        RuntimeError: If the resolved device index is less than ``-1``.
-    """
+    """Return the default Stream for a given device."""
     device_index = _get_device_index(device, optional=True)
     if device_index is None:
         device_index = -1
@@ -754,15 +580,7 @@ def default_stream(device=None) -> Stream:
 
 
 def set_stream(stream: Stream) -> None:
-    """Set the current Neuron stream.
-
-    Args:
-        stream (Stream or None): Stream to select. Passing ``None`` leaves the current
-            stream unchanged.
-
-    Note:
-        Selecting a stream on another device also makes that device current.
-    """
+    """Set the current stream."""
     if stream is None:
         return
     _C._neuron_setStream(
@@ -773,17 +591,13 @@ def set_stream(stream: Stream) -> None:
 
 
 class device:  # noqa: N801
-    """Temporarily select a Neuron device.
+    """Context-manager that changes the selected device.
 
     Args:
-        device (int, str, torch.device, or None): Device to select, or ``None`` to use
-            the current device.
+        device: Device index (int) or torch.device object
 
-    Raises:
-        ValueError: If ``device`` is invalid, is not a Neuron device, or has an unavailable index.
-
-    Note:
-        Exiting the context restores the previously selected device.
+    Returns:
+        Context manager that switches to the specified device
     """
 
     def __init__(self, device):
@@ -803,15 +617,7 @@ class device:  # noqa: N801
 
 
 class StreamContext:
-    """Temporarily select a Neuron stream.
-
-    Args:
-        stream (Stream or None): Stream to select, or ``None`` to leave it unchanged.
-
-    Note:
-        Exiting restores the previous source stream and any previous
-        destination-device stream used for a cross-device context.
-    """
+    """Context-manager that selects a given stream."""
 
     def __init__(self, stream):
         self.stream = stream
@@ -852,12 +658,5 @@ class StreamContext:
 
 
 def stream(stream) -> StreamContext:
-    """Return a context manager that temporarily selects a Neuron stream.
-
-    Args:
-        stream (Stream or None): Stream to select, or ``None`` to leave it unchanged.
-
-    Returns:
-        StreamContext: Context manager that restores the previous stream on exit.
-    """
+    """Wrap around the Context-manager StreamContext that selects a given stream."""
     return StreamContext(stream)

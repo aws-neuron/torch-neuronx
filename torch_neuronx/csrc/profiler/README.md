@@ -29,19 +29,7 @@ with profile(
     pass
 ```
 
-Both export APIs support `InspectExportMask.DEVICE_PROFILE` for device events.
-`InspectExportMask.ALL` selects both system and device events (`SYSTEM_PROFILE | DEVICE_PROFILE`).
-Live device export requires a runtime with device support in `nrt_inspect_export`.
-Set the runtime gate before Python starts:
-
-```sh
-NEURON_RT_INSPECT_ENABLE_PERIODIC_HBM_COLLECTOR=1 python capture.py
-```
-
-With the gate unset or `0`, device export succeeds without collecting device events.
-NRT retains exported device data in host memory until session stop writes the NTFF.
-
-With explicit _asynchronous_ system and device profile export:
+With explicit _asynchronous_ system-profile export:
 ```python
 from torch_neuronx.profiling import (
     ContinuousExportConfig,
@@ -52,28 +40,28 @@ from torch_neuronx.profiling import (
 )
 
 config = NeuronConfig(
-    modes=[ProfileMode.RUNTIME, ProfileMode.DEVICE],
+    modes=[ProfileMode.RUNTIME],
     continuous_export=ContinuousExportConfig(),
 )
 with profile(activities=[ProfilerActivity.PrivateUse1], experimental_config=config):
     # workload steps1
-    request_export(InspectExportMask.ALL)
+    request_export(InspectExportMask.SYSTEM_PROFILE)
     # workload steps2.
-    request_export(InspectExportMask.ALL)
+    request_export(InspectExportMask.SYSTEM_PROFILE)
     # workload steps3.
     # step3 emitted events will be collected at session end.
 ```
 
-With _synchronous_ device-profile export (blocks the calling thread until the drain completes; needs
+With _synchronous_ system-profile export (blocks the calling thread until the drain completes; needs
 no `ContinuousExportConfig()` — it is a direct `nrt_inspect_export` passthrough available in any
 session):
 ```python
 from torch_neuronx.profiling import InspectExportMask, NeuronConfig, ProfileMode, export_now
 
-config = NeuronConfig(modes=[ProfileMode.DEVICE])
+config = NeuronConfig(modes=[ProfileMode.RUNTIME])
 with profile(activities=[ProfilerActivity.PrivateUse1], experimental_config=config):
     # workload steps1
-    export_now(InspectExportMask.DEVICE_PROFILE)  # returns after NRT stages the device data
+    export_now(InspectExportMask.SYSTEM_PROFILE)  # returns once the drain is on disk
     # workload steps2
 ```
 
@@ -84,46 +72,6 @@ Both APIs return `None` on success and raise `NRTProfilerError` on failure (`.st
 verbatim NRT status for `export_now`, or the frontend `ExportStatus` gating reason for
 `request_export`). The async drain itself runs later on a background thread; its outcome is
 reported only in the Neuron logs.
-
-### Automatic export on a timer
-
-Configure one optional time policy to export during an active profile session:
-
-```python
-from torch_neuronx.profiling import (
-    ContinuousExportConfig,
-    InspectExportMask,
-    NeuronConfig,
-    ProfileMode,
-    TimeTrigger,
-)
-
-config = NeuronConfig(
-    modes=[ProfileMode.RUNTIME],
-    continuous_export=ContinuousExportConfig(
-        policy=TimeTrigger(interval_ms=100, mask=InspectExportMask.SYSTEM_PROFILE),
-    ),
-)
-with profile(activities=[ProfilerActivity.PrivateUse1], experimental_config=config):
-    # Run the workload. The worker requests exports on the configured interval.
-    pass
-```
-
-The interval must be a positive integer number of milliseconds. The mask must be a
-nonzero combination supported by the installed frontend. Capture modes remain
-independent of the mask. `ContinuousExportConfig()` without a policy keeps manual
-requests enabled. Configuration objects can be reused across sessions; each worker
-starts a fresh schedule.
-
-The existing C++ export worker handles both the timer and explicit requests. Its
-first deadline is one interval after worker start. Manual requests do not postpone
-the schedule. An export that runs from 100 ms to 350 ms on a 100 ms schedule leaves
-400 ms as the next deadline. Missed ticks coalesce with the running export for the
-mask bits it covers. Uncovered bits remain pending.
-
-Timing is best effort and can be delayed by scheduling or NRT calls. Export failures
-are logged. The worker stops before NRT performs the final drain at session end.
-No timer runs outside an active session.
 
 ## Architecture
 
@@ -175,7 +123,7 @@ flow arrows linking back to the originating CPU op via Kineto correlation IDs.
 | When | NRT Function |
 |------|--------------|
 | Session start | `nrt_inspect_begin_with_options()` |
-| Explicit or timed mid-session export | `nrt_inspect_export(mask)` |
+| Explicit mid-session export | `nrt_inspect_export(mask)` |
 | Session stop | `nrt_inspect_stop()` |
 
 ### Activity Type Mapping
@@ -194,13 +142,7 @@ Passed via `_ExperimentalConfig(custom_profiler_config="key:value;key:value")`:
 - `capture_enabled_for_nc` — Which NCs to profile ("0,1,2-5")
 - `host_memory` — Profile host memory (bool)
 - `profile_output_dir` — Where NRT writes traces
-- `continuous_export` - Enables the async export worker
-- `export_policy` - `time` enables a timer when continuous export is enabled
-- `export_interval_ms` - Positive integer interval, required for a time policy
-- `export_mask` - Numeric mask, required for a time policy
-
-Invalid or incomplete raw policy settings log a warning and leave automatic export
-disabled. Profiling and explicitly enabled manual export continue.
+- `continuous_export` — Enables the async export worker for explicit `request_export(mask)` calls
 
 ## Testing
 

@@ -105,11 +105,6 @@ POINTWISE_OPS = [
     ("aten::logit", lambda x: torch.ops.aten.logit(x), _unit),
     ("aten::exp2", lambda x: torch.ops.aten.exp2(x), torch.randn(8)),
     ("aten::special_i1e", lambda x: torch.ops.aten.special_i1e(x), torch.randn(8)),
-    ("aten::elu", lambda x: torch.ops.aten.elu(x), torch.randn(8)),
-    ("aten::hardtanh", lambda x: torch.ops.aten.hardtanh(x), torch.randn(8)),
-    ("aten::hardshrink", lambda x: torch.ops.aten.hardshrink(x), torch.randn(8)),
-    ("aten::hardswish", lambda x: torch.ops.aten.hardswish(x), torch.randn(8)),
-    ("aten::mish", lambda x: torch.ops.aten.mish(x), torch.randn(8)),
 ]
 
 

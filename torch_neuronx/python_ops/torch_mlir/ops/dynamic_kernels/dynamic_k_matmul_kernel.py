@@ -125,22 +125,16 @@ def _accumulate_row_band(
 
 @nki.jit()
 def dynamic_k_matmul_kernel(x_e, dout, num_k_tiles):
-    """Multiply K-major matrices over a runtime-dynamic contraction dimension.
+    """out[M,N] = x_eᵀ @ dout, contracting the K partition dim.
+
+    M and N accept any positive size. Both are baked, so this kernel peels a short tile.
 
     Args:
-        x_e (tensor): ``[K_compile, M]`` operand whose selected rows are transposed.
-        dout (tensor): ``[K_compile, N]`` right operand.
-        num_k_tiles (tensor): Int32 ``[1, 1]`` count of 128-row K tiles to contract.
-
+        x_e: [K_compile, M] bf16 on HBM (first num_k_tiles*128 rows used)
+        dout: [K_compile, N] bf16 on HBM
+        num_k_tiles: [1, 1] int32 — number of 128-row K tiles to contract
     Returns:
-        tensor: ``[M, N]`` product with the ``x_e`` dtype in HBM.
-
-    Raises:
-        AssertionError: If the compiled K dimensions differ.
-
-    Note:
-        M and N need not be tile-aligned, but N must fit the resident
-        zero-initialization buffer budget.
+        out: [M, N] bf16 on HBM
     """
     K_compile, M = x_e.shape  # noqa: N806
     K_compile_, N = dout.shape  # noqa: N806
@@ -176,11 +170,6 @@ def dynamic_k_matmul_kernel(x_e, dout, num_k_tiles):
     d_tile = nl.ndarray((tile_k, tile_n), dout.dtype, nl.sbuf)
 
     def body(_i):
-        """Accumulate one dynamic K-tile iteration.
-
-        Args:
-            _i (int): Loop iteration index accepted but not used.
-        """
         if num_full_m:
             for mb in nl.affine_range(num_full_m):
                 _accumulate_row_band(

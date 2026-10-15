@@ -8,8 +8,6 @@
 #include <random>
 #include <sstream>
 
-#include "torch_neuronx/csrc/core/cache/CompilationCacheKey.h"
-
 constexpr const char* kPreserveArtifactsEnvVar = "TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS";
 constexpr const char* kDebugDir = "TORCH_NEURONX_DEBUG_DIR";
 
@@ -27,17 +25,6 @@ std::string ComputeXXH3Hash128(const std::vector<uint8_t>& data) {
   oss << std::hex << std::setfill('0') << std::setw(16) << hash.high64 << std::setw(16)
       << hash.low64;
   return oss.str();
-}
-
-std::string HashCacheKeyString(const std::string& key) {
-  return ComputeXXH3Hash128(std::vector<uint8_t>(key.begin(), key.end()));
-}
-
-std::string HashHloCacheKey(const std::string& key) {
-  // BuildCompilerExtension() does not read the content-key gate, so this stays safe when
-  // the NEFF key is content-addressed.
-  const CompilationCacheKey cache_key(key, "", "");
-  return HashCacheKeyString(key + "|" + cache_key.BuildCompilerExtension());
 }
 
 std::string GetDebugDir() {

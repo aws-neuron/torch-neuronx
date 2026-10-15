@@ -71,21 +71,4 @@ NRT_STATUS DispatchExecution(ModelHandle* model, TensorSetHandle* input_set,
   return nrta_execute_schedule(model, input_set, output_set, queue, ret, req_sequence);
 }
 
-std::vector<std::pair<std::string, size_t>> GetMemoryUsageBreakdown(uint32_t vnc_id) {
-  std::vector<std::pair<std::string, size_t>> breakdown;
-
-  nrt_memory_usage_breakdown_t* result = nullptr;
-  NRT_STATUS status = nrt_get_memory_usage_breakdown(vnc_id, &result);
-  if (status == NRT_SUCCESS && result != nullptr) {
-    breakdown.reserve(result->count);
-    for (size_t i = 0; i < result->count; i++) {
-      breakdown.emplace_back(result->entries[i].category, result->entries[i].bytes);
-    }
-  }
-  // Free unconditionally: the runtime allocates the result on success even when
-  // count == 0, and free(nullptr) is a safe no-op otherwise.
-  nrt_memory_usage_breakdown_free(result);
-  return breakdown;
-}
-
 }  // namespace at::neuron::nrt

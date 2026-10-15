@@ -140,8 +140,8 @@ packed Int→Long short-circuit, placed *before* the `mlir_can_handle` check, th
 routes through `NeuronSafeCast` → `materialize_from_i32` (with stride
 preservation). This keeps `_to_copy` consistent with the operand-cast path and
 matters for any op whose Python implementation finishes with `result.to(int64)`
-(e.g. the value-dependent ops like `masked_select`, which re-lower on every call
-and rely on that final cast for the upcast).
+(e.g. the value-dependent ops like `masked_select`, which run on a Python
+dispatch path and rely on that final cast for the upcast).
 
 ### Recursion guard (important)
 

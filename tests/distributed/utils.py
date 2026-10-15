@@ -8,7 +8,7 @@ from contextlib import contextmanager
 import pytest
 import torch
 
-from tests.utils.neuron_test_utils import get_rank_core
+from tests.utils.neuron_test_utils import get_core_start_index
 
 
 def broadcast_object_from_rank0(obj, rank: int, world_size: int, tag: str):
@@ -57,7 +57,6 @@ def get_free_port():
 @contextmanager
 def distributed_context(master_addr, master_port, rank: int, world_size: int, process_index):
     """Context manager for distributed setup"""
-    core = get_rank_core(rank)
     try:
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = master_port
@@ -65,7 +64,7 @@ def distributed_context(master_addr, master_port, rank: int, world_size: int, pr
         os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
         os.environ["RANK"] = str(rank)
         os.environ["LOCAL_RANK"] = str(rank)
-        os.environ["NEURON_RT_VISIBLE_CORES"] = str(core)
+        os.environ["NEURON_RT_VISIBLE_CORES"] = str(get_core_start_index() + rank)
         import torch.distributed as dist
 
         import torch_neuronx
@@ -79,10 +78,7 @@ def distributed_context(master_addr, master_port, rank: int, world_size: int, pr
         del os.environ["RANK"]
         del os.environ["LOCAL_RANK"]
         del os.environ["NEURON_RT_VISIBLE_CORES"]
-        # Destroy only what init_process_group built. An unconditional call raises
-        # "Process group cannot be None" and hides the real setup error.
-        if dist.is_initialized():
-            dist.destroy_process_group()
+        dist.destroy_process_group()
 
 
 _BASE_MASTER_PORT = 29500

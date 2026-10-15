@@ -79,15 +79,7 @@ LNC = int(get_logical_neuron_cores())
 
 
 def div_ceil(numerator: int, denominator: int) -> int:
-    """Compute the ceiling of an integer quotient.
-
-    Args:
-        numerator (int): Dividend.
-        denominator (int): Nonzero divisor.
-
-    Returns:
-        int: Smallest integer greater than or equal to the quotient.
-    """
+    """Ceiling division. Avoids inline ``(n + d - 1) // d`` per NKI conventions."""
     return -(-numerator // denominator)
 
 
@@ -110,12 +102,8 @@ def _flat_gather_lane(grouped_in, out, stride=2, lane=0):
     """
     numel = out.shape[0]
 
-    # A launch without a grid has no axis 0.
-    if nl.program_ndim() == 0:
-        num_progs, prog_id = 1, 0
-    else:
-        num_progs = nl.num_programs(0)
-        prog_id = nl.program_id(0)
+    num_progs = nl.num_programs(0)
+    prog_id = nl.program_id(0)
     per_prog = div_ceil(div_ceil(numel, num_progs), P_MAX) * P_MAX
     core_base = prog_id * per_prog
     core_n = min(per_prog, numel - core_base)
@@ -176,12 +164,8 @@ def _flat_scatter_lane(grouped_io, vals, stride=2, lane=0):
     """
     numel = vals.shape[0]
 
-    # A launch without a grid has no axis 0.
-    if nl.program_ndim() == 0:
-        num_progs, prog_id = 1, 0
-    else:
-        num_progs = nl.num_programs(0)
-        prog_id = nl.program_id(0)
+    num_progs = nl.num_programs(0)
+    prog_id = nl.program_id(0)
     per_prog = div_ceil(div_ceil(numel, num_progs), P_MAX) * P_MAX
     core_base = prog_id * per_prog
     core_n = min(per_prog, numel - core_base)
@@ -231,55 +215,37 @@ def _flat_scatter_lane(grouped_io, vals, stride=2, lane=0):
 
 @nki.jit
 def strided_flat_gather_kernel_(grouped_in, out, stride, lane):
-    """Gather one lane from a flat grouped stream into an existing output.
+    """Gather lane ``lane`` of a flat stride-``stride`` group-stream (in place).
 
-    Args:
-        grouped_in (nl.ndarray): Flat source arranged in groups of ``stride`` elements.
-        out (nl.ndarray): Contiguous destination receiving one value per group.
-        stride (int): Number of elements in each source group.
-        lane (int): Zero-based element to select from each group.
-
-    Returns:
-        nl.ndarray: ``out`` after the selected values are written.
-
-    Note:
-        A stride of two selects low or high words from packed ``int64`` storage.
+    In-place stride-S gather (writes into the caller's ``out``) — used by
+    copy_strided to move a uniform stride-S lane view (e.g. a ``[:, lane]``
+    column of an ``(N, stride)`` tensor) into a contiguous buffer on-device,
+    instead of a per-element / host round-trip. ``stride=2`` is the packed-int64
+    low/high-word gather. Delegates to the shared ``_flat_gather_lane`` core.
     """
     return _flat_gather_lane(grouped_in, out, stride, lane)
 
 
 @nki.jit
 def strided_flat_scatter_kernel(grouped_io, vals, stride, lane):
-    """Scatter contiguous values into one lane of a flat grouped stream.
+    """Scatter contiguous ``vals`` into lane ``lane`` of a flat stride-``stride`` stream.
 
-    Args:
-        grouped_io (nl.ndarray): Grouped destination whose other lanes are preserved.
-        vals (nl.ndarray): Contiguous values to scatter.
-        stride (int): Number of elements in each destination group.
-        lane (int): Zero-based element to replace in each group.
-
-    Returns:
-        nl.ndarray: ``grouped_io`` after the in-place updates.
-
-    Note:
-        A stride of two replaces low or high words in packed ``int64`` storage.
+    In-place stride-S scatter; preserves the other lanes of each group
+    (burst-load / on-chip write / burst-store). ``stride=2`` is the packed-int64
+    scatter. Delegates to the shared ``_flat_scatter_lane`` core.
     """
     return _flat_scatter_lane(grouped_io, vals, stride, lane)
 
 
 def run_strided_gather(src_tensor, dst_tensor, *, stride: int, lane: int = 0):
-    """Gather a uniformly strided lane into a contiguous destination.
+    """Gather a uniform stride-S lane view into a contiguous destination.
 
     Args:
-        src_tensor (torch.Tensor): Source lane view with uniform storage stride.
-        dst_tensor (torch.Tensor): Contiguous destination with the same logical shape.
-        stride (int): Number of storage elements in each source group.
-        lane (int, optional): Element selected from each group. Defaults to ``0``.
-
-    Note:
-        ``lane`` must equal ``src_tensor.storage_offset() % stride``. This function
-        writes ``dst_tensor`` and uses a dynamic kernel when the supported
-        packed-``int64`` conditions are satisfied.
+        src_tensor: source with uniform stride ``stride`` over its storage (a
+            lane view; ``storage_offset % stride == lane``).
+        dst_tensor: contiguous destination of the same logical shape.
+        stride: group size S (the uniform element stride of ``src_tensor``).
+        lane: which element of each group to gather (== storage_offset % stride).
     """
     numel = int(dst_tensor.numel())
     if numel == 0:
@@ -311,18 +277,15 @@ def run_strided_gather(src_tensor, dst_tensor, *, stride: int, lane: int = 0):
 
 
 def run_strided_scatter(src_tensor, dst_tensor, *, stride: int, lane: int = 0):
-    """Scatter a contiguous source into a uniformly strided destination lane.
+    """Scatter a contiguous source into a uniform stride-S lane view.
 
     Args:
-        src_tensor (torch.Tensor): Contiguous source tensor.
-        dst_tensor (torch.Tensor): Destination lane view whose other lanes are preserved.
-        stride (int): Number of storage elements in each destination group.
-        lane (int, optional): Element replaced in each group. Defaults to ``0``.
-
-    Note:
-        ``lane`` must equal ``dst_tensor.storage_offset() % stride``. This function
-        updates ``dst_tensor`` in place, preserves other lanes, and safely handles
-        minimal-span storage views.
+        src_tensor: contiguous source.
+        dst_tensor: destination with uniform stride ``stride`` over its storage
+            (a lane view; ``storage_offset % stride == lane``). Other lanes are
+            preserved.
+        stride: group size S (the uniform element stride of ``dst_tensor``).
+        lane: which element of each group to write (== storage_offset % stride).
     """
     numel = int(src_tensor.numel())
     if numel == 0:
@@ -339,20 +302,22 @@ def run_strided_scatter(src_tensor, dst_tensor, *, stride: int, lane: int = 0):
 
 @nki.jit
 def stride2_flat_gather_kernel(packed_in, parity: int = 0):
-    """Gather one lane from a flat stream of packed pairs.
+    """Out-of-place gather of one lane from a flat packed pair-stream.
 
     Args:
-        packed_in (nl.ndarray): Flat contiguous ``int32`` stream of ``[low, high]`` pairs.
-        parity (int, optional): Gather ``0`` for low or ``1`` for high. Defaults to ``0``.
+        packed_in: flat int32 [2*numel] contiguous ``[lo, hi, ...]`` pairs (the
+            physical view of a contiguous int64 tensor).
+        parity: lane to gather — 0 = low words (default), 1 = high words.
 
     Returns:
-        nl.ndarray: Flat ``int32[numel]`` output for ``packed_in`` length ``2 * numel``.
+        out: flat int32 [numel] contiguous lane words, allocated in shared_hbm.
 
-    Note:
-        Allocating in shared HBM avoids external ``out`` operands with
-        ``output_operand_aliases`` whose identical buffers CSE could merge, causing
-        gathers to alias and clobber one another. It uses balanced flat tiling from
-        ``_flat_gather_lane``.
+    Out-of-place on purpose: when several packed inputs are gathered in one
+    graph, an in-place kernel's ``out`` buffer becomes a custom_call operand with
+    ``output_operand_aliases``, and the identically-shaped ``torch.empty``
+    buffers get CSE'd into a single constant — so the gathers alias and clobber
+    each other. Allocating the output internally gives each call an independent
+    result. Shares the balanced tiling via ``_flat_gather_lane``.
     """
     numel = packed_in.shape[0] // 2
     out = nl.ndarray((numel,), dtype=nl.int32, buffer=nl.shared_hbm)
@@ -363,21 +328,11 @@ _wrapped_flat_gather = wrap_nki(stride2_flat_gather_kernel)
 
 
 @nki_op("nki_kernels::packed_gather", mutates_args={})
-def packed_gather_nki(packed: torch.Tensor, parity: int = 0, lnc: int = 0) -> torch.Tensor:
-    """Gather one lane from a packed ``int32[..., 2]`` tensor.
+def packed_gather_nki(packed: torch.Tensor, parity: int = 0, lnc: int = 1) -> torch.Tensor:
+    """Gather one lane (low words by default) from a packed int32[..., 2] tensor.
 
-    Args:
-        packed (torch.Tensor): Tensor whose final dimension contains low/high words.
-        parity (int, optional): Final-dimension lane to gather. Defaults to ``0``.
-        lnc (int, optional): Logical NeuronCore count used for the launch; ``0`` selects
-            the current logical core count. Defaults to ``0``.
-
-    Returns:
-        torch.Tensor: ``int32`` values with the packed tensor's logical shape.
-
-    Note:
-        The gather co-compiles into the caller's NEFF and returns an empty tensor
-        without launching NKI when the input has no elements.
+    Called inside a traced ``torch_fn`` so the gather co-compiles into the op's
+    NEFF. Returns int32 with the input's logical shape.
     """
     logical_shape = packed.shape[:-1]
     # Empty operand (e.g. cat / foreach with a size-0 int64 tensor): the NKI
@@ -388,5 +343,5 @@ def packed_gather_nki(packed: torch.Tensor, parity: int = 0, lnc: int = 0) -> to
     if packed.numel() == 0:
         return torch.empty(logical_shape, dtype=torch.int32, device=packed.device)
     flat = packed.reshape(-1)
-    lane = _wrapped_flat_gather[(lnc or int(get_logical_neuron_cores()),)](flat, parity)
+    lane = _wrapped_flat_gather[(lnc,)](flat, parity)
     return lane.reshape(logical_shape)

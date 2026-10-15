@@ -1,0 +1,22 @@
+{
+  "$schema": "https://raw.githubusercontent.com/aws/amazon-q-developer-cli/refs/heads/main/schemas/agent-v1.json",
+  "allowedTools": [
+    "fs_read",
+    "grep",
+    "glob",
+    "execute_bash",
+    "todo_list"
+  ],
+  "description": "Implementer agent that adds a native Neuron lowering for ONE ATen op end-to-end by following the /aten-op-lowering runbook: reference extraction, the lowering, unit tests, the upstream suites (single-tenant, whole host), fix-vs-xfail triage, registry hygiene, perf/vertical coverage, docs (flip CPU_FALLBACK to Y), and a draft PR from the template. Spawned per-op by aten-lowering-orchestrator, and usable standalone.",
+  "model": "claude-opus-4.8",
+  "name": "aten-op-lowering",
+  "prompt": "file://./.kiro/agents/aten-op-lowering.md",
+  "resources": [
+    "skill://.kiro/skills/aten-op-lowering/SKILL.md",
+    "skill://.kiro/skills/pytorch-upstream-test-debugger/SKILL.md",
+    "skill://.kiro/skills/torch-neuronx-docs/SKILL.md"
+  ],
+  "tools": [
+    "@builtin"
+  ]
+}

@@ -4,6 +4,8 @@ fixture. Used by ``TestLazyAllocDeferRetry`` and ``TestMultiStreamDeferRetry``."
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
@@ -21,6 +23,13 @@ _BIG_FRACTION_NUM = 42
 _STAGED_FRACTION_NUM = 62
 _OVERSIZE_FRACTION_NUM = 150
 _FRACTION_DENOM = 100
+
+
+_LAZY_ALLOC_ENABLED = os.environ.get("TORCH_NEURONX_ENABLE_LAZY_ALLOC") == "1"
+requires_lazy_alloc = pytest.mark.skipif(
+    not _LAZY_ALLOC_ENABLED,
+    reason="Requires TORCH_NEURONX_ENABLE_LAZY_ALLOC=1",
+)
 
 
 def vnc_hbm_mib() -> int:

@@ -96,8 +96,16 @@ class TestReadDispatchTimeUs:
         )
         assert dt._read_dispatch_time_us()[1] == 2000
 
-    def test_none_when_the_metric_recorded_nothing(self, monkeypatch):
+    def test_falls_back_to_python_accumulator(self, monkeypatch):
         monkeypatch.setattr(dt.met, "get_metric_data", lambda name: {"total_samples": 0})
+        monkeypatch.setattr(dt, "_DISPATCH_TIMING_ENABLED", True)
+        monkeypatch.setattr(dt, "_dispatch_times", [10_000, 20_000])
+        assert dt._read_dispatch_time_us() == (20.0, 2, "python_accumulator")
+
+    def test_none_when_neither_source_recorded(self, monkeypatch):
+        monkeypatch.setattr(dt.met, "get_metric_data", lambda name: {"total_samples": 0})
+        monkeypatch.setattr(dt, "_DISPATCH_TIMING_ENABLED", True)
+        monkeypatch.setattr(dt, "_dispatch_times", [])
         assert dt._read_dispatch_time_us() == (None, 0, "")
 
 

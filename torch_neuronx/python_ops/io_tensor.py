@@ -9,55 +9,32 @@ import torch
 
 @torch._dynamo.disable
 def empty(*args, **kwargs):
-    """Create an uninitialized physical tensor outside Dynamo tracing.
-
-    Args:
-        *args (Any): Positional arguments forwarded to ``torch.empty``.
-        **kwargs (Any): Keyword arguments forwarded to ``torch.empty``.
-
-    Returns:
-        torch.Tensor: Physical tensor created by ``torch.empty``.
+    """
+    Create empty tensor for I/O operations. Accepts same arguments as torch.empty.
     """
     return torch.empty(*args, **kwargs)
 
 
 @torch._dynamo.disable
 def empty_like(*args, **kwargs):
-    """Create an uninitialized physical tensor like another tensor.
-
-    Args:
-        *args (Any): Positional arguments forwarded to ``torch.empty_like``.
-        **kwargs (Any): Keyword arguments forwarded to ``torch.empty_like``.
-
-    Returns:
-        torch.Tensor: Physical tensor created by ``torch.empty_like``.
+    """
+    Create empty tensor like another tensor for I/O operations.
+    Accepts same arguments as torch.empty_like.
     """
     return torch.empty_like(*args, **kwargs)
 
 
 @torch._dynamo.disable
 def tensor(*args, **kwargs):
-    """Create a physical tensor outside Dynamo tracing.
-
-    Args:
-        *args (Any): Positional arguments forwarded to ``torch.tensor``.
-        **kwargs (Any): Keyword arguments forwarded to ``torch.tensor``.
-
-    Returns:
-        torch.Tensor: Physical tensor created by ``torch.tensor``.
+    """
+    Create tensor for I/O operations. Accepts same arguments as torch.tensor.
     """
     return torch.tensor(*args, **kwargs)
 
 
 @torch._dynamo.disable
 def zeros(*args, **kwargs):
-    """Create a zero-filled physical tensor outside Dynamo tracing.
-
-    Args:
-        *args (Any): Positional arguments forwarded to ``torch.zeros``.
-        **kwargs (Any): Keyword arguments forwarded to ``torch.zeros``.
-
-    Returns:
-        torch.Tensor: Physical tensor created by ``torch.zeros``.
+    """
+    Create zero tensor for I/O operations. Accepts same arguments as torch.zeros.
     """
     return torch.zeros(*args, **kwargs)

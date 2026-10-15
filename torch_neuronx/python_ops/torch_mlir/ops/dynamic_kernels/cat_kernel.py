@@ -27,18 +27,15 @@ def _h_segments(hidden, tile_size_h):
 
 @nki.jit()
 def cat_kernel(input_a, input_b, num_m_tiles):
-    """Concatenate two tensors along their free dimension.
+    """
+    Free-dim concat: output[:, :H1] = input_a, output[:, H1:] = input_b
 
     Args:
-        input_a (tensor): First ``[m_static, H1]`` HBM operand.
-        input_b (tensor): Second ``[m_static, H2]`` HBM operand.
-        num_m_tiles (tensor): Int32 ``[1, 1]`` count of 128-row tiles to copy.
-
+        input_a: [m_static, H1] bf16 on HBM
+        input_b: [m_static, H2] bf16 on HBM
+        num_m_tiles: [1, 1] int32 — number of 128-row tiles to copy
     Returns:
-        tensor: ``[m_static, H1 + H2]`` concatenated HBM tensor.
-
-    Note:
-        Only the first ``128 * num_m_tiles`` rows are initialized.
+        output: [m_static, H1 + H2] bf16 on HBM
     """
     m_static, H1 = input_a.shape  # noqa: N806
     _, H2 = input_b.shape  # noqa: N806
@@ -65,11 +62,6 @@ def cat_kernel(input_a, input_b, num_m_tiles):
 
     def body(_i):
         # input_a -> result[:, 0:H1]
-        """Process one dynamic row-tile iteration.
-
-        Args:
-            _i (int): Loop iteration index.
-        """
         for seg in range(len(a_starts)):
             h_start, h_width = a_starts[seg], a_widths[seg]
             a_tile = nl.ndarray((tile_size_m, h_width), input_a.dtype, nl.sbuf)

@@ -54,24 +54,6 @@ def _validate_im2col(self, kernel_size, dilation, padding, stride, out=None):
     validate_static_inputs=_validate_im2col,
 )
 def torch_im2col(self, kernel_size, dilation, padding, stride, out=None):
-    """Extract sliding image blocks through the registered ATen lowering.
-
-    Args:
-        self (torch.Tensor): Batched or unbatched image tensor.
-        kernel_size (Sequence[int]): Height and width of each block.
-        dilation (Sequence[int]): Spacing between kernel elements.
-        padding (Sequence[int]): Implicit padding on each spatial dimension.
-        stride (Sequence[int]): Step between adjacent blocks.
-        out (torch.Tensor, optional): Output buffer handled by the registration wrapper rather
-            than this function body. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Columns containing the extracted image blocks.
-
-    Raises:
-        NotImplementedError: If ``self`` has an integral dtype.
-        RuntimeError: If the kernel size is nonpositive or padding is negative.
-    """
     return aten.im2col.default(self, kernel_size, dilation, padding, stride)
 
 
@@ -94,23 +76,4 @@ def _validate_col2im(self, output_size, kernel_size, dilation, padding, stride, 
     validate_static_inputs=_validate_col2im,
 )
 def torch_col2im(self, output_size, kernel_size, dilation, padding, stride, out=None):
-    """Combine column blocks into an image through the registered ATen lowering.
-
-    Args:
-        self (torch.Tensor): Batched or unbatched tensor of column blocks.
-        output_size (Sequence[int]): Height and width of the output image.
-        kernel_size (Sequence[int]): Height and width of each block.
-        dilation (Sequence[int]): Spacing between kernel elements.
-        padding (Sequence[int]): Implicit padding on each spatial dimension.
-        stride (Sequence[int]): Step between adjacent blocks.
-        out (torch.Tensor, optional): Output buffer handled by the registration wrapper rather
-            than this function body. Defaults to ``None``.
-
-    Returns:
-        torch.Tensor: Image formed by summing overlapping blocks.
-
-    Raises:
-        NotImplementedError: If ``self`` has an integral dtype.
-        RuntimeError: If the kernel-size product overflows ``uint64``.
-    """
     return aten.col2im.default(self, output_size, kernel_size, dilation, padding, stride)

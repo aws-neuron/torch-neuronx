@@ -1250,14 +1250,15 @@ class TestExecutor:
     @patch("torch_neuronx._C._nki_copy_strided_neuron_to_neuron")
     @patch("torch_neuronx._C.execute_compiled_graph")
     @patch("torch.neuron.current_device")
-    def test_noncontiguous_neuron_input_made_contiguous(
+    def test_noncontiguous_neuron_input_uses_strided_copy(
         self, mock_current_device, mock_execute, mock_strided_copy
     ):
-        """Test that non-contiguous neuron inputs are made contiguous with .contiguous().
+        """Test that non-contiguous neuron inputs are made contiguous via a device strided copy.
 
-        .contiguous() routes to the on-device transpose kernel that eager uses.
-        A direct strided copy splits a permuted input into one tiny copy per
-        contiguous run, which floods the queue.
+        When torch.compile graph segments produce non-contiguous views (e.g. from
+        scatter/gather in torch_geometric MessagePassing), calling .contiguous()
+        would re-enter the dispatch pipeline and fail inside the compilation context.
+        Instead, _prepare_inputs uses torch.empty + the strided copy binding directly.
         """
         mock_current_device.return_value = 0
 
@@ -1271,16 +1272,18 @@ class TestExecutor:
         neuron_tensor.dtype = torch.float32
         neuron_tensor.shape = [2, 3]
         neuron_tensor.is_contiguous.return_value = False
-        contiguous_tensor = MagicMock(spec=torch.Tensor)
-        contiguous_tensor.dtype = torch.float32
-        neuron_tensor.contiguous.return_value = contiguous_tensor
 
-        with _mock_empty_output():
+        with patch("torch.empty") as mock_empty:
+            contiguous_buf = MagicMock(spec=torch.Tensor)
+            contiguous_buf.dtype = torch.float32
+            # First call: contiguous buffer for input; second call: output allocation
+            mock_empty.side_effect = [contiguous_buf, MagicMock(dtype=torch.float32)]
+
             executor(neuron_tensor)
 
-            # Verify .contiguous() was used, not the strided-copy binding.
-            neuron_tensor.contiguous.assert_called_once_with()
-            mock_strided_copy.assert_not_called()
+            # Verify the strided copy was used (not .contiguous())
+            mock_strided_copy.assert_called_once_with(neuron_tensor, contiguous_buf)
+            neuron_tensor.contiguous.assert_not_called()
 
     @patch("torch_neuronx._C._nki_copy_strided_neuron_to_neuron")
     @patch("torch_neuronx._C.execute_compiled_graph")
@@ -1327,6 +1330,7 @@ class TestExecutor:
         neuron_tensor.device.type = "neuron"
         neuron_tensor.dtype = torch.int64
         neuron_tensor.shape = [2, 3]
+        neuron_tensor.dim.return_value = 2
         neuron_tensor.is_contiguous.return_value = False
 
         contiguous_buf = MagicMock(spec=torch.Tensor)
@@ -1335,15 +1339,16 @@ class TestExecutor:
         contiguous_buf.is_contiguous.return_value = True
         int32_tensor = MagicMock(spec=torch.Tensor)
         contiguous_buf.view.return_value = int32_tensor
-        neuron_tensor.contiguous.return_value = contiguous_buf
 
-        with _mock_empty_output():
+        with patch("torch.empty") as mock_empty:
+            # First call: contiguous buffer for input; second call: output allocation
+            mock_empty.side_effect = [contiguous_buf, MagicMock(dtype=torch.float32)]
+
             executor(neuron_tensor)
 
-            # Verify: .contiguous() first, then view(int32) on the contiguous result
-            neuron_tensor.contiguous.assert_called_once_with()
+            # Verify: NRT copy first, then view(int32) on the contiguous result
+            mock_strided_copy.assert_called_once_with(neuron_tensor, contiguous_buf)
             contiguous_buf.view.assert_called_once_with(torch.int32)
-            mock_strided_copy.assert_not_called()
 
 
 def _make_io_specs(
@@ -1366,19 +1371,11 @@ def _make_io_specs(
 
 
 def _make_cpu_tensor(*, name=None):
-    """Create a mock CPU tensor that returns a mock neuron tensor on .to().
-
-    shape and dtype are real so the executor's copy-back validation compares them for
-    real rather than being skipped for a test double.
-    """
+    """Create a mock CPU tensor that returns a mock neuron tensor on .to()."""
     tensor = MagicMock(spec=torch.Tensor, name=name)
     tensor.device.type = "cpu"
     tensor.dtype = torch.float32
-    tensor.shape = torch.Size([2, 3])
-    neuron = MagicMock(spec=torch.Tensor, name=f"{name}_neuron" if name else None)
-    neuron.dtype = torch.float32
-    neuron.shape = torch.Size([2, 3])
-    tensor.to.return_value = neuron
+    tensor.to.return_value = MagicMock(spec=torch.Tensor, name=f"{name}_neuron" if name else None)
     return tensor
 
 

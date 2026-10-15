@@ -15,17 +15,18 @@ from dataclasses import dataclass, field
 
 @dataclass
 class AliasInfo:
-    """Represent one StableHLO input-output buffer alias.
+    """Single input-output aliasing relationship for StableHLO buffer optimization.
 
-    Args:
-        parameter_number (int): Zero-based input whose buffer is reused.
+    Represents a mapping where a function output aliases (shares memory with) a
+    function input. Used to set the mhlo.input_output_alias attribute.
+
+    Attributes:
+        parameter_number (int): Index of the input parameter in the function signature
+            (0-indexed). This is the input whose buffer will be reused.
         parameter_index (list[int] | None): Index path into nested tuple parameters.
-            Use an empty list for a flat parameter or ``None`` when inapplicable.
-        output_index (int): Zero-based output that aliases the input.
-
-    Note:
-        This record supplies the ``mhlo.input_output_alias`` attribute used for
-        StableHLO buffer optimization.
+            Empty list [] for flat parameters, None if not applicable.
+        output_index (int): Index of the output in the function's return tuple
+            (0-indexed) that aliases the specified input parameter.
     """
 
     parameter_number: int
@@ -35,45 +36,22 @@ class AliasInfo:
 
 @dataclass
 class AliasingInfo:
-    """Collect StableHLO input-output buffer aliases.
-
-    Args:
-        aliases (list[AliasInfo]): Alias records in insertion order. Defaults to
-            an empty list.
-        output_to_input (dict[int, int]): Output-to-input lookup table. Defaults
-            to an empty dictionary.
-    """
-
     aliases: list[AliasInfo] = field(default_factory=list)
     output_to_input: dict[int, int] = field(default_factory=dict, repr=False)
 
     def get_input_index(self, output_index: int) -> int | None:
-        """Get the input index aliased by an output.
-
-        Args:
-            output_index (int): Output index to query.
-
-        Returns:
-            int | None: Aliased input index, or ``None`` if no alias exists.
-        """
+        """Get input index for an aliased output, or None if not aliased."""
         return self.output_to_input.get(output_index)
 
     def add(
         self, parameter_number: int, parameter_index: list[int] | None, output_index: int
     ) -> None:
-        """Add an input-output aliasing relationship.
+        """Add an aliasing relationship to the collection.
 
         Args:
-            parameter_number (int): Input parameter index.
-            parameter_index (list[int] | None): Index path for a nested parameter.
-            output_index (int): Aliased output index.
-
-        Raises:
-            ValueError: If the output already aliases a different input.
-
-        Note:
-            Re-adding an output mapped to the same parameter number has no effect; a
-            different ``parameter_index`` for that mapping is ignored.
+            parameter_number (int): Index of the input parameter.
+            parameter_index (list[int] | None): Index path for nested parameters.
+            output_index (int): Index of the aliased output.
         """
         if output_index in self.output_to_input:
             existing_input = self.output_to_input[output_index]

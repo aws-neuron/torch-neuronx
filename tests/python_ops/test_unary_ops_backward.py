@@ -40,15 +40,6 @@ UNARY_OPS = [
     (torch.neg, "aten::neg", None),
     (F.softplus, "aten::softplus", "aten::softplus_backward"),
     (F.logsigmoid, "aten::log_sigmoid_forward", "aten::log_sigmoid_backward"),
-    (F.elu, "aten::elu", "aten::elu_backward"),
-    (F.hardtanh, "aten::hardtanh", "aten::hardtanh_backward"),
-    (F.hardshrink, "aten::hardshrink", "aten::hardshrink_backward"),
-    (F.hardswish, "aten::hardswish", "aten::hardswish_backward"),
-    (F.mish, "aten::mish", "aten::mish_backward"),
-    # selu and relu6 are CompositeImplicitAutograd. They decompose to elu and
-    # hardtanh, so the backward runs as elu_backward and hardtanh_backward.
-    (torch.selu, "aten::elu", "aten::elu_backward"),
-    (F.relu6, "aten::hardtanh", "aten::hardtanh_backward"),
     # Wrappers for unary ops that need extra arguments
     (softmax_wrapper, "aten::softmax", "aten::_softmax_backward_data"),
     (log_softmax_wrapper, "aten::log_softmax", "aten::_log_softmax_backward_data"),
@@ -133,16 +124,6 @@ class TestUnaryOpsBackward:
 
         torch.testing.assert_close(x_neuron.grad.cpu(), x.grad, rtol=1e-4, atol=1e-4)
 
-    def test_elu_selu_forward_reference_accuracy(self):
-        # elu's negative branch is scale*alpha*expm1(input_scale*x). The hardware
-        # exp misses the strict reference-numerics oracle, so the lowering uses the
-        # accurate expm1. Check elu and selu against CPU at the oracle tolerance.
-        x = torch.linspace(-20.0, 20.0, 4000, dtype=torch.float32)
-        x_neuron = x.to("neuron")
-        for fn in (torch.selu, F.elu):
-            got = fn(x_neuron).cpu()
-            torch.testing.assert_close(got, fn(x), rtol=1.3e-6, atol=1e-5)
-
 
 class TestGradInputVariants:
     """Tests for .grad_input variant dispatch to Neuron."""
@@ -196,59 +177,3 @@ class TestGradInputVariants:
         expected = torch.ops.aten.log_sigmoid_backward(grad_output, x, buffer)
         torch.testing.assert_close(result.cpu(), expected.cpu())
         torch.testing.assert_close(grad_input.cpu(), expected.cpu())
-
-    @pytest.mark.parametrize("shape", [(32,), (8, 16)])
-    def test_elu_backward_grad_input_variant(self, shape):
-        torch.manual_seed(42)
-        grad_output = torch.randn(shape, device="neuron")
-        self_or_result = torch.randn(shape, device="neuron")
-        grad_input = torch.empty(shape, device="neuron")
-
-        with track_neuron_ops():
-            result = torch.ops.aten.elu_backward.grad_input(
-                grad_output, 1.5, 1.0, 1.0, False, self_or_result, grad_input=grad_input
-            )
-        assert_op_runs_on_neuron("aten::elu_backward")
-        expected = torch.ops.aten.elu_backward(grad_output, 1.5, 1.0, 1.0, False, self_or_result)
-        torch.testing.assert_close(result.cpu(), expected.cpu())
-        torch.testing.assert_close(grad_input.cpu(), expected.cpu())
-
-    @pytest.mark.parametrize("shape", [(32,), (8, 16)])
-    def test_hardtanh_backward_grad_input_variant(self, shape):
-        torch.manual_seed(42)
-        grad_output = torch.randn(shape, device="neuron")
-        x = torch.randn(shape, device="neuron")
-        grad_input = torch.empty(shape, device="neuron")
-
-        with track_neuron_ops():
-            result = torch.ops.aten.hardtanh_backward.grad_input(
-                grad_output, x, 0.0, 6.0, grad_input=grad_input
-            )
-        assert_op_runs_on_neuron("aten::hardtanh_backward")
-        expected = torch.ops.aten.hardtanh_backward(grad_output, x, 0.0, 6.0)
-        torch.testing.assert_close(result.cpu(), expected.cpu())
-        torch.testing.assert_close(grad_input.cpu(), expected.cpu())
-
-    @pytest.mark.parametrize("shape", [(32,), (8, 16)])
-    def test_hardshrink_backward_grad_input_variant(self, shape):
-        torch.manual_seed(42)
-        grad_output = torch.randn(shape, device="neuron")
-        x = torch.randn(shape, device="neuron")
-        grad_input = torch.empty(shape, device="neuron")
-
-        with track_neuron_ops():
-            result = torch.ops.aten.hardshrink_backward.grad_input(
-                grad_output, x, 0.5, grad_input=grad_input
-            )
-        assert_op_runs_on_neuron("aten::hardshrink_backward")
-        expected = torch.ops.aten.hardshrink_backward(grad_output, x, 0.5)
-        torch.testing.assert_close(result.cpu(), expected.cpu())
-        torch.testing.assert_close(grad_input.cpu(), expected.cpu())
-
-    def test_elu_inplace_backward_negative_alpha_raises(self):
-        # The in-place elu_ (is_result=True) with a negative alpha cannot recover
-        # the gradient from its output. aten raises; the Neuron lowering must too.
-        a = torch.tensor([-1.0, 1.0], device="neuron", requires_grad=True)
-        out = torch.nn.functional.elu_(a.clone(), alpha=-2.0)
-        with pytest.raises(RuntimeError, match="call out-of-place version"):
-            out.backward(torch.ones(2, device="neuron"))

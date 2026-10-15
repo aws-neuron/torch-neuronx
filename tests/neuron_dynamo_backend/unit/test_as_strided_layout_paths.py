@@ -1,7 +1,7 @@
 """Unit tests for the as_strided / as_strided_scatter contiguous fast paths.
 
-A contiguous access is served by narrow + reshape on the read side and a zero-padded copy
-of src masked in on the write side; only overlapping and permuted layouts gather. CPU-only.
+A contiguous access is served by narrow + reshape on the read side and a concat of the
+untouched spans on the write side; only overlapping and permuted layouts gather. CPU-only.
 """
 
 import collections
@@ -57,7 +57,7 @@ def test_contiguous_view_matches_reference(flat, size, stride, offset, label):
 
 @pytest.mark.parametrize("size,stride,offset,label", CONTIGUOUS, ids=[c[3] for c in CONTIGUOUS])
 def test_contiguous_view_is_recognized(size, stride, offset, label):
-    """The gate drives the write-side pad plus select, so it must accept a contiguous span."""
+    """The gate drives the write-side concat, so it must accept a contiguous span."""
     assert decompositions._is_static_contiguous_access(size, stride, offset), label
 
 
@@ -102,7 +102,7 @@ def test_scatter_strided_falls_back_and_stays_correct(size, stride, offset, labe
 
 
 # Any of these in the graph means the access went back to one index per element.
-PER_ELEMENT = ("scatter", "index_copy", "index_put", "index_select", "_unsafe_masked_index")
+PER_ELEMENT = ("scatter", "index_copy", "index_put", "arange", "index_select")
 
 # Contiguous writes, one per multi-span layout, plus the suffix-only layout at KV scale.
 # (size, stride, offset, storage, label)
@@ -113,12 +113,12 @@ WRITE_LAYOUTS = [
     ((7, 2, 64, 64, 2), (16384, 8192, 128, 2, 1), 0, 2 * 7 * 16384, "KV half"),
 ]
 
-# Pad amounts the flat write must produce: (elements before src, elements after it).
-EXPECTED_PAD = {
-    "suffix only": (0, 8),
-    "prefix only": (8, 0),
-    "prefix and suffix": (4, 4),
-    "KV half": (0, 7 * 16384),
+# Concat operands each layout must produce: src plus the spans it does not touch.
+EXPECTED_OPERANDS = {
+    "suffix only": 2,
+    "prefix only": 2,
+    "prefix and suffix": 3,
+    "KV half": 2,
 }
 
 
@@ -156,36 +156,26 @@ def test_contiguous_write_has_no_per_element_form(size, stride, offset, storage,
     WRITE_LAYOUTS,
     ids=[w[4] for w in WRITE_LAYOUTS],
 )
-def test_contiguous_write_pads_src_to_the_storage_span(size, stride, offset, storage, label):
-    """The span boundary lives in the pad attribute and the select spans all of storage."""
+def test_contiguous_write_concatenates_untouched_spans(size, stride, offset, storage, label):
+    """The write is one concat of src plus only the spans it does not touch."""
     gm, counts = _trace_write(size, stride, offset, storage)
-    assert "aten.cat.default" not in counts, f"{label}: concatenated instead of selecting"
-    assert counts["aten.constant_pad_nd.default"] == 1, f"{label}: expected one pad"
-    assert counts["aten.where.self"] == 1, f"{label}: expected one select"
+    assert counts["aten.cat.default"] == 1, f"{label}: expected exactly one concat"
 
-    pad = next(n for n in gm.graph.nodes if str(n.target) == "aten.constant_pad_nd.default")
-    # The write is planned on the flattened buffer, so there is one dim and one pad pair.
-    assert tuple(pad.args[1]) == EXPECTED_PAD[label], f"{label}: pad {pad.args[1]}"
-    assert pad.meta["val"].shape == (storage,), f"{label}: pad reached {pad.meta['val'].shape}"
-
-    where = next(n for n in gm.graph.nodes if str(n.target) == "aten.where.self")
-    mask = where.args[0].meta["val"]
-    assert mask.shape == (storage,), f"{label}: mask is {mask.shape}, not the storage span"
-    assert mask.dtype == torch.bool, f"{label}: mask dtype {mask.dtype}"
+    cat = next(n for n in gm.graph.nodes if str(n.target) == "aten.cat.default")
+    shapes = [tuple(a.meta["val"].shape) for a in cat.args[0]]
+    assert len(shapes) == EXPECTED_OPERANDS[label], f"{label}: concat operands {shapes}"
+    assert all(0 not in s for s in shapes), f"{label}: zero-size concat operand {shapes}"
+    assert sum(s[0] for s in shapes) == storage, f"{label}: spans {shapes} != {storage}"
 
 
-def test_full_buffer_write_still_masks_over_a_zero_width_pad():
-    """A whole-buffer write has nothing outside src, so both pad amounts are zero.
-
-    as_strided_scatter has no whole-extent short circuit, so it pads and selects here too.
-    """
-    gm, counts = _trace_write((4, 4), (4, 1), 0, 16)
-    assert "aten.cat.default" not in counts, f"whole-buffer write concatenated: {counts}"
+def test_full_buffer_write_skips_the_concat():
+    """A write covering the whole buffer is a reshape, with nothing to rejoin."""
+    _, counts = _trace_write((4, 4), (4, 1), 0, 16)
+    assert (
+        "aten.cat.default" not in counts
+    ), f"nothing to rejoin, but the graph concatenates: {counts}"
     bad = {k: v for k, v in counts.items() if any(t in k for t in PER_ELEMENT)}
     assert not bad, f"per-element write form in the graph: {bad}"
-
-    pad = next(n for n in gm.graph.nodes if str(n.target) == "aten.constant_pad_nd.default")
-    assert tuple(pad.args[1]) == (0, 0), f"whole-buffer write padded by {pad.args[1]}"
 
 
 @pytest.mark.parametrize(
@@ -205,7 +195,7 @@ def test_contiguous_write_matches_reference_at_every_layout(size, stride, offset
     assert torch.equal(got, expected), label
 
 
-# The span layouts above plus the full-buffer write, which pads by (0, 0).
+# The span layouts above plus the full-buffer write, which needs no concat.
 # (size, stride, offset, storage, label)
 DTYPE_LAYOUTS = [
     ((2, 4), (4, 1), 0, 16, "suffix only"),
@@ -219,7 +209,7 @@ DTYPE_LAYOUTS = [
     "size,stride,offset,storage,label", DTYPE_LAYOUTS, ids=[d[4] for d in DTYPE_LAYOUTS]
 )
 def test_write_casts_src_to_destination_dtype(size, stride, offset, storage, label):
-    """select would type-promote; aten casts src into the destination instead."""
+    """cat would type-promote; aten casts src into the destination instead."""
     dst = torch.zeros(storage, dtype=torch.float32)
     n = math.prod(size)
     src = torch.arange(1, n + 1, dtype=torch.float64).reshape(size)

@@ -13,18 +13,17 @@ def compute_suffix(
     *,
     out=None,
 ):
-    """Merge attention heads and apply the output projection.
+    """
+    Transform attention output and apply projection.
 
     Args:
-        attn_output (torch.Tensor): Attention output shaped
-            ``(batch, num_heads, seq_len, d_head)``.
-        proj_weight (torch.Tensor): Projection weight shaped ``(d_model, d_model)``.
-        proj_bias (torch.Tensor): Projection bias shaped ``(d_model,)``.
-        out (torch.Tensor | None, optional): Accepted for output-parameter compatibility but not
-            inspected. Defaults to ``None``.
+        attn_output: (batch, num_heads, seq_len, d_head)
+        proj_weight: (d_model, d_model)
+        proj_bias: (d_model,)
+        out: output tensor (excluded from tracing)
 
     Returns:
-        torch.Tensor: Projected tensor shaped ``(batch, seq_len, d_model)``.
+        output: (batch, seq_len, d_model)
     """
     batch, num_heads, seq_len, d_head = attn_output.shape
     d_model = num_heads * d_head
@@ -42,11 +41,7 @@ def compute_suffix(
 
 
 class NativeMultiHeadAttnSuffixMLIRImpl(OperationImplementation):
-    """Implement the attention-suffix projection with Torch-MLIR.
-
-    Args:
-        op_name (str): Operation name used to compile the kernel.
-    """
+    """MLIR implementation of suffix operation"""
 
     def __init__(self, op_name: str):
         self.kernel = TorchMlirKernel(
@@ -57,19 +52,6 @@ class NativeMultiHeadAttnSuffixMLIRImpl(OperationImplementation):
         self.op_name = op_name
 
     def can_handle(self, *args, **kwargs) -> bool:
-        """Check whether the attention-suffix arguments satisfy kernel constraints.
-
-        Args:
-            *args (Any): Attention output, projection weight, and projection bias tensors.
-            **kwargs (Any): Options; ``num_heads`` defaults to ``8``.
-
-        Returns:
-            bool: ``True`` for compatible ranks, shapes, head counts, and tensors on a
-                Neuron device.
-
-        Raises:
-            RuntimeError: If a non-scalar tensor is not on a Neuron device.
-        """
         if not super().can_handle(*args, **kwargs):
             return False
 

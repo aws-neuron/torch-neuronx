@@ -30,35 +30,10 @@ def _is_device_mesh_fso(val) -> bool:
 
 
 class ReplaceDeviceMeshPlaceholders(NeuronFXPass):
-    """Remove ``DeviceMesh`` placeholders and pass-through outputs from an FX graph.
-
-    Args:
-        state (NeuronFXPassState, optional): Shared pass state used to record input and
-            output mutations. Defaults to ``None``.
-
-    Note:
-        Recorded output mutations restore removed pass-through meshes from their original
-        runtime inputs.
-    """
-
     def __init__(self, state: NeuronFXPassState | None = None):
         super().__init__(state)
 
     def call(self, gm: torch.fx.GraphModule) -> PassResult:
-        """Remove ``DeviceMesh`` inputs and outputs from an FX graph.
-
-        Args:
-            gm (torch.fx.GraphModule): FX graph module to update.
-
-        Returns:
-            PassResult: Graph module and whether any mesh input or output was removed.
-
-        Raises:
-            RuntimeError: If a mesh output was produced by an intermediate computation.
-
-        Note:
-            This method mutates ``gm`` in place by erasing placeholders and rewriting outputs.
-        """
         placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
 
         # Map from DeviceMesh placeholder node -> original input index.

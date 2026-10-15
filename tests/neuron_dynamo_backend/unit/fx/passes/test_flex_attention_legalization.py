@@ -8,7 +8,6 @@ produces correct numerical results and properly integrates with PassManager.
 """
 
 import logging
-import math
 import operator
 from unittest.mock import patch
 
@@ -23,7 +22,6 @@ from tests.neuron_dynamo_backend.unit.utils.test_utils import create_capture_com
 from torch_neuronx.neuron_dynamo_backend.fx.passes.flex_attention_legalization import (
     AttentionShapes,
     FlexAttentionLegalization,
-    decomposition_unsupported_reason,
 )
 
 logger = logging.getLogger(__name__)
@@ -135,7 +133,7 @@ class TestExpandKVForGQA:
     def test_gqa_expansion_numerical_accuracy(self):
         """Test that the generated FX graph produces correct numerical results."""
         b, h_q, h_kv, s, e = 2, 8, 2, 16, 32
-        shapes = AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=16, S=s, E_qk=e, E_v=e)
+        shapes = AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=16, S=s, E=e)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -166,7 +164,7 @@ class TestExpandKVForGQA:
     def test_gqa_expansion_head_repetition(self):
         """Test that each KV head is correctly repeated to match Q heads."""
         b, h_q, h_kv, s, e = 1, 6, 2, 8, 4
-        shapes = AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=8, S=s, E_qk=e, E_v=e)
+        shapes = AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=8, S=s, E=e)
         repeat_factor = h_q // h_kv
 
         flex_pass = FlexAttentionLegalization()
@@ -197,7 +195,7 @@ class TestExpandKVForGQA:
         flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
-        shapes = AttentionShapes(B=2, H_q=8, H_kv=8, L=64, S=64, E_qk=32, E_v=32)
+        shapes = AttentionShapes(B=2, H_q=8, H_kv=8, L=64, S=64, E=32)
         key = graph.placeholder("key")
         key.meta = {"val": torch.empty(2, 8, 64, 32)}
         value = graph.placeholder("value")
@@ -214,7 +212,7 @@ class TestExpandKVForGQA:
         flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
-        shapes = AttentionShapes(B=2, H_q=7, H_kv=2, L=64, S=64, E_qk=32, E_v=32)
+        shapes = AttentionShapes(B=2, H_q=7, H_kv=2, L=64, S=64, E=32)
         key = graph.placeholder("key")
         key.meta = {"val": torch.empty(2, 2, 64, 32)}
         value = graph.placeholder("value")
@@ -230,7 +228,7 @@ class TestReduceGQAGradients:
     def test_gradient_reduction_numerical_accuracy(self):
         """Test that gradient reduction produces correct numerical results."""
         B, H_q, H_kv, S, E = 2, 8, 2, 16, 32
-        shapes = AttentionShapes(B=B, H_q=H_q, H_kv=H_kv, L=16, S=S, E_qk=E, E_v=E)
+        shapes = AttentionShapes(B=B, H_q=H_q, H_kv=H_kv, L=16, S=S, E=E)
         repeat_factor = H_q // H_kv
 
         flex_pass = FlexAttentionLegalization()
@@ -263,7 +261,7 @@ class TestReduceGQAGradients:
         flex_pass = FlexAttentionLegalization()
 
         graph = fx.Graph()
-        shapes = AttentionShapes(B=2, H_q=8, H_kv=8, L=64, S=64, E_qk=32, E_v=32)
+        shapes = AttentionShapes(B=2, H_q=8, H_kv=8, L=64, S=64, E=32)
         grad_key = graph.placeholder("grad_key")
         grad_key.meta = {"val": torch.empty(2, 8, 64, 32)}
         grad_value = graph.placeholder("grad_value")
@@ -290,7 +288,7 @@ class TestComputeAttentionScores:
     def test_attention_scores_numerical_accuracy(self, create_graph, B, H, L, S, E):
         """Test that attention scores computation produces correct results."""
         scale = 1.0 / (E**0.5)
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=E, E_v=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -326,7 +324,7 @@ class TestComputeAttentionScores:
     def test_scale_is_applied_correctly(self, create_graph, B, H, L, S, E):
         """Test that the scale factor is correctly applied."""
         scale = 1.0 / (E**0.5)
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=E, E_v=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -363,7 +361,7 @@ class TestComputeSoftmax:
     )
     def test_softmax_matches_pytorch(self, create_graph, B, H, L, S):
         """Test that softmax computation matches PyTorch's F.softmax."""
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=64, E_v=64)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=64)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -373,9 +371,7 @@ class TestComputeSoftmax:
             }
         )
 
-        attn_weights, _, _ = flex_pass._compute_softmax(
-            graph, nodes["scores"], shapes, torch.float32
-        )
+        attn_weights, _ = flex_pass._compute_softmax(graph, nodes["scores"], shapes, torch.float32)
         graph.output(attn_weights)
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -388,7 +384,7 @@ class TestComputeSoftmax:
     def test_softmax_numerical_stability(self):
         """Test softmax is numerically stable with large values."""
         B, H, L, S = 1, 1, 1, 4
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=8, E_v=8)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=8)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -396,7 +392,7 @@ class TestComputeSoftmax:
         scores_node = graph.placeholder("scores")
         scores_node.meta = {"val": torch.empty(B, H, L, S)}
 
-        attn_weights, _, _ = flex_pass._compute_softmax(graph, scores_node, shapes, torch.float32)
+        attn_weights, _ = flex_pass._compute_softmax(graph, scores_node, shapes, torch.float32)
         graph.output(attn_weights)
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -416,9 +412,9 @@ class TestComputeSoftmax:
             (1, 1, 1, 4),
         ],
     )
-    def test_softmax_logsumexp_is_log2_of_sumexp(self, create_graph, B, H, L, S):
-        """Test that _compute_softmax returns the logsumexp in the log2 scale of the HOP."""
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=64, E_v=64)
+    def test_softmax_logsumexp_matches_pytorch(self, create_graph, B, H, L, S):
+        """Test that _compute_softmax returns correct logsumexp values."""
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=64)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -428,13 +424,13 @@ class TestComputeSoftmax:
             }
         )
 
-        _, logsumexp, _ = flex_pass._compute_softmax(graph, nodes["scores"], shapes, torch.float32)
+        _, logsumexp = flex_pass._compute_softmax(graph, nodes["scores"], shapes, torch.float32)
         graph.output(logsumexp)
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
         scores = torch.randn(B, H, L, S)
         result = gm(scores)
-        expected = torch.logsumexp(scores, dim=-1) / math.log(2.0)
+        expected = torch.logsumexp(scores, dim=-1)
 
         assert result.shape == (B, H, L), f"LSE shape mismatch: {result.shape} vs {(B, H, L)}"
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-6)
@@ -447,7 +443,7 @@ class TestFullAttentionPipeline:
         """Test building and executing a complete MHA attention forward pass."""
         B, H, L, S, E = 2, 4, 8, 16, 32
         scale = 1.0 / (E**0.5)
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=E, E_v=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -462,7 +458,7 @@ class TestFullAttentionPipeline:
         scores = flex_pass._compute_attention_scores(
             graph, query_node, key_node, scale, shapes, torch.float32
         )
-        attn_weights, _, _ = flex_pass._compute_softmax(graph, scores, shapes, torch.float32)
+        attn_weights, _ = flex_pass._compute_softmax(graph, scores, shapes, torch.float32)
         output = graph.call_function(torch.ops.aten.matmul.default, args=(attn_weights, value_node))
         graph.output(output)
 
@@ -485,7 +481,7 @@ class TestFullAttentionPipeline:
         """Test attention pipeline with GQA (H_q != H_kv)."""
         B, H_q, H_kv, L, S, E = 2, 8, 2, 8, 16, 32
         scale = 1.0 / (E**0.5)
-        shapes = AttentionShapes(B=B, H_q=H_q, H_kv=H_kv, L=L, S=S, E_qk=E, E_v=E)
+        shapes = AttentionShapes(B=B, H_q=H_q, H_kv=H_kv, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -506,7 +502,7 @@ class TestFullAttentionPipeline:
         scores = flex_pass._compute_attention_scores(
             graph, query_node, key_expanded, scale, shapes, torch.float32
         )
-        attn_weights, _, _ = flex_pass._compute_softmax(graph, scores, shapes, torch.float32)
+        attn_weights, _ = flex_pass._compute_softmax(graph, scores, shapes, torch.float32)
         output = graph.call_function(
             torch.ops.aten.matmul.default, args=(attn_weights, value_expanded)
         )
@@ -994,450 +990,6 @@ class TestCombinedScoreMaskMod:
                     assert result[0, 0, i, j] == float("-inf")
 
 
-class TestBackwardScoreMaskMod:
-    """The decomposed backward must apply the same score_mod and mask_mod as the forward."""
-
-    @staticmethod
-    def _reference(query, key, value, score_mod, mask_mod):
-        """Eager attention reference, since flex_attention has no CPU backward."""
-        B, H_q, L, E = query.shape
-        H_kv, S = key.shape[1], key.shape[2]
-        key = key.repeat_interleave(H_q // H_kv, dim=1)
-        value = value.repeat_interleave(H_q // H_kv, dim=1)
-        scores = (query @ key.transpose(-1, -2)) * (E**-0.5)
-
-        b = torch.arange(B).view(B, 1, 1, 1)
-        h = torch.arange(H_q).view(1, H_q, 1, 1)
-        q_idx = torch.arange(L).view(1, 1, L, 1)
-        kv_idx = torch.arange(S).view(1, 1, 1, S)
-
-        if score_mod is not None:
-            scores = score_mod(scores, b, h, q_idx, kv_idx)
-        if mask_mod is not None:
-            scores = torch.where(
-                mask_mod(b, h, q_idx, kv_idx), scores, torch.full_like(scores, float("-inf"))
-            )
-        return torch.softmax(scores, dim=-1) @ value
-
-    @pytest.mark.parametrize(
-        "pattern,seq_len",
-        [
-            pytest.param("noop", 128, id="noop"),
-            pytest.param("causal", 128, id="causal"),
-            pytest.param("sliding_window", 128, id="sliding_window"),
-            pytest.param("alibi", 128, id="alibi"),
-            pytest.param("document", 128, id="document"),
-            pytest.param("head_bias", 128, id="head_bias"),
-            pytest.param("head_bias_document", 128, id="head_bias_document"),
-            pytest.param("causal", 256, id="causal_two_tiles"),
-            pytest.param("document", 256, id="document_two_tiles"),
-            pytest.param("head_bias_document", 256, id="head_bias_document_two_tiles"),
-        ],
-    )
-    def test_backward_applies_score_and_mask_mod(self, pattern, seq_len):
-        from torch._dynamo.backends.common import aot_autograd
-        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-
-        B, H_q, H_kv, E = 1, 4, 2, 16
-        L = S = seq_len
-
-        # 96 is not a multiple of the 128 block size, so a document boundary falls inside a
-        # tile and the mask differs on the two sides of a tile boundary.
-        document_id = torch.arange(L) // 96
-        # The bias varies along kv_idx, the softmax axis. A bias that only varies along h
-        # cancels in the softmax, so it cannot show whether the score_mod was applied.
-        bias = torch.randn(H_q, S, generator=torch.Generator().manual_seed(13))
-
-        def alibi(score, b, h, q_idx, kv_idx):
-            return score + (kv_idx - q_idx) * torch.exp2(-((h + 1) * 8.0 / H_q))
-
-        def head_bias(score, b, h, q_idx, kv_idx):
-            return score + bias[h, kv_idx]
-
-        def causal(b, h, q_idx, kv_idx):
-            return q_idx >= kv_idx
-
-        def sliding_window(b, h, q_idx, kv_idx):
-            return (q_idx >= kv_idx) & (q_idx - kv_idx <= 64)
-
-        def document(b, h, q_idx, kv_idx):
-            return document_id[q_idx] == document_id[kv_idx]
-
-        score_mods = {"alibi": alibi, "head_bias": head_bias, "head_bias_document": head_bias}
-        mask_mods = {
-            "causal": causal,
-            "alibi": causal,
-            "sliding_window": sliding_window,
-            "document": document,
-            "head_bias_document": document,
-        }
-        score_mod = score_mods.get(pattern)
-        mask_mod = mask_mods.get(pattern)
-
-        # BLOCK_SIZE is explicit because the default sentinel is rejected on this path.
-        block_mask = (
-            create_block_mask(mask_mod, B, H_q, L, S, device="cpu", BLOCK_SIZE=(128, 128))
-            if mask_mod is not None
-            else None
-        )
-
-        class FlexAttnModule(torch.nn.Module):
-            def __init__(self, mask):
-                super().__init__()
-                self.block_mask = mask
-
-            def forward(self, q, k, v):
-                kwargs = {"enable_gqa": True}
-                if score_mod is not None:
-                    kwargs["score_mod"] = score_mod
-                if self.block_mask is not None:
-                    kwargs["block_mask"] = self.block_mask
-                return flex_attention(q, k, v, **kwargs)
-
-        def legalizing_compiler(gm, example_inputs):
-            return make_boxed_func(legalize_flex_attention_pass(gm).forward)
-
-        def backend(gm, example_inputs):
-            return aot_autograd(fw_compiler=legalizing_compiler, bw_compiler=legalizing_compiler)(
-                gm, example_inputs
-            )
-
-        def make_inputs():
-            gen = torch.Generator().manual_seed(7)
-            return [
-                torch.randn(*shape, generator=gen, requires_grad=True)
-                for shape in ((B, H_q, L, E), (B, H_kv, S, E), (B, H_kv, S, E))
-            ]
-
-        grad_out = torch.randn(B, H_q, L, E, generator=torch.Generator().manual_seed(11))
-
-        backward_buffers = []
-        legalize_backward = FlexAttentionLegalization._legalize_flex_backward
-
-        def record_buffers(self, graph, gm, node):
-            backward_buffers.append((node.args[12], node.args[13]))
-            return legalize_backward(self, graph, gm, node)
-
-        # Dynamo, not aot_module directly: it lifts the block_mask tensors to graph
-        # inputs, so they reach the flex_attention HOP as FakeTensors.
-        torch._dynamo.reset()
-        query, key, value = make_inputs()
-        decomposed = torch.compile(FlexAttnModule(block_mask), backend=backend)
-        with patch.object(FlexAttentionLegalization, "_legalize_flex_backward", record_buffers):
-            output = decomposed(query, key, value)
-            if isinstance(output, tuple):
-                output = output[0]
-            output.backward(grad_out)
-
-        # head_bias and document are the only mods that capture a tensor. The comparison
-        # below cannot see a dropped buffer, so check that the capture reaches the backward
-        # node as score_mod_other_buffers (args[12]) or mask_mod_other_buffers (args[13]).
-        assert len(backward_buffers) == 1
-        score_mod_buffers, mask_mod_buffers = backward_buffers[0]
-        assert bool(score_mod_buffers) == (score_mod is head_bias)
-        assert bool(mask_mod_buffers) == (mask_mod is document)
-
-        ref_query, ref_key, ref_value = make_inputs()
-        ref_output = self._reference(ref_query, ref_key, ref_value, score_mod, mask_mod)
-        ref_output.backward(grad_out)
-
-        torch.testing.assert_close(output, ref_output, rtol=1e-4, atol=1e-5)
-        for name, actual, expected in (
-            ("grad_query", query.grad, ref_query.grad),
-            ("grad_key", key.grad, ref_key.grad),
-            ("grad_value", value.grad, ref_value.grad),
-        ):
-            torch.testing.assert_close(
-                actual, expected, rtol=1e-4, atol=1e-5, msg=lambda m, name=name: f"{name}: {m}"
-            )
-
-
-def _run_decomposed(module, make_inputs, grad_out):
-    """Run both directions of a module through the legalization pass.
-
-    Returns (output, inputs). The caller reads the gradients from the inputs.
-    """
-    from torch._dynamo.backends.common import aot_autograd
-
-    def legalizing_compiler(gm, example_inputs):
-        return make_boxed_func(legalize_flex_attention_pass(gm).forward)
-
-    def backend(gm, example_inputs):
-        return aot_autograd(fw_compiler=legalizing_compiler, bw_compiler=legalizing_compiler)(
-            gm, example_inputs
-        )
-
-    # Dynamo, not aot_module directly: it lifts the captured tensors to graph inputs, so
-    # the flex_attention HOP gets them as FakeTensors.
-    torch._dynamo.reset()
-    inputs = make_inputs()
-    output = torch.compile(module, backend=backend)(*inputs)
-    if isinstance(output, tuple):
-        output = output[0]
-    output.backward(grad_out)
-    return output, inputs
-
-
-def _assert_grads_close(inputs, ref_inputs, rtol=1e-4, atol=1e-5):
-    for name, actual, expected in (
-        ("grad_query", inputs[0].grad, ref_inputs[0].grad),
-        ("grad_key", inputs[1].grad, ref_inputs[1].grad),
-        ("grad_value", inputs[2].grad, ref_inputs[2].grad),
-    ):
-        torch.testing.assert_close(
-            actual, expected, rtol=rtol, atol=atol, msg=lambda m, name=name: f"{name}: {m}"
-        )
-
-
-class TestBackwardScoreModDerivative:
-    """Tests that the backward applies the derivative of the score modification.
-
-    The backward HOP carries that derivative as its joint_graph argument. An additive
-    modification has a unit derivative, so only a modification with a different derivative
-    shows if the pass applies the joint graph. Without the joint graph, a modification that
-    multiplies the score by 2 makes the query and key gradients 2 times too small.
-    """
-
-    _B, _H_q, _H_kv, _L, _S, _E = 1, 4, 2, 128, 128, 16
-
-    # The weight changes along kv_idx, the softmax axis. A weight that only changes along h
-    # cancels in the softmax, so it cannot show if the pass applied the derivative.
-    _WEIGHT = torch.rand(_H_q, _S, generator=torch.Generator().manual_seed(17)) + 0.5
-
-    @staticmethod
-    def _double(score, b, h, q_idx, kv_idx):
-        return 2 * score
-
-    @staticmethod
-    def _soft_cap(score, b, h, q_idx, kv_idx):
-        return 2 * torch.tanh(score / 2)
-
-    @classmethod
-    def _weighted(cls, score, b, h, q_idx, kv_idx):
-        return score * cls._WEIGHT[h, kv_idx]
-
-    @pytest.mark.parametrize(
-        "name",
-        [
-            pytest.param("double", id="linear"),
-            pytest.param("soft_cap", id="nonlinear"),
-            pytest.param("weighted", id="captured_buffer"),
-        ],
-    )
-    def test_backward_applies_the_score_mod_derivative(self, name):
-        from torch.nn.attention.flex_attention import flex_attention
-
-        B, H_q, H_kv, L, S, E = self._B, self._H_q, self._H_kv, self._L, self._S, self._E
-        score_mod = {
-            "double": self._double,
-            "soft_cap": self._soft_cap,
-            "weighted": self._weighted,
-        }[name]
-
-        class FlexAttnModule(torch.nn.Module):
-            def forward(self, q, k, v):
-                return flex_attention(q, k, v, score_mod=score_mod, enable_gqa=True)
-
-        def make_inputs():
-            gen = torch.Generator().manual_seed(7)
-            return [
-                torch.randn(*shape, generator=gen, requires_grad=True)
-                for shape in ((B, H_q, L, E), (B, H_kv, S, E), (B, H_kv, S, E))
-            ]
-
-        grad_out = torch.randn(B, H_q, L, E, generator=torch.Generator().manual_seed(11))
-
-        output, inputs = _run_decomposed(FlexAttnModule(), make_inputs, grad_out)
-
-        ref_inputs = make_inputs()
-        ref_output = TestBackwardScoreMaskMod._reference(*ref_inputs, score_mod, None)
-        ref_output.backward(grad_out)
-
-        torch.testing.assert_close(output, ref_output, rtol=1e-4, atol=1e-5)
-        _assert_grads_close(inputs, ref_inputs)
-
-    @staticmethod
-    def _signed_half_inputs(B, H, L, S, E):
-        """Build inputs whose score is positive on the first half of the keys and negative on
-        the second half. The first key component carries the sign, so a mask on kv_idx selects
-        exactly the positions whose score is negative.
-        """
-        gen = torch.Generator().manual_seed(23)
-        query = 0.1 * torch.randn(B, H, L, E, generator=gen)
-        key = 0.1 * torch.randn(B, H, S, E, generator=gen)
-        value = torch.randn(B, H, S, E, generator=gen)
-        query[..., 0] = 1.0
-        key[..., 0] = 2.0
-        key[:, :, S // 2 :, 0] = -2.0
-        return [t.requires_grad_(True) for t in (query, key, value)]
-
-    def test_a_masked_score_does_not_poison_the_derivative(self):
-        """A derivative that is nan on a masked score must not reach the query and key gradients.
-
-        The mask replaces a masked score only after the modification, so the derivative still
-        reads the original value there. A square root of a negative score gives a nan
-        derivative, and a masked position contributes no gradient, so the result must match a
-        modification that is finite everywhere and equal on every live position.
-        """
-        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-
-        B, H, L, S, E = 1, 2, 128, 128, 16
-
-        def mask_mod(b, h, q_idx, kv_idx):
-            return kv_idx < S // 2
-
-        def unsafe(score, b, h, q_idx, kv_idx):
-            return torch.sqrt(score)
-
-        def safe(score, b, h, q_idx, kv_idx):
-            return torch.sqrt(torch.clamp(score, min=0.0))
-
-        block_mask = create_block_mask(mask_mod, B, H, L, S, device="cpu")
-
-        def make_module(score_mod):
-            class FlexAttnModule(torch.nn.Module):
-                def forward(self, q, k, v):
-                    return flex_attention(q, k, v, score_mod=score_mod, block_mask=block_mask)
-
-            return FlexAttnModule()
-
-        def make_inputs():
-            return self._signed_half_inputs(B, H, L, S, E)
-
-        grad_out = torch.randn(B, H, L, E, generator=torch.Generator().manual_seed(29))
-
-        output, inputs = _run_decomposed(make_module(unsafe), make_inputs, grad_out)
-        safe_output, safe_inputs = _run_decomposed(make_module(safe), make_inputs, grad_out)
-
-        for name, grad in (
-            ("grad_query", inputs[0].grad),
-            ("grad_key", inputs[1].grad),
-            ("grad_value", inputs[2].grad),
-        ):
-            assert torch.isfinite(grad).all(), f"{name} has {grad.isnan().sum()} nan entries"
-        assert inputs[0].grad.abs().max() > 0, "grad_query is all zeros, so the case proves nothing"
-
-        torch.testing.assert_close(output, safe_output, rtol=1e-4, atol=1e-5)
-        _assert_grads_close(inputs, safe_inputs)
-
-    def test_gqa_with_independent_value_dimension(self):
-        """The decomposition must support a value head dimension of its own."""
-        from torch.nn.attention.flex_attention import flex_attention
-
-        B, H_q, H_kv, L, S = 1, 8, 2, 128, 128
-        D_qk, D_v = 192, 128
-
-        class FlexAttnModule(torch.nn.Module):
-            def forward(self, q, k, v):
-                return flex_attention(q, k, v, enable_gqa=True)
-
-        def make_inputs():
-            gen = torch.Generator().manual_seed(5)
-            return [
-                torch.randn(*shape, generator=gen, requires_grad=True)
-                for shape in ((B, H_q, L, D_qk), (B, H_kv, S, D_qk), (B, H_kv, S, D_v))
-            ]
-
-        grad_out = torch.randn(B, H_q, L, D_v, generator=torch.Generator().manual_seed(9))
-
-        output, inputs = _run_decomposed(FlexAttnModule(), make_inputs, grad_out)
-        assert output.shape == (B, H_q, L, D_v)
-
-        ref_inputs = make_inputs()
-        ref_output = TestBackwardScoreMaskMod._reference(*ref_inputs, None, None)
-        ref_output.backward(grad_out)
-
-        torch.testing.assert_close(output, ref_output, rtol=1e-4, atol=1e-5)
-        _assert_grads_close(inputs, ref_inputs)
-
-
-class TestDecompositionUnsupportedReason:
-    """Tests the check that the NKI compile budget does before it leaves an operator."""
-
-    @staticmethod
-    def _flex_node(graph, nodes, backward, joint_graph="joint_graph0"):
-        args = [nodes["query"], nodes["key"], nodes["value"]]
-        if backward:
-            args += [None, None, None, None, "fw_graph0", joint_graph, (), 0.125]
-        else:
-            args += ["score_mod0", (), 0.125, {}, (), ()]
-        return graph.call_function(torch.ops.higher_order.flex_attention, args=tuple(args))
-
-    @pytest.mark.parametrize("backward", [False, True])
-    def test_a_supported_node_gives_no_reason(self, create_graph, backward):
-        graph, nodes = create_graph(
-            {"query": (1, 4, 8, 16), "key": (1, 2, 8, 16), "value": (1, 2, 8, 16)}
-        )
-        node = self._flex_node(graph, nodes, backward)
-        assert decomposition_unsupported_reason(node, backward, has_score_mod=True) is None
-
-    @pytest.mark.parametrize("backward", [False, True])
-    def test_an_independent_value_dimension_is_supported(self, create_graph, backward):
-        graph, nodes = create_graph(
-            {"query": (1, 8, 8, 192), "key": (1, 2, 8, 192), "value": (1, 2, 8, 128)}
-        )
-        node = self._flex_node(graph, nodes, backward)
-        assert decomposition_unsupported_reason(node, backward, has_score_mod=True) is None
-
-    @pytest.mark.parametrize("backward", [False, True])
-    def test_different_batch_sizes_are_unsupported(self, create_graph, backward):
-        graph, nodes = create_graph(
-            {"query": (2, 4, 8, 16), "key": (1, 4, 8, 16), "value": (1, 4, 8, 16)}
-        )
-        node = self._flex_node(graph, nodes, backward)
-        reason = decomposition_unsupported_reason(node, backward, has_score_mod=False)
-        assert reason is not None
-        assert "batch sizes are not equal" in reason
-
-    @pytest.mark.parametrize("backward", [False, True])
-    def test_a_head_count_that_does_not_divide_is_unsupported(self, create_graph, backward):
-        graph, nodes = create_graph(
-            {"query": (1, 7, 8, 16), "key": (1, 2, 8, 16), "value": (1, 2, 8, 16)}
-        )
-        node = self._flex_node(graph, nodes, backward)
-        reason = decomposition_unsupported_reason(node, backward, has_score_mod=False)
-        assert reason is not None
-        assert "does not divide" in reason
-
-    @pytest.mark.parametrize("backward", [False, True])
-    def test_too_few_arguments_are_unsupported(self, create_graph, backward):
-        graph, nodes = create_graph(
-            {"query": (1, 4, 8, 16), "key": (1, 4, 8, 16), "value": (1, 4, 8, 16)}
-        )
-        node = graph.call_function(
-            torch.ops.higher_order.flex_attention,
-            args=(nodes["query"], nodes["key"], nodes["value"]),
-        )
-        reason = decomposition_unsupported_reason(node, backward, has_score_mod=False)
-        assert reason is not None
-        assert "arguments" in reason
-
-    def test_missing_shape_metadata_is_unsupported(self, create_graph):
-        graph, nodes = create_graph(
-            {"query": (1, 4, 8, 16), "key": (1, 4, 8, 16), "value": (1, 4, 8, 16)}
-        )
-        nodes["value"].meta = {}
-        node = self._flex_node(graph, nodes, backward=False)
-        reason = decomposition_unsupported_reason(node, False, has_score_mod=False)
-        assert reason == "the query, the key or the value has no shape metadata"
-
-    def test_a_backward_score_mod_without_a_joint_graph_is_unsupported(self, create_graph):
-        graph, nodes = create_graph(
-            {"query": (1, 4, 8, 16), "key": (1, 4, 8, 16), "value": (1, 4, 8, 16)}
-        )
-        node = self._flex_node(graph, nodes, backward=True, joint_graph=None)
-        reason = decomposition_unsupported_reason(node, True, has_score_mod=True)
-        assert reason is not None
-        assert "joint graph" in reason
-
-    def test_a_backward_without_a_score_mod_needs_no_joint_graph(self, create_graph):
-        graph, nodes = create_graph(
-            {"query": (1, 4, 8, 16), "key": (1, 4, 8, 16), "value": (1, 4, 8, 16)}
-        )
-        node = self._flex_node(graph, nodes, backward=True, joint_graph=None)
-        assert decomposition_unsupported_reason(node, True, has_score_mod=False) is None
-
-
 class TestFlexAttentionLegalizationE2E:
     """End-to-end tests for FlexAttentionLegalization with real flex_attention graphs."""
 
@@ -1515,7 +1067,7 @@ class TestDtypeSizeCombinations:
     )
     def test_gqa_expansion_dtypes(self, dtype, b, h_q, h_kv, s, e):
         """Test GQA expansion preserves dtype correctly."""
-        shapes = AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=16, S=s, E_qk=e, E_v=e)
+        shapes = AttentionShapes(B=b, H_q=h_q, H_kv=h_kv, L=16, S=s, E=e)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -1548,7 +1100,7 @@ class TestDtypeSizeCombinations:
     def test_attention_scores_dtypes(self, dtype, B, H, L, S, E):
         """Test attention scores computation with different dtypes."""
         scale = 1.0 / (E**0.5)
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=E, E_v=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -1582,7 +1134,7 @@ class TestDtypeSizeCombinations:
     )
     def test_softmax_dtypes(self, dtype, B, H, L, S):
         """Test softmax computation with different dtypes."""
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=64, E_v=64)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=64)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -1590,7 +1142,7 @@ class TestDtypeSizeCombinations:
         scores_node = graph.placeholder("scores")
         scores_node.meta = {"val": torch.empty(B, H, L, S, dtype=dtype)}
 
-        attn_weights, _, _ = flex_pass._compute_softmax(graph, scores_node, shapes, dtype)
+        attn_weights, _ = flex_pass._compute_softmax(graph, scores_node, shapes, dtype)
         graph.output(attn_weights)
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
@@ -1602,58 +1154,6 @@ class TestDtypeSizeCombinations:
         # bfloat16 has lower precision
         rtol, atol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
         torch.testing.assert_close(result, expected, rtol=rtol, atol=atol)
-
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_deferred_normalization_returns_denominator(self, dtype):
-        """Deferring leaves the weights unnormalized and hands the denominator back."""
-        B, H, L, S = 2, 4, 8, 16
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=64, E_v=64)
-        flex_pass = FlexAttentionLegalization()
-
-        graph = fx.Graph()
-        scores_node = graph.placeholder("scores")
-        scores_node.meta = {"val": torch.empty(B, H, L, S, dtype=dtype)}
-
-        weights, _, denom = flex_pass._compute_softmax(
-            graph, scores_node, shapes, dtype, defer_normalization=True
-        )
-        assert denom is not None
-        graph.output((weights, denom))
-        gm = fx.GraphModule(torch.nn.Module(), graph)
-
-        divides = [n for n in graph.nodes if n.target is torch.ops.aten.div.Tensor]
-        assert divides == []
-
-        scores = torch.randn(B, H, L, S, dtype=dtype)
-        weights_out, denom_out = gm(scores)
-        torch.testing.assert_close(
-            weights_out / denom_out,
-            F.softmax(scores.float(), dim=-1).to(dtype),
-            rtol=1e-2,
-            atol=1e-2,
-        )
-
-    def test_deferred_normalization_declined_for_float16(self):
-        """float16 keeps the division; deferring would overflow it above finfo.max / S."""
-        B, H, L, S = 1, 1, 4, 8
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=64, E_v=64)
-        flex_pass = FlexAttentionLegalization()
-
-        graph = fx.Graph()
-        scores_node = graph.placeholder("scores")
-        scores_node.meta = {"val": torch.empty(B, H, L, S, dtype=torch.float16)}
-
-        weights, _, denom = flex_pass._compute_softmax(
-            graph, scores_node, shapes, torch.float16, defer_normalization=True
-        )
-        assert denom is None
-        graph.output(weights)
-        gm = fx.GraphModule(torch.nn.Module(), graph)
-
-        scores = torch.randn(B, H, L, S, dtype=torch.float16)
-        torch.testing.assert_close(
-            gm(scores), F.softmax(scores.float(), dim=-1).to(torch.float16), rtol=1e-3, atol=1e-3
-        )
 
     @pytest.mark.parametrize(
         "B,H,L,S,E",
@@ -1669,7 +1169,7 @@ class TestDtypeSizeCombinations:
     def test_attention_scores_various_sizes(self, B, H, L, S, E):
         """Test attention scores with various tensor sizes."""
         scale = 1.0 / (E**0.5)
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=E, E_v=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -1707,7 +1207,7 @@ class TestComputeAttentionBackward:
     def test_backward_gradient_shapes(self, B, H, L, S, E):
         """Test that backward pass produces correct gradient shapes."""
         scale = 1.0 / (E**0.5)
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=E, E_v=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -1759,7 +1259,7 @@ class TestComputeAttentionBackward:
     def test_backward_grad_value_numerical(self, B, H, L, S, E):
         """Test grad_value computation: grad_value = attn_weights^T @ grad_out."""
         scale = 1.0
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=E, E_v=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -1808,132 +1308,71 @@ class TestComputeAttentionBackward:
             (2, 4, 8, 16, 32),
         ],
     )
-    @pytest.mark.parametrize("with_lse_term", [False, True])
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-    def test_backward_with_autograd_reference(
-        self, create_graph, B, H, L, S, E, with_lse_term, dtype
-    ):
-        """Test the backward pass against the PyTorch autograd reference.
-
-        `with_lse_term` puts the log-sum-exp in the loss, so the pass must also fold in its
-        gradient on the log2 scale that the HOP uses. The HOP always gives that gradient in
-        float32, so a lower-precision query also covers the cast down to the query dtype.
-        """
+    def test_backward_with_autograd_reference(self, B, H, L, S, E):
+        """Test backward pass against PyTorch autograd reference."""
         scale = 1.0 / (E**0.5)
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=E, E_v=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
-        query = torch.randn(B, H, L, E, dtype=dtype)
-        key = torch.randn(B, H, S, E, dtype=dtype)
-        value = torch.randn(B, H, S, E, dtype=dtype)
-        grad_out = torch.randn(B, H, L, E, dtype=dtype)
-        lse_weight = torch.randn(B, H, L)
+        # Create inputs with gradients
+        query = torch.randn(B, H, L, E, requires_grad=True)
+        key = torch.randn(B, H, S, E, requires_grad=True)
+        value = torch.randn(B, H, S, E, requires_grad=True)
 
-        ref_query = query.float().requires_grad_(True)
-        ref_key = key.float().requires_grad_(True)
-        ref_value = value.float().requires_grad_(True)
-
-        scores = torch.matmul(ref_query, ref_key.transpose(-2, -1)) * scale
+        # Forward pass with PyTorch
+        scores = torch.matmul(query, key.transpose(-2, -1)) * scale
         attn_weights = F.softmax(scores, dim=-1)
-        output = torch.matmul(attn_weights, ref_value)
-        loss = (output * grad_out.float()).sum()
-        if with_lse_term:
-            loss = loss + (torch.logsumexp(scores, dim=-1) * lse_weight).sum()
-        loss.backward()
+        output = torch.matmul(attn_weights, value)
 
-        expected_grad_q = ref_query.grad.clone()
-        expected_grad_k = ref_key.grad.clone()
-        expected_grad_v = ref_value.grad.clone()
+        # Backward with PyTorch
+        grad_out = torch.randn(B, H, L, E)
+        output.backward(grad_out)
 
+        expected_grad_q = query.grad.clone()
+        expected_grad_k = key.grad.clone()
+        expected_grad_v = value.grad.clone()
+
+        # Now test our implementation
         flex_pass = FlexAttentionLegalization()
-        graph, nodes = create_graph(
-            {
-                "query": ((B, H, L, E), dtype),
-                "key": ((B, H, S, E), dtype),
-                "value": ((B, H, S, E), dtype),
-                "attn_weights": ((B, H, L, S), dtype),
-                "grad_out": ((B, H, L, E), dtype),
-                "grad_logsumexp": ((B, H, L), torch.float32),
-            }
-        )
+
+        graph = fx.Graph()
+        query_node = graph.placeholder("query")
+        query_node.meta = {"val": torch.empty(B, H, L, E)}
+        key_node = graph.placeholder("key")
+        key_node.meta = {"val": torch.empty(B, H, S, E)}
+        value_node = graph.placeholder("value")
+        value_node.meta = {"val": torch.empty(B, H, S, E)}
+        attn_weights_node = graph.placeholder("attn_weights")
+        attn_weights_node.meta = {"val": torch.empty(B, H, L, S)}
+        grad_out_node = graph.placeholder("grad_out")
+        grad_out_node.meta = {"val": torch.empty(B, H, L, E)}
 
         grad_q, grad_k, grad_v = flex_pass._compute_attention_backward(
             graph,
-            nodes["query"],
-            nodes["key"],
-            nodes["value"],
-            nodes["attn_weights"],
-            nodes["grad_out"],
+            query_node,
+            key_node,
+            value_node,
+            attn_weights_node,
+            grad_out_node,
             scale,
             shapes,
-            dtype,
-            grad_logsumexp=nodes["grad_logsumexp"] if with_lse_term else None,
+            torch.float32,
         )
         graph.output((grad_q, grad_k, grad_v))
         gm = fx.GraphModule(torch.nn.Module(), graph)
 
-        # The HOP hands the pass the gradient of the log2-scaled output.
-        grad_logsumexp = lse_weight * math.log(2.0) if with_lse_term else torch.zeros(B, H, L)
+        # Use detached tensors and recomputed attn_weights
+        query_detached = query.detach()
+        key_detached = key.detach()
+        value_detached = value.detach()
+        attn_weights_detached = attn_weights.detach()
+
         grad_query, grad_key, grad_value = gm(
-            query,
-            key,
-            value,
-            attn_weights.detach().to(dtype),
-            grad_out,
-            grad_logsumexp,
+            query_detached, key_detached, value_detached, attn_weights_detached, grad_out
         )
 
-        assert grad_query.dtype == dtype
-        exact = dtype == torch.float32
-        tol = {"rtol": 1e-4, "atol": 1e-5} if exact else {"rtol": 2e-2, "atol": 2e-2}
-        torch.testing.assert_close(grad_query.float(), expected_grad_q, **tol)
-        torch.testing.assert_close(grad_key.float(), expected_grad_k, **tol)
-        torch.testing.assert_close(grad_value.float(), expected_grad_v, **tol)
-
-    def test_backward_grad_logsumexp_none_matches_zeros(self, create_graph):
-        """Test that a missing log-sum-exp gradient gives the same result as a zero one."""
-        B, H, L, S, E = 1, 2, 4, 8, 16
-        scale = 1.0 / (E**0.5)
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=E, E_v=E)
-
-        query = torch.randn(B, H, L, E)
-        key = torch.randn(B, H, S, E)
-        value = torch.randn(B, H, S, E)
-        attn_weights = F.softmax(torch.matmul(query, key.transpose(-2, -1)) * scale, dim=-1)
-        grad_out = torch.randn(B, H, L, E)
-
-        def build(with_grad_logsumexp: bool):
-            flex_pass = FlexAttentionLegalization()
-            graph, nodes = create_graph(
-                {
-                    "query": (B, H, L, E),
-                    "key": (B, H, S, E),
-                    "value": (B, H, S, E),
-                    "attn_weights": (B, H, L, S),
-                    "grad_out": (B, H, L, E),
-                    "grad_logsumexp": (B, H, L),
-                }
-            )
-            grads = flex_pass._compute_attention_backward(
-                graph,
-                nodes["query"],
-                nodes["key"],
-                nodes["value"],
-                nodes["attn_weights"],
-                nodes["grad_out"],
-                scale,
-                shapes,
-                torch.float32,
-                grad_logsumexp=nodes["grad_logsumexp"] if with_grad_logsumexp else None,
-            )
-            graph.output(grads)
-            return fx.GraphModule(torch.nn.Module(), graph)
-
-        args = (query, key, value, attn_weights, grad_out, torch.zeros(B, H, L))
-        without = build(False)(*args)
-        with_zeros = build(True)(*args)
-
-        for a, b in zip(without, with_zeros, strict=True):
-            torch.testing.assert_close(a, b)
+        torch.testing.assert_close(grad_query, expected_grad_q, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(grad_key, expected_grad_k, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(grad_value, expected_grad_v, rtol=1e-4, atol=1e-5)
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
     @pytest.mark.parametrize(
@@ -1946,7 +1385,7 @@ class TestComputeAttentionBackward:
     def test_backward_dtypes(self, dtype, B, H, L, S, E):
         """Test backward pass preserves dtype."""
         scale = 1.0
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=E, E_v=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -2113,7 +1552,7 @@ class TestScoreModInlining:
     )
     def test_inline_score_mod_creates_nodes(self, B, H, L, S, E):
         """Test that _inline_score_mod creates expected nodes in graph."""
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=E, E_v=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -2163,7 +1602,7 @@ class TestScoreModInlining:
     )
     def test_inline_score_mod_with_arithmetic(self, B, H, L, S, E):
         """Test score_mod inlining with arithmetic operations using indices."""
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=E, E_v=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -2211,7 +1650,7 @@ class TestScoreModInlining:
     )
     def test_create_index_tensors_shapes(self, B, H, L, S, E):
         """Test that _create_index_tensors creates correctly shaped tensors."""
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=E, E_v=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
 
@@ -2237,7 +1676,7 @@ class TestScoreModInlining:
     )
     def test_create_index_tensors_values(self, B, H, L, S, E):
         """Test that _create_index_tensors creates correct index values."""
-        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E_qk=E, E_v=E)
+        shapes = AttentionShapes(B=B, H_q=H, H_kv=H, L=L, S=S, E=E)
 
         flex_pass = FlexAttentionLegalization()
 

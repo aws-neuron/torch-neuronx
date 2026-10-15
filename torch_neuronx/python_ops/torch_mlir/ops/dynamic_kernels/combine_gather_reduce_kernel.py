@@ -19,19 +19,10 @@ _TILE_M = 128
 
 @nki.jit()
 def combine_gather_reduce_kernel(routed, inv_idx, out_buffer, num_t_tiles):
-    """Accumulate routed expert rows into a token output buffer.
+    """out_buffer[t,:] += sum over top_k of routed[inv_idx[:,k], :] (in-place).
 
-    Args:
-        routed (tensor): Routed expert values with shape ``[N, D]``.
-        inv_idx (tensor): Int32 source-row indices with shape ``[T, top_k]``.
-        out_buffer (tensor): ``[T, D]`` destination modified in place.
-        num_t_tiles (tensor): Int32 ``[1, 1]`` token-tile count per program.
-
-    Returns:
-        tensor: The updated ``out_buffer``.
-
-    Note:
-        Each token adds the sum of its routed rows using a float32 accumulator.
+    routed: [N, D]. inv_idx: [T, top_k] int32. out_buffer: [T, D] (modified in place).
+    num_t_tiles: [1,1] int32 — token 128-row tiles PER PROGRAM. Returns out_buffer.
     """
     T, top_k = inv_idx.shape  # noqa: N806
     _N, D = routed.shape  # noqa: N806
@@ -64,11 +55,6 @@ def combine_gather_reduce_kernel(routed, inv_idx, out_buffer, num_t_tiles):
     nisa.memset(inv_step, 0.0)
 
     def body(_i):
-        """Process one dynamic token-tile iteration.
-
-        Args:
-            _i (int): Unused loop iteration index.
-        """
         for seg in range(len(d_starts)):
             ds, dw = d_starts[seg], d_widths[seg]
             acc = nl.ndarray((_TILE_M, dw), nl.float32, nl.sbuf)  # fp32 accumulate

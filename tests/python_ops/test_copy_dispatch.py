@@ -3,21 +3,14 @@
 Covers CPU↔Neuron transfers, Neuron→Neuron same-dtype (NRT),
 Neuron→Neuron unsupported-dtype (CPU bounce), Neuron→Neuron
 supported-dtype (MLIR), empty tensors, self-copy, broadcasting,
-scalar src, non-contiguous dst, and lowering while the Python dispatch key is excluded.
+scalar src, and non-contiguous dst.
 """
 
 import pytest
 import torch
-from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.utils._mode_utils import no_dispatch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import (
-    assert_op_runs_on_neuron,
-    force_cold_hlo_cache,
-    track_neuron_ops,
-)
-from torch_neuronx.python_ops.torch_mlir.ops.copy import CopyMLIRImpl
+from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
 
 pytestmark = pytest.mark.skipif(
     torch_neuronx.device_count() == 0, reason="No Neuron devices available"
@@ -146,30 +139,6 @@ class TestCopyDispatch:
         dst.copy_(src)
         torch_neuronx.synchronize()
         torch.testing.assert_close(dst.cpu(), src_cpu)
-
-    def test_copy_lowers_with_python_dispatch_excluded(self, device, monkeypatch):
-        """Neuron-to-Neuron copy_ lowers while the Python dispatch key is excluded."""
-        force_cold_hlo_cache(monkeypatch)
-        dst = torch.zeros(4, device=device)
-        src = torch.arange(4, dtype=torch.float32, device=device)
-
-        lower = CopyMLIRImpl().get_lower_func()
-        with no_dispatch():
-            result = lower(dst, src)
-
-        assert result is not None and result.stablehlo_bytes
-
-    def test_tensor_constant_on_device_under_fake_tensor_mode(self, device, monkeypatch):
-        """torch.tensor([-1], device=neuron) lowers inside FakeTensorMode."""
-        force_cold_hlo_cache(monkeypatch)
-
-        with track_neuron_ops():
-            with FakeTensorMode():
-                out = torch.tensor([-1], dtype=torch.int64, device=device)
-            torch_neuronx.synchronize()
-            assert_op_runs_on_neuron("aten::copy_")
-
-        assert out.shape == (1,)
 
     # ── Op tracking ──
 

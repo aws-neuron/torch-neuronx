@@ -221,11 +221,3 @@ class TestResize:
             assert x.shape == (2, 4, 3, 5, 7)
             assert x.is_contiguous(memory_format=torch.channels_last_3d)
             assert_op_runs_on_neuron("aten::resize_")
-
-    def test_resize_as_preserves_strides(self):
-        """resize_as_(self) is a no-op that preserves strides."""
-        device = torch.device("neuron")
-        x = torch.empty(2, 3, device=device).t()
-        old_strides = x.stride()
-        x.resize_as_(x)
-        assert x.stride() == old_strides

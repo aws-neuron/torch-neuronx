@@ -15,13 +15,18 @@ import torch.fx
 
 @dataclass
 class DynamicDimConstraints:
-    """Represent dynamic dimension constraints extracted from an FX graph.
+    """Dynamic dimension size constraint metadata extracted from an FX graph.
 
-    Args:
-        symbol_to_arg_index (dict[str, int]): Symbol names mapped to positional
-            scalar argument indices that provide their runtime values.
-        tensor_dim_exprs (dict[int, dict[int, str]]): Tensor argument indices mapped
-            to dynamic dimension indices and their SymPy expression strings.
+    Captures two pieces of information for propagation to the downstream compiler:
+
+    1. ``symbol_to_arg_index``: maps each sympy symbol name (e.g. "s0") to its
+       positional argument index in the function signature. This tells the compiler
+       which runtime scalar argument provides the value for that symbol.
+
+    2. ``tensor_dim_exprs``: maps each tensor argument index to a dict of
+       ``{dim_index: expr_string}`` for its dynamic dimensions. The expression
+       string is a sympy expression (e.g. "s0", "s0 + 1", "2*s1") that the
+       compiler is responsible for parsing and lowering to arithmetic.
     """
 
     symbol_to_arg_index: dict[str, int]
@@ -29,23 +34,13 @@ class DynamicDimConstraints:
 
 
 def build_dynamic_dim_constraints(g: torch.fx.Graph) -> DynamicDimConstraints | None:
-    """Extract dynamic dimension constraints from FX graph placeholders.
+    """Extract dynamic dimension constraint metadata from an FX graph.
 
-    Args:
-        g (torch.fx.Graph): Post-AOTAutograd graph to inspect.
+    Scans placeholder nodes to identify SymInt arguments and the symbolic
+    expressions on each tensor argument's dynamic dimensions.
 
     Returns:
-        DynamicDimConstraints | None: Symbol and tensor dimension mappings, or
-        ``None`` when the graph has no resolvable dynamic tensor dimensions.
-
-    Raises:
-        AssertionError: If a symbolic scalar input is neither a bare symbol nor an
-            integer constant, or, after mapping at least one bare symbol, a tensor
-            dimension references an unmapped symbol.
-
-    Note:
-        Constant symbolic scalar inputs are ignored; bare symbols provide runtime
-        values for tensor dimension expressions.
+        DynamicDimConstraints if any dynamic dimensions exist, else None.
     """
     placeholders = [node for node in g.nodes if node.op == "placeholder"]
 

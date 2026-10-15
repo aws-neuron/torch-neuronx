@@ -26,7 +26,7 @@ def _to_copy_fn(src, out_dtype=None, out=None):
 
 @neuron_op("aten::_to_copy", disable_dtype_autocast=True, priority=90)
 class ToCopyMLIRImpl(TorchMlirOpImpl):
-    """Implement ``aten::_to_copy`` between Neuron devices with Torch-MLIR."""
+    """MLIR-based implementation for neuron-to-neuron to_copy operations."""
 
     def __init__(self):
         super().__init__(
@@ -49,20 +49,11 @@ class ToCopyMLIRImpl(TorchMlirOpImpl):
         return [dtype] if dtype is not None else []
 
     def can_handle(self, *args, **kwargs) -> bool:
-        """Check device, dtype, and stream eligibility for the Torch-MLIR copy path.
+        """Only handle neuron-to-neuron tensor copies.
 
         Args:
-            *args (Any): Positional arguments with the source tensor first.
-            **kwargs (Any): Copy options such as ``dtype`` and ``device``.
-
-        Returns:
-            bool: ``True`` when source and target use Neuron devices, dtypes are
-                supported, and stream state is eligible.
-
-        Note:
-            Float64, int64, and uint64 source or target dtypes are rejected. When
-            host-side collective communication is enabled, copies on a non-default
-            stream are also rejected.
+            args[0]: source tensor
+            kwargs: dtype, layout, device, pin_memory, non_blocking, memory_format
         """
         src = args[0]
 
@@ -97,18 +88,11 @@ class ToCopyMLIRImpl(TorchMlirOpImpl):
         return not (is_host_cc_enabled() and current_stream() != default_stream())
 
     def execute(self, *args, **kwargs):
-        """Execute a tensor copy between Neuron devices through Torch-MLIR.
+        """Execute to_copy operation using MLIR backend.
 
         Args:
-            *args (Any): Positional arguments with the source tensor first.
-            **kwargs (Any): Copy options; only ``dtype`` and ``device`` are consumed here.
-
-        Returns:
-            ExecutionResult: The copied tensor or a captured execution failure.
-
-        Note:
-            Empty inputs allocate empty outputs. Non-overlapping dense source strides
-            are preserved; source layouts with gaps produce contiguous outputs.
+            args[0]: source tensor
+            kwargs: dtype, layout, device, pin_memory, non_blocking, memory_format
         """
         src = args[0]
         dtype = kwargs.get("dtype")
@@ -149,27 +133,14 @@ class ToCopyMLIRImpl(TorchMlirOpImpl):
         return super().execute(src_prepared, **mlir_kwargs)
 
     def get_lower_func(self):
-        """Return a lowering function that translates raw ATen copy arguments.
+        """Return a lower function that translates aten::_to_copy args to kernel kwargs.
 
-        Returns:
-            Callable: Function that maps ``dtype`` to the kernel's ``out_dtype`` argument.
-
-        Note:
-            C++ dispatch supplies raw ``aten::_to_copy`` keyword arguments, while the kernel
-            consumes only the source tensor and an optional output dtype.
+        C++ Dispatch calls lower_func(src, dtype=..., layout=..., device=..., ...) with
+        raw aten kwargs. The kernel expects lower(src, out_dtype=..., out=...).
         """
         kernel = self.kernel
 
         def to_copy_lower(*args, **kwargs):
-            """Lower a raw ``aten::_to_copy`` invocation.
-
-            Args:
-                *args (Any): Positional arguments with the source tensor first.
-                **kwargs (Any): Raw ATen copy keywords; only ``dtype`` affects lowering.
-
-            Returns:
-                LoweringResult: Lowered kernel metadata for the requested dtype.
-            """
             src = args[0]
             target_dtype = kwargs.get("dtype", src.dtype)
 

@@ -347,7 +347,7 @@ static PyObject* THNPEvent_get_device(THNPEvent* self, void* unused) {
 static PyObject* THNPEvent_get_neuron_event(THNPEvent* self, void* unused) {
   HANDLE_TH_ERRORS
   // Return a pointer representation of the event
-  return PyLong_FromVoidPtr(self->neuron_event.get_handle());
+  return PyLong_FromVoidPtr(self->neuron_event.get_impl().get());
   END_HANDLE_TH_ERRORS
 }
 

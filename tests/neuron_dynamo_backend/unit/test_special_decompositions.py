@@ -3,7 +3,7 @@
 """
 Unit tests for special math function decompositions:
 i0, i0e, i1, i1e, bessel_j0, bessel_j1, spherical_bessel_j0,
-ndtri, log_ndtr, laguerre_polynomial_l, polygamma, erfcx.
+ndtri, log_ndtr, laguerre_polynomial_l, polygamma.
 """
 
 from typing import ClassVar
@@ -57,7 +57,6 @@ class TestSpecialFunctionDecompositionsRegistered:
             torch.ops.aten.special_laguerre_polynomial_l.n_scalar,
             torch.ops.aten.special_laguerre_polynomial_l.x_scalar,
             torch.ops.aten.polygamma.default,
-            torch.ops.aten.special_erfcx.default,
             torch.ops.aten.igamma.default,
             torch.ops.aten.igammac.default,
             torch.ops.aten.special_gammainc.default,
@@ -66,30 +65,6 @@ class TestSpecialFunctionDecompositionsRegistered:
     )
     def test_registered(self, op):
         assert op in decompositions.neuron_decompositions
-
-
-class TestErfcxDecomposition:
-    """erfcx(x) = exp(x^2) * erfc(x).
-
-    Bounded as x -> +inf, but grows as ~2*exp(x^2) as x -> -inf. A prior
-    decomposition clamped exp(x^2) and branched on signed x, which truncated
-    the large-negative tail. These CPU-only tests check the decomposition math
-    against torch.special.erfcx; they need no Neuron device.
-    """
-
-    def test_erfcx_matches_reference_across_range(self):
-        # Covers the large-negative tail (|x| up to 5) that the clamp broke.
-        x = torch.linspace(-5.0, 5.0, 4001, dtype=torch.float32)
-        got = decompositions.special_erfcx_decomp(x)
-        ref = torch.special.erfcx(x)
-        torch.testing.assert_close(got, ref, rtol=3e-3, atol=1e-5)
-
-    def test_erfcx_negative_tail_not_truncated(self):
-        # Regression: the old clamp returned ~2*e^10 (~4.4e4) at x=-5; true ~1.4e11.
-        x = torch.tensor([-5.0], dtype=torch.float32)
-        got = decompositions.special_erfcx_decomp(x)
-        assert got.item() > 1e10
-        torch.testing.assert_close(got, torch.special.erfcx(x), rtol=1e-3, atol=0.0)
 
 
 @pytest.mark.skipif(not torch.neuron.is_available(), reason="Neuron not available")

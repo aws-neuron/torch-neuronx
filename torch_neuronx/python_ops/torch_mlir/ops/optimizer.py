@@ -81,40 +81,19 @@ def _make_adam_compute_fn(decoupled_wd):
         amsgrad,
         maximize,
     ):
-        """Compute fused Adam updates with NKI kernels and scalar fallback.
-
-        Args:
-            params (list[torch.Tensor]): Parameter tensors to update.
-            grads (list[torch.Tensor]): Gradients for the parameters.
-            exp_avgs (list[torch.Tensor]): First-moment state tensors.
-            exp_avg_sqs (list[torch.Tensor]): Second-moment state tensors.
-            max_exp_avg_sqs (list[torch.Tensor]): Maximum second-moment state tensors.
-            state_steps (list[torch.Tensor]): Per-parameter optimizer step tensors.
-            lr (torch.Tensor): Learning rate.
-            beta1 (torch.Tensor): First-moment decay coefficient.
-            beta2 (torch.Tensor): Second-moment decay coefficient.
-            weight_decay (torch.Tensor): Weight-decay coefficient.
-            eps (torch.Tensor): Denominator stability term.
-            amsgrad (bool): Whether to maintain maximum second moments.
-            maximize (bool): Whether to maximize the objective.
-
-        Returns:
-            tuple[torch.Tensor, ...]: Parameters, moments, and optional AMSGrad maxima in list
-                order; zero-element outputs alias their corresponding inputs.
-        """
         from torch_neuronx.python_ops.nki_kernels.adamw import adam_nki, adamw_nki
 
         wd_val = (1.0 - lr * weight_decay) if decoupled_wd else weight_decay
+        # retain step-dependent params as tensors to avoid recompilation
+        step = state_steps[0]
+        bc1 = 1.0 - torch.pow(beta1, step)
+        bc2_sqrt = torch.sqrt(1.0 - torch.pow(beta2, step))
+        step_size = lr / bc1
+        inv_bc2_sqrt = 1.0 / bc2_sqrt
 
         results_p, results_ea, results_eas, results_meas = [], [], [], []
 
         for i in range(len(params)):
-            # Counter is a runtime tensor; no host scalar or per-step recompilation.
-            step = state_steps[i]
-            bc1 = 1.0 - torch.pow(beta1, step)
-            bc2_sqrt = torch.sqrt(1.0 - torch.pow(beta2, step))
-            step_size = lr / bc1
-            inv_bc2_sqrt = 1.0 / bc2_sqrt
             grad = -grads[i] if maximize else grads[i]
             meas = max_exp_avg_sqs[i] if amsgrad else params[i]
 
@@ -197,27 +176,6 @@ def _make_adam_compute_fn(decoupled_wd):
         amsgrad,
         maximize,
     ):
-        """Compute fused Adam updates with elementwise MLIR operations.
-
-        Args:
-            params (list[torch.Tensor]): Parameter tensors to update.
-            grads (list[torch.Tensor]): Gradients for the parameters.
-            exp_avgs (list[torch.Tensor]): First-moment state tensors.
-            exp_avg_sqs (list[torch.Tensor]): Second-moment state tensors.
-            max_exp_avg_sqs (list[torch.Tensor]): Maximum second-moment state tensors.
-            state_steps (list[torch.Tensor]): Optimizer step tensors.
-            lr (torch.Tensor): Learning rate.
-            beta1 (torch.Tensor): First-moment decay coefficient.
-            beta2 (torch.Tensor): Second-moment decay coefficient.
-            weight_decay (torch.Tensor): Weight-decay coefficient.
-            eps (torch.Tensor): Denominator stability term.
-            amsgrad (bool): Whether to maintain maximum second moments.
-            maximize (bool): Whether to maximize the objective.
-
-        Returns:
-            tuple[torch.Tensor, ...]: Parameters, moments, and optional AMSGrad maxima in list
-                order; zero-element outputs alias their corresponding inputs.
-        """
         updated_params = []
         updated_exp_avgs = []
         updated_exp_avg_sqs = []
@@ -307,29 +265,6 @@ def _register_fused_adam(op_names, decoupled_wd):
         found_inf=None,
         **kwargs,
     ):
-        """Return fused Adam's compute function, inputs, donated buffers, and no-op postprocessor.
-
-        Args:
-            params (list[torch.Tensor]): Parameter tensors to update.
-            grads (list[torch.Tensor]): Gradients for the parameters.
-            exp_avgs (list[torch.Tensor]): First-moment state tensors.
-            exp_avg_sqs (list[torch.Tensor]): Second-moment state tensors.
-            max_exp_avg_sqs (list[torch.Tensor]): Maximum second-moment state tensors.
-            state_steps (list[torch.Tensor]): Optimizer step tensors.
-            lr (float or torch.Tensor, optional): Learning rate. Defaults to ``0.001``.
-            beta1 (float, optional): First-moment decay. Defaults to ``0.9``.
-            beta2 (float, optional): Second-moment decay. Defaults to ``0.999``.
-            weight_decay (float, optional): Defaults to ``0.01`` for AdamW, else ``0.0``.
-            eps (float, optional): Denominator stability term. Defaults to ``1e-8``.
-            amsgrad (bool, optional): Maintain maximum second moments. Defaults to ``False``.
-            maximize (bool, optional): Maximize the objective. Defaults to ``False``.
-            grad_scale (torch.Tensor | None, optional): Ignored metadata. Defaults to ``None``.
-            found_inf (torch.Tensor | None, optional): Ignored metadata. Defaults to ``None``.
-            **kwargs (Any): Additional dispatcher keyword arguments; currently ignored.
-
-        Returns:
-            tuple: Compute function, inputs, donated state buffers, and no-op postprocessor.
-        """
         compute_fn = _make_adam_compute_fn(decoupled_wd)
 
         if not params:

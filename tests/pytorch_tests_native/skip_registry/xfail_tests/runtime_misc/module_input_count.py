@@ -1,9 +1,13 @@
 RUNTIME_MISC_MODULE_INPUT_COUNT = [
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_linalg_lu_factor_neuron_float32",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_linalg_qr_neuron_float32",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_qr_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_linalg_det_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_linalg_householder_product_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_out_arange_neuron_float32",
     "test_ops.py::TestCommonNEURON::test_out_linalg_matrix_power_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_out_ones_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_out_zeros_neuron_float32",
     "test_optim.py::TestOptimRenewedNEURON::test_forloop_goes_right_direction_contiguous_False_with_lrsched_False_Muon_neuron_float32",
     "test_optim.py::TestOptimRenewedNEURON::test_forloop_goes_right_direction_contiguous_False_with_lrsched_True_Muon_neuron_float32",
     "test_optim.py::TestOptimRenewedNEURON::test_forloop_goes_right_direction_contiguous_True_with_lrsched_False_Muon_neuron_float32",
@@ -14,4 +18,5 @@ RUNTIME_MISC_MODULE_INPUT_COUNT = [
     "test_optim.py::TestOptimRenewedNEURON::test_tensor_lr_num_dim_1_Muon_neuron_float32",
     "test_optim.py::TestOptimRenewedNEURON::test_tensor_lr_num_dim_2_Muon_neuron_float32",
     "test_torch.py::TestTorchDeviceTypeNEURON::test_diff_noncontig_neuron_bool",
+    "test_torch.py::TestTorchDeviceTypeNEURON::test_swap_data_ptr_device_mismatch_neuron",
 ]

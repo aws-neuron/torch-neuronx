@@ -601,42 +601,10 @@ func.func @torch.aten.div.Tensor_mode$trunc_rounding(%arg0: !torch.vtensor<[4,4]
 // CHECK-SAME:                                                          %[[VAL_1:.*]]: !torch.vtensor<[4,4],f32>) -> !torch.vtensor<[4,4],f32> {
 // CHECK-DAG:       %[[VAL_2:.*]] = torch_c.to_builtin_tensor %[[VAL_0]] : !torch.vtensor<[4,4],f32> -> tensor<4x4xf32>
 // CHECK-DAG:       %[[VAL_3:.*]] = torch_c.to_builtin_tensor %[[VAL_1]] : !torch.vtensor<[4,4],f32> -> tensor<4x4xf32>
-// CHECK:           %[[MOD:.*]] = chlo.broadcast_remainder %[[VAL_2]], %[[VAL_3]] : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
-// CHECK:           %[[NUM:.*]] = chlo.broadcast_subtract %[[VAL_2]], %[[MOD]] : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
-// CHECK:           %[[DIV:.*]] = chlo.broadcast_divide %[[NUM]], %[[VAL_3]] : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
-// CHECK:           %[[ZERO:.*]] = "chlo.constant_like"(%[[DIV]]) <{value = 0.000000e+00 : f32}> : (tensor<4x4xf32>) -> tensor<4x4xf32>
-// CHECK:           %[[ONE:.*]] = "chlo.constant_like"(%[[DIV]]) <{value = 1.000000e+00 : f32}> : (tensor<4x4xf32>) -> tensor<4x4xf32>
-// CHECK:           %[[C23:.*]] = "chlo.constant_like"(%[[DIV]]) <{value = 0x4B800000 : f32}> : (tensor<4x4xf32>) -> tensor<4x4xf32>
-// CHECK:           %[[AX:.*]] = stablehlo.abs %[[VAL_2]] : tensor<4x4xf32>
-// CHECK:           %[[RX:.*]] = chlo.broadcast_compare %[[AX]], %[[C23]] {comparison_direction = #chlo<comparison_direction LT>} : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xi1>
-// CHECK:           %[[AY:.*]] = stablehlo.abs %[[VAL_3]] : tensor<4x4xf32>
-// CHECK:           %[[RY:.*]] = chlo.broadcast_compare %[[AY]], %[[C23]] {comparison_direction = #chlo<comparison_direction LT>} : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xi1>
-// CHECK:           %[[AQ:.*]] = stablehlo.abs %[[DIV]] : tensor<4x4xf32>
-// CHECK:           %[[RQ:.*]] = chlo.broadcast_compare %[[AQ]], %[[C23]] {comparison_direction = #chlo<comparison_direction LT>} : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xi1>
-// CHECK:           %[[AND1:.*]] = stablehlo.and %[[RX]], %[[RY]] : tensor<4x4xi1>
-// CHECK:           %[[SAFE:.*]] = stablehlo.and %[[AND1]], %[[RQ]] : tensor<4x4xi1>
-// CHECK:           %[[C22:.*]] = "chlo.constant_like"(%[[DIV]]) <{value = 0x4B000000 : f32}> : (tensor<4x4xf32>) -> tensor<4x4xf32>
-// CHECK:           %[[DS:.*]] = stablehlo.select %[[SAFE]], %[[DIV]], %[[ZERO]] : tensor<4x4xi1>, tensor<4x4xf32>
-// CHECK:           %[[RND:.*]] = stablehlo.round_nearest_even %[[DS]] : tensor<4x4xf32>
-// CHECK:           %[[ADS:.*]] = stablehlo.abs %[[DS]] : tensor<4x4xf32>
-// CHECK:           %[[BIG:.*]] = chlo.broadcast_compare %[[ADS]], %[[C22]] {comparison_direction = #chlo<comparison_direction GE>} : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xi1>
-// CHECK:           %[[G1:.*]] = stablehlo.select %[[BIG]], %[[DS]], %[[RND]] : tensor<4x4xi1>, tensor<4x4xf32>
-// CHECK:           %[[ISNAN:.*]] = chlo.broadcast_compare %[[DS]], %[[DS]] {comparison_direction = #chlo<comparison_direction NE>} : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xi1>
-// CHECK:           %[[Q:.*]] = stablehlo.select %[[ISNAN]], %[[DS]], %[[G1]] : tensor<4x4xi1>, tensor<4x4xf32>
-// CHECK:           %[[PROD:.*]] = chlo.broadcast_multiply %[[MOD]], %[[VAL_3]] : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
-// CHECK:           %[[ADJ:.*]] = chlo.broadcast_compare %[[PROD]], %[[ZERO]] {comparison_direction = #chlo<comparison_direction LT>} : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xi1>
-// CHECK:           %[[DN:.*]] = stablehlo.subtract %[[Q]], %[[ONE]] : tensor<4x4xf32>
-// CHECK:           %[[EXACT:.*]] = stablehlo.select %[[ADJ]], %[[DN]], %[[Q]] : tensor<4x4xi1>, tensor<4x4xf32>
-// CHECK:           %[[NQ:.*]] = chlo.broadcast_divide %[[VAL_2]], %[[VAL_3]] : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
-// CHECK:           %[[FL:.*]] = stablehlo.floor %[[NQ]] : tensor<4x4xf32>
-// CHECK:           %[[ANQ:.*]] = stablehlo.abs %[[NQ]] : tensor<4x4xf32>
-// CHECK:           %[[NBIG:.*]] = chlo.broadcast_compare %[[ANQ]], %[[C22]] {comparison_direction = #chlo<comparison_direction GE>} : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xi1>
-// CHECK:           %[[NG1:.*]] = stablehlo.select %[[NBIG]], %[[NQ]], %[[FL]] : tensor<4x4xi1>, tensor<4x4xf32>
-// CHECK:           %[[NNAN:.*]] = chlo.broadcast_compare %[[NQ]], %[[NQ]] {comparison_direction = #chlo<comparison_direction NE>} : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xi1>
-// CHECK:           %[[NAIVE:.*]] = stablehlo.select %[[NNAN]], %[[NQ]], %[[NG1]] : tensor<4x4xi1>, tensor<4x4xf32>
-// CHECK:           %[[OUT:.*]] = stablehlo.select %[[SAFE]], %[[EXACT]], %[[NAIVE]] : tensor<4x4xi1>, tensor<4x4xf32>
-// CHECK:           %[[RES:.*]] = torch_c.from_builtin_tensor %[[OUT]] : tensor<4x4xf32> -> !torch.vtensor<[4,4],f32>
-// CHECK:           return %[[RES]] : !torch.vtensor<[4,4],f32>
+// CHECK:           %[[VAL_4:.*]] = chlo.broadcast_divide %[[VAL_2]], %[[VAL_3]] : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
+// CHECK:           %[[VAL_5:.*]] = stablehlo.floor %[[VAL_4]] : tensor<4x4xf32>
+// CHECK:           %[[VAL_6:.*]] = torch_c.from_builtin_tensor %[[VAL_5]] : tensor<4x4xf32> -> !torch.vtensor<[4,4],f32>
+// CHECK:           return %[[VAL_6]] : !torch.vtensor<[4,4],f32>
 // CHECK:         }
 func.func @torch.aten.div.Tensor_mode$floor_rounding(%arg0: !torch.vtensor<[4,4],f32>, %arg1: !torch.vtensor<[4,4],f32>) -> !torch.vtensor<[4,4],f32> {
   %str = torch.constant.str "floor"

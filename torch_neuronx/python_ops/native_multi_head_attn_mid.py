@@ -7,24 +7,10 @@ from .nki_kernels.scaled_dot_product_attention import scaled_dot_product_attenti
 
 
 class NativeMultiHeadAttnMidNKIImpl(OperationImplementation):
-    """Implement the middle native multi-head attention stage with NKI."""
+    """NKI implementation of native multi-head attention middle operation"""
 
     def can_handle(self, query, key, value, **kwargs) -> bool:
-        """Check whether NKI supports the supplied attention tensors.
-
-        Args:
-            query (torch.Tensor): Query tensor in ``[B, H, D, S]`` layout.
-            key (torch.Tensor): Key tensor matching ``query``.
-            value (torch.Tensor): Value tensor matching ``query``.
-            **kwargs (Any): Additional compatibility arguments for the base handler.
-
-        Returns:
-            bool: ``True`` for matching four-dimensional Neuron tensors with
-            ``S % 512 == 0``.
-
-        Raises:
-            RuntimeError: If a non-scalar tensor argument is not on a Neuron device.
-        """
+        """Check if this implementation can handle the given inputs"""
         if not super().can_handle(query, key, value, **kwargs):
             return False
 
@@ -75,25 +61,6 @@ class NativeMultiHeadAttnMidNKIImpl(OperationImplementation):
         out: torch.Tensor | None = None,
     ) -> ExecutionResult:
         # Check for empty tensors first
-        """Execute attention after rejecting empty input tensors.
-
-        Args:
-            query (torch.Tensor): Query tensor in ``[B, H, D, S]`` layout.
-            key (torch.Tensor): Key tensor matching ``query``.
-            value (torch.Tensor): Value tensor matching ``query``.
-            use_causal_mask (bool, optional): Apply a causal attention mask.
-                Defaults to ``False``.
-            dropout_p (float, optional): Compatibility dropout probability; the
-                current NKI wrapper ignores it. Defaults to ``0.0``.
-            training (bool, optional): Enable training behavior in the NKI kernel.
-                Defaults to ``False``.
-            out (torch.Tensor | None, optional): Destination passed to ``copy_`` and
-                returned when the copy succeeds. Defaults to ``None``.
-
-        Returns:
-            ExecutionResult: Failure details, the computed ``[B, H, S, D]`` output,
-            or the supplied ``out`` after a successful copy.
-        """
         empty_result = self._check_and_handle_empty(query, key, value)
         if empty_result is not None:
             return empty_result
@@ -154,7 +121,7 @@ class NativeMultiHeadAttnMidNKIImpl(OperationImplementation):
 
 
 class NativeMultiHeadAttnMidOp(Operation):
-    """Dispatch the middle native multi-head attention operation."""
+    """Native multi-head attention middle operation with NKI implementation"""
 
     def _setup_implementations(self):
         self._implementations.append(NativeMultiHeadAttnMidNKIImpl())
@@ -164,9 +131,4 @@ class NativeMultiHeadAttnMidOp(Operation):
 
     @property
     def op_name(self) -> str:
-        """Return the registered operation name.
-
-        Returns:
-            str: ``native_multi_head_attn_mid``.
-        """
         return "native_multi_head_attn_mid"

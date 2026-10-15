@@ -121,34 +121,3 @@ class TestCacheDisabled:
         put("disabled_key", entry)
         _hlo_cache_mod._enabled = True
         assert get("disabled_key") is None
-
-
-class TestStorageKeyFoldsPlatform:
-    """The storage name must carry the platform fields.
-
-    The HLO is target-specific and the eager frontend key carries no platform target and
-    no LNC count. Without them, a trn2 or LNC=2 run can serve its HLO to a trn1 or LNC=1
-    run through a shared cache directory.
-    """
-
-    def _hash(self, monkeypatch, key, *, target="trn2", lnc="2"):
-        """Hash key with both fields pinned. Otherwise the helper queries the instance
-        type, which throws on an unknown one."""
-        import torch_neuronx
-
-        monkeypatch.setenv("NEURON_PLATFORM_TARGET_OVERRIDE", target)
-        monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
-        return torch_neuronx._C._hash_hlo_cache_key(key)
-
-    def test_lnc_changes_the_storage_name(self, monkeypatch):
-        one = self._hash(monkeypatch, "same_frontend_key", lnc="1")
-        two = self._hash(monkeypatch, "same_frontend_key", lnc="2")
-        assert one != two, "LNC must change the HLO cache storage name"
-
-    def test_platform_target_changes_the_storage_name(self, monkeypatch):
-        trn1 = self._hash(monkeypatch, "same_frontend_key", target="trn1")
-        trn2 = self._hash(monkeypatch, "same_frontend_key", target="trn2")
-        assert trn1 != trn2, "The platform target must change the HLO cache storage name"
-
-    def test_same_environment_is_stable(self, monkeypatch):
-        assert self._hash(monkeypatch, "k") == self._hash(monkeypatch, "k")

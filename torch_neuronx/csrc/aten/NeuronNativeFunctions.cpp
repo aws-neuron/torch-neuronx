@@ -310,14 +310,7 @@ const at::Tensor& resize_neuron(const at::Tensor& self, c10::IntArrayRef size,
               "resize_: expected neuron tensor, but got: ", self.device());
 
   auto format = memory_format.value_or(c10::MemoryFormat::Contiguous);
-  if (!memory_format.has_value() && self.sizes().equals(size)) {
-    // No format requested and size unchanged — preserve existing strides.
-    return self;
-  }
   if (format == c10::MemoryFormat::Preserve) {
-    if (self.sizes().equals(size)) {
-      return self;
-    }
     format = c10::MemoryFormat::Contiguous;
   }
 

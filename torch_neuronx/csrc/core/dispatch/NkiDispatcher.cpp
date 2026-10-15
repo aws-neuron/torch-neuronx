@@ -216,18 +216,15 @@ py::object NkiDispatchEager(std::vector<at::Tensor> tensor_args_vec, int64_t ker
     TORCH_NEURONX_DISPATCH_DEBUG("[NkiDispatchEager] CACHE HIT with DumpedConfig: ",
                                  "num_output_specs=", entry->nki_output_specs.size(),
                                  " num_aliases=", entry->nki_operand_output_aliases.size());
-    // Alias copy-back: copy aliased outputs back to corresponding input tensors.
-    // Skipped when input_output_aliases already made the NEFF write in place.
-    if (entry->input_output_aliases.empty()) {
-      for (const auto& [input_id, output_id] : entry->nki_operand_output_aliases) {
-        TORCH_CHECK(input_id >= 0 && static_cast<size_t>(input_id) < tensor_args.size(),
-                    "[NkiDispatchEager] alias input_id ", input_id, " out of range for ",
-                    tensor_args.size(), " tensor args");
-        TORCH_CHECK(output_id >= 0 && static_cast<size_t>(output_id) < results.size(),
-                    "[NkiDispatchEager] alias output_id ", output_id, " out of range for ",
-                    results.size(), " results");
-        tensor_args.get(input_id).copy_(results[output_id]);
-      }
+    // Alias copy-back: copy aliased outputs back to corresponding input tensors
+    for (const auto& [input_id, output_id] : entry->nki_operand_output_aliases) {
+      TORCH_CHECK(input_id >= 0 && static_cast<size_t>(input_id) < tensor_args.size(),
+                  "[NkiDispatchEager] alias input_id ", input_id, " out of range for ",
+                  tensor_args.size(), " tensor args");
+      TORCH_CHECK(output_id >= 0 && static_cast<size_t>(output_id) < results.size(),
+                  "[NkiDispatchEager] alias output_id ", output_id, " out of range for ",
+                  results.size(), " results");
+      tensor_args.get(input_id).copy_(results[output_id]);
     }
 
     // Return only actual outputs (first nki_output_specs.size() tensors)
