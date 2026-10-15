@@ -31,19 +31,30 @@ print_header() {
 # Function to generate dynamic LD_LIBRARY_PATH
 generate_ld_library_path() {
     local workspace_dir="$1"
-    local pytorch_path="${2:-${PYTORCH_LOCAL_PATH:-.venv/lib/python3.10/site-packages/torch}}"
+    local pytorch_path="${2:-${PYTORCH_LOCAL_PATH:-.venv/lib/python${PYTHON_VERSION:-3.10}/site-packages/torch}}"
 
     # Build the library paths
     if [[ "$pytorch_path" = /* ]]; then
         # Absolute path
         torch_lib_path="$pytorch_path/lib"
+        site_packages_dir="$(dirname "$pytorch_path")"
     else
         # Relative path - make it relative to workspace
         torch_lib_path="$workspace_dir/$pytorch_path/lib"
+        site_packages_dir="$workspace_dir/$(dirname "$pytorch_path")"
+    fi
+
+    # Collect CUDA lib paths from nvidia/*/lib (py3.12 torch wheel splits
+    # libtorch_cuda.so, libcupti.so, etc. into separate nvidia subdirs)
+    local extra_paths=""
+    if [[ -d "$site_packages_dir/nvidia" ]]; then
+        for nvidia_lib in "$site_packages_dir"/nvidia/*/lib; do
+            [[ -d "$nvidia_lib" ]] && extra_paths="${extra_paths}${nvidia_lib}:"
+        done
     fi
 
     # Construct the full LD_LIBRARY_PATH
-    echo "$torch_lib_path:${LD_LIBRARY_PATH:-}"
+    echo "${torch_lib_path}:${extra_paths}${LD_LIBRARY_PATH:-}"
 }
 
 # Function to print test results summary
@@ -124,8 +135,20 @@ if [ -z "$TEST_TARGET" ]; then
     TEST_TARGET="//:cpp_unit_tests"
 fi
 
-# Set Python version (default from .python-version)
-PYTHON_VERSION="${PYTHON_VERSION:-$(cat .python-version)}"
+# Set Python version. Prefer the active interpreter (so the hermetic
+# toolchain matches libpython linked into embedded-Python tests on images
+# whose interpreter differs from .python-version), falling back to the
+# repo pin.
+PYTHON_VERSION="${PYTHON_VERSION:-$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || cat .python-version)}"
+
+# Resolve PYTORCH_LOCAL_PATH before generating LD_LIBRARY_PATH so nvidia/ lib
+# discovery uses the correct site-packages directory
+if [ -z "${PYTORCH_LOCAL_PATH:-}" ]; then
+    PYTORCH_LOCAL_PATH="${PROJECT_ROOT}/.venv/lib/python${PYTHON_VERSION}/site-packages/torch"
+    if [ ! -d "$PYTORCH_LOCAL_PATH" ]; then
+        PYTORCH_LOCAL_PATH=$(python3 -c "import torch, os; print(os.path.dirname(torch.__file__))" 2>/dev/null || echo "")
+    fi
+fi
 
 # Generate dynamic LD_LIBRARY_PATH (after PYTORCH_LOCAL_PATH is set)
 DYNAMIC_LD_LIBRARY_PATH=$(generate_ld_library_path "$PROJECT_ROOT")
@@ -133,7 +156,7 @@ DYNAMIC_LD_LIBRARY_PATH=$(generate_ld_library_path "$PROJECT_ROOT")
 print_header "Configuration"
 echo -e "${YELLOW}Project root:${NC} $PROJECT_ROOT"
 echo -e "${YELLOW}Test target:${NC} $TEST_TARGET"
-echo -e "${YELLOW}PyTorch path:${NC} ${PYTORCH_LOCAL_PATH:-.venv/lib/python3.10/site-packages/torch}"
+echo -e "${YELLOW}PyTorch path:${NC} ${PYTORCH_LOCAL_PATH:-.venv/lib/python${PYTHON_VERSION:-3.10}/site-packages/torch}"
 echo -e "${YELLOW}Generated LD_LIBRARY_PATH:${NC}"
 echo -e "  ${DYNAMIC_LD_LIBRARY_PATH}"
 
@@ -152,6 +175,11 @@ BAZEL_CMD="bazel test"
 BAZEL_CMD="$BAZEL_CMD --@rules_python//python/config_settings:python_version=$PYTHON_VERSION"
 BAZEL_CMD="$BAZEL_CMD --action_env=PYTHON_VERSION=$PYTHON_VERSION"
 
+# Ensure PYTORCH_LOCAL_PATH is set so Bazel uses local PyTorch instead of downloading
+if [ -n "$PYTORCH_LOCAL_PATH" ] && [ -d "$PYTORCH_LOCAL_PATH" ]; then
+    BAZEL_CMD="$BAZEL_CMD --action_env=PYTORCH_LOCAL_PATH=$PYTORCH_LOCAL_PATH"
+fi
+
 # Set PYTHONHOME so tests that call Py_Initialize() can find the hermetic stdlib
 PYTHON_VERSION_UNDERSCORE="${PYTHON_VERSION//./_}"
 BAZEL_OUTPUT_BASE=$(bazel info output_base 2>/dev/null)
@@ -167,6 +195,10 @@ fi
 
 # Add the dynamic LD_LIBRARY_PATH to the test environment
 BAZEL_CMD="$BAZEL_CMD --test_env=LD_LIBRARY_PATH=\"$DYNAMIC_LD_LIBRARY_PATH\""
+
+# Standalone C++ tests do not import torch_neuronx, so seed the package-default cell.
+BAZEL_CMD="$BAZEL_CMD --test_env=TORCH_NEURONX_ENABLE_STREAMS=1"
+BAZEL_CMD="$BAZEL_CMD --test_env=TORCH_NEURONX_ENABLE_HOST_CC=0"
 
 # Set PYTHONHOME for tests that embed Python via Py_Initialize()
 if [ -d "$PYTHONHOME" ]; then

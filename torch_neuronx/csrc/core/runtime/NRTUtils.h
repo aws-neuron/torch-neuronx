@@ -14,6 +14,7 @@ extern "C" {
 #include <nrt/nrt_profile.h>
 }
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -113,16 +114,22 @@ inline NRTReduceOp MapReduceOpToNRT(c10d::ReduceOp op) {
   }
 }
 
-// State for tracking async NRT operation scheduling
+// State for tracking async NRT operation scheduling.
 struct AsyncSchedulingState {
-  SequenceId sequence_id{0};      // Sequence number from Schedule()
-  bool is_scheduled{false};       // Whether async scheduling was called (in-flight)
-  bool is_pending_signal{false};  // kSignal event waiting for prior op to complete
+  SequenceId sequence_id{0};  // Sequence number from Schedule()
+  bool is_scheduled{false};   // Whether async scheduling was called (in-flight)
+  // Host-side op pending completion via a completion hook (not NRT device
+  // scheduling). Set for kEvent/kBarrier/kAlloc/kDealloc; all advance the
+  // stream cursor past themselves once scheduled.
+  bool is_pending_signal{false};
+  std::atomic<bool> is_host_inflight{false};  // kHost: submitted to HostWorkerPool
+                                              // (incl. RDMA P2P batches)
 
   void Reset() {
     sequence_id = 0;
     is_scheduled = false;
     is_pending_signal = false;
+    is_host_inflight.store(false, std::memory_order_release);
   }
 };
 
@@ -245,133 +252,17 @@ inline NRT_STATUS AllocateSliceTensor(nrt_tensor_t* base_tensor, size_t offset, 
  */
 inline void* GetTensorVA(nrt_tensor_t* tensor) { return nrt_tensor_get_va(tensor); }
 
+/**
+ * Get the runtime trace correlation id of a tensor.
+ * The runtime stamps the same id on its system-trace events, so the framework
+ * memory snapshot and the runtime trace correlate.
+ * @param tensor Tensor to query
+ * @return Trace correlation id
+ */
+inline uint64_t GetTensorTraceId(nrt_tensor_t* tensor) { return nrt_tensor_get_trace_id(tensor); }
+
 // NRT Profiling/Tracing Functions
 // These provide access to NRT inspect functionality for comprehensive profiling
-
-/**
- * Stop tracing/profiling and dump profile data
- * Dumps captured profile data to the configured output directory
- * @return NRT_STATUS indicating success or failure
- */
-inline NRT_STATUS StopInspect() { return nrt_inspect_stop(); }
-
-// NRT Profiling with Options Functions
-// These provide wrapper functions for the advanced NRT inspect configuration APIs
-
-/**
- * Allocate memory for the options structure for configurable profiling
- * @param options Output pointer to allocated config structure
- * @return NRT_STATUS indicating success or failure
- */
-inline NRT_STATUS AllocateInspectConfig(nrt_inspect_config_t** options) {
-  return nrt_inspect_config_allocate(options);
-}
-
-/**
- * Free memory for the options structure
- * @param options Pointer to config structure to free
- * @return NRT_STATUS indicating success or failure
- */
-inline NRT_STATUS FreeInspectConfig(nrt_inspect_config_t* options) {
-  return nrt_inspect_config_free(options);
-}
-
-/**
- * Set all fields of the config structure to their default values
- * @param options Pointer to config structure
- * @return NRT_STATUS indicating success or failure
- */
-inline NRT_STATUS SetInspectConfigDefaults(nrt_inspect_config_t* options) {
-  return nrt_inspect_config_set_defaults(options);
-}
-
-/**
- * Set the output directory for profiling results
- * @param options Pointer to config structure
- * @param output_dir Path to the output directory
- * @return NRT_STATUS indicating success or failure
- */
-inline NRT_STATUS SetInspectConfigOutputDir(nrt_inspect_config_t* options, const char* output_dir) {
-  return nrt_inspect_config_set_output_dir(options, output_dir);
-}
-
-/**
- * Enable or disable inspect profiling for normal execution
- * @param options Pointer to config structure
- * @param enable_inspect Boolean to enable or disable profiling
- * @return NRT_STATUS indicating success or failure
- */
-inline NRT_STATUS SetInspectConfigEnableInspect(nrt_inspect_config_t* options,
-                                                bool enable_inspect) {
-  return nrt_inspect_config_set_enable_inspect(options, enable_inspect);
-}
-
-/**
- * Set system trace capture enabled for a specific NeuronCore
- * @param options Pointer to config structure
- * @param nc_idx Index of the NeuronCore
- * @param enabled Boolean to enable or disable capture
- * @return NRT_STATUS indicating success or failure
- */
-inline NRT_STATUS SetInspectConfigCaptureEnabledForNC(nrt_inspect_config_t* options,
-                                                      uint32_t nc_idx, bool enabled) {
-  return nrt_inspect_config_set_capture_enabled_for_nc(options, nc_idx, enabled);
-}
-
-/**
- * Set system trace capture enabled for a specific event type
- * @param options Pointer to config structure
- * @param event_type String name of the event type
- * @param enabled Boolean to enable or disable capture
- * @return NRT_STATUS indicating success or failure
- */
-inline NRT_STATUS SetInspectConfigCaptureEnabledForEventType(nrt_inspect_config_t* options,
-                                                             const char* event_type, bool enabled) {
-  // TODO: linking to this API fails fix merged update once cherry-picked to 2.30
-  //  return nrt_inspect_config_set_capture_enabled_for_event_type_string(options, event_type,
-  //  enabled); (SIM ID: P372975680)
-  return NRT_STATUS(0);
-}
-
-/**
- * Set the device profile mode for inspect profiling
- * @param options Pointer to config structure
- * @param device_profile_mode Device profile mode (0=disabled, 1=model, 2=session)
- * @return NRT_STATUS indicating success or failure
- */
-inline NRT_STATUS SetInspectConfigDeviceProfileMode(nrt_inspect_config_t* options,
-                                                    int device_profile_mode) {
-  return nrt_inspect_config_set_inspect_device_profile_mode(
-      options, static_cast<nrt_inspect_device_profile_mode_t>(device_profile_mode));
-}
-
-/**
- * Get all available activity type strings
- * @param activity_types Output pointer to array of activity type strings
- * @param count Output pointer to number of activity types
- * @return NRT_STATUS indicating success or failure
- */
-inline NRT_STATUS GetAllActivityTypes(const char*** activity_types, size_t* count) {
-  return nrt_inspect_config_get_all_activity_types(activity_types, count);
-}
-
-/**
- * Free activity types array allocated by GetAllActivityTypes
- * @param activity_types Pointer to activity types array
- * @param count Number of activity types
- */
-inline void FreeActivityTypes(const char** activity_types, size_t count) {
-  nrt_inspect_config_free_activity_types(activity_types, count);
-}
-
-/**
- * Begin tracing/profiling with configurable options
- * @param options Pointer to config structure with profiling options
- * @return NRT_STATUS indicating success or failure
- */
-inline NRT_STATUS BeginInspectWithOptions(nrt_inspect_config_t* options) {
-  return nrt_inspect_begin_with_options(options);
-}
 
 /**
  * Get the instance-specific output directory path used by NRT profiling
@@ -384,6 +275,25 @@ inline NRT_STATUS GetInstanceOutputDir(const char* output_dir, char* instance_di
                                        size_t buf_size) {
   return nrt_inspect_get_instance_output_dir(output_dir, instance_dir_buf, buf_size);
 }
+
+/**
+ * @brief Enable pre-caching of profile info during warmup iterations.
+ */
+inline void PrecacheEnable() { nrt_inspect_precache_enable(); }
+
+/**
+ * @brief Disable pre-caching of profile info.
+ */
+inline void PrecacheDisable() { nrt_inspect_precache_disable(); }
+
+/**
+ * Get per-category HBM memory usage breakdown for a VNC.
+ *
+ * @param vnc_id Virtual NeuronCore id
+ * @return Vector of (category name, bytes) pairs. Empty on failure or when no
+ *         category has non-zero usage.
+ */
+std::vector<std::pair<std::string, size_t>> GetMemoryUsageBreakdown(uint32_t vnc_id);
 
 // ============================================================================
 // Asynchronous NRT operations
@@ -440,6 +350,19 @@ inline NRT_STATUS ScheduleTensorCopy(nrt_tensor_t* src, uint64_t src_offset, nrt
                                      int queue, NRT_STATUS* ret, SequenceId* req_sequence) {
   return nrta_tensor_copy(src, src_offset, dst, dst_offset, size_bytes, lnc_idx, queue, ret,
                           req_sequence);
+}
+
+/**
+ * Enqueue an asynchronous cross-dtype tensor cast.
+ *
+ * Descriptor offsets are measured in elements of their respective dtypes.
+ * The referenced tensors must remain allocated until the request completes.
+ */
+inline NRT_STATUS ScheduleTensorCast(const nrt_compute_tensor_t& src,
+                                     const nrt_compute_tensor_t& dst, uint64_t num_elements,
+                                     int lnc_idx, int queue, NRT_STATUS* ret,
+                                     SequenceId* req_sequence) {
+  return nrta_tensor_cast(&src, &dst, num_elements, lnc_idx, queue, ret, req_sequence);
 }
 
 /**
@@ -538,5 +461,9 @@ inline int GetHardwareQueue(nrta_xu_t xu, c10::StreamId stream_id) {
   if (stream_id == 0) return 0;
   return 1 + ((stream_id - 1) % (num_queues - 1));
 }
+
+inline void* PinnedMalloc(size_t size) { return nrt_pinned_malloc(size, NRT_PINNED_MALLOC); }
+
+inline void PinnedFree(void* ptr) { nrt_pinned_free(ptr); }
 
 }  // namespace at::neuron::nrt

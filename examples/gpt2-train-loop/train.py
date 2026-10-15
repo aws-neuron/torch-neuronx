@@ -7,7 +7,12 @@ import torch_neuronx
 
 
 class FakeDataset:
-    """Fake dataset that generates random token IDs"""
+    """Generate random token ID samples for GPT-2 training.
+
+    Args:
+        seq_length (int, optional): Tokens in each sample. Defaults to ``2048``.
+        vocab_size (int, optional): Exclusive upper bound for token IDs. Defaults to ``50257``.
+    """
 
     def __init__(self, seq_length=2048, vocab_size=50257):
         self.seq_length = seq_length
@@ -24,6 +29,7 @@ class FakeDataset:
 
 
 def main():
+    """Train a small GPT-2 model on random token IDs on a Neuron device."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--iterations", type=int, default=2, help="Number of training iterations")
     args = parser.parse_args()

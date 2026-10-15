@@ -17,7 +17,6 @@ import os
 import shlex
 import sys
 from dataclasses import dataclass
-from pathlib import Path
 
 from .compiler_config import CompilerConfig
 from .compiler_subprocess import CompilerSubprocess, NEFFCompilationError
@@ -27,7 +26,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ParsedArgs:
-    """Parsed command-line arguments for neuronx-cc wrapper."""
+    """Store parsed arguments for the ``neuronx-cc`` wrapper.
+
+    Args:
+        config (CompilerConfig): Parsed compiler configuration.
+        lnc_override (str | None): Logical NeuronCore override, if parsed.
+        input_file (str | None): Input HLO or MLIR file path, if parsed.
+        output_file (str | None): Output NEFF file path, if parsed.
+        workdir (str | None): Compiler working directory, if parsed.
+    """
 
     config: CompilerConfig
     lnc_override: str | None
@@ -37,20 +44,21 @@ class ParsedArgs:
 
 
 class NeuronxCCWrapper:
-    """Command-line wrapper for the CompilerSubprocess caching system."""
+    """Wrap cached compilation in a ``neuronx-cc`` command-line interface."""
 
     def __init__(self):
         """Initialize the wrapper."""
         self.compiler = CompilerSubprocess()
 
     def compile_with_caching(self, args: list[str]) -> int:
-        """Main compilation method with caching support.
+        """Compile an input file through the NEFF cache.
 
         Args:
-            args: Command line arguments
+            args (list[str]): ``neuronx-cc`` command-line arguments.
 
         Returns:
-            Exit code (0 for success, non-zero for failure)
+            int: ``0`` on success and ``1`` for missing parsed paths, input-reading
+            errors, or handled cache and compilation failures.
         """
         try:
             parsed = self._parse_neuronx_cc_args(args)
@@ -74,7 +82,7 @@ class NeuronxCCWrapper:
                 return 1
 
             # Determine IR type based on file extension
-            ir_type = "StableHLO" if Path(parsed.input_file).suffix == ".mlir" else "XLA"
+            ir_type = "StableHLO"
 
             # Get cached neff or compile
             self.compiler.get_or_compile(
@@ -164,10 +172,15 @@ class NeuronxCCWrapper:
 
 
 def main(args=None):
-    """Main entry point for the neuronx_cc_wrapper.
+    """Run the cached ``neuronx-cc`` command-line wrapper.
 
     Args:
-        args: List of command line arguments to parse. If None, uses sys.argv.
+        args (iterable[str], optional): Arguments to parse. Defaults to
+            ``sys.argv[1:]``.
+
+    Returns:
+        int: Status from ``compile_with_caching``: ``0`` on success or ``1`` for a
+            handled failure.
     """
     args = sys.argv[1:] if args is None else list(args)
 

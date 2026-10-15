@@ -65,28 +65,52 @@ class TestNeuronModule(unittest.TestCase):
             neuron.get_device_name("invalid")
 
     @patch("torch_neuronx._C._neuron_getDeviceProperties")
+    @patch("torch_neuronx.device_count", return_value=64)
     @patch("torch_neuronx.neuron.current_device")
-    def test_get_device_properties(self, mock_current, mock_get_props):
-        """Test get_device_properties function"""
-        mock_current.return_value = 0
+    def test_get_device_properties(self, mock_current, mock_device_count, mock_get_props):
+        """Test get_device_properties passes current_device() to C++ layer.
+
+        In distributed mode, each rank has a different current_device().
+        get_device_properties() must pass that value (not hardcoded 0) so the
+        C++ layer can convert it to the correct vnc via get_vnc_id().
+        """
         mock_props = MagicMock()
         mock_props.total_memory = 0
         mock_get_props.return_value = mock_props
 
+        # Rank 0: current_device()=0 → called_with(0)
+        mock_current.return_value = 0
         props = neuron.get_device_properties()
         self.assertEqual(props.total_memory, 0)
-        mock_get_props.assert_called_once_with(0)
+        mock_get_props.assert_called_with(0)
+
+        mock_get_props.reset_mock()
+
+        # Rank 8: current_device()=8 → called_with(8), not 0
+        mock_current.return_value = 8
+        props = neuron.get_device_properties()
+        mock_get_props.assert_called_with(8)
 
     @patch("torch_neuronx._C._neuron_getDeviceProperties")
     def test_get_device_properties_with_string_device(self, mock_get_props):
-        """Test get_device_properties parses device string correctly"""
+        """Test get_device_properties parses device strings correctly.
+
+        'neuron:0' and bare 'neuron' both resolve to device_id=0.
+        In distributed mode, callers should pass 'neuron:<local_rank>' to
+        get the correct device for their rank.
+        """
         mock_props = MagicMock()
         mock_props.total_memory = 0
         mock_get_props.return_value = mock_props
 
-        props = neuron.get_device_properties("neuron:0")
-        self.assertEqual(props.total_memory, 0)
-        mock_get_props.assert_called_once_with(0)  # Should parse "neuron:0" to device_id=0
+        neuron.get_device_properties("neuron:0")
+        mock_get_props.assert_called_with(0)
+
+        mock_get_props.reset_mock()
+
+        # bare 'neuron' (no index) also resolves to device_id=0
+        neuron.get_device_properties("neuron")
+        mock_get_props.assert_called_with(0)
 
     def test_empty_cache(self):
         """Test empty_cache function"""

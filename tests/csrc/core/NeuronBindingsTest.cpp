@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "tests/csrc/mocks/MockNRT.h"
 #include "tests/csrc/utils/TestUtils.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
@@ -10,10 +11,23 @@
 
 using namespace at::neuron;
 using namespace at::neuron::testing;
+using ::testing::_;
+using ::testing::DoAll;
+using ::testing::Return;
+using ::testing::SetArgPointee;
 
 class NeuronBindingsTest : public ::testing::Test {
  protected:
+  torch_neuronx::testing::MockNRTSession mock_session_;
+  torch_neuronx::testing::MockNRT* mock_nrt_ = torch_neuronx::testing::MockNRT::GetInstance();
+
   void SetUp() override {
+    nrt_instance_info_t info{};
+    info.family = NRT_INSTANCE_TRN3;
+    EXPECT_CALL(*mock_nrt_, nrt_get_instance_info(_, _))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly(DoAll(SetArgPointee<0>(info), Return(NRT_SUCCESS)));
+
     input_tensor_ = create_test_tensor({2, 3});
     output_tensor_ = create_test_tensor({2, 3});
     inputs_ = {input_tensor_};
@@ -49,7 +63,7 @@ TEST_F(NeuronBindingsTest, CompileGraphReturnsCacheKey) {
   std::vector<uint8_t> stablehlo_bytes = {0x01, 0x02, 0x03};
 
   CompileOnlyKernelExecution kernel(base_cache_key, stablehlo_bytes, false);
-  std::string cache_key = kernel.GetCacheKey();
+  std::string cache_key = kernel.GetCompileKey();
 
   // Cache key (in-memory) is the base key
   EXPECT_EQ(cache_key, base_cache_key);
@@ -77,7 +91,7 @@ TEST_F(NeuronBindingsTest, ExecuteCompiledGraphCreatesValidKernel) {
 
   EXPECT_TRUE(kernel.IsValid());
   EXPECT_EQ(kernel.GetOpName(), graph_name);
-  EXPECT_EQ(kernel.GetCacheKey(), cache_key);
+  EXPECT_EQ(kernel.GetCompileKey(), cache_key);
   EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kHLO);
 }
 

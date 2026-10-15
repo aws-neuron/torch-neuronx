@@ -14,7 +14,16 @@ namespace c10_neuron {
 namespace lazy {
 
 // Transformation type enum
-enum class TransformationType { TRANSPOSE, RESHAPE, BROADCAST, SLICE, COMPOUND, NONE };
+enum class TransformationType {
+  TRANSPOSE,
+  RESHAPE,
+  BROADCAST,
+  SLICE,
+  SCATTER_IOTA,  // Scatter with iota-computed indices — flat storage writeback (epilogue only)
+  COMPOUND,
+  COMPOUND_FOLDED,  // Folded decomposition for narrow→view→permute patterns
+  NONE
+};
 
 // Enhanced structure with complete transformation metadata and validation
 struct TensorTransformation {
@@ -93,6 +102,14 @@ struct TensorTransformation {
       case TransformationType::SLICE:
         ValidateSlice();
         break;
+      case TransformationType::SCATTER_IOTA:
+        // Scatter with iota-computed indices for flat storage writeback (epilogue only)
+        // Input is ND update tensor, output is 1D flat storage — ranks intentionally differ
+        break;
+      case TransformationType::NONE:
+      case TransformationType::COMPOUND:
+      case TransformationType::COMPOUND_FOLDED:
+        break;  // No specific validation
       default:
         throw std::invalid_argument("TensorTransformation: Unknown transformation type");
     }
@@ -253,6 +270,15 @@ struct BroadcastParams {
   std::vector<int64_t> broadcast_dims;  // Dimensions to broadcast
 };
 
+// Parameters for scatter_iota transformations (epilogue only)
+// Uses iota-computed flat indices to scatter update elements into flat storage.
+// Matches TorchNeuron's SCATTER_IOTA approach — unambiguous, handles any stride pattern.
+struct ScatterIotaParams {
+  std::vector<int64_t> view_strides;  // Strides of the destination view
+  int64_t storage_offset;             // Storage offset of the view
+  int64_t storage_span;               // Total flat storage size (elements)
+};
+
 // ============================================================================
 // TransformationTask - Pure data structure
 // ============================================================================
@@ -272,7 +298,8 @@ struct TransformationTask {
 
   // Type-specific parameters
   // Use std::monostate for RESHAPE (no additional params needed)
-  std::variant<std::monostate, TransposeParams, SliceParams, BroadcastParams> params;
+  std::variant<std::monostate, TransposeParams, SliceParams, BroadcastParams, ScatterIotaParams>
+      params;
 };
 
 // ============================================================================

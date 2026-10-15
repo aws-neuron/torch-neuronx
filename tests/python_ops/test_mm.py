@@ -2,7 +2,7 @@ import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import assert_raises
+from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, assert_raises, track_neuron_ops
 
 
 class TestMm:
@@ -111,7 +111,11 @@ class TestMm:
         result2 = torch.mm(identity, mat)
         torch.testing.assert_close(result2.cpu(), mat.cpu(), rtol=1e-4, atol=1e-4)
 
-    @assert_raises(RuntimeError, match="must have same reduction dim")
+    @assert_raises(
+        RuntimeError,
+        match=r".*must have same reduction dim.*",
+        match_cpu=r".*shapes cannot be multiplied.*",
+    )
     def test_mm_dimension_mismatch_error(self, monkeypatch):
         """Test that dimension mismatch raises appropriate error"""
         monkeypatch.setenv("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS", "1")
@@ -121,7 +125,11 @@ class TestMm:
 
         torch.mm(mat1, mat2)
 
-    @assert_raises(RuntimeError, match="must be 2D")
+    @assert_raises(
+        RuntimeError,
+        match=r".*must be 2D.*",
+        match_cpu=r".*must be a matrix.*",
+    )
     def test_mm_wrong_dimensions_error(self, monkeypatch):
         """Test that non-2D tensors raise appropriate error"""
         monkeypatch.setenv("TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS", "1")
@@ -161,3 +169,19 @@ class TestMm:
                 rtol=1e-4 if dtype == torch.float32 else 1e-8,
                 atol=1e-4 if dtype == torch.float32 else 1e-8,
             )
+
+    @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+    def test_mm_dtype_out(self, out_dtype):
+        """Test aten::mm.dtype_out dispatches to Neuron and casts to out_dtype."""
+        mat1 = torch.randn(4, 8).to("neuron")
+        mat2 = torch.randn(8, 4).to("neuron")
+        out = torch.empty(4, 4, dtype=out_dtype, device="neuron")
+
+        with track_neuron_ops():
+            torch.ops.aten.mm.dtype_out(mat1, mat2, out_dtype, out=out)
+            assert_op_runs_on_neuron("aten::mm")
+
+        assert out.dtype == out_dtype
+        # Both sides compute mm in float32 then cast; results are bit-identical.
+        expected = torch.mm(mat1.cpu(), mat2.cpu()).to(out_dtype)
+        assert torch.equal(out.cpu(), expected)

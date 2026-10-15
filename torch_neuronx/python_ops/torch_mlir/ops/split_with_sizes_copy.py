@@ -32,7 +32,7 @@ def _split_copy_fn(input_tensor, split_sizes=None, dim=0, out=None):
 
 @neuron_op("aten::split_with_sizes_copy.out", disable_dtype_autocast=True, priority=90)
 class SplitWithSizesCopyMLIR(TorchMlirOpImpl):
-    """MLIR-based split_with_sizes_copy that compiles to a single kernel."""
+    """Implement fused ``split_with_sizes_copy.out`` with Torch-MLIR."""
 
     def __init__(self):
         super().__init__(
@@ -43,8 +43,33 @@ class SplitWithSizesCopyMLIR(TorchMlirOpImpl):
             static_argnames=("split_sizes", "dim"),
         )
 
+    def translate_args(self, *args, **kwargs):
+        """Translate raw ATen split arguments into kernel arguments.
+
+        Args:
+            *args (Any): Input tensor, split sizes, and optional dimension.
+            **kwargs (Any): Keyword dimension and output tensors.
+
+        Returns:
+            tuple: A one-item positional-argument tuple and a dictionary of static
+                split arguments and output tensors.
+        """
+        input_tensor = args[0]
+        split_sizes = tuple(int(s) for s in args[1]) if len(args) > 1 else ()
+        dim = int(args[2]) if len(args) > 2 else int(kwargs.get("dim", 0))
+        out = kwargs.get("out")
+        return (input_tensor,), {"split_sizes": split_sizes, "dim": dim, "out": out}
+
     def can_handle(self, *args, **kwargs) -> bool:
-        """Handle when input is on Neuron device."""
+        """Check whether the input and outputs use a Neuron device.
+
+        Args:
+            *args (Any): Positional split arguments with the input tensor first.
+            **kwargs (Any): Keyword arguments containing the output tensors.
+
+        Returns:
+            bool: ``True`` when the input and every output are Neuron tensors.
+        """
         input_tensor = args[0]
         if not isinstance(input_tensor, torch.Tensor):
             return False
@@ -57,17 +82,22 @@ class SplitWithSizesCopyMLIR(TorchMlirOpImpl):
         return all(t.device.type == "neuron" for t in out)
 
     def execute(self, *args, **kwargs):
-        """Execute split_with_sizes_copy using MLIR backend.
+        """Execute fused split copies through Torch-MLIR.
 
         Args:
-            args[0]: input tensor
-            args[1]: split_sizes (list/tuple of ints)
-            args[2]: dim (default 0)
-            kwargs['out']: output tensors
+            *args (Any): Translated arguments with the input tensor first.
+            **kwargs (Any): Static split sizes, dimension, and output tensors.
+
+        Returns:
+            ExecutionResult: Success with ``output=None`` for empty work or completed
+                output writes; otherwise failure details.
+
+        Note:
+            Non-contiguous inputs are materialized contiguously before kernel execution.
         """
         input_tensor = args[0]
-        split_sizes = tuple(args[1]) if len(args) > 1 else ()
-        dim = args[2] if len(args) > 2 else kwargs.get("dim", 0)
+        split_sizes = kwargs.get("split_sizes", ())
+        dim = kwargs.get("dim", 0)
         out = kwargs.get("out")
 
         n_outputs = len(split_sizes)

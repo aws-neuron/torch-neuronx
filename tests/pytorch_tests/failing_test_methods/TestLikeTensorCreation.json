@@ -1,8 +1,0 @@
-{
-  "failed_tests": [
-    "test_full_like_inference_neuron",
-    "test_rand_like_neuron",
-    "test_randint_like_neuron",
-    "test_randn_like_neuron"
-  ]
-}

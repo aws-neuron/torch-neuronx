@@ -372,7 +372,9 @@ class IrNodeManager {
    *
    * @note Updates node->cache_key, node->module, node->ir_serialized, and output vectors
    */
-  bool PruneSingleOutput(StableHloNode* node, void* dealloc_address);
+  enum class PruneSource { kConcatAll, kDoubleBuffer };
+  bool PruneSingleOutput(StableHloNode* node, void* dealloc_address,
+                         PruneSource source = PruneSource::kConcatAll);
 
   mlir::MLIRContext* GetContext() const { return context.get(); }
 
@@ -479,6 +481,13 @@ class IrNodeManager {
    * @return true if pruning succeeded, false otherwise
    */
   bool PruneMlirFunction(StableHloNode* node, void* dealloc_address);
+
+  std::unique_ptr<MergeMapping> RebuildMergeMappingAfterPrune(
+      const MergeMapping& old_mapping, const std::unordered_set<size_t>& pruned_set);
+
+  void ValidatePostPruneConsistency(const StableHloNode* node);
+
+  void DiscardMergedNode(ConcatState& state);
 
   /// MLIR context managing the module's lifetime and resources
   std::unique_ptr<mlir::MLIRContext> context;

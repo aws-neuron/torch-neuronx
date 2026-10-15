@@ -20,7 +20,6 @@ add_library(test_mocks STATIC
     mocks/MockCopyUtils.cpp
     mocks/MockCopyUtils.h
     mocks/MockNRTHandler.cpp
-    mocks/MockPythonUtils.cpp
     mocks/MockOperationExecutionEngine.h
     mocks/MockStreamImpl.h
 )
@@ -102,5 +101,6 @@ add_neuron_test(OperationContextTest core/OperationContextTest.cpp)
 add_neuron_test(OperationExecutionEngineTest core/OperationExecutionEngineTest.cpp)
 add_neuron_test(ErrorHandlerTest core/utils/ErrorHandlerTest.cpp)
 add_neuron_test(ErrorRecoveryTest core/utils/ErrorRecoveryTest.cpp)
+add_neuron_test(PlatformUtilsTest core/utils/PlatformUtilsTest.cpp)
 add_neuron_test(CPUFallbackExecutorTest core/utils/CPUFallbackExecutorTest.cpp)
 add_neuron_test(NeuronBindingsTest core/utils/NeuronBindingsTest.cpp)

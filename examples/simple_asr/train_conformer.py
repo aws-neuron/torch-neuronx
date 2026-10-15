@@ -14,8 +14,21 @@ import torch_neuronx
 
 
 class FakeASRDataset:
-    """
-    Generates random spectrograms + random token sequences
+    """Generate random spectrogram and token samples indefinitely.
+
+    Args:
+        n_mels (int, optional): Number of mel-frequency features. Defaults to ``80``.
+        vocab_size (int, optional): Number of non-blank token IDs. Defaults to ``1000``.
+        min_audio_len (int, optional): Stored minimum audio length; generation ignores it.
+            Defaults to ``100``.
+        max_audio_len (int, optional): Stored maximum audio length; generation ignores it.
+            Defaults to ``400``.
+        min_text_len (int, optional): Minimum generated token-sequence length. Defaults to ``10``.
+        max_text_len (int, optional): Maximum generated token-sequence length. Defaults to ``50``.
+        seed (int, optional): Seed for the sample generator. Defaults to ``0``.
+
+    Note:
+        Every generated spectrogram contains 512 frames for flash attention.
     """
 
     def __init__(
@@ -62,6 +75,20 @@ class FakeASRDataset:
 # Conformer + CTC head
 # --------------------------
 class ConformerCTC(nn.Module):
+    """Build a Conformer encoder with a CTC classification head.
+
+    Args:
+        n_mels (int, optional): Number of input mel-frequency features. Defaults to ``80``.
+        d_model (int, optional): Encoder and projection dimension. Defaults to ``256``.
+        num_layers (int, optional): Number of Conformer layers. Defaults to ``2``.
+        num_heads (int, optional): Number of attention heads. Defaults to ``4``.
+        ffn_dim (int, optional): Feed-forward network dimension. Defaults to ``256``.
+        depthwise_conv_kernel_size (int, optional): Depthwise convolution kernel size.
+            Defaults to ``15``.
+        vocab_size (int, optional): Number of non-blank output tokens. Defaults to ``1000``.
+        dropout (float, optional): Dropout probability in the encoder. Defaults to ``0.0``.
+    """
+
     def __init__(
         self,
         n_mels=80,
@@ -86,6 +113,16 @@ class ConformerCTC(nn.Module):
         self.classifier = nn.Linear(d_model, vocab_size + 1)  # +1 for CTC blank
 
     def forward(self, x, x_lens):
+        """Encode acoustic features and produce time-major CTC logits.
+
+        Args:
+            x (torch.Tensor): Batched features shaped ``(batch, time, n_mels)``.
+            x_lens (torch.Tensor): Valid input lengths shaped ``(batch,)``.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: Logits shaped
+                ``(time, batch, vocab_size + 1)`` and lengths shaped ``(batch,)``.
+        """
         x = self.in_proj(x)  # (B, T, d_model)
         enc, out_lens = self.encoder(x, x_lens)  # (B, T, d_model), (B,)
         logits = self.classifier(enc)  # (B, T, V)
@@ -93,6 +130,11 @@ class ConformerCTC(nn.Module):
 
 
 def train(args):
+    """Train the example Conformer CTC model on generated samples.
+
+    Args:
+        args (argparse.Namespace): Arguments containing the number of ``iterations``.
+    """
     device = "neuron"
     dataset = FakeASRDataset()
     model = ConformerCTC().to(device)

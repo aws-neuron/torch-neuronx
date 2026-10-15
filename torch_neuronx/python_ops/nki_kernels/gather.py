@@ -10,18 +10,23 @@ from .klir_gather import gather
 
 @nki_op("nki_kernels::gather", mutates_args={})
 def gather_kernel(input: torch.Tensor, dim: int, index: torch.Tensor) -> torch.Tensor:
-    """
-    Wrapper for NKI gather kernel.
+    """Gather rows through the wrapped NKI gather kernel.
 
     Args:
-        input: Input tensor (2D)
-        dim: Dimension to gather from (must be 0)
-        index: Index tensor (2D)
+        input (torch.Tensor): Two-dimensional source tensor.
+        dim (int): Gather dimension, which must be ``0``.
+        index (torch.Tensor): One-dimensional row indices.
 
     Returns:
-        Gathered tensor
-    """
+        torch.Tensor: Gathered rows with shape ``(index.numel(), input.shape[1])``.
 
+    Raises:
+        AssertionError: If the ranks or dimension are unsupported, or if the index
+            length is not divisible by the logical Neuron core count.
+
+    Note:
+        Out-of-bounds index values fault in the wrapped ``@nki.jit`` kernel.
+    """
     logical_neuron_cores = int(get_logical_neuron_cores())
     grid = (logical_neuron_cores,)
 

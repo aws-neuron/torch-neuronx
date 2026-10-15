@@ -2,7 +2,7 @@ import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import assert_raises
+from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, assert_raises, track_neuron_ops
 
 
 class TestAddmm:
@@ -283,3 +283,20 @@ class TestAddmm:
 
             # Compare results
             torch.testing.assert_close(result.cpu(), expected, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+    def test_addmm_dtype_out(self, out_dtype):
+        """Test aten::addmm.dtype_out dispatches to Neuron and casts to out_dtype."""
+        bias = torch.randn(4).to("neuron")
+        mat1 = torch.randn(4, 8).to("neuron")
+        mat2 = torch.randn(8, 4).to("neuron")
+        out = torch.empty(4, 4, dtype=out_dtype, device="neuron")
+
+        with track_neuron_ops():
+            torch.ops.aten.addmm.dtype_out(bias, mat1, mat2, out_dtype, out=out)
+            assert_op_runs_on_neuron("aten::addmm")
+
+        assert out.dtype == out_dtype
+        # Both sides compute addmm in float32 then cast; results are bit-identical.
+        expected = torch.addmm(bias.cpu(), mat1.cpu(), mat2.cpu()).to(out_dtype)
+        assert torch.equal(out.cpu(), expected)

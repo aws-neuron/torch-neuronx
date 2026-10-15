@@ -133,3 +133,21 @@ class TestTanh:
             assert result.shape == shape
             torch.testing.assert_close(result.cpu(), expected)
             assert_op_runs_on_neuron("aten::tanh")
+
+    @pytest.mark.parametrize("shape", [(32,), (8, 16), (4, 8, 16)])
+    def test_tanh_backward_grad_input_variant(self, shape):
+        """Test aten::tanh_backward.grad_input dispatches to Neuron."""
+        torch.manual_seed(42)
+        grad_output = torch.randn(shape, device="neuron")
+        output = torch.tanh(torch.randn(shape)).to("neuron")
+        grad_input = torch.empty(shape, device="neuron")
+
+        with track_neuron_ops():
+            result = torch.ops.aten.tanh_backward.grad_input(
+                grad_output, output, grad_input=grad_input
+            )
+        assert_op_runs_on_neuron("aten::tanh_backward")
+
+        expected = torch.ops.aten.tanh_backward(grad_output, output)
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+        torch.testing.assert_close(grad_input.cpu(), expected.cpu())

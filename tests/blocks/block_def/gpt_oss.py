@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as functional
+from block_def import force_local_contiguous
 from block_def.rope import apply_rotary_emb, precompute_rope_cache
 
 
@@ -77,7 +78,8 @@ class Attention(nn.Module):
         v = v.repeat_interleave(self.n_rep, dim=1)
 
         output = functional.scaled_dot_product_attention(q, k, v, is_causal=True)
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        output = force_local_contiguous(output.transpose(1, 2))
+        output = output.view(bsz, seqlen, -1)
         return self.wo(output)
 
 

@@ -1,0 +1,37 @@
+"""foreach binary-op tests that create interleaved [device, cpu] tensor
+lists; Neuron pairs are same-device so the expected mixed-device error is
+not raised (platform difference, not a bug)."""
+
+FOREACH_DIFFERENT_DEVICES = [
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_add_neuron_bfloat16",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_add_neuron_float16",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_add_neuron_float32",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_add_neuron_int16",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_add_neuron_int32",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_add_neuron_int64",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_add_neuron_int8",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_add_neuron_uint8",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_div_neuron_bfloat16",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_div_neuron_bool",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_div_neuron_float32",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_div_neuron_int16",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_div_neuron_int32",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_div_neuron_int64",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_div_neuron_int8",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_div_neuron_uint8",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_mul_neuron_float16",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_mul_neuron_float32",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_mul_neuron_int16",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_mul_neuron_int32",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_mul_neuron_int64",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_mul_neuron_int8",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_mul_neuron_uint8",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_sub_neuron_bfloat16",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_sub_neuron_float16",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_sub_neuron_float32",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_sub_neuron_int16",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_sub_neuron_int32",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_sub_neuron_int64",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_sub_neuron_int8",
+    "test_foreach.py::TestForeachNEURON::test_binary_op_tensors_on_different_devices__foreach_sub_neuron_uint8",
+]

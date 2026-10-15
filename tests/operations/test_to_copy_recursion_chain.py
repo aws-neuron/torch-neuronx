@@ -27,20 +27,17 @@ def test_to_copy_chain_no_bounce_32bit():
     assert counts == {"reads": 0, "writes": 0}, f"Unexpected CPU bounce calls: {counts}"
 
 
-def test_to_copy_chain_bounce_64bit():
-    """Chain: rms_norm -> type_as -> to/_to_copy; expect CPU bounce for 64-bit cast."""
+def test_to_copy_chain_64bit_is_correct():
+    """Chain: rms_norm -> type_as -> to/_to_copy; 64-bit cast returns correct values."""
     device = torch.device("neuron:0")
     x = torch.randn(32, 32, dtype=torch.float32, device=device)
 
     y = _rms_norm(x)
-    # Keep type_as in the chain (no-op)
     z_same = y.type_as(y)
 
-    def run_to():
-        z = z_same.to(dtype=torch.float64)
-        # dtype float64, on neuron
-        assert z.dtype == torch.float64
-        assert z.device.type == "neuron"
-
-    counts = count_cpu_bounce_calls(run_to)
-    assert counts["reads"] >= 1 and counts["writes"] >= 1, f"Expected CPU bounce, got: {counts}"
+    # C++ dispatch calls NRT directly from C++, bypassing the Python-level
+    # monkeypatch in count_cpu_bounce_calls.  Verify correctness instead.
+    z = z_same.to(dtype=torch.float64)
+    assert z.dtype == torch.float64
+    assert z.device.type == "neuron"
+    torch.testing.assert_close(z.cpu(), z_same.cpu().to(torch.float64))

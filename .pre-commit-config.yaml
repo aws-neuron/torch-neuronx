@@ -4,23 +4,34 @@ repos:
     hooks:
       - id: ruff
         args: [--fix]
-        exclude: ^torch_neuronx/python_ops/jax/jax_impl\.py$|^torch_neuronx/protos/
+        exclude: ^(torch_neuronx/protos/|third_party/)
       - id: ruff-format
-        exclude: ^tests/pytorch_tests/clone_tests\.py$
+        exclude: ^third_party/
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v19.1.0
     hooks:
       - id: clang-format
         files: \.(cpp|h|hpp|cc|cxx)$
+        exclude: ^third_party/
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
       - id: trailing-whitespace
-        exclude: ^torch_neuronx/python_ops/jax/jax_impl\.py$|^torch_neuronx/protos/|\.diff$
+        exclude: ^(torch_neuronx/protos/|third_party/)|\.diff$
       - id: end-of-file-fixer
-        exclude: ^torch_neuronx/python_ops/jax/jax_impl\.py$|^torch_neuronx/protos/
+        exclude: ^(torch_neuronx/protos/|third_party/)
       - id: check-yaml
       - id: check-added-large-files
+        exclude: ^third_party/
       - id: pretty-format-json
         args: [--autofix]
+
+  - repo: local
+    hooks:
+      - id: torch-mlir-python-bindings
+        name: torch-mlir Python bindings match the Torch dialect
+        entry: tools/check-torch-mlir-python-bindings
+        language: system
+        pass_filenames: false
+        files: ^third_party/torch-mlir/(include/torch-mlir/Dialect/Torch/IR/.*\.td|python/torch_mlir/dialects/(TorchBinding\.td|_torch_ops_gen\.py))$

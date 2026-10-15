@@ -17,30 +17,11 @@ logger = logging.getLogger(__name__)
 _current_model_name = None
 
 
-def get_rank() -> int:
-    """Get the current process rank.
-
-    Returns the distributed rank if torch.distributed is initialized,
-    otherwise returns the current Neuron device ID.
-
-    Returns:
-        int: Process rank or device ID.
-    """
-    return (
-        torch.distributed.get_rank()
-        if torch.distributed.is_initialized()
-        else torch.neuron.current_device()
-    )
-
-
 def get_local_rank() -> int:
-    """Get the current process rank within the local node.
-
-    Returns the node-local rank if torch.distributed is initialized,
-    otherwise returns the current Neuron device ID.
+    """Return the node-local rank or current Neuron device identifier.
 
     Returns:
-        int: Local process rank or device ID.
+        int: Node-local rank when distributed; otherwise, the Neuron device identifier.
     """
     return (
         torch.distributed.get_node_local_rank()
@@ -50,13 +31,10 @@ def get_local_rank() -> int:
 
 
 def get_world_size() -> int:
-    """Get the total number of processes in the distributed group.
-
-    Returns the distributed world size if torch.distributed is initialized,
-    otherwise returns the number of available Neuron devices.
+    """Return the distributed world size or available Neuron device count.
 
     Returns:
-        int: Number of processes or devices.
+        int: Distributed world size when initialized; otherwise, the Neuron device count.
     """
     return (
         torch.distributed.get_world_size()
@@ -66,22 +44,19 @@ def get_world_size() -> int:
 
 
 def get_local_world_size() -> int:
-    """Get the number of processes within the local node.
-
-    Reads from LOCAL_WORLD_SIZE environment variable if set,
-    otherwise returns the number of available Neuron devices.
+    """Return the local process count or available Neuron device count.
 
     Returns:
-        int: Number of local processes or devices.
+        int: ``LOCAL_WORLD_SIZE`` when set; otherwise, the Neuron device count.
     """
     return _getenv_int("LOCAL_WORLD_SIZE", torch.neuron.device_count())
 
 
 def set_model_name(name: str):
-    """Set the current model name for NEFF file naming
+    """Set the process-global model name used for compilation artifact naming.
 
     Args:
-        name (str): Name for the module.
+        name (str): Model name to store.
     """
     global _current_model_name
     _current_model_name = name
@@ -89,10 +64,10 @@ def set_model_name(name: str):
 
 
 def get_model_name() -> str:
-    """Get the current model name
+    """Return the process-global model name, initializing its default if needed.
 
     Returns:
-        str: Name of current model
+        str: Current model name, defaulting to ``"model_default"``.
     """
     global _current_model_name
     if _current_model_name is None:

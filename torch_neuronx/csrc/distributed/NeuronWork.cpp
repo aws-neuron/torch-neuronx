@@ -37,7 +37,7 @@ void TensorShelf::clear() {
 
 NeuronWork::NeuronWork(const std::string& pg_uid, const std::string& pg_desc, at::Device device,
                        int rank, const std::string& op_type, uint64_t seq_num,
-                       std::vector<at::Tensor> outputs, bool enable_timing, float timeout_ms,
+                       std::vector<at::Tensor> outputs, bool enable_timing, int64_t timeout_ms,
                        at::neuron::NeuronStream* stream, bool blocking_wait)
     : c10d::Work(rank, c10d::OpType::UNKNOWN),
       pg_uid_(pg_uid),
@@ -125,10 +125,6 @@ bool NeuronWork::isCompleted() {
     }
   }
 
-  // Query the end event directly (non-blocking).
-  // Thread-safe without mutex because:
-  // NeuronEvent::query() reads from std::atomic<bool> is_completed
-  // Called from: main thread (wait()), watchdog thread (work iteration)
   return end_event_.query();
 }
 
@@ -147,8 +143,7 @@ bool NeuronWork::checkTimeout(std::optional<std::chrono::milliseconds> timeout) 
   auto current_time = std::chrono::steady_clock::now();
   auto elapsed =
       std::chrono::duration_cast<std::chrono::milliseconds>(current_time - work_start_time_);
-  auto work_timeout =
-      timeout.value_or(std::chrono::milliseconds(static_cast<int64_t>(timeout_ms_)));
+  auto work_timeout = timeout.value_or(std::chrono::milliseconds(timeout_ms_));
 
   if (elapsed < work_timeout) {
     return false;
@@ -178,6 +173,9 @@ c10::intrusive_ptr<c10::ivalue::Future> NeuronWork::getFuture() { return future_
 
 float NeuronWork::getDuration() const {
   TORCH_CHECK(timing_enabled_, "getDuration() only works if timing was enabled");
+  // wait() may return before end_event_ is CPU-complete; elapsed_time() no
+  // longer blocks, so synchronize explicitly first.
+  end_event_.synchronize();
   return start_event_.elapsed_time(end_event_);
 }
 
@@ -330,5 +328,6 @@ bool NeuronWork::wait(std::chrono::milliseconds timeout) {
 
   return true;
 }
+
 }  // namespace distributed
 }  // namespace torch_neuronx

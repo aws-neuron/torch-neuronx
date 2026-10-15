@@ -221,3 +221,30 @@ class TestMul:
 
         # Compare results
         torch.testing.assert_close(result_neuron.cpu(), expected)
+
+    def test_mul_inplace_tensor(self):
+        """Test in-place multiply with a tensor (mul_.Tensor)."""
+        a_cpu = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        b_cpu = torch.tensor([2.0, 0.5, 4.0, 0.25])
+        a_neuron = a_cpu.clone().to("neuron")
+        b_neuron = b_cpu.to("neuron")
+
+        with track_neuron_ops():
+            a_neuron.mul_(b_neuron)
+            assert_op_runs_on_neuron("aten::mul_")
+
+        a_cpu.mul_(b_cpu)
+        torch.testing.assert_close(a_neuron.cpu(), a_cpu)
+
+    @pytest.mark.parametrize("scalar", [2.0, 0.5, -3.0])
+    def test_mul_inplace_scalar(self, scalar):
+        """Test in-place multiply with a Python scalar (mul_.Scalar)."""
+        a_cpu = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        a_neuron = a_cpu.clone().to("neuron")
+
+        with track_neuron_ops():
+            a_neuron.mul_(scalar)
+            assert_op_runs_on_neuron("aten::mul_")
+
+        a_cpu.mul_(scalar)
+        torch.testing.assert_close(a_neuron.cpu(), a_cpu)

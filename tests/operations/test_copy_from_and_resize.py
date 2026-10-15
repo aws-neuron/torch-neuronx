@@ -58,18 +58,29 @@ class TestCopyFromAndResize:
             cpu_dst = dst.cpu()
             assert torch.allclose(cpu_dst, src)
 
-    @assert_raises(RuntimeError, match="same size")
-    def test_copy_from_cpu_different_size_error(self):
-        """Test that copying to non-empty tensor with different size raises error."""
-        # Create source CPU tensor
-        src = torch.randn(10, 20)
+    def test_copy_from_cpu_different_size(self):
+        """Test that copying to non-empty tensor with different size resizes dst.
 
-        # Create destination Neuron tensor with different size
-        device = torch.device("neuron")
-        dst = torch.empty(5, 5, device=device)
+        PyTorch's out= contract requires that a nonempty out tensor with the
+        wrong shape be resized (a UserWarning is emitted by the framework).
+        """
+        with track_neuron_ops():
+            # Create source CPU tensor
+            src = torch.randn(10, 20)
 
-        # Should raise error for size mismatch
-        torch._copy_from_and_resize(src, dst)
+            # Create destination Neuron tensor with different (nonempty) size
+            device = torch.device("neuron")
+            dst = torch.empty(5, 5, device=device)
+
+            # Should resize dst to match src, not raise
+            result = torch._copy_from_and_resize(src, dst)
+
+            assert result is dst
+            assert dst.shape == src.shape
+            assert_op_runs_on_neuron("aten::resize_")
+
+            cpu_dst = dst.cpu()
+            assert torch.allclose(cpu_dst, src)
 
     @assert_raises(RuntimeError, match="only support copy from cpu tensor to")
     def test_copy_from_neuron_to_neuron_error(self):

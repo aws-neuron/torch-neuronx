@@ -117,3 +117,26 @@ class TestBatchNormStats:
 
         assert mean_out.shape == (8,)
         assert invstd_out.shape == (8,)
+
+    def test_batch_norm_stats_out_variant(self):
+        """Test batch_norm_stats.out variant with pre-allocated output tensors."""
+        device = "neuron"
+        input_cpu = torch.randn(4, 16, 32, 32)
+        eps = 1e-5
+
+        # Get reference from functional variant
+        ref_mean, ref_invstd = torch.ops.aten.batch_norm_stats(input_cpu.to(device), eps)
+
+        out_mean = torch.empty(16, device=device)
+        out_invstd = torch.empty(16, device=device)
+
+        with track_neuron_ops():
+            torch.ops.aten.batch_norm_stats.out(
+                input_cpu.to(device), eps, out0=out_mean, out1=out_invstd
+            )
+            assert_op_runs_on_neuron("aten::batch_norm_stats")
+
+        assert out_mean.shape == (16,)
+        assert out_invstd.shape == (16,)
+        torch.testing.assert_close(out_mean.cpu(), ref_mean.cpu())
+        torch.testing.assert_close(out_invstd.cpu(), ref_invstd.cpu())

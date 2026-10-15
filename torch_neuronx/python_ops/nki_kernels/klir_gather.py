@@ -28,29 +28,21 @@ def _validate_gather_inputs(input, dim, index, num_shards):
 
 @nki.jit
 def gather(input, dim, index):
-    """
-    Gather from input based on indices in index using indirect load.
-    Equivalent to PyTorch's torch.gather(input, dim=dim, index=index).
+    """Gather complete rows with indirect NKI loads.
 
     Args:
-        input: (N, D) - source tensor to gather from
-        dim: int - dimension along which to gather (must be 0)
-        index: (K,) - 1D tensor of indices
+        input (nl.ndarray): Two-dimensional source with shape ``(N, D)``.
+        dim (int): Gather dimension, which must be ``0``.
+        index (nl.ndarray): One-dimensional row indices with shape ``(K,)``.
 
     Returns:
-        output: (K, D) - gathered result where output[i, :] = input[index[i], :]
-        Output dtype matches input.dtype
+        nl.ndarray: Gathered result with shape ``(K, D)`` and the input data type.
 
-    Example:
-        input shape: (4096, 2880)
-        dim: 0
-        index shape: (16384,)
-        output shape: (16384, 2880)
+    Raises:
+        AssertionError: If ranks, dimension, or launch sharding are unsupported.
 
-    Restrictions:
-        - Input tensor must be 2D
-        - Index tensor must be 1D
-        - dim must be 0
+    Note:
+        Programs own disjoint output-row ranges, and out-of-bounds indices fault.
     """
     k = index.shape[0]
     d = input.shape[1]

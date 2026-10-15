@@ -178,3 +178,33 @@ class TestSubRegistration:
         c = a_neuron - b_neuron
 
         torch.testing.assert_close(c.cpu(), expected)
+
+    def test_rsub_runs_on_neuron(self):
+        """Test that rsub (reverse subtract) runs on Neuron without CPU fallback."""
+        a_cpu = torch.tensor([1.0, 2.0, 3.0])
+        b_cpu = torch.tensor([4.0, 5.0, 6.0])
+        expected = torch.ops.aten.rsub(a_cpu, b_cpu)
+
+        with track_neuron_ops():
+            a_neuron = a_cpu.to("neuron")
+            b_neuron = b_cpu.to("neuron")
+            result = torch.ops.aten.rsub(a_neuron, b_neuron)
+
+            assert result.device.type == "neuron"
+            torch.testing.assert_close(result.cpu(), expected)
+            assert_op_runs_on_neuron("aten::rsub")
+
+    def test_rsub_with_alpha_runs_on_neuron(self):
+        """Test that rsub with alpha runs on Neuron without CPU fallback."""
+        a_cpu = torch.tensor([1.0, 2.0, 3.0])
+        b_cpu = torch.tensor([4.0, 5.0, 6.0])
+        expected = torch.ops.aten.rsub(a_cpu, b_cpu, alpha=2)
+
+        with track_neuron_ops():
+            a_neuron = a_cpu.to("neuron")
+            b_neuron = b_cpu.to("neuron")
+            result = torch.ops.aten.rsub(a_neuron, b_neuron, alpha=2)
+
+            assert result.device.type == "neuron"
+            torch.testing.assert_close(result.cpu(), expected)
+            assert_op_runs_on_neuron("aten::rsub")

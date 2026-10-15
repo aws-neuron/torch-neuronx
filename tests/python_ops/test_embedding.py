@@ -21,13 +21,41 @@ if use_mlir_aten_ops():
 else:
     _EMBEDDING_BACKWARD_OP = "embedding_dense_backward"
 
+_NKI_THRESHOLD_ENV = "TORCH_NEURONX_EMBEDDING_BWD_NKI_THRESHOLD"
+_NKI_THRESHOLD_DEFAULT = 2**28  # matches the decomposition default
+
+
+def _assert_dispatched(num_weights, embed_dim, indices_dtype):
+    """Assert the decomposition took the path implied by the E*D dispatch threshold:
+    E*D > threshold -> NKI kernel (emits neuron::nki_call); otherwise index_add (does not).
+
+    Skipped for int64 indices: Neuron emulates int64 indexing with its own NKI kernel, so
+    neuron::nki_call is present regardless of which embedding path ran -- the signal is
+    unreliable in both directions. Only asserted for int32 indices."""
+    if indices_dtype == torch.int64:
+        return
+    threshold = int(os.environ.get(_NKI_THRESHOLD_ENV, _NKI_THRESHOLD_DEFAULT))
+    expect_nki = num_weights * embed_dim > threshold
+    executed = torch_neuronx.get_executed_ops()
+    took_nki = any("nki_call" in op or "nki_kernel_global" in op for op in executed)
+    if expect_nki:
+        assert took_nki, (
+            f"E*D={num_weights * embed_dim} > {threshold}: expected NKI path but "
+            f"nki_call absent; executed: {executed}"
+        )
+    else:
+        assert not took_nki, (
+            f"E*D={num_weights * embed_dim} <= {threshold}: expected index_add path but "
+            f"nki_call present; executed: {executed}"
+        )
+
 
 class TestEmbeddingDenseBackward:
     @pytest.mark.parametrize("padding_idx", [None, 3])
     @pytest.mark.parametrize("scale_grad_by_freq", [False, True])
     def test_embedding_dense_backward(self, padding_idx, scale_grad_by_freq):
-        """Test embedding backward using padding and scale_grad_by_freq"""
-
+        """Test embedding backward using padding and scale_grad_by_freq (small E*D ->
+        index_add path)."""
         embedding_dim = 4
         num_embeddings = 10
 
@@ -55,15 +83,17 @@ class TestEmbeddingDenseBackward:
             scale_grad_by_freq=scale_grad_by_freq,
         )
         loss_neuron = out_neuron.sum()
-        loss_neuron.backward()
+        torch_neuronx.clear_op_tracking()
+        with track_neuron_ops():
+            loss_neuron.backward()
 
         torch.testing.assert_close(embedding_matrix_neuron.grad.cpu(), embedding_matrix.grad)
         executed_ops = torch_neuronx.get_executed_ops()
         assert _EMBEDDING_BACKWARD_OP in executed_ops
+        _assert_dispatched(num_embeddings, embedding_dim, indices.dtype)
 
     def test_embedding_dense_backward_with_single_elements(self):
-        """Test embedding backward using single elements"""
-
+        """Test embedding backward using single elements (small E*D -> index_add path)."""
         embedding_dim = 1
         num_embeddings = 1
 
@@ -81,11 +111,14 @@ class TestEmbeddingDenseBackward:
         embedding_matrix_neuron.requires_grad = True
         out_neuron = f.embedding(indices_neuron, embedding_matrix_neuron)
         loss_neuron = out_neuron.sum()
-        loss_neuron.backward()
+        torch_neuronx.clear_op_tracking()
+        with track_neuron_ops():
+            loss_neuron.backward()
 
         torch.testing.assert_close(embedding_matrix_neuron.grad.cpu(), embedding_matrix.grad)
         executed_ops = torch_neuronx.get_executed_ops()
         assert _EMBEDDING_BACKWARD_OP in executed_ops
+        _assert_dispatched(num_embeddings, embedding_dim, indices.dtype)
 
     @pytest.mark.parametrize(
         "indices_dtype",
@@ -132,8 +165,7 @@ class TestEmbeddingDenseBackward:
     def test_embedding_dense_backward_with_different_dtypes(
         self, indices_dtype, weight_dtype, scale_grad_by_freq
     ):
-        """Test embedding backward using different dtypes"""
-
+        """Test embedding backward using different dtypes (small E*D -> index_add path)."""
         embedding_dim = 4
         num_embeddings = 10
 
@@ -164,6 +196,7 @@ class TestEmbeddingDenseBackward:
 
             assert grad_weight.device.type == "neuron"
             assert grad_weight.dtype == weight_dtype
+            _assert_dispatched(num_embeddings, embedding_dim, indices_dtype)
         else:
             raise ValueError(f"Unsupported indices_dtype test: {indices_dtype}")
 
@@ -203,19 +236,96 @@ class TestEmbeddingDenseBackward:
             False,
         )
 
-    def test_embedding_dense_backward_large_vocab(self):
-        """Test embedding backward with large vocab size (Qwen3 case)."""
+    @pytest.mark.needs_process_isolation(
+        reason="Pre-allocates ~17GB to force the NKI path, which aborts the xdist worker "
+        "when tests share a process."
+    )
+    @pytest.mark.parametrize("padding_idx", [None, 3])
+    @pytest.mark.parametrize("scale_grad_by_freq", [False, True])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("values", ["ones", "randn"])
+    def test_embedding_dense_backward_large_vocab(
+        self, values, dtype, scale_grad_by_freq, padding_idx
+    ):
+        """Test embedding backward with large vocab size (Qwen3 case). Large E*D routes to
+        the NKI path; parametrized over padding_idx and scale_grad_by_freq so those
+        variations are exercised on the NKI kernel too."""
         num_weights = 151936
         embed_dim = 4096
         seq_len = 4096
+        # aten::embedding_dense_backward takes an int padding_idx; -1 means "no padding".
+        padding_idx_arg = -1 if padding_idx is None else padding_idx
 
         # Pre-allocate ~17GB
         memory_pressure = torch.empty(
             17 * 1024 * 1024 * 1024 // 2, dtype=torch.bfloat16, device="neuron"
         )
+        try:
+            torch.manual_seed(42)
+            if values == "ones":
+                grad_output_cpu = torch.ones(1, seq_len, embed_dim, dtype=dtype)
+            else:
+                grad_output_cpu = torch.randn(1, seq_len, embed_dim, dtype=dtype)
+            indices_cpu = torch.randint(0, num_weights, (1, seq_len), dtype=torch.int64)
+
+            cpu_result = embedding_dense_backward(
+                grad_output_cpu, indices_cpu, num_weights, padding_idx_arg, scale_grad_by_freq
+            )
+
+            grad_output = grad_output_cpu.to("neuron")
+            indices = indices_cpu.to("neuron")
+
+            torch_neuronx.clear_op_tracking()
+            with track_neuron_ops():
+                # scratchpad usage should be negligible, should not OOM
+                grad_weight = embedding_dense_backward(
+                    grad_output,
+                    indices,
+                    num_weights,
+                    padding_idx_arg,
+                    scale_grad_by_freq,
+                )
+
+                assert grad_weight.shape == (num_weights, embed_dim)
+                assert grad_weight.dtype == dtype
+                assert_op_runs_on_neuron("embedding_dense_backward")
+
+            _assert_dispatched(num_weights, embed_dim, indices_cpu.dtype)
+            # Loosened tolerance for randn: same mismatch the baseline matmul shows,
+            # from bf16 precision over a large [E, D] output.
+            torch.testing.assert_close(grad_weight.cpu(), cpu_result, rtol=1.6e-2, atol=2e-2)
+        finally:
+            # Free the 17GB pressure on failure so it does not leak and OOM the next test.
+            del memory_pressure
+            torch_neuronx.empty_cache()
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            torch.bfloat16,
+            pytest.param(
+                torch.float32,
+                marks=pytest.mark.xfail(
+                    reason=(
+                        "P482391671: compiler lowering omits shard-1 write dependencies "
+                        "for this LNC2 shape"
+                    )
+                ),
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("values", ["ones", "randn"])
+    def test_embedding_dense_backward_llama(self, values, dtype):
+        """Test embedding backward at Llama-3.3-70B vocab/hidden (E=128256, D=8192)."""
+        num_weights = 128256
+        embed_dim = 8192
+        seq_len = 8192
 
         torch.manual_seed(42)
-        grad_output_cpu = torch.ones(1, seq_len, embed_dim, dtype=torch.bfloat16)
+        if values == "ones":
+            grad_output_cpu = torch.ones(1, seq_len, embed_dim, dtype=dtype)
+        else:
+            grad_output_cpu = torch.randn(1, seq_len, embed_dim, dtype=dtype)
         indices_cpu = torch.randint(0, num_weights, (1, seq_len), dtype=torch.int64)
 
         cpu_result = embedding_dense_backward(grad_output_cpu, indices_cpu, num_weights, -1, False)
@@ -223,6 +333,7 @@ class TestEmbeddingDenseBackward:
         grad_output = grad_output_cpu.to("neuron")
         indices = indices_cpu.to("neuron")
 
+        torch_neuronx.clear_op_tracking()
         with track_neuron_ops():
             # scratchpad usage should be negligible, should not OOM
             grad_weight = embedding_dense_backward(
@@ -234,12 +345,40 @@ class TestEmbeddingDenseBackward:
             )
 
             assert grad_weight.shape == (num_weights, embed_dim)
-            assert grad_weight.dtype == torch.bfloat16
+            assert grad_weight.dtype == dtype
             assert_op_runs_on_neuron("embedding_dense_backward")
 
-        torch.testing.assert_close(grad_weight.cpu(), cpu_result)
+        _assert_dispatched(num_weights, embed_dim, indices_cpu.dtype)
+        # Loosened tolerance for randn: same mismatch the baseline matmul shows,
+        # from bf16 precision over a large [E, D] output.
+        torch.testing.assert_close(grad_weight.cpu(), cpu_result, rtol=1.6e-2, atol=2e-2)
 
-        del memory_pressure
+    def test_embedding_dense_backward_heavy_collisions(self):
+        """Stress the NKI dedup + cross-tile carry: each index repeated across several
+        128-row tiles, unaligned to tile boundaries (200 = 128 + 72). reps <= 256 so
+        the all-ones counts stay bf16-exact (default tolerance)."""
+        num_weights = 65536  # E*D = 536M > 2**28 -> NKI path
+        embed_dim = 8192
+
+        torch.manual_seed(42)
+        reps = 200
+        base = torch.arange(7, dtype=torch.int64).repeat_interleave(reps)
+        seq_len = base.shape[0]
+        indices_cpu = base[torch.randperm(seq_len)].reshape(1, seq_len)
+        grad_output_cpu = torch.ones(1, seq_len, embed_dim, dtype=torch.bfloat16)
+
+        cpu_result = embedding_dense_backward(grad_output_cpu, indices_cpu, num_weights, -1, False)
+
+        grad_output = grad_output_cpu.to("neuron")
+        indices = indices_cpu.to("neuron")
+        torch_neuronx.clear_op_tracking()
+        with track_neuron_ops():
+            grad_weight = embedding_dense_backward(grad_output, indices, num_weights, -1, False)
+            assert grad_weight.shape == (num_weights, embed_dim)
+            assert_op_runs_on_neuron("embedding_dense_backward")
+
+        _assert_dispatched(num_weights, embed_dim, indices_cpu.dtype)
+        torch.testing.assert_close(grad_weight.cpu(), cpu_result)
 
 
 class TestEmbedding:
@@ -308,6 +447,16 @@ class TestEmbedding:
             assert cpu_result.dtype == neuron_result.dtype == cpu_embedding.weight.dtype
             assert cpu_result.numel() == neuron_result.numel()
             assert_op_runs_on_neuron("aten::embedding")
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
+    def test_nn_embedding_rejects_float_indices(self, dtype):
+        """Test that embedding raises RuntimeError for non-integer indices."""
+        embedding = nn.Embedding(10, 3).to("neuron")
+        float_indices = torch.tensor([1.5, 2.5], dtype=dtype).to("neuron")
+        with pytest.raises(
+            RuntimeError, match="Expected tensor for argument.*indices.*scalar type.*Long.*Int"
+        ):
+            embedding(float_indices)
 
     @pytest.mark.parametrize(
         "input_shape,expected_shape",

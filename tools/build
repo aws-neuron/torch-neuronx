@@ -5,8 +5,10 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Supported Python versions
-SUPPORTED_VERSIONS="3.10 3.11 3.12 3.13"
+SUPPORTED_VERSIONS="3.10 3.11 3.12 3.13 3.14"
 
 # Parse arguments
 BUILD_WHEEL=0
@@ -53,13 +55,23 @@ export PYTHON_VERSION
 echo "Building torch-neuronx for Python $PYTHON_VERSION..."
 
 # Decide how to run python (prefer uv if available)
+has_uv() { command -v uv >/dev/null 2>&1; }
+
 if [ -n "$VIRTUAL_ENV" ]; then
-    RUNNER=(python)
-elif command -v uv >/dev/null 2>&1; then
+    # You are in an active virtual environment.
+    if has_uv && ! uv lock --check >/dev/null 2>&1; then
+        # uv.lock is missing or out of sync with pyproject.toml — sync needed.
+        RUNNER=(uv run --active python)
+    else
+        # Deps already synced or uv unavailable. Execute raw python at maximum speed.
+        RUNNER=(python)
+    fi
+elif has_uv; then
     RUNNER=(uv run python)
 else
     RUNNER=(python)
 fi
+echo "RUNNER=(${RUNNER[@]})"
 
 # Build extension
 if ! USE_BAZEL=1 "${RUNNER[@]}" setup.py build_ext --quiet > /dev/null; then

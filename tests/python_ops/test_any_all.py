@@ -176,3 +176,9 @@ class TestAnyAllRegistration:
 
         expected = op_func(x, dim=0, keepdim=keepdim)
         torch.testing.assert_close(result.cpu(), expected)
+
+    # Note: aten::all.dims_out is NOT registered here because adding it to the
+    # same registration group as aten::all confuses the C++ dispatcher's output
+    # shape inference — causing all(x, dim=None, keepdim=True) to produce a
+    # scalar [] instead of the correct [1,1,...] shape. The dims_out variant
+    # already works via PyTorch's dispatcher routing it through all.out.

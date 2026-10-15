@@ -1,66 +1,66 @@
 """Tests ensuring slice-based contiguous path is used when applicable."""
 
-import os
-from unittest.mock import patch
-
 import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import get_cache_size
+from tests.utils.neuron_test_utils import (
+    assert_op_runs_on_neuron,
+    track_neuron_ops,
+)
 
 
 @pytest.mark.usefixtures("enable_metrics_for_class")
 class TestContiguousSlice:
     """Test class for contiguous slice operations"""
 
-    def test_contiguous_slice_uses_mlir_kernel(self, monkeypatch):
-        """Slice case should use the slice kernel (MLIR), not the generic copy."""
-        from torch_neuronx.python_ops import contiguous as contiguous_mod
-        from torch_neuronx.python_ops.contiguous_slice import ContiguousSliceMLIRImpl
+    # ── New tests: work with both Python and C++ dispatch paths ──
 
-        slice_called = {"count": 0}
-        generic_called = {"count": 0}
+    def test_contiguous_slice_runs_on_neuron(self):
+        """Single-axis slice contiguous should run on Neuron, not CPU fallback."""
+        with track_neuron_ops():
+            x = torch.randn(2, 4, 8, 64, device="neuron", dtype=torch.float32)
+            sliced_view = x[..., :32]
+            assert not sliced_view.is_contiguous()
 
-        impl_class = ContiguousSliceMLIRImpl
-        orig_get_kernel = impl_class._get_kernel
+            y = sliced_view.contiguous()
 
-        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
-            k = orig_get_kernel(self)
+            assert y.is_contiguous()
+            assert y.shape == (2, 4, 8, 32)
+            assert torch.allclose(y.cpu(), sliced_view.cpu())
+            assert_op_runs_on_neuron("aten::contiguous")
 
-            def wrapper(*args, **kwargs):
-                slice_called["count"] += 1
-                return k(*args, **kwargs)
+    def test_multiple_dimensions_sliced_produces_correct_result(self):
+        """Multi-dimension slice contiguous produces correct results regardless of path."""
+        x = torch.randn(8, 16, 32, device="neuron")
+        y = x[2:6, 4:12]
 
-            return wrapper
+        if not y.is_contiguous():
+            z = y.contiguous()
+            assert z.is_contiguous()
+            expected = x.cpu()[2:6, 4:12].contiguous()
+            assert torch.allclose(z.cpu(), expected)
 
-        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
+    def test_different_slice_patterns_produce_correct_results(self):
+        """Different slice patterns each produce correct results."""
+        with track_neuron_ops():
+            # Slice last dimension
+            x1 = torch.randn(4, 8, 64, device="neuron", dtype=torch.float32)
+            sliced_1 = x1[..., :32]
+            if not sliced_1.is_contiguous():
+                result_1 = sliced_1.contiguous()
+                assert result_1.is_contiguous()
+                assert torch.allclose(result_1.cpu(), sliced_1.cpu())
 
-        # Wrap the generic fallback to ensure it's not hit in the slice case
-        orig_generic = contiguous_mod.contiguous_generic_kernel
+            # Different axis
+            x2 = torch.randn(8, 64, 32, device="neuron", dtype=torch.float32)
+            sliced_2 = x2[:4, ...]
+            if not sliced_2.is_contiguous():
+                result_2 = sliced_2.contiguous()
+                assert result_2.is_contiguous()
+                assert torch.allclose(result_2.cpu(), sliced_2.cpu())
 
-        def wrapped_generic(*args, **kwargs):
-            generic_called["count"] += 1
-            return orig_generic(*args, **kwargs)
-
-        monkeypatch.setattr(
-            contiguous_mod, "contiguous_generic_kernel", wrapped_generic, raising=True
-        )
-
-        # Execute: slice should be handled by the slice-based path
-        x = torch.randn(2, 4, 8, 64, device="neuron", dtype=torch.float32)
-        sliced_view = x[..., :32]  # slice from start
-        assert not sliced_view.is_contiguous()
-
-        y = sliced_view.contiguous()
-
-        assert y.is_contiguous()
-        assert y.shape == (2, 4, 8, 32)
-        assert torch.allclose(y.cpu(), sliced_view.cpu())
-
-        # Validate paths taken
-        assert slice_called["count"] >= 1, "Expected MLIR slice kernel to be invoked"
-        assert generic_called["count"] == 0, "Generic fallback should not be used for slice"
+            assert_op_runs_on_neuron("aten::contiguous")
 
     def test_contiguous_slice_autograd(self):
         """slice path should preserve gradients."""
@@ -130,36 +130,6 @@ class TestContiguousSlice:
             assert y.is_contiguous()
             assert torch.allclose(y.cpu(), sliced_view.cpu())
 
-    def test_multiple_dimensions_sliced_fallback(self):
-        """Test that multiple dimension slice falls back to generic kernel."""
-        from torch_neuronx.python_ops.contiguous import contiguous_generic_kernel
-
-        original_generic_kernel = contiguous_generic_kernel
-        generic_called = {"count": 0}
-
-        def mock_counting_generic_kernel(
-            src, dst, shape, src_strides, dst_strides, src_storage_offset=0
-        ):
-            generic_called["count"] += 1
-            return original_generic_kernel(
-                src, dst, shape, src_strides, dst_strides, src_storage_offset
-            )
-
-        with patch(
-            "torch_neuronx.python_ops.contiguous.contiguous_generic_kernel",
-            side_effect=mock_counting_generic_kernel,
-        ):
-            # Create a tensor with multiple dimensions sliced
-            x = torch.randn(8, 16, 32, device="neuron")
-            # slice multiple dimensions - should NOT be handled by slice implementation
-            y = x[2:6, 4:12]  # Two dimensions sliced
-
-            if not y.is_contiguous():
-                y.contiguous()
-                assert (
-                    generic_called["count"] >= 1
-                ), "Should fall back to generic for multiple slices"
-
     def test_multiaxis_slice_zero_(self):
         """Regression test: zero_() on a multi-axis narrow view must not corrupt data.
 
@@ -181,53 +151,3 @@ class TestContiguousSlice:
         expected = torch.ones(s, s, s, dtype=torch.int16)
         expected[2, :, 3] = 0
         assert torch.equal(t.cpu(), expected), "Only narrow(0,2).narrow(2,3) region should be zero"
-
-    def test_contiguous_slice_compilation_caching(self, monkeypatch):
-        """Test that different slice patterns compile separate kernels."""
-        from torch_neuronx.python_ops.contiguous_slice import ContiguousSliceMLIRImpl
-
-        compile_called = {"count": 0}
-
-        impl_class = ContiguousSliceMLIRImpl
-        orig_get_kernel = impl_class._get_kernel
-
-        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
-            kernel = orig_get_kernel(self)
-
-            def wrapper(*args, **kwargs):
-                orig_cache_size = get_cache_size(kernel)
-                result = kernel(*args, **kwargs)
-                updated_cache_size = get_cache_size(kernel)
-                if updated_cache_size > orig_cache_size:
-                    compile_called["count"] += 1
-                return result
-
-            return wrapper
-
-        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
-
-        # Test case 1: slice last dimension
-        x1 = torch.randn(4, 8, 64, device="neuron", dtype=torch.float32)
-        sliced_1 = x1[..., :32]
-
-        if not sliced_1.is_contiguous():
-            compile_called["count"] = 0
-            result_1 = sliced_1.contiguous()
-            assert (
-                compile_called["count"] == 1
-            ), f"Expected 1 compilation, got {compile_called['count']}"
-            assert result_1.is_contiguous()
-            assert torch.allclose(result_1.cpu(), sliced_1.cpu())
-
-        # Test case 2: different axis - should compile new kernel
-        x2 = torch.randn(8, 64, 32, device="neuron", dtype=torch.float32)
-        sliced_2 = x2[:4, ...]
-
-        if not sliced_2.is_contiguous():
-            compile_called["count"] = 0
-            result_2 = sliced_2.contiguous()
-            assert (
-                compile_called["count"] == 1
-            ), f"Expected 1 compilation, got {compile_called['count']}"
-            assert result_2.is_contiguous()
-            assert torch.allclose(result_2.cpu(), sliced_2.cpu())

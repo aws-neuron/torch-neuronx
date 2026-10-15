@@ -19,6 +19,7 @@ Binary arithmetic operations:
 Unary mathematical operations:
 - abs, neg, sqrt, rsqrt
 - cos, sin, exp, log
+- log2, log10, log1p
 - erf, erfinv, ceil, trunc
 - sign, reciprocal
 
@@ -65,7 +66,7 @@ Tensor manipulation (shape, stacking, etc.):
 
 ### creation.py
 Tensor creation operations:
-- arange, zeros, ones, ones_like
+- arange, linspace, zeros, ones, ones_like
 - eye
 - fill_, zero_
 

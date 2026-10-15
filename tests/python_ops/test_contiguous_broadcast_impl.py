@@ -1,70 +1,70 @@
 """Tests ensuring broadcast-based contiguous path is used when applicable."""
 
 import math
-import os
-from unittest.mock import patch
 
 import pytest
 import torch
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import get_cache_size
+from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
 
 
 @pytest.mark.usefixtures("enable_metrics_for_class")
 class TestContiguousBroadcast:
     """Test class for contiguous broadcast operations"""
 
-    def test_contiguous_broadcast_uses_mlir_kernel(self, monkeypatch):
-        """Broadcast case should use the broadcast kernel (MLIR), not the generic copy."""
-        from torch_neuronx.python_ops import contiguous as contiguous_mod
-        from torch_neuronx.python_ops.contiguous_broadcast import ContiguousBroadcastMLIRImpl
+    # ── New tests: work with both Python and C++ dispatch paths ──
 
-        broadcast_called = {"count": 0}
-        generic_called = {"count": 0}
+    def test_contiguous_broadcast_runs_on_neuron(self):
+        """Broadcast contiguous should run on Neuron, not CPU fallback."""
+        with track_neuron_ops():
+            scalar = torch.tensor(42.0, device="neuron")
+            broadcasted_view = scalar.expand(128, 256)
+            assert not broadcasted_view.is_contiguous()
 
-        impl_class = ContiguousBroadcastMLIRImpl
-        orig_get_kernel = impl_class._get_kernel
+            y = broadcasted_view.contiguous()
 
-        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel, impl_class=impl_class):
-            k = orig_get_kernel(self)
+            assert y.is_contiguous()
+            assert y.shape == (128, 256)
+            assert torch.allclose(y.cpu(), broadcasted_view.cpu())
+            assert torch.all(y == 42.0)
+            assert_op_runs_on_neuron("aten::contiguous")
 
-            def wrapper(*args, **kwargs):
-                broadcast_called["count"] += 1
-                print(f"{impl_class.__name__}._get_kernel called")
-                return k(*args, **kwargs)
+    def test_repeat_kv_runs_on_neuron(self):
+        """repeat_kv pattern should run on Neuron, not CPU fallback."""
 
-            return wrapper
+        def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+            bs, slen, n_kv_heads, head_dim = x.shape
+            if n_rep == 1:
+                return x
+            return (
+                torch.unsqueeze(x, dim=3)
+                .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+                .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+            )
 
-        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
+        with track_neuron_ops():
+            x = torch.zeros(1, 4096, 8, 128, dtype=torch.bfloat16, device="neuron")
+            y = _repeat_kv(x, 4)
+            y_cpu = _repeat_kv(x.cpu(), 4)
 
-        # Wrap the generic fallback to ensure it's not hit in the broadcast case
-        orig_generic = contiguous_mod.contiguous_generic_kernel
+            assert torch.allclose(y.cpu(), y_cpu)
+            assert_op_runs_on_neuron("aten::contiguous")
 
-        def wrapped_generic(*args, **kwargs):
-            generic_called["count"] += 1
-            return orig_generic(*args, **kwargs)
+    def test_broadcast_different_shapes_produce_correct_results(self):
+        """Different broadcast shapes should each produce correct results."""
+        with track_neuron_ops():
+            scalar = torch.tensor(123.0, dtype=torch.bfloat16, device="neuron")
 
-        monkeypatch.setattr(
-            contiguous_mod, "contiguous_generic_kernel", wrapped_generic, raising=True
-        )
+            result_1 = scalar.expand(4096, 2048).contiguous()
+            assert result_1.is_contiguous()
+            assert torch.all(result_1 == 123.0)
 
-        # Execute: broadcast should be handled by the broadcast-based path
-        scalar = torch.tensor(42.0, device="neuron")
-        broadcasted_view = scalar.expand(128, 256)  # All strides = 0
-        assert not broadcasted_view.is_contiguous()
-        assert broadcasted_view.stride() == (0, 0)
+            result_2 = scalar.expand(2048, 4096).contiguous()
+            assert result_2.is_contiguous()
+            assert torch.all(result_2 == 123.0)
 
-        y = broadcasted_view.contiguous()
-
-        assert y.is_contiguous()
-        assert y.shape == (128, 256)
-        assert torch.allclose(y.cpu(), broadcasted_view.cpu())
-        assert torch.all(y == 42.0)
-
-        # Validate paths taken
-        assert broadcast_called["count"] >= 1, "Expected broadcast MLIR kernel to be invoked"
-        assert generic_called["count"] == 0, "Generic fallback should not be used for broadcast"
+            assert_op_runs_on_neuron("aten::contiguous")
 
     def test_contiguous_broadcast_autograd(self):
         """Broadcast path should preserve gradients."""
@@ -142,170 +142,3 @@ class TestContiguousBroadcast:
 
         # Verify neuron tensor properties
         assert torch.allclose(contiguous_neuron.cpu(), contiguous_cpu)
-
-    def test_repeat_kv_uses_mlir_kernel(self, monkeypatch):
-        """Test repeat_kv uses broadcast MLIR kernel"""
-        from torch_neuronx.python_ops import contiguous as contiguous_mod
-        from torch_neuronx.python_ops.contiguous_broadcast import ContiguousBroadcastMLIRImpl
-
-        mlir_called = {"count": 0}
-        generic_called = {"count": 0}
-
-        impl_class = ContiguousBroadcastMLIRImpl
-        orig_get_kernel = impl_class._get_kernel
-
-        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
-            k = orig_get_kernel(self)
-
-            def wrapper(*args, **kwargs):
-                mlir_called["count"] += 1
-                return k(*args, **kwargs)
-
-            return wrapper
-
-        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
-
-        # Wrap the generic fallback to ensure it's not hit in the broadcast case
-        orig_generic = contiguous_mod.contiguous_generic_kernel
-
-        def wrapped_generic(*args, **kwargs):
-            generic_called["count"] += 1
-            return orig_generic(*args, **kwargs)
-
-        monkeypatch.setattr(
-            contiguous_mod, "contiguous_generic_kernel", wrapped_generic, raising=True
-        )
-
-        def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-            bs, slen, n_kv_heads, head_dim = x.shape
-            if n_rep == 1:
-                return x
-
-            return (
-                torch.unsqueeze(x, dim=3)
-                .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-                .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-            )
-
-        bs = 1
-        slen = 4096
-        n_kv_heads = 8
-        head_dim = 128
-        x = torch.zeros(bs, slen, n_kv_heads * head_dim, dtype=torch.bfloat16, device="neuron")
-        x_cpu = torch.zeros(bs, slen, n_kv_heads * head_dim, dtype=torch.bfloat16, device="cpu")
-
-        x = x.view(bs, slen, n_kv_heads, head_dim)
-        y = _repeat_kv(x, 4)
-        x_cpu = x_cpu.view(bs, slen, n_kv_heads, head_dim)
-        y_cpu = _repeat_kv(x_cpu, 4)
-
-        assert torch.allclose(y.cpu(), y_cpu), "repeat_kv output on neuron does not match cpu"
-        # Validate paths taken
-        assert mlir_called["count"] >= 1, "Expected broadcast kernel to be invoked"
-        assert generic_called["count"] == 0, "Generic fallback should not be used for broadcast"
-
-    def test_incorrect_fallback_to_generic_kernel(self, monkeypatch):
-        """Test incorrect fallback to generic kernel for different target shapes"""
-
-        from torch_neuronx.python_ops.contiguous_broadcast import ContiguousBroadcastMLIRImpl
-
-        compile_called = {"count": 0}
-
-        impl_class = ContiguousBroadcastMLIRImpl
-        orig_get_kernel = impl_class._get_kernel
-
-        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
-            kernel = orig_get_kernel(self)
-
-            def wrapper(*args, **kwargs):
-                orig_cache_size = get_cache_size(kernel)
-                result = kernel(*args, **kwargs)
-                updated_cache_size = get_cache_size(kernel)
-                if updated_cache_size > orig_cache_size:
-                    compile_called["count"] += 1
-                return result
-
-            return wrapper
-
-        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
-
-        def mock_contiguous_generic_kernel(
-            src, dst, shape, src_strides, dst_strides, src_storage_offset=0
-        ):
-            """Mock that returns corrupted output to detect generic kernel was used"""
-            dst.cpu().zero_()  # Fill with zeros instead of correct values
-            return dst
-
-        with patch(
-            "torch_neuronx.python_ops.contiguous.contiguous_generic_kernel",
-            side_effect=mock_contiguous_generic_kernel,
-        ):
-            # Test case 1
-            scalar_value = 123.0
-            scalar_tensor = torch.tensor(scalar_value, dtype=torch.bfloat16, device="neuron")
-            broadcasted_1 = scalar_tensor.expand(4096, 2048)
-            assert broadcasted_1.stride() == (0, 0)
-            assert not broadcasted_1.is_contiguous()
-
-            compile_called["count"] = 0
-            result_1 = broadcasted_1.contiguous()
-            assert (
-                compile_called["count"] == 1
-            ), f"Expected 1 compilation, got {compile_called['count']}"
-
-            # Should not be zeros (proving broadcast kernel was used, not mock)
-            assert torch.all(result_1 == scalar_value)
-            assert result_1.stride() == (2048, 1)
-            assert result_1.is_contiguous()
-
-            # Step 2: This should compile a new neff and successfully execute
-            broadcasted_2 = scalar_tensor.expand(2048, 4096)
-            assert not broadcasted_2.is_contiguous()
-
-            compile_called["count"] = 0
-            result_2 = broadcasted_2.contiguous()
-            assert (
-                compile_called["count"] == 1
-            ), f"Expected 1 compilation, got {compile_called['count']}"
-
-            assert torch.all(result_2 == scalar_value)
-            assert result_2.stride() == (4096, 1)
-            assert result_2.is_contiguous()
-
-    def test_mixed_broadcast_handled_by_compound(self):
-        """Test that mixed broadcast/non-broadcast patterns are handled on-device.
-
-        Previously these patterns fell back to contiguous_generic_kernel (CPU roundtrip).
-        Now TryCreateCompound handles them via the prologue system, so the generic
-        kernel should NOT be called.
-        """
-
-        from torch_neuronx.python_ops.contiguous import contiguous_generic_kernel
-
-        original_generic_kernel = contiguous_generic_kernel
-        generic_called = {"count": 0}
-
-        def mock_counting_generic_kernel(
-            src, dst, shape, src_strides, dst_strides, src_storage_offset=0
-        ):
-            generic_called["count"] += 1
-            # Call the original function we stored before patching
-            return original_generic_kernel(
-                src, dst, shape, src_strides, dst_strides, src_storage_offset
-            )
-
-        with patch(
-            "torch_neuronx.python_ops.contiguous.contiguous_generic_kernel",
-            side_effect=mock_counting_generic_kernel,
-        ):
-            # Create a tensor with mixed stride pattern (some 0, some non-zero)
-            x = torch.randn(2, 3, 4, device="neuron")
-            # Create a view that has some broadcasted and some non-broadcasted dimensions
-            y = x[:, 0:1, :].expand(-1, 3, -1)  # Middle dim broadcasted, others not
-
-            # TryCreateCompound handles mixed broadcast patterns on-device via prologue
-            if not y.is_contiguous():
-                result = y.contiguous()
-                # Verify the result is correct (contiguous with same data)
-                assert result.is_contiguous(), "Result should be contiguous"
-                assert result.shape == y.shape, "Shape should be preserved"

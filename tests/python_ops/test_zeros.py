@@ -52,6 +52,19 @@ class TestZerosRegistration:
             assert x.to("cpu").item() == 0
             assert_op_runs_on_neuron("aten::zeros")
 
+    @pytest.mark.parametrize("factory", [torch.zeros, torch.ones], ids=["zeros", "ones"])
+    @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
+    @pytest.mark.parametrize("shape", [(), (2, 3)])
+    def test_complex_constant_factories(self, factory, dtype, shape):
+        expected = factory(shape, dtype=dtype)
+        with track_neuron_ops():
+            actual = factory(shape, dtype=dtype, device="neuron")
+            assert actual.device.type == "neuron"
+            assert actual.dtype == dtype
+            assert actual.shape == expected.shape
+            assert torch.equal(actual.cpu(), expected)
+            assert_op_runs_on_neuron(f"aten::{factory.__name__}")
+
     @pytest.mark.parametrize(
         "size,expected_exception",
         [
@@ -132,3 +145,22 @@ class TestZerosRegistration:
                 size = (size,)
             assert tensor.shape == torch.Size(size)
             assert (tensor == 0).all()
+
+    def test_zeros_cache_key_excludes_device(self, monkeypatch):
+        """Test that device static argname is not leaked to the cache key"""
+        from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
+
+        captured = []
+        original = TorchMlirKernel._get_or_compile_hlo
+
+        def capture(self, *args, **kwargs):
+            captured.append(self)
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(TorchMlirKernel, "_get_or_compile_hlo", capture)
+
+        torch.zeros((128, 128), dtype=torch.bfloat16, device="neuron")
+
+        assert captured, "_get_or_compile_hlo was not invoked"
+        for key in captured[0].hlo_cache:
+            assert "dev:" not in key, f"device leaked into cache key: {key!r}"

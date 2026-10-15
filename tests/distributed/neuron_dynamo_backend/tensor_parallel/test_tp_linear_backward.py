@@ -29,17 +29,17 @@ def run_linear_backward_test(rank, world_size, kwargs):
     y_cpu.sum().backward()
     ref_grad = x_cpu.grad.clone()
 
-    # Neuron model with same weights
+    # Neuron model with same weights (init on CPU then move to avoid RNG divergence)
     class Model(nn.Module):
         def __init__(self):
             super().__init__()
-            self.linear = nn.Linear(64, 128, bias=bias, device=device)
+            self.linear = nn.Linear(64, 128, bias=bias)
 
         def forward(self, x):
             return self.linear(x)
 
     torch.manual_seed(42)
-    model = Model()
+    model = Model().to(device)
     parallelize_module(model, mesh["tp"], {"linear": ColwiseParallel()})
 
     x = x_cpu.detach().clone().to(device).requires_grad_(True)

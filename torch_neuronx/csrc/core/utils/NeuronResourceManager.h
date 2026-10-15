@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
+#include "torch_neuronx/csrc/core/allocator/NeuronSegmentAllocator.h"
+#include "torch_neuronx/csrc/core/allocator/ScalarDeviceMemoryCache.h"
 
 namespace at::neuron {
 
@@ -144,13 +146,27 @@ class NeuronResourceManager {
   // Returns: Reference to the execution engine
   OperationExecutionEngine& GetOperationExecutionEngine();
 
+  // Test-only: swap in a different OperationExecutionEngine. Returns the
+  // previous one (which the caller is responsible for shutting down before
+  // destruction). Callers holding a previously-returned reference to the
+  // engine will see it dangle after this swap — quiesce all background
+  // workers and drop all engine references before calling. The swap itself
+  // is mutex-protected, but stale references obtained before the swap are
+  // not invalidated.
+  std::unique_ptr<OperationExecutionEngine> SetExecutionEngineForTesting(
+      std::unique_ptr<OperationExecutionEngine> engine);
+
   // Get the shared resource semaphore for general resource management
   // Returns: Reference to the global resource semaphore
   ResourceSemaphore& GetResourceSemaphore();
 
-  // Get the tensor pool for a specific device
-  // Returns: Reference to the device's tensor pool
-  c10_neuron::NrtTensorPool& GetTensorPool(int device);
+  // Get the segment pool for a specific device.
+  // Returns: Reference to the device's NeuronSegmentPool
+  c10_neuron::NeuronSegmentPool& GetSegmentPool(int device);
+
+  // Get the scalar device memory cache for a specific device.
+  // Returns: Reference to the device's ScalarDeviceMemoryCache
+  c10_neuron::ScalarDeviceMemoryCache& GetScalarCache(int device);
 
  private:
   // Private constructor for singleton pattern
@@ -168,7 +184,8 @@ class NeuronResourceManager {
 
   mutable std::mutex mutex_;
 
-  std::vector<std::unique_ptr<c10_neuron::NrtTensorPool>> tensor_pools_;
+  std::vector<std::unique_ptr<c10_neuron::NeuronSegmentPool>> segment_pools_;
+  std::vector<std::unique_ptr<c10_neuron::ScalarDeviceMemoryCache>> scalar_caches_;
   std::unique_ptr<CompilationCache> compilation_cache_;
   std::unique_ptr<ModelHandleCache> model_handle_cache_;
   std::unique_ptr<OperationExecutionEngine> operation_execution_engine_;

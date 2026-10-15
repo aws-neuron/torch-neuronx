@@ -21,6 +21,14 @@ logger = logging.getLogger(__name__)
 
 @neuron_op("aten::_to_copy", disable_dtype_autocast=True, priority=50)
 class ToCopyNeuronImpl(OperationImplementation):
+    """Implement ``aten::_to_copy`` transfers involving a Neuron device.
+
+    Note:
+        CPU-to-Neuron and Neuron-to-CPU paths use raw NRT helpers.
+        Neuron-to-Neuron dtype changes may instead use an MLIR kernel or CPU fallback.
+        Neuron-involving paths avoid redispatching through ``copy_``.
+    """
+
     def can_handle(
         self,
         self_tensor: torch.Tensor,
@@ -35,6 +43,22 @@ class ToCopyNeuronImpl(OperationImplementation):
         **kwargs,
     ) -> bool:
         # Resolve target device and dtype
+        """Check whether a copy transfers to or from a Neuron device.
+
+        Args:
+            self_tensor (torch.Tensor): Source tensor.
+            dtype (torch.dtype, optional): Target dtype; ignored. Defaults to ``None``.
+            layout (torch.layout, optional): Target layout; ignored. Defaults to ``None``.
+            device (torch.device | str, optional): Destination device. Defaults to ``None``.
+            pin_memory (bool, optional): Pin-memory request; ignored. Defaults to ``None``.
+            non_blocking (bool, optional): Async-copy request; ignored. Defaults to ``False``.
+            memory_format (torch.memory_format, optional): Format; ignored. Defaults to ``None``.
+            out (Any, optional): Output buffer; ignored. Defaults to ``None``.
+            **kwargs (Any): Additional options not used for selection.
+
+        Returns:
+            bool: ``True`` when the source or resolved destination is a Neuron device.
+        """
         dst_device = (
             device
             if isinstance(device, torch.device)
@@ -112,6 +136,15 @@ class ToCopyNeuronImpl(OperationImplementation):
                 target_dtype=(target_dtype if not no_dtype_change else None),
                 non_blocking=non_blocking,
             )
+            # Preserve strides for non-overlapping-and-dense sources (e.g. transpose)
+            if not self_tensor.is_contiguous() and torch.ops.aten.is_non_overlapping_and_dense(
+                self_tensor
+            ):
+                strided_out = torch.empty_strided(
+                    self_tensor.shape, self_tensor.stride(), dtype=cpu_dst.dtype
+                )
+                strided_out.copy_(cpu_dst)
+                cpu_dst = strided_out
             return ExecutionResult(success=True, output=cpu_dst)
 
         # Neuron -> Neuron (device may or may not change index)

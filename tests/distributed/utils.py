@@ -1,4 +1,6 @@
+import base64
 import os
+import pickle
 import socket
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -6,7 +8,42 @@ from contextlib import contextmanager
 import pytest
 import torch
 
-from tests.utils.neuron_test_utils import get_core_start_index
+from tests.utils.neuron_test_utils import get_rank_core
+
+
+def broadcast_object_from_rank0(obj, rank: int, world_size: int, tag: str):
+    """SPMD-safe replacement for ``dist.broadcast_object_list([...], src=0)``: return rank 0's
+    ``obj`` on every rank via the PG's TCPStore, avoiding the neuron on-device object collective
+    (its int64 size broadcast is flaky under parallel CI). ``tag`` must be unique per call site.
+    """
+    import time
+
+    import torch.distributed as dist
+
+    store = dist.distributed_c10d._get_default_store()
+    data_key = f"__spmd_bcast__/data/{tag}"
+    done_key = f"__spmd_bcast__/done/{tag}"
+
+    if rank == 0:
+        store.set(data_key, base64.b64encode(pickle.dumps(obj)).decode("ascii"))
+    # store.get blocks until rank 0 has published the key (bounded by the
+    # store's timeout), so it also acts as an arrival gate.
+    payload = store.get(data_key)
+    result = pickle.loads(base64.b64decode(payload))
+
+    # Rendezvous: every rank reports arrival, then waits for all peers. This
+    # prevents rank 0 from destroying the store before slower ranks have read.
+    store.add(done_key, 1)
+    while int(store.get(done_key).decode()) < world_size:
+        time.sleep(0.005)
+
+    # Tight release: a true (nrt) barrier so all ranks leave together and rank 0
+    # -- which hosts the TCPStore server -- cannot race ahead into
+    # ``destroy_process_group`` (which does store I/O) while a slower rank is
+    # still mid-poll above. This uses nrt_barrier, not the int64 allreduce path.
+    dist.barrier()
+
+    return result
 
 
 def get_free_port():
@@ -20,6 +57,7 @@ def get_free_port():
 @contextmanager
 def distributed_context(master_addr, master_port, rank: int, world_size: int, process_index):
     """Context manager for distributed setup"""
+    core = get_rank_core(rank)
     try:
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = master_port
@@ -27,7 +65,7 @@ def distributed_context(master_addr, master_port, rank: int, world_size: int, pr
         os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
         os.environ["RANK"] = str(rank)
         os.environ["LOCAL_RANK"] = str(rank)
-        os.environ["NEURON_RT_VISIBLE_CORES"] = str(get_core_start_index() + rank)
+        os.environ["NEURON_RT_VISIBLE_CORES"] = str(core)
         import torch.distributed as dist
 
         import torch_neuronx
@@ -41,7 +79,10 @@ def distributed_context(master_addr, master_port, rank: int, world_size: int, pr
         del os.environ["RANK"]
         del os.environ["LOCAL_RANK"]
         del os.environ["NEURON_RT_VISIBLE_CORES"]
-        dist.destroy_process_group()
+        # Destroy only what init_process_group built. An unconditional call raises
+        # "Process group cannot be None" and hides the real setup error.
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 _BASE_MASTER_PORT = 29500
@@ -120,5 +161,5 @@ class DistributedTester:
             import traceback
 
             tb = traceback.format_exc()
-            error_queue.put((rank, e, tb))
+            error_queue.put((rank, f"{type(e).__name__}: {e}", tb))
             raise

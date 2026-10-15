@@ -1,9 +1,11 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary")
 load("@rules_uv//uv:pip.bzl", "pip_compile")
+load("@rules_proto//proto:defs.bzl", "proto_library")
+load("@protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
 
 # Common compiler options for all targets in this package
 # -Werror is scoped to this package only, not applied to external dependencies
-PACKAGE_COPTS = ["-Werror", "-Wno-interference-size", "-DFMT_HEADER_ONLY"]
+PACKAGE_COPTS = ["-Werror", "-Wno-interference-size", "-Wno-deprecated-declarations", "-DFMT_HEADER_ONLY"]
 
 pip_compile(
     name = "generate_requirements_txt",
@@ -47,7 +49,7 @@ cc_library(
         "torch_neuronx/csrc/core/utils/ProcessExecutor.cpp",
         "torch_neuronx/csrc/core/utils/TempDirectory.cpp",
         "torch_neuronx/csrc/core/utils/StringUtils.cpp",
-        "torch_neuronx/csrc/core/lazy_materialization/OperationPrologue.cpp",
+        "torch_neuronx/csrc/core/lazy_materialization/OperationTransformations.cpp",
         "torch_neuronx/csrc/core/metrics/NeuronMetrics.cpp",
         "torch_neuronx/csrc/core/metrics/NeuronMemorySnapshot.cpp",
     ],
@@ -70,6 +72,10 @@ cc_library(
         "torch_neuronx/csrc/core/OperationContext.h",
         "torch_neuronx/csrc/core/ProfilerMappingCollector.h",
         "torch_neuronx/csrc/core/KernelExecution.h",
+        "torch_neuronx/csrc/core/Coexistence.h",
+        "torch_neuronx/csrc/core/dispatch/CpuFallback.h",
+        "torch_neuronx/csrc/core/dispatch/DispatchUtils.h",
+        "torch_neuronx/csrc/core/dispatch/Int64Policy.h",
         "torch_neuronx/csrc/core/NeuronLogging.h",
         "torch_neuronx/csrc/core/compilation/NeuronCompiler.h",
         "torch_neuronx/csrc/core/compilation/experimental/TensorizerCompiler.h",
@@ -84,12 +90,14 @@ cc_library(
         "torch_neuronx/csrc/core/utils/CPUFallbackContext.h",
         "torch_neuronx/csrc/core/utils/TempDirectory.h",
         "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h",
+        "torch_neuronx/csrc/core/allocator/NeuronSegmentAllocator.h",
+        "torch_neuronx/csrc/core/allocator/ScalarDeviceMemoryCache.h",
         "torch_neuronx/csrc/core/NeuronTensorImpl.h",
         "torch_neuronx/csrc/core/NeuronDevice.h",
         "torch_neuronx/csrc/core/utils/NeuronExceptions.h",
         "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.h",
         "torch_neuronx/csrc/core/lazy_materialization/TransformationTypes.h",
-        "torch_neuronx/csrc/core/lazy_materialization/OperationPrologue.h",
+        "torch_neuronx/csrc/core/lazy_materialization/OperationTransformations.h",
         "torch_neuronx/csrc/core/metrics/NeuronMetrics.h",
         "torch_neuronx/csrc/core/concatenation/IrNode.h",
         "torch_neuronx/csrc/core/metrics/NeuronMemorySnapshot.h",
@@ -101,6 +109,7 @@ cc_library(
         ":lazy_materialization",
         ":concatenation",
         ":non_temporal_memcpy",
+        ":dtype_cast_vec",
         "@xxhash",
         "@nrt//:nrt",
         "@torch//:headers",
@@ -120,8 +129,10 @@ cc_library(
         "torch_neuronx/csrc/core/runtime/ModelHandleCache.cpp",
         "torch_neuronx/csrc/core/runtime/NRTHandler.cpp",
         "torch_neuronx/csrc/core/runtime/NRTUtils.cpp",
+        "torch_neuronx/csrc/core/allocator/NeuronSegmentAllocator.cpp",
         "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.cpp",
         "torch_neuronx/csrc/core/allocator/NeuronHostAllocator.cpp",
+        "torch_neuronx/csrc/core/allocator/ScalarDeviceMemoryCache.cpp",
         "torch_neuronx/csrc/c10/neuron/NeuronStream.cpp",
         "torch_neuronx/csrc/c10/neuron/NeuronEvent.cpp",
         "torch_neuronx/csrc/core/streams/StreamImpl.cpp",
@@ -129,14 +140,18 @@ cc_library(
         "torch_neuronx/csrc/core/utils/ErrorRecovery.cpp",
         "torch_neuronx/csrc/core/utils/NeuronResourceManager.cpp",
         "torch_neuronx/csrc/core/utils/CPUFallbackExecutor.cpp",
+        "torch_neuronx/csrc/core/utils/OpErrorHandler.cpp",
         "torch_neuronx/csrc/core/OperationExecutionEngine.cpp",
+        "torch_neuronx/csrc/core/utils/HostChain.cpp",
         "torch_neuronx/csrc/core/NeuronOpTracking.cpp",
-        "torch_neuronx/csrc/utils/CopyUtils.cpp",
-        "torch_neuronx/csrc/utils/NonTemporalMemcpy.cpp",
+        "torch_neuronx/csrc/core/utils/CopyUtils.cpp",
+        "torch_neuronx/csrc/core/utils/PackedInt64Utils.cpp",
+        "torch_neuronx/csrc/core/utils/NonTemporalMemcpy.cpp",
         "torch_neuronx/csrc/core/NeuronStorageImpl.cpp",
         "torch_neuronx/csrc/ops/InternalOps.cpp",
         "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.cpp",
         "torch_neuronx/csrc/profiler/Profiler.cpp",
+        "torch_neuronx/csrc/profiler/ContinuousExporter.cpp",
         "torch_neuronx/csrc/profiler/Session.cpp",
         "torch_neuronx/csrc/profiler/Registration.cpp",
         "torch_neuronx/csrc/profiler/TorchStubs.cpp",
@@ -149,21 +164,27 @@ cc_library(
         "torch_neuronx/csrc/core/runtime/ModelHandleCache.h",
         "torch_neuronx/csrc/core/runtime/NRTHandler.h",
         "torch_neuronx/csrc/core/runtime/NRTUtils.h",
+        "torch_neuronx/csrc/core/allocator/NeuronSegmentAllocator.h",
         "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h",
         "torch_neuronx/csrc/core/allocator/NeuronHostAllocator.h",
+        "torch_neuronx/csrc/core/allocator/ScalarDeviceMemoryCache.h",
         "torch_neuronx/csrc/core/allocator/ShelvesCleanup.h",
         "torch_neuronx/csrc/c10/neuron/NeuronStream.h",
         "torch_neuronx/csrc/c10/neuron/NeuronEvent.h",
+        "torch_neuronx/csrc/core/streams/StreamConfig.h",
         "torch_neuronx/csrc/core/streams/StreamImpl.h",
         "torch_neuronx/csrc/core/utils/ErrorHandler.h",
         "torch_neuronx/csrc/core/utils/ErrorRecovery.h",
         "torch_neuronx/csrc/core/utils/NeuronExceptions.h",
         "torch_neuronx/csrc/core/utils/NeuronResourceManager.h",
         "torch_neuronx/csrc/core/utils/CPUFallbackExecutor.h",
+        "torch_neuronx/csrc/core/utils/OpErrorHandler.h",
+        "torch_neuronx/csrc/core/utils/HostChain.h",
         "torch_neuronx/csrc/core/OperationExecutionEngine.h",
         "torch_neuronx/csrc/core/NeuronOpTracking.h",
-        "torch_neuronx/csrc/utils/CopyUtils.h",
-        "torch_neuronx/csrc/utils/NonTemporalMemcpy.h",
+        "torch_neuronx/csrc/core/utils/CopyUtils.h",
+        "torch_neuronx/csrc/core/utils/PackedInt64Utils.h",
+        "torch_neuronx/csrc/core/utils/NonTemporalMemcpy.h",
         "torch_neuronx/csrc/core/NeuronStorageImpl.h",
         "torch_neuronx/csrc/ops/InternalOps.h",
         "torch_neuronx/csrc/core/utils/TensorContext.h",
@@ -174,6 +195,7 @@ cc_library(
         "torch_neuronx/csrc/core/metrics/NeuronMetrics.h",
         "torch_neuronx/csrc/profiler/Registration.h",
         "torch_neuronx/csrc/profiler/Profiler.h",
+        "torch_neuronx/csrc/profiler/ContinuousExporter.h",
         "torch_neuronx/csrc/profiler/Session.h",
         "torch_neuronx/csrc/profiler/LogWrapper.h",
         "torch_neuronx/csrc/profiler/NConfigParser.h",
@@ -226,6 +248,7 @@ cc_library(
     name = "profiler_test_lib",
     srcs = [
         "torch_neuronx/csrc/profiler/Profiler.cpp",
+        "torch_neuronx/csrc/profiler/ContinuousExporter.cpp",
         "torch_neuronx/csrc/profiler/Session.cpp",
         "torch_neuronx/csrc/profiler/NConfigParser.cpp",
         "torch_neuronx/csrc/profiler/ProfilerEventBuffer.cpp",
@@ -234,6 +257,7 @@ cc_library(
     ],
     hdrs = [
         "torch_neuronx/csrc/profiler/Profiler.h",
+        "torch_neuronx/csrc/profiler/ContinuousExporter.h",
         "torch_neuronx/csrc/profiler/Session.h",
         "torch_neuronx/csrc/profiler/NConfigParser.h",
         "torch_neuronx/csrc/profiler/ProfilerEventBuffer.h",
@@ -262,6 +286,7 @@ test_suite(
         "//tests/csrc:ProfilerTest",
         "//tests/csrc:ProfilerEventBufferTest",
         "//tests/csrc:CorrelationTrackerTest",
+        "//tests/csrc:ContinuousExporterTest",
     ],
     visibility = ["//visibility:public"],
 )
@@ -273,6 +298,7 @@ cc_library(
         "torch_neuronx/csrc/core/opbuilder/module_builder/TransposeOpBuilder.cc",
         "torch_neuronx/csrc/core/opbuilder/module_builder/ReshapeOpBuilder.cc",
         "torch_neuronx/csrc/core/opbuilder/module_builder/SliceOpBuilder.cc",
+        "torch_neuronx/csrc/core/opbuilder/module_builder/ScatterIotaOpBuilder.cpp",
         "torch_neuronx/csrc/core/opbuilder/module_builder/EmptyOpBuilder.cc",
         "torch_neuronx/csrc/core/opbuilder/module_builder/BroadcastOpBuilder.cc",
         "torch_neuronx/csrc/core/opbuilder/utility/StableHloUtils.cpp",
@@ -283,6 +309,7 @@ cc_library(
         "torch_neuronx/csrc/core/opbuilder/module_builder/TransposeOpBuilder.h",
         "torch_neuronx/csrc/core/opbuilder/module_builder/ReshapeOpBuilder.h",
         "torch_neuronx/csrc/core/opbuilder/module_builder/SliceOpBuilder.h",
+        "torch_neuronx/csrc/core/opbuilder/module_builder/ScatterIotaOpBuilder.h",
         "torch_neuronx/csrc/core/opbuilder/module_builder/EmptyOpBuilder.h",
         "torch_neuronx/csrc/core/opbuilder/module_builder/BroadcastOpBuilder.h",
         "torch_neuronx/csrc/core/opbuilder/utility/StableHloUtils.h",
@@ -370,6 +397,8 @@ cc_library(
         "torch_neuronx/csrc/c10/neuron/NeuronEvent.h",
         "torch_neuronx/csrc/core/NeuronTensorImpl.h",
         "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h",
+        "torch_neuronx/csrc/core/allocator/NeuronSegmentAllocator.h",
+        "torch_neuronx/csrc/core/allocator/ScalarDeviceMemoryCache.h",
         "torch_neuronx/csrc/core/compilation/CacheEntry.h",
         "torch_neuronx/csrc/core/compilation/CompilationCache.h",
         "torch_neuronx/csrc/core/compilation/CompilationBackend.h",
@@ -411,6 +440,8 @@ cc_library(
         "torch_neuronx/csrc/distributed/NeuronWatchdog.cpp",
     ],
     hdrs = [
+        "torch_neuronx/csrc/distributed/DynamicCollectiveTiling.h",
+        "torch_neuronx/csrc/distributed/DistributedUtils.h",
         "torch_neuronx/csrc/distributed/NeuronWork.h",
         "torch_neuronx/csrc/distributed/NeuronWatchdog.h",
     ],
@@ -425,11 +456,79 @@ cc_library(
     alwayslink = True,
 )
 
+# RDMA transfer descriptor protobuf — peer-to-peer descriptor exchange between RDMA endpoints.
+proto_library(
+    name = "transfer_descriptor_proto",
+    srcs = ["torch_neuronx/csrc/core/rdma/TransferDescriptor.proto"],
+)
+
+cc_proto_library(
+    name = "transfer_descriptor_cc_proto",
+    visibility = ["//visibility:public"],
+    deps = [":transfer_descriptor_proto"],
+)
+
+cc_library(
+    name = "rdma",
+    srcs = [
+        "torch_neuronx/csrc/core/rdma/RdmaManager.cc",
+    ],
+    hdrs = [
+        "torch_neuronx/csrc/core/rdma/RdmaManager.h",
+    ],
+    copts = PACKAGE_COPTS + ["-I.", "-fvisibility=default"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":runtime",
+        ":transfer_descriptor_cc_proto",
+        # libfabric loaded via dlopen at runtime (see LibfabricSymbols struct).
+        # Headers provide struct definitions and inline helper functions.
+        "@libfabric//:libfabric_hdrs",
+        "@nrt//:nrt",
+        "@torch//:headers",
+        "@torch//:runtime_headers",
+        "@torch//:libtorch",
+        "@rules_python//python/cc:current_py_cc_headers",
+    ],
+)
+
 cc_library(
     name = "non_temporal_memcpy",
-    srcs = ["torch_neuronx/csrc/utils/NonTemporalMemcpy.cpp"],
-    hdrs = ["torch_neuronx/csrc/utils/NonTemporalMemcpy.h"],
+    srcs = ["torch_neuronx/csrc/core/utils/NonTemporalMemcpy.cpp"],
+    hdrs = ["torch_neuronx/csrc/core/utils/NonTemporalMemcpy.h"],
     copts = ["-mavx2", "-mavx512f"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "dtype_cast_vec_avx512",
+    srcs = ["torch_neuronx/csrc/core/utils/DtypeCastVecAvx512.cpp"],
+    hdrs = ["torch_neuronx/csrc/core/utils/DtypeCastVecAvx512.h"],
+    copts = [
+        "-mavx2",
+        "-mavx512f",
+        "-mavx512bw",
+        "-mavx512vl",
+        "-mavx512dq",
+        "-mf16c",
+        "-DCPU_CAPABILITY_AVX512",
+        "-DCPU_CAPABILITY=AVX512",
+    ],
+    deps = [
+        "@torch//:headers",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "dtype_cast_vec",
+    srcs = ["torch_neuronx/csrc/core/utils/DtypeCastVec.cpp"],
+    hdrs = ["torch_neuronx/csrc/core/utils/DtypeCastVec.h"],
+    deps = [
+        ":dtype_cast_vec_avx512",
+        ":non_temporal_memcpy",
+        "@torch//:headers",
+    ],
     visibility = ["//visibility:public"],
 )
 
@@ -476,8 +575,39 @@ cc_library(
     srcs = [
         "torch_neuronx/csrc/core/NeuronBindings.cpp",
         "torch_neuronx/csrc/core/NeuronBarrier.cpp",
+        "torch_neuronx/csrc/core/cache/CacheKeyGenerator.cpp",
+        "torch_neuronx/csrc/core/dispatch/DispatchUtils.cpp",
+        "torch_neuronx/csrc/core/dispatch/DtypeUtils.cpp",
+        "torch_neuronx/csrc/core/dispatch/CpuFallback.cpp",
+        "torch_neuronx/csrc/core/dispatch/Int64Policy.cpp",
+        "torch_neuronx/csrc/core/dispatch/NeuronDispatcher.cpp",
+        "torch_neuronx/csrc/core/dispatch/NkiDispatcher.cpp",
+        "torch_neuronx/csrc/core/dispatch/OutputProcessing.cpp",
+        "torch_neuronx/csrc/core/dispatch/ParseLoweringResult.cpp",
+        "torch_neuronx/csrc/core/dispatch/PreprocessArgs.cpp",
+        "torch_neuronx/csrc/core/dispatch/StructuralComplexOps.cpp",
+        "torch_neuronx/csrc/utils/TypeConversion.cpp",
+        "torch_neuronx/csrc/distributed/NeuronBackend.cpp",
     ],
-    hdrs = ["torch_neuronx/csrc/core/NeuronBarrier.h"],
+    hdrs = [
+        "torch_neuronx/csrc/core/NeuronBarrier.h",
+        "torch_neuronx/csrc/core/NeuronOpsApi.h",
+        "torch_neuronx/csrc/core/cache/CacheKeyGenerator.h",
+        "torch_neuronx/csrc/core/dispatch/DispatchUtils.h",
+        "torch_neuronx/csrc/core/dispatch/DtypeUtils.h",
+        "torch_neuronx/csrc/core/dispatch/CpuFallback.h",
+        "torch_neuronx/csrc/core/dispatch/Int64Policy.h",
+        "torch_neuronx/csrc/core/dispatch/LoweringResult.h",
+        "torch_neuronx/csrc/core/dispatch/NeuronDispatcher.h",
+        "torch_neuronx/csrc/core/dispatch/NkiDispatcher.h",
+        "torch_neuronx/csrc/core/dispatch/OutputProcessing.h",
+        "torch_neuronx/csrc/core/dispatch/ParseLoweringResult.h",
+        "torch_neuronx/csrc/core/dispatch/PreprocessArgs.h",
+        "torch_neuronx/csrc/core/dispatch/StructuralComplexOps.h",
+        "torch_neuronx/csrc/utils/TypeConversion.h",
+        "torch_neuronx/csrc/distributed/NeuronBackend.h",
+        "torch_neuronx/csrc/distributed/DynamicCollectiveTiling.h",
+    ],
     copts = [
         "-DTORCH_API_INCLUDE_EXTENSION_H",
         "-fPIC",
@@ -492,6 +622,7 @@ cc_library(
         ":runtime",
         ":torch_neuronx_core",
         ":distributed",
+        ":rdma",
         "@nrt//:nrt",
         "@torch//:headers",
         "@torch//:runtime_headers",
@@ -545,7 +676,35 @@ cc_binary(
         "@torch//:libshm",
         # TODO(apoorvgu): Added for verification, remove this dummy dependency on real stableHLO use
         "@stablehlo//:stablehlo_ops",
+        # MLIR/torch-mlir symbols — needed so _mlir.so can link against _C.so
+        ":mlir_capi_deps",
     ],
+)
+
+# MLIR CAPI + torch-mlir Python bindings, kept as a separate cc_library
+# so the top-level _C.so binary stays modular.
+cc_library(
+    name = "mlir_capi_deps",
+    deps = [
+        "@llvm-project//mlir:CAPIIR",
+        "@llvm-project//mlir:CAPIAsync",
+        "@llvm-project//mlir:CAPIDebug",
+        "@llvm-project//mlir:CAPIInterfaces",
+        "@llvm-project//mlir:CAPITransforms",
+        "//third_party/torch-mlir:TorchMLIRBindingsPythonCore",
+        "//third_party/torch-mlir:TorchMLIRCAPI",
+        "//third_party/torch-mlir:TorchMLIRInitAll",
+        "//third_party/torch-mlir:AggregateCAPIForceLink",
+    ],
+)
+
+# Verify _C.so does not link device-optional libraries at build time.
+# libfabric must be loaded via dlopen, not linked (see RdmaManager.cc).
+sh_test(
+    name = "no_device_libs_test",
+    srcs = ["tests/no_device_libs.sh"],
+    args = ["$(location :_C.so)"],
+    data = [":_C.so"],
 )
 
 # Test suite target to run all C++ unit tests

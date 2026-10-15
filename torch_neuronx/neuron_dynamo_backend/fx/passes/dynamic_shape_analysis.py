@@ -7,14 +7,22 @@ as torch-neuronx requires static shapes for compilation.
 import logging
 
 import torch
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
+
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
+    NeuronFXPass,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class DynamicShapeAnalysis(PassBase):
-    def __init__(self):
-        super().__init__()
+class DynamicShapeAnalysis(NeuronFXPass):
+    """Reject FX graphs that contain symbolic dynamic dimensions.
+
+    Args:
+        state (NeuronFXPassState, optional): Shared state used for pass artifact dumping.
+            Defaults to ``None``.
+    """
 
     def _dynamic_shape_checker(self, gm: torch.fx.GraphModule) -> tuple[bool, str]:
         """Check for dynamic shapes in the FX graph and generate detailed error information.
@@ -35,7 +43,14 @@ class DynamicShapeAnalysis(PassBase):
         """
 
         def get_shape_env(gm: torch.fx.GraphModule):
-            """Extract ShapeEnv from GraphModule if it exists."""
+            """Extract the shape environment from an FX graph module.
+
+            Args:
+                gm (torch.fx.GraphModule): Graph module to inspect.
+
+            Returns:
+                object: Shape environment found on the graph or its fake tensors, or ``None``.
+            """
             # Check common locations for shape_env
             if hasattr(gm, "_shape_env"):
                 return gm._shape_env
@@ -94,22 +109,17 @@ class DynamicShapeAnalysis(PassBase):
         return True, "".join(error_parts)
 
     def call(self, gm: torch.fx.GraphModule) -> PassResult:
-        """Execute the dynamic shape analysis pass on the given GraphModule.
-
-        This is the main entry point for the pass that performs dynamic shape detection
-        and validation. The pass ensures that the FX graph contains only static shapes,
-        which is a requirement for torch-neuronx compilation.
+        """Reject dynamic dimensions in an FX graph module.
 
         Args:
-            gm (torch.fx.GraphModule): The FX graph module to analyze. This should be
-                a valid GraphModule that may contain shape environment information.
+            gm (torch.fx.GraphModule): FX graph module to analyze.
 
         Returns:
-            PassResult: A PassResult object indicating the outcome of the pass:
+            PassResult: Unmodified graph when no dynamic dimensions are found.
 
         Raises:
-            RuntimeError: If dynamic shapes are detected in the graph. The error message
-                contains detailed diagnostic information
+            RuntimeError: If the graph contains dynamic dimensions, with detailed
+                diagnostics and remediation guidance.
         """
         # Check dynamic shape here for error message consistency
         logger.debug("Running DynamicShapeAnalysis pass...")

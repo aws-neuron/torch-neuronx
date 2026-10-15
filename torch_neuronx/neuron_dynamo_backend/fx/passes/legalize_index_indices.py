@@ -14,8 +14,9 @@ import logging
 
 import torch
 from torch.fx import Node
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
 
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import NeuronFXPass
 from torch_neuronx.neuron_dynamo_backend.utils.fx_utils import _add_metadata_to_node
 
 logger = logging.getLogger(__name__)
@@ -26,17 +27,32 @@ _INDEX_OPS = {
 }
 
 
-class LegalizeIndexIndices(PassBase):
-    """Legalize indices in indexing ops (index and index_put).
+class LegalizeIndexIndices(NeuronFXPass):
+    """Legalize empty and negative indices in ``index`` and ``index_put`` operations.
 
-    - If any integer index has a 0-sized dimension, the op is a no-op:
-      index_put is replaced with its input tensor, index is replaced with
-      an empty tensor matching the expected output shape.
-    - Otherwise, normalizes negative integer indices to positive equivalents
-      via: idx = torch.where(idx < 0, idx + dim_size, idx)
+    Args:
+        state (NeuronFXPassState, optional): Shared FX-pass state used for artifact
+            dumping. Defaults to ``None``.
+
+    Note:
+        Replaces ``index_put`` with its input and ``index`` with an empty tensor when an
+        integer index has a zero-sized dimension. Otherwise, normalizes negative integer
+        indices when input fake-tensor metadata is available; indices whose input metadata is
+        absent are left unchanged.
     """
 
     def call(self, gm: torch.fx.GraphModule) -> PassResult:
+        """Legalize indexing nodes in an FX graph.
+
+        Args:
+            gm (torch.fx.GraphModule): FX graph module to update.
+
+        Returns:
+            PassResult: Graph module and whether any indexing node changed.
+
+        Raises:
+            ValueError: If required index or output fake-tensor metadata is missing.
+        """
         graph = gm.graph
         modified = False
 
@@ -119,6 +135,7 @@ class LegalizeIndexIndices(PassBase):
                     zero = graph.call_function(
                         torch.ops.aten.scalar_tensor.default,
                         args=(0,),
+                        kwargs={"dtype": idx_meta.dtype},
                     )
                     _add_metadata_to_node(zero, shape=(), dtype=idx_meta.dtype)
                     lt = graph.call_function(torch.ops.aten.lt.Tensor, args=(idx, zero))
@@ -126,6 +143,7 @@ class LegalizeIndexIndices(PassBase):
                     offset = graph.call_function(
                         torch.ops.aten.scalar_tensor.default,
                         args=(dim_size,),
+                        kwargs={"dtype": idx_meta.dtype},
                     )
                     _add_metadata_to_node(offset, shape=(), dtype=idx_meta.dtype)
                     shifted = graph.call_function(torch.ops.aten.add.Tensor, args=(idx, offset))

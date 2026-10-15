@@ -170,3 +170,35 @@ class TestThresholdEdgeCases:
         y_manual = torch.where(x > threshold, x, torch.tensor(value))
 
         torch.testing.assert_close(y_neuron.cpu(), y_manual, rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.parametrize("shape", [(32,), (8, 16)])
+    def test_threshold_backward_grad_input_variant(self, shape):
+        """Test aten::threshold_backward.grad_input dispatches to Neuron."""
+        torch.manual_seed(42)
+        grad_output = torch.randn(shape, device="neuron")
+        self_tensor = torch.randn(shape, device="neuron")
+        grad_input = torch.empty(shape, device="neuron")
+
+        with track_neuron_ops():
+            result = torch.ops.aten.threshold_backward.grad_input(
+                grad_output, self_tensor, 0.0, grad_input=grad_input
+            )
+        assert_op_runs_on_neuron("aten::threshold_backward")
+        expected = torch.ops.aten.threshold_backward(grad_output, self_tensor, 0.0)
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+        torch.testing.assert_close(grad_input.cpu(), expected.cpu())
+
+    @pytest.mark.parametrize("shape", [(32,), (8, 16)])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_threshold_out_variant(self, shape, dtype):
+        """Test aten::threshold.out accepts out= kwarg and produces correct results."""
+        x = torch.randn(shape, dtype=dtype, device="neuron")
+        out = torch.empty(shape, dtype=dtype, device="neuron")
+
+        with track_neuron_ops():
+            result = torch.ops.aten.threshold.out(x, threshold=0.0, value=0.0, out=out)
+            assert_op_runs_on_neuron("aten::threshold")
+
+        expected = torch.ops.aten.threshold(x, threshold=0.0, value=0.0)
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+        torch.testing.assert_close(out.cpu(), expected.cpu())

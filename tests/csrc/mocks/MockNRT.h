@@ -23,6 +23,7 @@ class MockNRT {
   MOCK_METHOD(void, nrt_close, ());
   MOCK_METHOD(NRT_STATUS, nrt_get_total_vnc_count, (uint32_t*));
   MOCK_METHOD(NRT_STATUS, nrt_get_visible_vnc_count, (uint32_t*));
+  MOCK_METHOD(NRT_STATUS, nrt_get_instance_info, (nrt_instance_info_t*, size_t));
 
   // Tensor management
   MOCK_METHOD(NRT_STATUS, nrt_tensor_allocate,
@@ -66,7 +67,10 @@ class MockNRT {
   MOCK_METHOD(NRT_STATUS, nrt_inspect_config_set_inspect_device_profile_mode,
               (nrt_inspect_config_t*, nrt_inspect_device_profile_mode_t));
   MOCK_METHOD(NRT_STATUS, nrt_inspect_config_set_output_dir, (nrt_inspect_config_t*, const char*));
+  MOCK_METHOD(NRT_STATUS, nrt_inspect_config_set_neff_cache_dir,
+              (nrt_inspect_config_t*, const char*));
   MOCK_METHOD(NRT_STATUS, nrt_inspect_begin_with_options, (nrt_inspect_config_t*));
+  MOCK_METHOD(NRT_STATUS, nrt_inspect_export, (uint32_t));
   MOCK_METHOD(NRT_STATUS, nrt_inspect_stop, ());
   // Barrier
   MOCK_METHOD(NRT_STATUS, nrt_barrier, (int32_t, uint32_t, uint32_t));
@@ -80,6 +84,9 @@ class MockNRT {
   MOCK_METHOD(NRT_STATUS, nrta_tensor_copy,
               (nrt_tensor_t*, uint64_t, nrt_tensor_t*, uint64_t, uint64_t, int, int, NRT_STATUS*,
                nrta_seq_t*));
+  MOCK_METHOD(NRT_STATUS, nrta_tensor_cast,
+              (const nrt_compute_tensor_t*, const nrt_compute_tensor_t*, uint64_t, int, int,
+               NRT_STATUS*, nrta_seq_t*));
   MOCK_METHOD(NRT_STATUS, nrta_is_completed, (nrta_seq_t, bool*));
   MOCK_METHOD(NRT_STATUS, nrta_event_register_seq_id_completion, (nrta_seq_t, int));
   MOCK_METHOD(NRT_STATUS, nrta_execute_schedule,

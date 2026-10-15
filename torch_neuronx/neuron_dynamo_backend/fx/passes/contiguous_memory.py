@@ -1,11 +1,18 @@
 """FX pass to ensure contiguous inputs for operations that require it."""
 
 import torch
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
+
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import NeuronFXPass
 
 
-class EnsureContiguousInputs(PassBase):
-    """Insert contiguous() before operations requiring contiguous memory layout."""
+class EnsureContiguousInputs(NeuronFXPass):
+    """Insert ``contiguous`` before split operations with noncontiguous inputs.
+
+    Args:
+        state (NeuronFXPassState, optional): Shared state used for pass artifact dumping.
+            Defaults to ``None``.
+    """
 
     def _is_contiguous(self, node: torch.fx.Node) -> bool:
         """Check if a node produces a contiguous tensor using FakeTensor metadata."""
@@ -18,6 +25,14 @@ class EnsureContiguousInputs(PassBase):
         return node.op == "placeholder"
 
     def call(self, graph_module: torch.fx.GraphModule) -> PassResult:
+        """Make inputs to supported split operations contiguous.
+
+        Args:
+            graph_module (torch.fx.GraphModule): FX graph module to update.
+
+        Returns:
+            PassResult: Graph module and whether a ``contiguous`` node was inserted.
+        """
         modified = False
         for node in graph_module.graph.nodes:
             # Match chunk and split operations

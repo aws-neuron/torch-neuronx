@@ -1,5 +1,7 @@
 import pytest
 import torch
+import torch.nn as nn
+import torch.nn.functional as functional
 
 import torch_neuronx
 from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
@@ -181,30 +183,160 @@ class TestSiluRegistration:
         dtypes, tensor shapes, sizes, and value ranges.
         """
 
-        def run_silu(device):
-            torch.manual_seed(0)
-            x = generate_test_input(input_shape, value_type, dtype=dtype)
-            x.retain_grad()
+        torch.manual_seed(0)
+        x_cpu = generate_test_input(input_shape, value_type, dtype=dtype).detach()
+        grad_output_cpu = torch.randn_like(x_cpu)
 
-            if device == "neuron":
-                x = x.to(device)
-                x.retain_grad()
-                # Track neuron ops only for neuron device
-                with track_neuron_ops():
-                    output = torch.nn.functional.silu(x)
-                    grad_output = torch.randn_like(output)
-                    output.backward(grad_output)
-            else:
-                output = torch.nn.functional.silu(x)
-                grad_output = torch.randn_like(output)
-                output.backward(grad_output)
+        # CPU reference
+        x_ref = x_cpu.clone().requires_grad_(True)
+        cpu_out = torch.nn.functional.silu(x_ref)
+        cpu_out.backward(grad_output_cpu)
+        cpu_grad = x_ref.grad
 
-            return output, x.grad
+        # Neuron
+        x_neuron = x_cpu.clone().to("neuron").requires_grad_(True)
+        with track_neuron_ops():
+            neuron_out = torch.nn.functional.silu(x_neuron)
+            neuron_out.backward(grad_output_cpu.to("neuron"))
+        neuron_grad = x_neuron.grad
 
-        # Run on both devices
-        neuron_output, neuron_grad = run_silu("neuron")
-        cpu_output, cpu_grad = run_silu("cpu")
-        assert neuron_output.dtype == dtype
-
+        assert neuron_out.dtype == dtype
         torch.testing.assert_close(neuron_grad.cpu(), cpu_grad, atol=atol, rtol=rtol)
         assert_op_runs_on_neuron("aten::silu_backward")
+
+    @pytest.mark.parametrize("shape", [(32,), (8, 16), (4, 8, 16)])
+    def test_silu_backward_grad_input_variant(self, shape):
+        """Test aten::silu_backward.grad_input dispatches to Neuron."""
+        torch.manual_seed(42)
+        grad_output = torch.randn(shape, device="neuron")
+        x = torch.randn(shape, device="neuron")
+        grad_input = torch.empty(shape, device="neuron")
+
+        with track_neuron_ops():
+            result = torch.ops.aten.silu_backward.grad_input(grad_output, x, grad_input=grad_input)
+        assert_op_runs_on_neuron("aten::silu_backward")
+
+        expected = torch.ops.aten.silu_backward(grad_output, x)
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+        torch.testing.assert_close(grad_input.cpu(), expected.cpu())
+
+
+# ============================================================================
+# Precision regression test for silu_backward fp32 upcast
+# Uses the same input distribution from isolate_silu_bwd.py that originally
+# exposed the precision issue. If someone removes the fp32 upcast, this test
+# will fail because Neuron bf16 error will exceed CPU bf16 error vs fp32.
+# ============================================================================
+
+
+def _fractional_ratio(target, baseline, reference):
+    """Compute error ratio: target_error / baseline_error relative to reference.
+
+    Returns how much worse target is compared to baseline, both measured
+    against reference (fp32 ground truth). Ratio <= 1.1 means target is
+    no worse than baseline.
+    """
+    err_baseline = (baseline.float() - reference.float()).norm().item()
+    err_target = (target.float() - reference.float()).norm().item()
+    return err_target / err_baseline if err_baseline > 0 else float("inf")
+
+
+@pytest.mark.skipif(torch_neuronx.device_count() == 0, reason="No Neuron devices available")
+class TestSiluBackwardPrecision:
+    """Regression tests ensuring silu_backward computes in fp32 internally.
+
+    These tests use the exact input distributions from the original accuracy
+    investigation (isolate_silu_bwd.py). The key insight: with bf16 silu_backward,
+    Neuron produces significantly worse gradients than CPU bf16 relative to fp32
+    ground truth. The fp32 upcast fix makes Neuron match CPU bf16 accuracy.
+    """
+
+    B, S, D, H = 1, 2048, 4096, 12288
+    MAX_RATIO = 1.1  # Neuron bf16 error must be <= 1.1x CPU bf16 error
+
+    @pytest.fixture(autouse=True)
+    def setup_weights(self):
+        """Fixed seed weights matching isolate_silu_bwd.py distribution."""
+        torch.manual_seed(42)
+        self.x_base = torch.normal(1e-6, 1e-6, (self.B, self.S, self.D))
+        self.w1_base = torch.normal(-0.81, 0.47, (self.H, self.D))
+        self.w3_base = torch.normal(-0.81, 0.47, (self.H, self.D))
+        self.w2_base = torch.normal(-0.81, 0.47, (self.D, self.H))
+
+    def _run_on(self, model_fn, dt, device):
+        """Run forward+backward, return weight grads and input grad."""
+        m, x = model_fn(dt, device)
+        x = x.detach().requires_grad_(True)
+        out = m(x)
+        out.sum().backward()
+        grads = {
+            n: p.grad.detach().cpu().float() for n, p in m.named_parameters() if p.grad is not None
+        }
+        grads["input"] = x.grad.detach().cpu().float()
+        return grads
+
+    def _assert_parity(self, model_fn, grad_names):
+        """Assert Neuron bf16 is no worse than CPU bf16 vs fp32 ground truth."""
+        ref = self._run_on(model_fn, torch.float32, "cpu")
+        cpu_bf16 = self._run_on(model_fn, torch.bfloat16, "cpu")
+        trn_bf16 = self._run_on(model_fn, torch.bfloat16, "neuron")
+
+        for name in grad_names:
+            ratio = _fractional_ratio(trn_bf16[name], cpu_bf16[name], ref[name])
+            assert ratio <= self.MAX_RATIO, (
+                f"g({name}): Neuron bf16 error is {ratio:.4f}x CPU bf16 error "
+                f"(max allowed {self.MAX_RATIO}x). "
+                f"silu_backward may not be upcasting to fp32."
+            )
+
+    def test_silu_w1_backward_precision(self):
+        """silu(w1(x)) — the core pattern in LLM MLP layers."""
+
+        def model_fn(dt, device):
+            m = nn.Sequential(nn.Linear(self.D, self.H, bias=False), nn.SiLU()).to(dt).to(device)
+            m[0].weight.data.copy_(self.w1_base.to(dt))
+            return m, self.x_base.to(dt).to(device)
+
+        self._assert_parity(model_fn, ["0.weight", "input"])
+
+    def test_gate_up_backward_precision(self):
+        """silu(w1(x)) * w3(x) — SwiGLU gate pattern."""
+
+        class GateUp(nn.Module):
+            def __init__(self, hidden_dim, intermediate_dim):
+                super().__init__()
+                self.w1 = nn.Linear(hidden_dim, intermediate_dim, bias=False)
+                self.w3 = nn.Linear(hidden_dim, intermediate_dim, bias=False)
+
+            def forward(self, x):
+                return functional.silu(self.w1(x)) * self.w3(x)
+
+        def model_fn(dt, device):
+            m = GateUp(self.D, self.H).to(dt).to(device)
+            m.w1.weight.data.copy_(self.w1_base.to(dt))
+            m.w3.weight.data.copy_(self.w3_base.to(dt))
+            return m, self.x_base.to(dt).to(device)
+
+        self._assert_parity(model_fn, ["w1.weight", "w3.weight", "input"])
+
+    def test_full_ff_backward_precision(self):
+        """w2(silu(w1(x)) * w3(x)) — full LLM feed-forward block."""
+
+        class FF(nn.Module):
+            def __init__(self, hidden_dim, intermediate_dim):
+                super().__init__()
+                self.w1 = nn.Linear(hidden_dim, intermediate_dim, bias=False)
+                self.w2 = nn.Linear(intermediate_dim, hidden_dim, bias=False)
+                self.w3 = nn.Linear(hidden_dim, intermediate_dim, bias=False)
+
+            def forward(self, x):
+                return self.w2(functional.silu(self.w1(x)) * self.w3(x))
+
+        def model_fn(dt, device):
+            m = FF(self.D, self.H).to(dt).to(device)
+            m.w1.weight.data.copy_(self.w1_base.to(dt))
+            m.w2.weight.data.copy_(self.w2_base.to(dt))
+            m.w3.weight.data.copy_(self.w3_base.to(dt))
+            return m, self.x_base.to(dt).to(device)
+
+        self._assert_parity(model_fn, ["w1.weight", "w2.weight", "w3.weight", "input"])

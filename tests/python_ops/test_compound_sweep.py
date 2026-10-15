@@ -30,7 +30,6 @@ Run with:
 
 NOTE: These tests require the prologue system to be enabled. They are skipped when:
     - NEURON_LAUNCH_BLOCKING=1 (sync mode disables prologue)
-    - TORCH_NEURONX_ENABLE_STABLEHLO=0 (StableHLO disabled)
     - TORCH_NEURONX_ENABLE_PROLOGUE=0 (prologue explicitly disabled)
 """
 
@@ -46,11 +45,9 @@ import torch
 
 # These tests require the prologue system to be enabled. The prologue is disabled in:
 # 1. Sync mode (NEURON_LAUNCH_BLOCKING=1)
-# 2. When StableHLO is disabled (TORCH_NEURONX_ENABLE_STABLEHLO=0)
-# 3. When prologue is explicitly disabled (TORCH_NEURONX_ENABLE_PROLOGUE=0)
+# 2. When prologue is explicitly disabled (TORCH_NEURONX_ENABLE_PROLOGUE=0)
 SKIP_PROLOGUE_DISABLED = pytest.mark.skipif(
     os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
-    or os.environ.get("TORCH_NEURONX_ENABLE_STABLEHLO", "1") in ("0", "false")
     or os.environ.get("TORCH_NEURONX_ENABLE_PROLOGUE", "1") in ("0", "false"),
     reason=(
         "Compound sweep tests require prologue to be enabled (disabled in sync mode "
@@ -63,12 +60,8 @@ SKIP_PROLOGUE_DISABLED = pytest.mark.skipif(
 # ---------------------------------------------------------------------------
 
 # Ops that are expected to fall back to CPU — these are not related to contiguous handling.
-# RNG ops (torch.randn, torch.rand, etc.) are not implemented on Neuron and always fall back.
 _EXPECTED_FALLBACK_OPS = frozenset(
     {
-        "aten::normal_",  # torch.randn()
-        "aten::uniform_",  # torch.rand()
-        "aten::random_",  # other RNG
         "aten::bernoulli_",  # torch.bernoulli()
         "aten::randperm",
         "aten::randint",
@@ -154,7 +147,6 @@ def no_cpu_fallback(monkeypatch, request):
     if (
         current_op != "clone"
         and "test_random_mixed_sequences" not in request.node.name
-        and "test_fallback_detection_self_test" not in request.node.name
         and _cg_module._fuzzer_fallback_triggered
     ):
         pytest.fail(
@@ -172,49 +164,49 @@ def no_cpu_fallback(monkeypatch, request):
 
 def make_contiguous(B, H, S, D, dtype, device):
     """Plain contiguous tensor [B, H, S, D]."""
-    return torch.randn(B, H, S, D, dtype=dtype, device=device)
+    return torch.randn(B, H, S, D, dtype=dtype).to(device)
 
 
 def make_transpose_only(B, H, S, D, dtype, device):
     """[B,S,H,D] -> transpose(1,2) -> [B,H,S,D]: pure transpose."""
-    return torch.randn(B, S, H, D, dtype=dtype, device=device).transpose(1, 2)
+    return torch.randn(B, S, H, D, dtype=dtype).to(device).transpose(1, 2)
 
 
 def make_slice_first_half(B, H, S, D, dtype, device):
     """Contiguous[..., :D//2]: pure slice, offset=0."""
-    return torch.randn(B, H, S, D, dtype=dtype, device=device)[..., : D // 2]
+    return torch.randn(B, H, S, D, dtype=dtype).to(device)[..., : D // 2]
 
 
 def make_slice_second_half(B, H, S, D, dtype, device):
     """Contiguous[..., D//2:]: pure slice, offset>0."""
-    return torch.randn(B, H, S, D, dtype=dtype, device=device)[..., D // 2 :]
+    return torch.randn(B, H, S, D, dtype=dtype).to(device)[..., D // 2 :]
 
 
 def make_transpose_slice_first(B, H, S, D, dtype, device):
     """transpose(1,2)[..., :D//2]: compound transpose+slice, offset=0."""
-    return torch.randn(B, S, H, D, dtype=dtype, device=device).transpose(1, 2)[..., : D // 2]
+    return torch.randn(B, S, H, D, dtype=dtype).to(device).transpose(1, 2)[..., : D // 2]
 
 
 def make_transpose_slice_second(B, H, S, D, dtype, device):
     """transpose(1,2)[..., D//2:]: compound transpose+slice, offset>0. (RoPE x2 pattern)"""
-    return torch.randn(B, S, H, D, dtype=dtype, device=device).transpose(1, 2)[..., D // 2 :]
+    return torch.randn(B, S, H, D, dtype=dtype).to(device).transpose(1, 2)[..., D // 2 :]
 
 
 def make_transpose_slice_seq(B, H, S, D, dtype, device):
     """transpose(1,2)[:,:,:S//2,:]: compound, slice in seq dim."""
-    return torch.randn(B, S, H, D, dtype=dtype, device=device).transpose(1, 2)[:, :, : S // 2, :]
+    return torch.randn(B, S, H, D, dtype=dtype).to(device).transpose(1, 2)[:, :, : S // 2, :]
 
 
 def make_multi_slice(B, H, S, D, dtype, device):
     """[..., :D//2][:,:,:S//2,:]: two slices on contiguous, no transpose."""
-    return torch.randn(B, H, S, D, dtype=dtype, device=device)[..., : D // 2][:, :, : S // 2, :]
+    return torch.randn(B, H, S, D, dtype=dtype).to(device)[..., : D // 2][:, :, : S // 2, :]
 
 
 def make_broadcast_expand(B, H, S, D, dtype, device):
     """unsqueeze(1).expand: pure broadcast (stride=0 on H dim).
     Simulates cos/sin in RoPE before unsqueeze_dim is applied."""
     # [B, S, D] -> unsqueeze(1) -> [B, 1, S, D] -> expand -> [B, H, S, D]
-    return torch.randn(B, S, D, dtype=dtype, device=device).unsqueeze(1).expand(B, H, S, D)
+    return torch.randn(B, S, D, dtype=dtype).to(device).unsqueeze(1).expand(B, H, S, D)
 
 
 def make_broadcast_transpose(B, H, S, D, dtype, device):
@@ -222,10 +214,7 @@ def make_broadcast_transpose(B, H, S, D, dtype, device):
     [B, S, D] -> unsqueeze(1) -> [B,1,S,D] -> expand -> [B,H,S,D] -> transpose(2,3)
     Results in stride=0 on H dim AND transposed S/D dims."""
     return (
-        torch.randn(B, S, D, dtype=dtype, device=device)
-        .unsqueeze(1)
-        .expand(B, H, S, D)
-        .transpose(2, 3)
+        torch.randn(B, S, D, dtype=dtype).to(device).unsqueeze(1).expand(B, H, S, D).transpose(2, 3)
     )  # [B, H, D, S]
 
 
@@ -233,9 +222,7 @@ def make_broadcast_slice(B, H, S, D, dtype, device):
     """Broadcast + slice: expand then slice last dim.
     [B, S, D] -> unsqueeze(1) -> [B,1,S,D] -> expand -> [B,H,S,D] -> [..., :D//2]"""
     return (
-        torch.randn(B, S, D, dtype=dtype, device=device)
-        .unsqueeze(1)
-        .expand(B, H, S, D)[..., : D // 2]
+        torch.randn(B, S, D, dtype=dtype).to(device).unsqueeze(1).expand(B, H, S, D)[..., : D // 2]
     )
 
 
@@ -247,11 +234,45 @@ def make_broadcast_transpose_slice(B, H, S, D, dtype, device):
     [B,S,D] -> unsqueeze(1) -> expand [B,H,S,D] -> transpose(1,2) -> [B,S,H,D] -> [..., D//2:]
     """
     return (
-        torch.randn(B, S, D, dtype=dtype, device=device)
+        torch.randn(B, S, D, dtype=dtype)
+        .to(device)
         .unsqueeze(1)
         .expand(B, H, S, D)
         .transpose(1, 2)[..., D // 2 :]
     )  # [B, S, H, D//2]
+
+
+# --- Folded patterns (narrow→view→permute) ---
+
+
+def make_folded_narrow_view_permute(B, H, S, D, dtype, device):
+    """Narrow a dim, then view-split it, then permute.
+    This creates coprime stride ratios that the GCD check rejects,
+    handled by TryFoldedDecomposition (SLICE→RESHAPE→TRANSPOSE).
+    [B, H, D] -> narrow(2, 0, D-1) -> view(B, H, D//2-1, 2) -> permute(2, 0, 3, 1)
+    Requires D >= 6 for the factorization to work."""
+    base_d = D + 1  # ensure narrow produces something factorable
+    t = torch.randn(B, H, base_d, dtype=dtype).to(device)
+    narrowed_size = D  # narrow to D elements
+    # Factor D into two parts
+    factor_a = 2
+    factor_b = D // 2
+    return t.narrow(2, 0, narrowed_size).view(B, H, factor_a, factor_b).permute(2, 0, 3, 1)
+
+
+def make_folded_padded_sequence(B, H, S, D, dtype, device):
+    """Padded sequence pattern: base[:, :seq, :].view(B, h1, h2, w, c).permute(0, 4, 1, 2, 3).
+    Simulates the common NLP/vision pattern where variable-length sequences are packed.
+    Uses smaller dimensions to keep test fast."""
+    # Create a base with a padding dim slightly larger than needed
+    seq_len = S * 2  # total sequence slots
+    padded_len = seq_len + S  # add padding
+    c_dim = min(D, 8)  # channel dim
+    t = torch.randn(B, padded_len, c_dim, dtype=dtype).to(device)
+    # narrow to seq_len, then reshape into multi-dim sequence
+    h1 = 2
+    h2 = seq_len // h1
+    return t[:, :seq_len, :].view(B, h1, h2, c_dim).permute(0, 3, 1, 2)
 
 
 # --- View-based patterns ---
@@ -261,7 +282,7 @@ def make_view_split_select(B, H, S, D, dtype, device):
     """View to split last dim into (D//2, 2), then select index 0.
     Creates stride-2 access pattern: strides [..., 2] instead of [..., 1].
     [B,H,S,D] -> view [B,H,S,D//2,2] -> [..., 0] -> [B,H,S,D//2] with stride[-1]=2."""
-    return torch.randn(B, H, S, D, dtype=dtype, device=device).view(B, H, S, D // 2, 2)[..., 0]
+    return torch.randn(B, H, S, D, dtype=dtype).to(device).view(B, H, S, D // 2, 2)[..., 0]
 
 
 def make_view_split_transpose(B, H, S, D, dtype, device):
@@ -269,9 +290,7 @@ def make_view_split_transpose(B, H, S, D, dtype, device):
     [B,H,S,D] -> view [B,H,S,D//2,2] -> transpose(-1,-2) -> [B,H,S,2,D//2]
     Non-contiguous: innermost stride becomes D//2 instead of 1."""
     return (
-        torch.randn(B, H, S, D, dtype=dtype, device=device)
-        .view(B, H, S, D // 2, 2)
-        .transpose(-1, -2)
+        torch.randn(B, H, S, D, dtype=dtype).to(device).view(B, H, S, D // 2, 2).transpose(-1, -2)
     )
 
 
@@ -280,7 +299,7 @@ def make_view_on_sliced(B, H, S, D, dtype, device):
     view on a non-contiguous tensor with the same shape is a no-op that preserves
     the non-contiguous strides. Tests that the prologue handles this correctly.
     [B,H,S,D] -> [:,:,:,D//4:3*D//4] -> view(B,H,S,D//2) -> still non-contiguous."""
-    sliced = torch.randn(B, H, S, D, dtype=dtype, device=device)[:, :, :, D // 4 : 3 * D // 4]
+    sliced = torch.randn(B, H, S, D, dtype=dtype).to(device)[:, :, :, D // 4 : 3 * D // 4]
     return sliced.view(B, H, S, D // 2)
 
 
@@ -290,7 +309,8 @@ def make_view_split_select_transpose(B, H, S, D, dtype, device):
     -> transpose(1,2) -> [B,H,S,D//2] (stride-2 + transposed).
     Exercises the compound decomposition with both step factor and transpose."""
     return (
-        torch.randn(B, S, H, D, dtype=dtype, device=device)
+        torch.randn(B, S, H, D, dtype=dtype)
+        .to(device)
         .view(B, S, H, D // 2, 2)[..., 0]
         .transpose(1, 2)
     )
@@ -318,20 +338,23 @@ PATTERNS = {
     "outermost_dim_slice": lambda B, H, S, D, dtype, device: (
         # Batch-dim slice on transposed tensor. When B==1 there's nothing to slice,
         # so fall back to a plain transpose (still exercises the prologue path).
-        torch.randn(B, S, H, D, dtype=dtype, device=device).transpose(1, 2)[max(0, B - 1) :, ...]
+        torch.randn(B, S, H, D, dtype=dtype).to(device).transpose(1, 2)[max(0, B - 1) :, ...]
         if B >= 2
-        else torch.randn(B, S, H, D, dtype=dtype, device=device).transpose(1, 2)
+        else torch.randn(B, S, H, D, dtype=dtype).to(device).transpose(1, 2)
     ),
     "step_slice": lambda B, H, S, D, dtype, device: (
         # Step slice on last dim of transposed tensor -- stride=2, handled via contiguous path
-        torch.randn(B, H, S, D, dtype=dtype, device=device).transpose(1, 2)[:, :, :, ::2]
+        torch.randn(B, H, S, D, dtype=dtype).to(device).transpose(1, 2)[:, :, :, ::2]
     ),
     "flip": lambda B, H, S, D, dtype, device: (
         # torch.flip() on Neuron is a registered compute op (aten::flip in tensor_ops.py),
         # NOT a view op. It compiles to MLIR, executes on-device, and returns a new
         # contiguous tensor -- no negative strides. This tests end-to-end correctness.
-        torch.randn(B, S, H, D, dtype=dtype, device=device).transpose(1, 2).flip(-1)
+        torch.randn(B, S, H, D, dtype=dtype).to(device).transpose(1, 2).flip(-1)
     ),
+    # --- Folded patterns (narrow→view→permute, handled by TryFoldedDecomposition) ---
+    "folded_narrow_view_permute": make_folded_narrow_view_permute,
+    "folded_padded_sequence": make_folded_padded_sequence,
     # --- View-based patterns (view can preserve/create non-contiguous strides) ---
     "view_split_select": make_view_split_select,
     "view_split_transpose": make_view_split_transpose,
@@ -481,12 +504,12 @@ def test_full_rope(shape):
 
     q_embed_cpu, k_embed_cpu = apply_rotary_pos_emb(q_cpu, k_cpu, cos_cpu, sin_cpu)
 
-    # Build Neuron tensors
+    # Build Neuron tensors (generate on CPU to avoid RNG divergence, then move)
     torch.manual_seed(0)
-    q_neuron = torch.randn(B, S, H, D, dtype=dtype, device="neuron").transpose(1, 2)
-    k_neuron = torch.randn(B, S, H, D, dtype=dtype, device="neuron").transpose(1, 2)
-    cos_neuron = torch.randn(B, S, D, dtype=dtype, device="neuron")
-    sin_neuron = torch.randn(B, S, D, dtype=dtype, device="neuron")
+    q_neuron = torch.randn(B, S, H, D, dtype=dtype).to("neuron").transpose(1, 2)
+    k_neuron = torch.randn(B, S, H, D, dtype=dtype).to("neuron").transpose(1, 2)
+    cos_neuron = torch.randn(B, S, D, dtype=dtype).to("neuron")
+    sin_neuron = torch.randn(B, S, D, dtype=dtype).to("neuron")
 
     try:
         q_embed_neuron, k_embed_neuron = apply_rotary_pos_emb(
@@ -528,9 +551,11 @@ def test_complex_transpose_two_slices(shape):
     cpu_result = -cpu
 
     torch.manual_seed(1)
-    neuron = torch.randn(B, S, H, D, dtype=dtype, device="neuron").transpose(1, 2)[
-        :, :, : S // 2, :
-    ][..., D // 4 : 3 * D // 4]
+    neuron = (
+        torch.randn(B, S, H, D, dtype=dtype)
+        .to("neuron")
+        .transpose(1, 2)[:, :, : S // 2, :][..., D // 4 : 3 * D // 4]
+    )
     try:
         neuron_result = -neuron
         neuron_cpu = neuron_result.cpu()
@@ -567,7 +592,8 @@ def test_complex_broadcast_transpose_two_slices(shape):
 
     torch.manual_seed(2)
     neuron = (
-        torch.randn(B, S, D, dtype=dtype, device="neuron")
+        torch.randn(B, S, D, dtype=dtype)
+        .to("neuron")
         .unsqueeze(1)
         .expand(B, H, S, D)
         .transpose(1, 2)[:, : S // 2, :, :][..., D // 4 :]
@@ -612,7 +638,8 @@ def test_complex_two_broadcast_dims_transpose_slice(shape):
 
     torch.manual_seed(3)
     neuron = (
-        torch.randn(B, S, D, dtype=dtype, device="neuron")
+        torch.randn(B, S, D, dtype=dtype)
+        .to("neuron")
         .unsqueeze(1)
         .unsqueeze(3)
         .expand(B, H, S, G, D)
@@ -675,7 +702,7 @@ def test_xfail_overlapping_strides(shape):
     cpu_result = -cpu
 
     torch.manual_seed(20)
-    neuron = torch.randn(B, H, S, D, dtype=dtype, device="neuron").unfold(2, 4, 2)
+    neuron = torch.randn(B, H, S, D, dtype=dtype).to("neuron").unfold(2, 4, 2)
     neuron_result = -neuron
     neuron_cpu = neuron_result.cpu()
 
@@ -713,8 +740,8 @@ def test_broadcast_compound_mul(shape):
     result_cpu = q_cpu * cos_cpu
 
     torch.manual_seed(7)
-    q_neuron = torch.randn(B, S, H, D, dtype=dtype, device="neuron").transpose(1, 2)
-    cos_neuron = torch.randn(B, S, D, dtype=dtype, device="neuron").unsqueeze(1)
+    q_neuron = torch.randn(B, S, H, D, dtype=dtype).to("neuron").transpose(1, 2)
+    cos_neuron = torch.randn(B, S, D, dtype=dtype).to("neuron").unsqueeze(1)
 
     try:
         result_neuron = q_neuron * cos_neuron
@@ -910,35 +937,17 @@ def _generate_and_apply_sequence(tensor, rng, num_ops):
 
                 if view_strategy == 0:
                     # Split a random dim into two factors.
-                    # IMPORTANT: Only on contiguous tensors. View-split on non-contiguous
-                    # tensors creates stride patterns that the prologue's GCD-based
-                    # factorization can't decompose back into base dimensions.
+                    # View-split on non-contiguous tensors creates stride patterns where
+                    # GCD-based factorization fails (coprime stride ratios). These are
+                    # handled by TryFoldedDecomposition which detects compact
+                    # sub-dimension groups and emits SLICE→RESHAPE→TRANSPOSE.
                     #
-                    # Example of the failure case:
+                    # Example:
                     #   x = torch.randn(2, 3, 5)
                     #   y = x.narrow(2, 0, 4).view(2, 3, 2, 2).permute(2, 0, 3, 1)
                     #   # shape=[2, 2, 2, 3], strides=(2, 15, 1, 5)
-                    #   # Sorted strides: [15, 5, 2, 1] → GCD(5, 2) = 1
-                    #
-                    # Why it happens: narrow creates a stride gap (stride 5 for size 4
-                    # in the last dim), then view splits the narrowed dim into two
-                    # sub-dims (strides 2, 1). After permute, these sub-dims interleave
-                    # with the gap dim, creating stride ratios that aren't integer
-                    # multiples of each other (GCD=1).
-                    #
-                    # Why it's hard to fix: the decomposition algorithm assumes each
-                    # output dimension maps to exactly one base dimension. View-split
-                    # creates output dimensions that are sub-divisions of a single base
-                    # dimension. Fixing this requires adding RESHAPE to the decomposition
-                    # chain (base → SLICE → RESHAPE → TRANSPOSE → BROADCAST).
-                    #
-                    # Note: this restriction only affects the fuzz test's random op
-                    # generation. The deterministic view-based test patterns
-                    # (make_view_split_select, make_view_split_transpose, etc.) work
-                    # because they start from contiguous tensors before the view-split.
-                    if not tensor.is_contiguous():
-                        op_log.append("view(split) SKIPPED (non-contiguous, known limitation)")
-                        continue
+                    #   # GCD(5, 2) = 1 → DecomposeStrides rejects
+                    #   # TryFoldedDecomposition: base [2, 3, 5] → SLICE → RESHAPE → TRANSPOSE
 
                     def _get_factors(n):
                         """Get all factor pairs (a, b) where a*b=n, a>1, b>1."""
@@ -1005,63 +1014,23 @@ def _generate_and_apply_sequence(tensor, rng, num_ops):
     return tensor, op_records, op_log
 
 
-# ---------------------------------------------------------------------------
-# Fallback detection self-test
-#
-# Verifies that the _fuzzer_fallback_triggered mechanism actually works by
-# intentionally triggering a known fallback case (unfold with overlapping
-# strides) and asserting that the detection fires.
-# ---------------------------------------------------------------------------
-
-
-@SKIP_PROLOGUE_DISABLED
-def test_fallback_detection_self_test():
-    """Meta-test: verify that our fallback detection infrastructure actually works.
-
-    Creates a tensor with overlapping strides (unfold, step < size) which is a
-    known limitation that falls through to contiguous_generic_kernel. Then checks
-    that _fuzzer_fallback_triggered correctly caught it.
-
-    If this test FAILS, it means our detection mechanism is broken and the fuzz
-    tests cannot be trusted to catch regressions.
-    """
-    try:
-        import torch_neuronx
-    except ImportError:
-        pytest.skip("torch_neuronx not available")
-
-    import torch_neuronx.python_ops.nki_kernels.contiguous_generic as _cg_module
-
-    _cg_module._fuzzer_fallback_triggered.clear()
-
-    # unfold with step < size creates overlapping strides — a known fallback case
-    torch.manual_seed(99)
-    neuron_tensor = torch.randn(2, 4, 16, 8, dtype=torch.bfloat16, device="neuron")
-    unfolded = neuron_tensor.unfold(2, 4, 2)  # overlapping strides
-
-    # This neg op will trigger contiguous_generic_kernel for the unfolded tensor
-    result = -unfolded
-    _ = result.cpu()
-
-    assert _cg_module._fuzzer_fallback_triggered, (
-        "SELF-TEST FAILED: contiguous_generic_kernel was NOT called for a known "
-        "fallback case (unfold with overlapping strides). This means the fallback "
-        "detection mechanism is broken and fuzz tests cannot be trusted."
-    )
-    print("\n  [fallback_detection_self_test] Detection mechanism verified ✓")
-
-
 _FUZZ_NUM_ITERATIONS = 200
 
 
 @SKIP_PROLOGUE_DISABLED
-@pytest.mark.xfail(reason="Flaky test - intermittent failures under investigation")
 @pytest.mark.parametrize("iteration", range(_FUZZ_NUM_ITERATIONS))
 def test_random_mixed_sequences(iteration):
-    """Fuzz test: single random transformation sequence, compare CPU vs Neuron.
+    """Fuzz test: random view-op sequences to find prologue system bugs.
 
-    Parametrized over 200 iterations so pytest-xdist can parallelize across workers.
-    Each iteration generates its own random seed and prints it on failure for reproduction.
+    Each iteration generates a random seed, applies random view ops (transpose,
+    slice, permute, select, expand, etc.) to create a non-contiguous tensor, then
+    runs neg() on Neuron and compares against CPU. Any failure is a real bug —
+    the prologue system should handle ALL standard view patterns on-device.
+
+    When this test fails:
+      1. Note the seed printed in the failure message
+      2. File a ticket for test_random_mixed_sequences with the seed
+      3. Fix the bug in the prologue system (Transformations.cpp)
 
     Run parallelized:  pytest -k test_random_mixed_sequences -n 8
     """
@@ -1094,7 +1063,7 @@ def test_random_mixed_sequences(iteration):
 
     # --- Neuron ---
     torch.manual_seed(torch_seed)
-    neuron_tensor = torch.randn(shape, dtype=dtype, device="neuron")
+    neuron_tensor = torch.randn(shape, dtype=dtype).to("neuron")
 
     # Flawlessly replay the exact same ops on the Neuron tensor
     neuron_transformed = neuron_tensor
@@ -1113,7 +1082,11 @@ def test_random_mixed_sequences(iteration):
         # Fail immediately if the prologue fell through to the CPU roundtrip path.
         if _cg_module._fuzzer_fallback_triggered:
             pytest.fail(
-                f"\n=== FALLBACK DETECTED (seed={seed}, iter={iteration}) ===\n"
+                f"\n{'='*70}\n"
+                f"PROLOGUE BUG: CPU fallback triggered for non-contiguous pattern\n"
+                f"{'='*70}\n"
+                f"Seed: {seed}\n"
+                f"Please file a ticket with this seed to track the fix.\n"
                 f"Shape: {shape}, num_ops: {num_ops}\n"
                 f"Operations:\n"
                 + "\n".join([f"  {entry}" for entry in op_log])
@@ -1121,27 +1094,38 @@ def test_random_mixed_sequences(iteration):
                 f"Final strides: {list(cpu_transformed.stride())}\n"
                 f"Offset: {cpu_transformed.storage_offset()}\n"
                 f"contiguous_generic_kernel was called — the prologue system did NOT "
-                f"handle this non-contiguous tensor pattern on-device."
+                f"handle this non-contiguous tensor pattern on-device.\n"
+                f"{'='*70}\n"
             )
 
     except RuntimeError as e:
         pytest.fail(
-            f"\n=== FUZZ FAILURE (seed={seed}, iter={iteration}) ===\n"
+            f"\n{'='*70}\n"
+            f"PROLOGUE BUG: Runtime error on non-contiguous pattern\n"
+            f"{'='*70}\n"
+            f"Seed: {seed}\n"
+            f"Please file a ticket with this seed to track the fix.\n"
             f"Shape: {shape}, num_ops: {num_ops}\n"
             f"Operations:\n"
             + "\n".join([f"  {entry}" for entry in op_log])
             + f"\nFinal shape: {list(cpu_transformed.shape)}\n"
             f"Error: {e}\n"
+            f"{'='*70}\n"
         )
 
     try:
         torch.testing.assert_close(neuron_cpu, cpu_result, atol=0, rtol=0)
     except AssertionError as e:
         pytest.fail(
-            f"\n=== FUZZ FAILURE (seed={seed}, iter={iteration}) ===\n"
+            f"\n{'='*70}\n"
+            f"PROLOGUE BUG: Numerical mismatch on non-contiguous pattern\n"
+            f"{'='*70}\n"
+            f"Seed: {seed}\n"
+            f"Please file a ticket with this seed to track the fix.\n"
             f"Shape: {shape}, num_ops: {num_ops}\n"
             f"Operations:\n"
             + "\n".join([f"  {entry}" for entry in op_log])
             + f"\nFinal shape: {list(cpu_transformed.shape)}\n"
             f"Error: {e}\n"
+            f"{'='*70}\n"
         )

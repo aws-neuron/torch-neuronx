@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <cstdlib>
 #include <filesystem>
@@ -20,7 +21,12 @@ class CompilerDebugUtilsTest : public ::testing::Test {
   void TearDown() override {
     unsetenv("TORCH_NEURONX_DUMP");
     unsetenv("TORCH_NEURONX_DUMP_HLO_PB");
-    std::filesystem::remove_all(test_dir_);
+
+    if (!test_dir_.empty() && std::filesystem::exists(test_dir_)) {
+      // Use system command instead of std::filesystem::remove_all to avoid hang
+      std::string cmd = "rm -rf " + test_dir_;
+      std::system(cmd.c_str());
+    }
   }
 
   std::string test_dir_;
@@ -122,5 +128,6 @@ TEST_F(CompilerDebugUtilsTest, DumpIRDetailsHashesLongCacheKey) {
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
+  int result = RUN_ALL_TESTS();
+  _exit(result);
 }

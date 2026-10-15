@@ -19,4 +19,5 @@ def _nrt_extension_impl(module_ctx):
 
 nrt_extension = module_extension(
     implementation = _nrt_extension_impl,
+    environ = ["NRT_LOCAL_PATH"],
 )

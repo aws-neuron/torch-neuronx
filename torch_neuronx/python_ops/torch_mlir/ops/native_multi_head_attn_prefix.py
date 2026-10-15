@@ -16,18 +16,21 @@ def compute_prefix(
     *,
     out=None,
 ):
-    """
-    QKV projection and transformation to multi-head format.
+    """Project query, key, and value tensors into attention heads.
 
     Args:
-        query, key, value: (batch, seq_len, d_model)
-        qkv_weight: (3*d_model, d_model)
-        qkv_bias: (3*d_model,)
-        num_heads: number of attention heads
-        out: output tensor (excluded from tracing)
+        query (torch.Tensor): Query tensor shaped ``(batch, seq_len, d_model)``.
+        key (torch.Tensor): Key tensor shaped ``(batch, seq_len, d_model)``.
+        value (torch.Tensor): Value tensor shaped ``(batch, seq_len, d_model)``.
+        qkv_weight (torch.Tensor): Projection weight shaped ``(3 * d_model, d_model)``.
+        qkv_bias (torch.Tensor): Projection bias shaped ``(3 * d_model,)``.
+        num_heads (int): Number of attention heads.
+        out (torch.Tensor | None, optional): Unused output placeholder excluded from tracing.
+            Defaults to ``None``.
 
     Returns:
-        q, k, v: (batch, num_heads, d_head, seq_len)
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Query, key, and value tensors
+            shaped ``(batch, num_heads, d_head, seq_len)``.
     """
     b, t, d_model = query.shape
     d_head = d_model // num_heads
@@ -50,6 +53,14 @@ def compute_prefix(
 
     # Split heads and transpose: [b, t, d_model] -> [b, num_heads, d_head, seq_len]
     def split_heads(x):
+        """Reshape and permute one projection into attention heads.
+
+        Args:
+            x (torch.Tensor): Projection shaped ``(batch, seq_len, d_model)``.
+
+        Returns:
+            torch.Tensor: Projection shaped ``(batch, num_heads, d_head, seq_len)``.
+        """
         x = x.reshape(b, t, num_heads, d_head)  # [b, t, h, d_h]
         x = x.permute(0, 2, 3, 1)  # [b, h, d_h, t]
         return x
@@ -58,7 +69,11 @@ def compute_prefix(
 
 
 class NativeMultiHeadAttnPrefixMLIRImpl(OperationImplementation):
-    """MLIR implementation of prefix operation"""
+    """Implement the attention-prefix projection with Torch-MLIR.
+
+    Args:
+        op_name (str): Operation name used to compile the kernel.
+    """
 
     def __init__(self, op_name: str):
         self.kernel = TorchMlirKernel(
@@ -70,6 +85,19 @@ class NativeMultiHeadAttnPrefixMLIRImpl(OperationImplementation):
         self.op_name = op_name
 
     def can_handle(self, *args, **kwargs) -> bool:
+        """Check whether the attention-prefix arguments satisfy kernel constraints.
+
+        Args:
+            *args (Any): Five query, key, value, weight, and bias tensors.
+            **kwargs (Any): Options including ``num_heads``.
+
+        Returns:
+            bool: ``True`` for compatible ranks, shapes, head counts, and tensors on a
+                Neuron device.
+
+        Raises:
+            RuntimeError: If a non-scalar tensor is not on a Neuron device.
+        """
         if not super().can_handle(*args, **kwargs):
             return False
 

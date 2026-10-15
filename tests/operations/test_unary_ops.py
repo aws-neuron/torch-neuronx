@@ -402,7 +402,7 @@ class TestUnaryOps:
         result = torch.nn.functional.gelu(neuron_input)
         assert result.device.type == "neuron"
 
-        # JAX may handle infinities differently than PyTorch
+        # Backend may handle infinities differently than PyTorch
         # For now, just check that the computation doesn't crash
         # and that NaN input produces NaN output
         assert torch.isnan(result.cpu()[2])  # gelu(nan) = nan
@@ -1216,3 +1216,23 @@ class TestUnaryOps:
 
         # All should produce the same result
         torch.testing.assert_close(result1.cpu(), result2.cpu(), rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.skipif(
+        not use_mlir_aten_ops(), reason="aten::softplus only supported using dynamo decompositions"
+    )
+    @pytest.mark.parametrize("shape", [(32,), (8, 16), (2, 3, 4)])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_softplus_out_variant(self, device, shape, dtype):
+        """Test aten::softplus.out accepts out= kwarg and produces correct results."""
+        x = torch.randn(shape, dtype=dtype, device=device)
+        out = torch.empty(shape, dtype=dtype, device=device)
+
+        with track_neuron_ops():
+            result = torch.ops.aten.softplus.out(x, beta=1, threshold=20, out=out)
+            assert_op_runs_on_neuron("aten::softplus")
+
+        expected = torch.ops.aten.softplus(x)
+        rtol = 1e-3 if dtype == torch.float16 else 1e-4
+        atol = 1e-3 if dtype == torch.float16 else 1e-4
+        torch.testing.assert_close(result.cpu(), expected.cpu(), rtol=rtol, atol=atol)
+        torch.testing.assert_close(out.cpu(), expected.cpu(), rtol=rtol, atol=atol)

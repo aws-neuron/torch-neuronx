@@ -25,21 +25,6 @@ TEST(ServiceProtocolTest, CompileRequestRoundTrip) {
   EXPECT_EQ(decoded.additional_args, "--model-type transformer --auto-cast=none");
 }
 
-TEST(ServiceProtocolTest, CompileRequestIrTypeXLA) {
-  CompileRequest req;
-  req.req_id = 1;
-  req.hlo_file_path = "/tmp/hlo_collective.pb";
-  req.ir_type = "XLA";
-  req.optimization_level = "-O1";
-  req.additional_args = "";
-
-  auto bytes = req.Serialize();
-  auto decoded = CompileRequest::Deserialize(bytes.data(), bytes.size());
-  EXPECT_EQ(decoded.ir_type, "XLA");
-  EXPECT_EQ(decoded.optimization_level, "-O1");
-  EXPECT_TRUE(decoded.additional_args.empty());
-}
-
 TEST(ServiceProtocolTest, CompileResponseRoundTrip) {
   CompileResponse resp;
   resp.req_id = 99;
@@ -78,7 +63,7 @@ TEST(ServiceProtocolTest, SocketSendRecvPair) {
   CompileRequest req;
   req.req_id = 123;
   req.hlo_file_path = "/tmp/test.pb";
-  req.ir_type = "XLA";
+  req.ir_type = "StableHLO";
   req.optimization_level = "-O1";
   req.additional_args = "--model-type transformer";
   auto payload = req.Serialize();

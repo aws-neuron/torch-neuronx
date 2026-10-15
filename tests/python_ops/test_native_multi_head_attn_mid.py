@@ -318,7 +318,7 @@ class TestNativeMultiHeadAttnMid:
         assert attn_output.shape == (batch_size, num_heads, seq_len, d_head)
 
     @patch(
-        "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+        "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
         wraps=convert_fx_to_stablehlo,
     )
     def test_mid_attn_ir_cache_correctness(self, mock_compiler):
@@ -351,7 +351,7 @@ class TestNativeMultiHeadAttnMid:
         _hlo_cache_mod._enabled = _orig_enabled
 
     @patch(
-        "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+        "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
         wraps=convert_fx_to_stablehlo,
     )
     def test_mid_attn_ir_cache_different_inputs_same_shape(self, mock_compiler):
@@ -400,7 +400,7 @@ class TestNativeMultiHeadAttnMid:
         _hlo_cache_mod._enabled = _orig_enabled
 
     @patch(
-        "torch_neuronx.python_ops.torch_mlir.kernel.convert_fx_to_stablehlo",
+        "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
         wraps=convert_fx_to_stablehlo,
     )
     def test_mid_attn_ir_cache_different_shapes(self, mock_compiler):

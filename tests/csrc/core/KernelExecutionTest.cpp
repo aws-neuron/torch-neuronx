@@ -1,19 +1,43 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <cstdlib>
+#include <future>
+#include <mutex>
 #include <vector>
 
+#include "tests/csrc/mocks/MockKernelExecution.h"
+#include "tests/csrc/mocks/MockNRT.h"
+#include "tests/csrc/mocks/MockOperationExecutionEngine.h"
 #include "tests/csrc/utils/TestUtils.h"
 #include "torch_neuronx/csrc/c10/neuron/NeuronEvent.h"
+#include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
 #include "torch_neuronx/csrc/core/NeuronDevice.h"
 #include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
 
 using namespace at::neuron;
 using namespace at::neuron::testing;
+using ::testing::_;
+using ::testing::DoAll;
+using ::testing::Return;
+using ::testing::SetArgPointee;
 
 class KernelExecutionTest : public ::testing::Test {
  protected:
+  torch_neuronx::testing::MockNRTSession mock_session_;
+  torch_neuronx::testing::MockNRT* mock_nrt_ = torch_neuronx::testing::MockNRT::GetInstance();
+
   void SetUp() override {
+    c10_neuron::set_compile_only(false);
+
+    // Mock NRT instance info for CompilationCacheKey construction
+    nrt_instance_info_t info{};
+    info.family = NRT_INSTANCE_TRN3;
+    EXPECT_CALL(*mock_nrt_, nrt_get_instance_info(_, _))
+        .Times(::testing::AnyNumber())
+        .WillRepeatedly(DoAll(SetArgPointee<0>(info), Return(NRT_SUCCESS)));
+
     // Set up world size for collective kernel tests
     c10_neuron::set_world_size(2);
     c10_neuron::set_rank(0);
@@ -28,6 +52,8 @@ class KernelExecutionTest : public ::testing::Test {
   }
 
   void TearDown() override {
+    c10_neuron::set_compile_only(false);
+
     // Reset distributed state so next test can set it again
     c10_neuron::reset_distributed_state();
   }
@@ -48,9 +74,33 @@ TEST_F(KernelExecutionTest, CompilableKernelConstruction) {
 
   EXPECT_EQ(kernel.GetOpName(), "compilable_op");
   EXPECT_TRUE(kernel.RequiresCompilation());
-  EXPECT_TRUE(kernel.GetCacheKey().find("cache_key_123") == 0);
+  EXPECT_TRUE(kernel.GetCompileKey().find("cache_key_123") == 0);
   EXPECT_FALSE(kernel.HasCachedNeff());
   EXPECT_FALSE(kernel.HasCollectives());
+  EXPECT_TRUE(kernel.IsValid());
+}
+
+TEST_F(KernelExecutionTest, ExecutionRequirementCapturedAtConstruction) {
+  CopyDirectKernelExecution normal_kernel("normal_copy", TensorDataRef(input_ptrs_[0]),
+                                          TensorDataRef(output_ptrs_[0]), 0, 0, sizeof(float), 0);
+  EXPECT_TRUE(normal_kernel.RequiresExecution());
+
+  c10_neuron::set_compile_only(true);
+  CopyDirectKernelExecution compile_only_kernel("compile_only_copy", TensorDataRef(input_ptrs_[0]),
+                                                TensorDataRef(output_ptrs_[0]), 0, 0, sizeof(float),
+                                                0);
+  EXPECT_FALSE(compile_only_kernel.RequiresExecution());
+
+  c10_neuron::set_compile_only(false);
+  EXPECT_FALSE(compile_only_kernel.RequiresExecution());
+}
+
+TEST_F(KernelExecutionTest, CastKernelConstruction) {
+  CastDirectKernelExecution kernel("cast", TensorDataRef(input_ptrs_[0]),
+                                   TensorDataRef(output_ptrs_[0]), 3, 7, c10::ScalarType::Float,
+                                   c10::ScalarType::BFloat16, 6, 0);
+
+  EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kCast);
   EXPECT_TRUE(kernel.IsValid());
 }
 
@@ -101,7 +151,7 @@ TEST_F(KernelExecutionTest, XLAKernelConstruction) {
 
   EXPECT_EQ(kernel.GetOpName(), "xla_op");
   EXPECT_TRUE(kernel.RequiresCompilation());
-  EXPECT_TRUE(kernel.GetCacheKey().find("xla_cache_key") == 0);
+  EXPECT_TRUE(kernel.GetCompileKey().find("xla_cache_key") == 0);
   EXPECT_EQ(kernel.GetHloBytes(), hlo_bytes);
   EXPECT_FALSE(kernel.HasCollectives());
   EXPECT_TRUE(kernel.IsValid());
@@ -268,7 +318,7 @@ TEST_F(KernelExecutionTest, CacheKeyIsBaseKey) {
                                       hlo_bytes, false, 0);
 
   // In-memory cache key is just the base key (compiler config is only in persistent key)
-  EXPECT_EQ(kernel.GetCacheKey(), "base_key");
+  EXPECT_EQ(kernel.GetCompileKey(), "base_key");
 }
 
 TEST_F(KernelExecutionTest, CompilableKernelAccessors) {
@@ -306,7 +356,7 @@ TEST_F(KernelExecutionTest, XLAEnvironmentVariableSupport) {
   EXPECT_EQ(kernel.GetOptimizationLevel(), "-O2");
 
   // Cache key is just the base key (compiler config is in persistent key only)
-  EXPECT_EQ(kernel.GetCacheKey(), "key");
+  EXPECT_EQ(kernel.GetCompileKey(), "key");
 
   // Clean up
   unsetenv("NEURON_CC_FLAGS");
@@ -327,8 +377,8 @@ TEST_F(KernelExecutionTest, SameBaseKeyDifferentArgsEqualInMemoryKey) {
                                        hlo_bytes, false, 0);
 
   // In-memory keys are equal (both just "same_base")
-  EXPECT_EQ(kernel1.GetCacheKey(), kernel2.GetCacheKey());
-  EXPECT_EQ(kernel1.GetCacheKey(), "same_base");
+  EXPECT_EQ(kernel1.GetCompileKey(), kernel2.GetCompileKey());
+  EXPECT_EQ(kernel1.GetCompileKey(), "same_base");
 
   unsetenv("NEURON_COMPILER_OPT_LEVEL");
 }
@@ -354,6 +404,50 @@ TEST_F(KernelExecutionTest, CachedNeffManagement) {
   // Now should have cached NEFF
   EXPECT_TRUE(kernel.HasCachedNeff());
   EXPECT_EQ(kernel.GetCachedNeff(), expected_data);
+}
+
+TEST_F(KernelExecutionTest, IoNamesDefaultEmpty) {
+  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
+  XLACompilableKernelExecution kernel("op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "key",
+                                      hlo_bytes, false, 0);
+
+  // By default a compilable kernel carries no I/O names — NRTHandler will
+  // fall back to ``input{i}`` / ``output{i}`` when scheduling.
+  EXPECT_TRUE(kernel.GetInputNames().empty());
+  EXPECT_TRUE(kernel.GetOutputNames().empty());
+}
+
+TEST_F(KernelExecutionTest, IoNamesSetAndGet) {
+  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
+  XLACompilableKernelExecution kernel("op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "key",
+                                      hlo_bytes, false, 0);
+
+  std::vector<std::string> in_names = {"q", "k", "v"};
+  std::vector<std::string> out_names = {"attn_out"};
+  kernel.SetInputNames(in_names);
+  kernel.SetOutputNames(out_names);
+
+  EXPECT_EQ(kernel.GetInputNames(), in_names);
+  EXPECT_EQ(kernel.GetOutputNames(), out_names);
+}
+
+TEST_F(KernelExecutionTest, IoNamesAcceptAliasSlots) {
+  // NKI kernel-builder produces aliased input ports named
+  // ``<output>.must_alias_input`` — verify those round-trip without any
+  // special handling in the base class.
+  std::vector<uint8_t> hlo_bytes = {0x48, 0x4C, 0x4F};
+  XLACompilableKernelExecution kernel("op", create_fake_tensor_refs(input_ptrs_),
+                                      create_fake_tensor_refs(output_ptrs_), {}, {}, "key",
+                                      hlo_bytes, false, 0);
+
+  kernel.SetInputNames({"a", "b", "out.must_alias_input"});
+  kernel.SetOutputNames({"out"});
+
+  const auto& ins = kernel.GetInputNames();
+  ASSERT_EQ(ins.size(), 3u);
+  EXPECT_EQ(ins[2], "out.must_alias_input");
 }
 
 TEST_F(KernelExecutionTest, XLACompilationConfigPropagation) {
@@ -474,6 +568,305 @@ TEST_F(KernelExecutionTest, EventKernelGetEventReturnsCorrectEvent) {
   EXPECT_EQ(kernel_event.get_impl(), event.get_impl());
 }
 
+TEST_F(KernelExecutionTest, EventReadinessDoesNotWaitForPublicSnapshotMutex) {
+  NeuronEvent event;
+  event.get_impl()->is_recorded.store(true, std::memory_order_release);
+  EventDirectKernelExecution kernel("fixed_wait", event,
+                                    EventDirectKernelExecution::EventAction::kWait, 0);
+  auto snapshot = kernel.GetEvent();
+  auto* handle = static_cast<EventHandle*>(snapshot.get_handle());
+  std::unique_lock<std::mutex> lock(handle->mutex);
+  auto readiness = std::async(std::launch::async, [&kernel] { return kernel.IsReady(); });
+  const auto status = readiness.wait_for(std::chrono::seconds(5));
+  // Release the mutex before joining so the old implementation fails without a deadlock.
+  lock.unlock();
+
+  EXPECT_EQ(status, std::future_status::ready);
+  EXPECT_FALSE(readiness.get());
+}
+
+TEST_F(KernelExecutionTest, EventKernelRecordOutlivesPublicHandles) {
+  std::weak_ptr<EventImpl> record;
+  {
+    std::unique_ptr<EventDirectKernelExecution> signal;
+    std::unique_ptr<EventDirectKernelExecution> wait;
+    {
+      NeuronEvent event;
+      event.get_impl()->is_recorded.store(true, std::memory_order_release);
+      record = event.get_impl();
+      signal = std::make_unique<EventDirectKernelExecution>(
+          "owned_signal", event, EventDirectKernelExecution::EventAction::kSignal, 0);
+      wait = std::make_unique<EventDirectKernelExecution>(
+          "owned_wait", event, EventDirectKernelExecution::EventAction::kWait, 0);
+    }
+
+    ASSERT_FALSE(record.expired());
+    EXPECT_FALSE(wait->IsReady());
+    auto snapshot = signal->GetEvent();
+    EXPECT_EQ(snapshot.get_impl(), record.lock());
+    signal->Schedule(nullptr, nullptr, 0);
+    signal.reset();
+    EXPECT_TRUE(wait->IsReady());
+    EXPECT_TRUE(snapshot.query());
+    wait.reset();
+    EXPECT_FALSE(record.expired());
+    EXPECT_TRUE(snapshot.query());
+  }
+  EXPECT_TRUE(record.expired());
+}
+
+TEST_F(KernelExecutionTest, EventKernelRetainsInternalRecordUntilCompletion) {
+  auto record = std::make_shared<EventImpl>();
+  record->is_recorded.store(true, std::memory_order_release);
+  std::weak_ptr<EventImpl> weak_record = record;
+  {
+    EventDirectKernelExecution signal("internal_signal", record,
+                                      EventDirectKernelExecution::EventAction::kSignal, 0);
+    EventDirectKernelExecution wait("internal_wait", record,
+                                    EventDirectKernelExecution::EventAction::kWait, 0);
+    record.reset();
+
+    ASSERT_FALSE(weak_record.expired());
+    EXPECT_FALSE(wait.IsReady());
+    signal.Schedule(nullptr, nullptr, 0);
+    EXPECT_TRUE(wait.IsReady());
+    EXPECT_TRUE(weak_record.lock()->is_completed.load());
+  }
+  EXPECT_TRUE(weak_record.expired());
+}
+
+class PublicEventRecordTest : public KernelExecutionTest {
+ protected:
+  void SetUp() override {
+    KernelExecutionTest::SetUp();
+    ON_CALL(*mock_nrt_, nrt_get_visible_vnc_count(_))
+        .WillByDefault(DoAll(SetArgPointee<0>(1), Return(NRT_SUCCESS)));
+    InitializeStreamPools();
+    NeuronResourceManager::Instance().GetOperationExecutionEngine().Shutdown();
+    scoped_engine_ = std::make_unique<ScopedTestEngine>(&compilation_cache_, &model_cache_);
+    stream_impl_ = NeuronStream::getDefaultStream(0).get_stream_impl();
+    auto kernel = std::make_unique<::testing::NiceMock<MockEventDirectKernelExecution>>(
+        "record_blocker", EventDirectKernelExecution::EventAction::kSignal, 0);
+    auto blocker = std::make_shared<OperationContext>(std::move(kernel));
+    blocker->MarkExecutionReady();
+    scoped_engine_->engine().InjectIntoRuntimeQueue(stream_impl_, std::move(blocker));
+    const char* blocking = std::getenv("NEURON_LAUNCH_BLOCKING");
+    if (blocking != nullptr && std::string(blocking) == "1") {
+      GTEST_SKIP() << "Pending-record tests require NEURON_LAUNCH_BLOCKING=0";
+    }
+  }
+
+  void TearDown() override {
+    if (scoped_engine_) {
+      scoped_engine_->engine().Shutdown();
+      scoped_engine_->engine().ClearRuntimeQueue(stream_impl_);
+      scoped_engine_->engine().dispatch_queue_.clear();
+      scoped_engine_.reset();
+    }
+    CleanupStreamPools();
+    KernelExecutionTest::TearDown();
+  }
+
+  EventDirectKernelExecution* FindEvent(const char* name,
+                                        const std::shared_ptr<EventImpl>& record) {
+    for (auto* op : scoped_engine_->engine().RuntimeQueueSnapshot(stream_impl_)) {
+      if (op->GetOpName() == name) {
+        auto& kernel = op->GetKernel<KernelTypeEnum::kEvent>();
+        if (kernel.GetEvent().get_impl() == record) return &kernel;
+      }
+    }
+    return nullptr;
+  }
+
+  CompilationCache compilation_cache_;
+  ModelHandleCache model_cache_;
+  std::unique_ptr<ScopedTestEngine> scoped_engine_;
+  StreamImpl* stream_impl_{nullptr};
+};
+
+TEST_F(PublicEventRecordTest, RecordedWaitAndSignalKeepFirstRecordAfterAliasRerecord) {
+  auto stream = NeuronStream::getDefaultStream(0);
+  NeuronEvent event;
+  NeuronEvent alias = event;
+  const void* identity = event.get_handle();
+  event.record(stream);
+  auto first = event.get_impl();
+  ASSERT_FALSE(event.query());
+  stream.wait_event(event);
+  auto captured = event.capture();
+
+  alias.record(stream);
+  auto second = event.get_impl();
+  scoped_engine_->engine().Shutdown();
+
+  ASSERT_NE(first, second);
+  EXPECT_EQ(alias.get_impl(), second);
+  EXPECT_EQ(event.get_handle(), identity);
+  EXPECT_EQ(alias.get_handle(), identity);
+  EXPECT_NE(captured.get_handle(), identity);
+  EXPECT_EQ(captured.get_impl(), first);
+  auto* first_signal = FindEvent("event_signal", first);
+  auto* first_wait = FindEvent("event_wait", first);
+  auto* second_signal = FindEvent("event_signal", second);
+  ASSERT_NE(first_signal, nullptr);
+  ASSERT_NE(first_wait, nullptr);
+  ASSERT_NE(second_signal, nullptr);
+  EXPECT_EQ(first_wait->GetSignalStreamImpl(), stream_impl_);
+  EXPECT_FALSE(first_wait->IsReady());
+  EXPECT_FALSE(event.query());
+
+  EXPECT_FALSE(first_signal->Schedule(nullptr, nullptr, stream.id()));
+  EXPECT_TRUE(first_wait->IsReady());
+  EXPECT_TRUE(captured.query());
+  EXPECT_FALSE(event.query());
+  EXPECT_FALSE(alias.query());
+  EXPECT_FALSE(first_wait->Schedule(nullptr, nullptr, stream.id()));
+  EXPECT_FALSE(event.query());
+
+  second_signal->CompleteWithoutExecution();
+  EXPECT_TRUE(event.query());
+  EXPECT_TRUE(alias.query());
+}
+
+TEST_F(PublicEventRecordTest, StreamWaitRetainsInternalRecord) {
+  auto stream = NeuronStream::getDefaultStream(0);
+  auto record = std::make_shared<EventImpl>();
+  record->is_recorded.store(true, std::memory_order_release);
+  stream.SubmitEventWait(record);
+  scoped_engine_->engine().Shutdown();
+  auto* wait = FindEvent("event_wait", record);
+  ASSERT_NE(wait, nullptr);
+  std::weak_ptr<EventImpl> weak_record = record;
+  record.reset();
+
+  ASSERT_FALSE(weak_record.expired());
+  EXPECT_FALSE(wait->IsReady());
+  weak_record.lock()->complete_event();
+  EXPECT_TRUE(wait->IsReady());
+  scoped_engine_->engine().ClearRuntimeQueue(stream_impl_);
+  EXPECT_TRUE(weak_record.expired());
+}
+
+TEST_F(PublicEventRecordTest, LaterRecordCompletionAndFenceDoNotChangeEarlierRecord) {
+  auto stream = NeuronStream::getDefaultStream(0);
+  NeuronEvent event;
+  event.record(stream);
+  auto captured = event.capture();
+  auto first = captured.get_impl();
+  captured.block(stream);
+  // Seed a published fence, not event completion or recording metadata.
+  first->queued_compute_sequence.store(17, std::memory_order_release);
+  event.record(stream);
+  auto second = event.get_impl();
+  scoped_engine_->engine().Shutdown();
+
+  ASSERT_NE(first, second);
+  EXPECT_EQ(first->queued_compute_sequence.load(), 17);
+  EXPECT_EQ(second->queued_compute_sequence.load(), 0);
+  EXPECT_EQ(captured.get_impl(), first);
+  auto* first_wait = FindEvent("event_wait", first);
+  auto* first_signal = FindEvent("event_signal", first);
+  auto* second_signal = FindEvent("event_signal", second);
+  ASSERT_NE(first_wait, nullptr);
+  ASSERT_NE(first_signal, nullptr);
+  ASSERT_NE(second_signal, nullptr);
+  EXPECT_FALSE(first_wait->IsReady());
+
+  EXPECT_FALSE(second_signal->Schedule(nullptr, nullptr, stream.id()));
+  EXPECT_TRUE(event.query());
+  EXPECT_FALSE(captured.query());
+  EXPECT_FALSE(first_wait->IsReady());
+  first_signal->CompleteWithoutExecution();
+  EXPECT_TRUE(captured.query());
+  EXPECT_TRUE(first_wait->IsReady());
+}
+
+TEST_F(PublicEventRecordTest, KernelCaptureKeepsRecordWhenPublicHandleIsRerecorded) {
+  auto stream = NeuronStream::getDefaultStream(0);
+  NeuronEvent event;
+  event.record(stream);
+  auto first = event.capture();
+  EventDirectKernelExecution wait("direct_wait", event,
+                                  EventDirectKernelExecution::EventAction::kWait, 0);
+  EventDirectKernelExecution signal("direct_signal", event,
+                                    EventDirectKernelExecution::EventAction::kSignal, 0);
+  event.record(stream);
+  scoped_engine_->engine().Shutdown();
+
+  ASSERT_NE(first.get_impl(), event.get_impl());
+  EXPECT_EQ(wait.GetEvent().get_impl(), first.get_impl());
+  EXPECT_EQ(signal.GetEvent().get_impl(), first.get_impl());
+  EXPECT_FALSE(wait.IsReady());
+  EXPECT_FALSE(signal.Schedule(nullptr, nullptr, stream.id()));
+  EXPECT_TRUE(first.query());
+  EXPECT_TRUE(wait.IsReady());
+  EXPECT_FALSE(event.query());
+}
+
+TEST_F(PublicEventRecordTest, CompletionTimestampSurvivesRerecordAndLateSignal) {
+  auto stream = NeuronStream::getDefaultStream(0);
+  NeuronEvent event(/*enable_timing=*/true);
+  event.record(stream);
+  auto first = event.capture();
+  event.record(stream);
+  scoped_engine_->engine().Shutdown();
+
+  auto* first_signal = FindEvent("event_signal", first.get_impl());
+  auto* second_signal = FindEvent("event_signal", event.get_impl());
+  ASSERT_NE(first_signal, nullptr);
+  ASSERT_NE(second_signal, nullptr);
+  ASSERT_FALSE(first.query());
+  ASSERT_FALSE(event.query());
+
+  const auto before_completion = std::chrono::steady_clock::now();
+  // An abort can complete the record before its queued signal executes.
+  first.complete_event();
+  const auto after_completion = std::chrono::steady_clock::now();
+  ASSERT_TRUE(first.query());
+  ASSERT_FALSE(event.query());
+  const auto first_time = first.get_impl()->record_time;
+  ASSERT_GE(first_time, before_completion);
+  EXPECT_LE(first_time, after_completion);
+  EXPECT_EQ(first.elapsed_time(first), 0.0f);
+  EXPECT_THROW(first.elapsed_time(event), c10::Error);
+
+  second_signal->CompleteWithoutExecution();
+  ASSERT_TRUE(event.query());
+  EXPECT_EQ(first.get_impl()->record_time, first_time);
+  EXPECT_GE(first.elapsed_time(event), 0.0f);
+  EXPECT_FALSE(first_signal->Schedule(nullptr, nullptr, stream.id()));
+  EXPECT_EQ(first.get_impl()->record_time, first_time);
+}
+
+TEST_F(PublicEventRecordTest, KernelSnapshotsCanBeRerecordedWithoutRetargetingKernels) {
+  auto stream = NeuronStream::getDefaultStream(0);
+  NeuronEvent event;
+  event.record(stream);
+  EventDirectKernelExecution signal("fixed_signal", event,
+                                    EventDirectKernelExecution::EventAction::kSignal, 0);
+  EventDirectKernelExecution wait("fixed_wait", event,
+                                  EventDirectKernelExecution::EventAction::kWait, 0);
+  auto signal_snapshot = signal.GetEvent();
+  auto wait_snapshot = wait.GetEvent();
+  auto alias = signal_snapshot;
+  signal_snapshot.record(stream);
+  wait_snapshot.record(stream);
+  scoped_engine_->engine().Shutdown();
+
+  EXPECT_EQ(alias.get_impl(), signal_snapshot.get_impl());
+  EXPECT_NE(signal_snapshot.get_impl(), event.get_impl());
+  EXPECT_NE(wait_snapshot.get_impl(), event.get_impl());
+  EXPECT_EQ(signal.GetEvent().get_impl(), event.get_impl());
+  EXPECT_EQ(wait.GetEvent().get_impl(), event.get_impl());
+  EXPECT_FALSE(wait.IsReady());
+  signal.CompleteWithoutExecution();
+  EXPECT_TRUE(event.query());
+  EXPECT_TRUE(wait.IsReady());
+  EXPECT_FALSE(signal_snapshot.query());
+  EXPECT_FALSE(alias.query());
+  EXPECT_FALSE(wait_snapshot.query());
+}
+
 TEST_F(KernelExecutionTest, EventKernelSharedEventState) {
   NeuronEvent original_event;
   NeuronEvent event_copy = original_event;
@@ -509,9 +902,10 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelConstruction) {
 
   EXPECT_TRUE(kernel.IsValid());
   EXPECT_TRUE(kernel.RequiresCompilation());
+  EXPECT_FALSE(kernel.RequiresExecution());
   EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kHLO);
   EXPECT_FALSE(kernel.HasCollectives());
-  EXPECT_TRUE(kernel.GetCacheKey().find("base_cache_key") == 0);
+  EXPECT_TRUE(kernel.GetCompileKey().find("base_cache_key") == 0);
 }
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelWithCollectives) {
@@ -535,7 +929,7 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelCacheKey) {
   CompileOnlyKernelExecution kernel("base_key", stablehlo_bytes, false);
 
   // In-memory cache key is just the base key
-  EXPECT_EQ(kernel.GetCacheKey(), "base_key");
+  EXPECT_EQ(kernel.GetCompileKey(), "base_key");
 }
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelEnvironmentVariables) {
@@ -551,6 +945,57 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelEnvironmentVariables) {
 
   unsetenv("NEURON_CC_FLAGS");
   unsetenv("NEURON_COMPILER_OPT_LEVEL");
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelExplicitConfigOverridesEnv) {
+  std::vector<uint8_t> stablehlo_bytes = {0x53, 0x48, 0x4C, 0x4F};
+
+  setenv("NEURON_CC_FLAGS", "--env-should-be-ignored", 1);
+  setenv("NEURON_COMPILER_OPT_LEVEL", "-O3", 1);
+
+  CompileOnlyKernelExecution kernel("key", stablehlo_bytes, /*has_collectives=*/true,
+                                    /*additional_args=*/"--foo", /*optimization_level=*/"-O1");
+
+  // Explicit args win; the environment is not consulted.
+  EXPECT_NE(kernel.GetAdditionalArgs().find("--foo"), std::string::npos);
+  EXPECT_EQ(kernel.GetAdditionalArgs().find("--env-should-be-ignored"), std::string::npos);
+  EXPECT_EQ(kernel.GetOptimizationLevel(), "-O1");
+  EXPECT_TRUE(kernel.IsValid());
+  EXPECT_TRUE(kernel.HasCollectives());
+
+  unsetenv("NEURON_CC_FLAGS");
+  unsetenv("NEURON_COMPILER_OPT_LEVEL");
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelDoesNotForceFmaFlag) {
+  std::vector<uint8_t> bytes = {0x53, 0x48, 0x4C, 0x4F};
+  CompileOnlyKernelExecution compile_only_kernel("key", bytes, false);
+
+  EXPECT_EQ(compile_only_kernel.GetAdditionalArgs().find("--internal-disable-fma-on-ios"),
+            std::string::npos);
+  EXPECT_NE(compile_only_kernel.GetAdditionalArgs().find("--model-type transformer"),
+            std::string::npos);
+
+  setenv("NEURON_CC_FLAGS", "--internal-disable-fma-on-ios", 1);
+  CompileOnlyKernelExecution optin_kernel("key2", bytes, false);
+  EXPECT_NE(optin_kernel.GetAdditionalArgs().find("--internal-disable-fma-on-ios"),
+            std::string::npos);
+  unsetenv("NEURON_CC_FLAGS");
+}
+
+TEST_F(KernelExecutionTest, CompileOnlyKernelCapturesTargetAtConstruction) {
+  // Verify target is captured at construction, not read live by the worker.
+  std::vector<uint8_t> bytes = {0x53, 0x48, 0x4C, 0x4F};
+
+  setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2", 1);
+  CompileOnlyKernelExecution kernel("key", bytes, false);
+  EXPECT_EQ(kernel.GetCapturedPlatformTarget(), "trn2");
+
+  setenv("NEURON_PLATFORM_TARGET_OVERRIDE", "trn3", 1);
+  EXPECT_EQ(kernel.GetCapturedPlatformTarget(), "trn2");
+
+  unsetenv("NEURON_PLATFORM_TARGET_OVERRIDE");
+  EXPECT_EQ(kernel.GetCapturedPlatformTarget(), "trn2");
 }
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelDefaultOptLevel) {
@@ -578,7 +1023,7 @@ TEST_F(KernelExecutionTest, NeffDirectKernelConstruction) {
                                    create_fake_tensor_refs(output_ptrs_), {}, {}, 0, false);
 
   EXPECT_EQ(kernel.GetOpName(), "graph_name");
-  EXPECT_EQ(kernel.GetCacheKey(), "cache_key");
+  EXPECT_EQ(kernel.GetCompileKey(), "cache_key");
   EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kHLO);
   EXPECT_FALSE(kernel.HasCollectives());
 }
@@ -656,15 +1101,14 @@ TEST_F(KernelExecutionTest, WriteKernelBufferConstruction) {
   EXPECT_TRUE(kernel.IsValid());
 }
 
-TEST_F(KernelExecutionTest, CollectiveKernelRequiresPrepare) {
+TEST_F(KernelExecutionTest, CollectiveKernelDoesNotRequirePrepare) {
   std::vector<std::vector<int>> replica_groups = {{0, 1}};
   CollectiveDirectKernelExecution kernel(
       "allreduce_op", CollectiveDirectKernelExecution::CollectiveType::kAllReduce,
       create_fake_tensor_refs(input_ptrs_), create_fake_tensor_refs(output_ptrs_), {}, {},
       c10::ScalarType::Float, c10d::ReduceOp::SUM, replica_groups, 0);
 
-  // Collectives require preparation before scheduling
-  EXPECT_TRUE(kernel.RequiresPrepare());
+  EXPECT_FALSE(kernel.RequiresPrepare());
 }
 
 TEST_F(KernelExecutionTest, NonCollectiveKernelsDoNotRequirePrepare) {
@@ -695,6 +1139,7 @@ TEST_F(KernelExecutionTest, IsDeviceKernelTypeReturnsTrue) {
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kHLO));
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kCollective));
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kCopy));
+  EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kCast));
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kWrite));
   EXPECT_TRUE(IsDeviceKernelType(KernelTypeEnum::kRead));
 }
@@ -702,7 +1147,6 @@ TEST_F(KernelExecutionTest, IsDeviceKernelTypeReturnsTrue) {
 TEST_F(KernelExecutionTest, IsDeviceKernelTypeReturnsFalse) {
   // Host-side kernel types should return false
   EXPECT_FALSE(IsDeviceKernelType(KernelTypeEnum::kEvent));
-  EXPECT_FALSE(IsDeviceKernelType(KernelTypeEnum::kHint));
 }
 
 TEST_F(KernelExecutionTest, GetXUIndexMapping) {
@@ -710,14 +1154,14 @@ TEST_F(KernelExecutionTest, GetXUIndexMapping) {
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kHLO), NRTA_XU_COMPUTE);
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kCollective), NRTA_XU_COLLECTIVES);
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kCopy), NRTA_XU_TENSOR_OP);
+  EXPECT_EQ(GetXUIndex(KernelTypeEnum::kCast), NRTA_XU_TENSOR_OP);
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kWrite), NRTA_XU_TENSOR_OP);
   EXPECT_EQ(GetXUIndex(KernelTypeEnum::kRead), NRTA_XU_TENSOR_OP);
 }
 
 TEST_F(KernelExecutionTest, GetXUIndexThrowsForNonDevice) {
   // Non-device kernel types should throw
-  EXPECT_THROW(GetXUIndex(KernelTypeEnum::kEvent), c10::Error);
-  EXPECT_THROW(GetXUIndex(KernelTypeEnum::kHint), c10::Error);
+  EXPECT_THROW(GetXUIndex(KernelTypeEnum::kEvent), torch_neuronx::ExecutionRuntimeException);
 }
 
 TEST_F(KernelExecutionTest, BaseKernelPrepareDoesNotThrow) {
@@ -827,7 +1271,7 @@ TEST_F(KernelExecutionTest, NRTReduceOpEnumValues) {
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelWithTensorizer) {
   std::vector<uint8_t> mlir_bytes = {0x4D, 0x4C, 0x49, 0x52};
-  CompileOnlyKernelExecution kernel("cache_key", mlir_bytes, false, true);
+  CompileOnlyKernelExecution kernel("cache_key", mlir_bytes, false, CompileMode::kTensorizer);
 
   EXPECT_TRUE(kernel.IsValid());
   EXPECT_TRUE(kernel.RequiresCompilation());
@@ -836,7 +1280,7 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelWithTensorizer) {
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelTensorizerCompilationThrows) {
   std::vector<uint8_t> mlir_bytes = {0x4D, 0x4C, 0x49, 0x52};
-  CompileOnlyKernelExecution kernel("key", mlir_bytes, false, true);
+  CompileOnlyKernelExecution kernel("key", mlir_bytes, false, CompileMode::kTensorizer);
 
   // CompileToNeff should throw since we don't have real compiler
   try {
@@ -850,7 +1294,7 @@ TEST_F(KernelExecutionTest, CompileOnlyKernelTensorizerCompilationThrows) {
 
 TEST_F(KernelExecutionTest, CompileOnlyKernelTensorizerWithEmptyBytes) {
   std::vector<uint8_t> empty_bytes;
-  CompileOnlyKernelExecution kernel("cache_key", empty_bytes, false, true);
+  CompileOnlyKernelExecution kernel("cache_key", empty_bytes, false, CompileMode::kTensorizer);
 
   EXPECT_FALSE(kernel.IsValid());
 }
@@ -876,6 +1320,58 @@ TEST_F(KernelExecutionTest, SetAndGetCompilationError) {
   EXPECT_TRUE(kernel.IsFailedCompilation());
   EXPECT_EQ(kernel.GetCompilationError(), "neuronx-cc: invalid HLO format");
   EXPECT_FALSE(kernel.HasCachedNeff());
+}
+
+// =============================================================================
+// Lazy Allocation Kernel Tests
+// =============================================================================
+
+TEST_F(KernelExecutionTest, AllocDirectKernelExecutionIsTyped) {
+  void* va = output_ptrs_[0];
+  TensorDataRef dst_ref(va);
+  AllocDirectKernelExecution kernel("alloc_op", std::move(dst_ref), 1024, 0);
+
+  EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kAlloc);
+  EXPECT_FALSE(kernel.RequiresCompilation());
+  EXPECT_EQ(kernel.GetSizeBytes(), 1024u);
+  EXPECT_TRUE(kernel.IsValid());
+
+  // dst_ptrs should contain the VA
+  auto dst_ptrs = kernel.GetDstPtrs();
+  EXPECT_EQ(dst_ptrs.size(), 1u);
+  EXPECT_EQ(dst_ptrs[0], va);
+}
+
+TEST_F(KernelExecutionTest, AllocationRecordOutlivesKernel) {
+  std::shared_ptr<EventImpl> record;
+  {
+    AllocDirectKernelExecution kernel("alloc_op", TensorDataRef(output_ptrs_[0]), 1024, 0);
+    record = kernel.GetEventImpl();
+  }
+  std::weak_ptr<EventImpl> weak_record = record;
+  EXPECT_FALSE(record->is_recorded.load());
+  EXPECT_FALSE(record->is_completed.load());
+  EXPECT_TRUE(record->query());
+  record->complete_event();
+  EXPECT_TRUE(record->is_completed.load());
+  record.reset();
+  EXPECT_TRUE(weak_record.expired());
+}
+
+TEST_F(KernelExecutionTest, DeallocDirectKernelExecutionIsTyped) {
+  void* va = input_ptrs_[0];
+  TensorDataRef src_ref(va);
+  DeallocDirectKernelExecution kernel("dealloc_op", std::move(src_ref), 1024, 0);
+
+  EXPECT_EQ(kernel.GetKernelType(), KernelTypeEnum::kDealloc);
+  EXPECT_FALSE(kernel.RequiresCompilation());
+  EXPECT_EQ(kernel.GetSizeBytes(), 1024u);
+  EXPECT_TRUE(kernel.IsValid());
+
+  // src_ptrs should contain the VA
+  auto src_ptrs = kernel.GetSrcPtrs();
+  EXPECT_EQ(src_ptrs.size(), 1u);
+  EXPECT_EQ(src_ptrs[0], va);
 }
 
 int main(int argc, char** argv) {

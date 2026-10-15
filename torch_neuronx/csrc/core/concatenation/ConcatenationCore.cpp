@@ -6,6 +6,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
@@ -84,8 +85,11 @@ int ConcatenationCore::ProcessExistingOperation(
 int ConcatenationCore::ProcessInvalidatedConcatenation(
     IrNode* ir_node, IrConcatResult& ir_concat_result,
     std::list<at::neuron::OperationContext*>& op_context_results) {
-  if (invalidated_cache_keys_.find(ir_node->cache_key) == invalidated_cache_keys_.end()) {
-    return -1;  // Not invalidated - caller should try other processing
+  {
+    std::lock_guard<std::mutex> lock(invalidated_cache_mutex_);
+    if (invalidated_cache_keys_.find(ir_node->cache_key) == invalidated_cache_keys_.end()) {
+      return -1;  // Not invalidated - caller should try other processing
+    }
   }
 
   // Get the original operations that would have been concatenated
@@ -289,33 +293,29 @@ ConcatenationResult ConcatenationCore::ProcessBufferedOperationsImpl(
   ir_node_to_op_context_map.clear();
 
   for (auto* op : op_contexts) {
-    if (op->GetKernelType() == at::neuron::KernelTypeEnum::kHint) {
-      auto* hint = dynamic_cast<at::neuron::HintDirectKernelExecution*>(op->kernel_execution.get());
-      if (hint &&
-          hint->GetHintType() == at::neuron::HintDirectKernelExecution::HintType::kDeallocation) {
-        // Create DeallocHintNode
-        auto hint_node = std::make_unique<DeallocHintNode>(hint->GetPtr());
-        mixed_ir_nodes.push_back(hint_node.get());
-        ir_nodes_owned.push_back(std::move(hint_node));
-      } else if (hint && hint->GetHintType() ==
-                             at::neuron::HintDirectKernelExecution::HintType::kAllocation) {
-        // Create AllocHintNode - signals address (re)allocation to clear from pruned set
-        auto hint_node = std::make_unique<AllocHintNode>(hint->GetPtr());
-        mixed_ir_nodes.push_back(hint_node.get());
-        ir_nodes_owned.push_back(std::move(hint_node));
-      }
+    auto kt = op->GetKernelType();
+    if (kt == at::neuron::KernelTypeEnum::kAlloc) {
+      auto hint_node = std::make_unique<AllocHintNode>(op->kernel_execution->GetDstPtrs()[0]);
+      mixed_ir_nodes.push_back(hint_node.get());
+      ir_nodes_owned.push_back(std::move(hint_node));
+      continue;
+    }
+    if (kt == at::neuron::KernelTypeEnum::kDealloc) {
+      auto hint_node = std::make_unique<DeallocHintNode>(op->kernel_execution->GetSrcPtrs()[0]);
+      mixed_ir_nodes.push_back(hint_node.get());
+      ir_nodes_owned.push_back(std::move(hint_node));
+      continue;
+    }
+    // Create IR node from HLO operation
+    // TODO(mengchiy): Handle hint nodes also in CreateNodeFromOperationContext
+    auto ir_node = ir_node_manager->CreateNodeFromOperationContext(op);
+    if (ir_node) {
+      ir_node_to_op_context_map[ir_node.get()] = op;
+      mixed_ir_nodes.push_back(ir_node.get());
+      ir_nodes_owned.push_back(std::move(ir_node));
     } else {
-      // Create IR node from HLO operation
-      // TODO(mengchiy): Handle hint nodes also in CreateNodeFromOperationContext
-      auto ir_node = ir_node_manager->CreateNodeFromOperationContext(op);
-      if (ir_node) {
-        ir_node_to_op_context_map[ir_node.get()] = op;
-        mixed_ir_nodes.push_back(ir_node.get());
-        ir_nodes_owned.push_back(std::move(ir_node));
-      } else {
-        // Failed to create IR node - throw exception which triggers fallback to op-by-op execution
-        throw std::runtime_error("Failed to create IR node for operation: " + op->GetOpName());
-      }
+      // Failed to create IR node - throw exception which triggers fallback to op-by-op execution
+      throw std::runtime_error("Failed to create IR node for operation: " + op->GetOpName());
     }
   }
 
@@ -392,6 +392,17 @@ std::unique_ptr<at::neuron::OperationContext> ConcatenationCore::CreateOpContext
     throw std::invalid_argument("IrNode must have valid cache_key");
   }
 
+  // Invariant: concatenation only supports StableHLO nodes.
+  if (ir_node->ir_type != IrNodeType::STABLEHLO) {
+    throw std::runtime_error("CreateOpContextFromIrNode: unsupported ir_type=" +
+                             std::to_string(static_cast<int>(ir_node->ir_type)) +
+                             " for op=" + ir_node->op_name + " — only StableHLO is supported");
+  }
+
+  // Validate TensorDataRef consistency before downcasting to StableHloNode.
+  // The static_cast is only safe on actual StableHloNode instances, so we must
+  // validate inputs/outputs first to catch malformed IrNodes early.
+
   // Use TensorDataRef and TensorContext from the IrNode
   // These are populated by IrNodeManager from original operations and propagated through merge
   // mapping
@@ -460,50 +471,120 @@ std::unique_ptr<at::neuron::OperationContext> ConcatenationCore::CreateOpContext
   input_contexts = ir_node->input_contexts;
   output_contexts = ir_node->output_contexts;
 
+  // Now safe to downcast — validation above ensures this is a well-formed node
+  auto* stable_node = static_cast<StableHloNode*>(ir_node);
+  if (stable_node->module) {
+    auto funcOp = (*stable_node->module)->lookupSymbol<mlir::func::FuncOp>("main");
+    if (funcOp) {
+      size_t mlir_results = funcOp.getNumResults();
+      size_t output_count = ir_node->outputs.size();
+      if (mlir_results != output_count) {
+        TORCH_NEURONX_ERROR(
+            "MLIR function result count mismatch at dispatch boundary, "
+            "this indicates a corrupted merged node from pruning.",
+            "op_name:", ir_node->op_name, "cache_key:", ir_node->cache_key,
+            "mlir_results:", mlir_results, "outputs_size:", output_count);
+        throw std::runtime_error("MLIR function result count (" + std::to_string(mlir_results) +
+                                 ") does not match outputs size (" + std::to_string(output_count) +
+                                 ") for op=" + ir_node->op_name +
+                                 " - corrupted merged node detected at dispatch boundary");
+      }
+    } else {
+      TORCH_NEURONX_WARN("StableHloNode has no 'main' function at dispatch boundary",
+                         "op_name:", ir_node->op_name, "cache_key:", ir_node->cache_key);
+    }
+  }
+
+  // NRT requires unique output pointers. Duplicates can arise from cache-hit remapping
+  // or multi-level merges. Keep only the last occurrence (last writer holds final value).
+  {
+    std::unordered_set<void*> unique_outputs(ir_node->outputs.begin(), ir_node->outputs.end());
+    if (unique_outputs.size() != ir_node->outputs.size()) {
+      const char* aliasing_env = std::getenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
+      if (aliasing_env && std::string(aliasing_env) == "1") {
+        std::unordered_map<void*, size_t> last_idx;
+        for (size_t i = 0; i < ir_node->outputs.size(); i++) {
+          if (ir_node->outputs[i]) last_idx[ir_node->outputs[i]] = i;
+        }
+        // Verify: all occurrences of the same address carry equivalent TensorDataRef
+        // (same underlying ptr). This must hold because in-place ops reuse the same buffer.
+        for (auto& [addr, last] : last_idx) {
+          for (size_t i = 0; i < ir_node->outputs.size(); i++) {
+            if (ir_node->outputs[i] == addr && i != last && i < ir_node->output_data_refs.size() &&
+                last < ir_node->output_data_refs.size()) {
+              TORCH_CHECK(ir_node->output_data_refs[i].ptr == ir_node->output_data_refs[last].ptr,
+                          "Dedup assumption violated: output_data_refs[", i,
+                          "].ptr != output_data_refs[", last, "].ptr for addr=", addr,
+                          " op=", ir_node->op_name);
+            }
+          }
+        }
+
+        std::vector<void*> deduped_outputs;
+        std::vector<at::neuron::TensorDataRef> deduped_refs;
+        std::vector<at::neuron::TensorContext> deduped_contexts;
+        std::unordered_set<void*> seen;
+        for (size_t i = 0; i < ir_node->outputs.size(); i++) {
+          void* addr = ir_node->outputs[i];
+          if (!addr || (last_idx[addr] == i && seen.insert(addr).second)) {
+            deduped_outputs.push_back(addr);
+            if (i < ir_node->output_data_refs.size())
+              deduped_refs.push_back(ir_node->output_data_refs[i]);
+            if (i < ir_node->output_contexts.size())
+              deduped_contexts.push_back(ir_node->output_contexts[i]);
+          }
+        }
+        size_t original_count = ir_node->outputs.size();
+        ir_node->outputs = std::move(deduped_outputs);
+        ir_node->output_data_refs = std::move(deduped_refs);
+        ir_node->output_contexts = std::move(deduped_contexts);
+        output_refs = ir_node->output_data_refs;
+        output_contexts = ir_node->output_contexts;
+        size_t removed = original_count - ir_node->outputs.size();
+        TORCH_NEURONX_DEBUG("Deduplicated outputs for aliased kernel", "op:", ir_node->op_name,
+                            "deduped_to:", ir_node->outputs.size(), "removed:", removed);
+
+        // Validate: removed outputs must correspond to alias entries on the module.
+        // Each aliased output shares an input buffer, so the NEFF expects fewer bindings.
+        auto* snode = static_cast<StableHloNode*>(ir_node);
+        if (snode->module) {
+          size_t alias_count = 0;
+          auto aliasAttr = (*snode->module)
+                               ->getOperation()
+                               ->getAttrOfType<mlir::ArrayAttr>("mhlo.input_output_alias");
+          if (aliasAttr) alias_count = aliasAttr.size();
+          TORCH_CHECK(removed <= alias_count, "Output deduplication removed ", removed,
+                      " outputs but only ", alias_count,
+                      " alias entries exist. op=", ir_node->op_name);
+        }
+      } else {
+        TORCH_NEURONX_ERROR("Duplicate outputs detected when creating kernel",
+                            "op_name:", ir_node->op_name, "cache_key:", ir_node->cache_key,
+                            "outputs_count:", ir_node->outputs.size(),
+                            "unique_outputs_count:", unique_outputs.size());
+        std::string output_addresses_str = "Output addresses: [";
+        for (size_t i = 0; i < ir_node->outputs.size(); ++i) {
+          if (i > 0) output_addresses_str += ", ";
+          std::ostringstream oss;
+          oss << "0x" << std::hex << reinterpret_cast<uintptr_t>(ir_node->outputs[i]);
+          output_addresses_str += oss.str();
+        }
+        output_addresses_str += "]";
+        TORCH_NEURONX_ERROR(output_addresses_str);
+        throw std::runtime_error("All outputs must be unique when creating a kernel");
+      }
+    }
+  }
+
   auto kernel = std::make_unique<at::neuron::XLACompilableKernelExecution>(
       ir_node->op_name, std::move(input_refs), std::move(output_refs), input_contexts,
       output_contexts, ir_node->cache_key, ir_node->ir_serialized, ir_node->has_collectives,
       device_id);
 
-  // Assert that all outputs are unique (no duplicate pointers)
-  {
-    std::unordered_set<void*> unique_outputs(ir_node->outputs.begin(), ir_node->outputs.end());
-    if (unique_outputs.size() != ir_node->outputs.size()) {
-      TORCH_NEURONX_ERROR("Duplicate outputs detected when creating kernel",
-                          "op_name:", ir_node->op_name, "cache_key:", ir_node->cache_key,
-                          "outputs_count:", ir_node->outputs.size(),
-                          "unique_outputs_count:", unique_outputs.size());
-
-      // Print all input addresses
-      std::string input_addresses_str = "Input addresses: [";
-      for (size_t i = 0; i < ir_node->inputs.size(); ++i) {
-        if (i > 0) input_addresses_str += ", ";
-        std::ostringstream oss;
-        oss << "0x" << std::hex << reinterpret_cast<uintptr_t>(ir_node->inputs[i]);
-        input_addresses_str += oss.str();
-      }
-      input_addresses_str += "]";
-      TORCH_NEURONX_ERROR(input_addresses_str);
-
-      // Print all output addresses
-      std::string output_addresses_str = "Output addresses: [";
-      for (size_t i = 0; i < ir_node->outputs.size(); ++i) {
-        if (i > 0) output_addresses_str += ", ";
-        std::ostringstream oss;
-        oss << "0x" << std::hex << reinterpret_cast<uintptr_t>(ir_node->outputs[i]);
-        output_addresses_str += oss.str();
-      }
-      output_addresses_str += "]";
-      TORCH_NEURONX_ERROR(output_addresses_str);
-
-      throw std::runtime_error("All outputs must be unique when creating a kernel");
-    }
-  }
-
   // Override cache key back to base key (without compiler extension) to ensure
   // consistency between IrNodeManager cache and CompilationCache
   // This allows invalidation to work correctly across both caches
-  kernel->UpdateCacheKey(ir_node->cache_key);
+  kernel->UpdateCompileKey(ir_node->cache_key);
 
   return std::make_unique<at::neuron::OperationContext>(std::move(kernel));
 }
@@ -542,6 +623,7 @@ std::unique_ptr<ConcatenationCore> ConcatenationCoreFactory::CreateInstance(
 void ConcatenationCore::InvalidateCacheEntry(const std::string& key) {
   TORCH_NEURONX_COUNTER("Concatenation.CacheInvalidations", 1);
   TORCH_NEURONX_INFO("[CONCATENATION CORE] Cache entry invalidated", "cache_key:", key);
+  std::lock_guard<std::mutex> lock(invalidated_cache_mutex_);
   invalidated_cache_keys_.insert(key);
 }
 

@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Check that ``_torch_ops_gen.py`` lists the same ops as the Torch dialect.
+
+The file is committed tablegen output, so it goes stale when an op lands in a
+``.td`` without a regeneration.
+
+Compares op names in both directions. Does not detect an operand, result,
+attribute, or trait change on an op that keeps its name; only a byte-exact
+regeneration does, which is too slow for pre-commit.
+
+``--fix`` regenerates with ``mlir-tblgen`` built at the LLVM commit
+``WORKSPACE`` pins.
+"""
+
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+TD_DIR = REPO / "third_party/torch-mlir/include/torch-mlir/Dialect/Torch/IR"
+DIALECTS = REPO / "third_party/torch-mlir/python/torch_mlir/dialects"
+BINDINGS = DIALECTS / "_torch_ops_gen.py"
+BINDING_TD = DIALECTS / "TorchBinding.td"
+TBLGEN_TARGET = "@llvm-project//mlir:mlir-tblgen"
+
+_OP_IN_TD = re.compile(r'Torch_Op<"([^"]+)"')
+_OP_IN_BINDINGS = re.compile(r'OPERATION_NAME = "torch\.([^"]+)"')
+
+
+def _stdout(*cmd: str) -> str:
+    """Run ``cmd`` and return its stdout. Let stderr reach the terminal."""
+    return subprocess.run(
+        cmd, cwd=REPO, text=True, check=True, stdout=subprocess.PIPE
+    ).stdout.strip()
+
+
+def regenerate() -> None:
+    print(f"building {TBLGEN_TARGET} ...", file=sys.stderr)
+    subprocess.run(("bazel", "build", TBLGEN_TARGET), cwd=REPO, check=True)
+    tblgen = _stdout("bazel", "cquery", "--output=files", TBLGEN_TARGET)
+    llvm = Path(_stdout("bazel", "info", "output_base")) / "external/llvm-project"
+    print(f"regenerating {BINDINGS.relative_to(REPO)} ...", file=sys.stderr)
+    subprocess.run(
+        (
+            str(REPO / tblgen),
+            "-gen-python-op-bindings",
+            "-bind-dialect=torch",
+            "-I",
+            "third_party/torch-mlir/include",
+            "-I",
+            str(llvm / "llvm/include"),
+            "-I",
+            str(llvm / "mlir/include"),
+            str(BINDING_TD.relative_to(REPO)),
+            "-o",
+            str(BINDINGS.relative_to(REPO)),
+        ),
+        cwd=REPO,
+        check=True,
+    )
+
+
+def _dialect_ops() -> set[str]:
+    ops: set[str] = set()
+    for path in sorted(TD_DIR.glob("*.td")):
+        ops |= set(_OP_IN_TD.findall(path.read_text()))
+    return ops
+
+
+def _bound_ops() -> set[str]:
+    return set(_OP_IN_BINDINGS.findall(BINDINGS.read_text())) if BINDINGS.is_file() else set()
+
+
+def _report(title: str, ops: list[str]) -> None:
+    print(f"  {title}", file=sys.stderr)
+    for op in ops[:20]:
+        print(f"    torch.{op}", file=sys.stderr)
+    if len(ops) > 20:
+        print(f"    ... and {len(ops) - 20} more", file=sys.stderr)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--fix", action="store_true", help="regenerate the bindings")
+    args = parser.parse_args()
+
+    # Gate on the dialect sources only. Absent bindings must fail, not skip.
+    if not TD_DIR.is_dir() or not any(TD_DIR.glob("*.td")):
+        print("skipping: the torch-mlir dialect sources are not in this tree", file=sys.stderr)
+        return 0
+
+    if args.fix:
+        regenerate()
+
+    dialect, bound = _dialect_ops(), _bound_ops()
+    missing, extra = sorted(dialect - bound), sorted(bound - dialect)
+    if not missing and not extra:
+        return 0
+
+    state = "is stale" if BINDINGS.is_file() else "is missing"
+    print(f"error: {BINDINGS.relative_to(REPO)} {state}.", file=sys.stderr)
+    if missing:
+        _report(f"{len(missing)} dialect op(s) have no Python binding:", missing)
+    if extra:
+        _report(f"{len(extra)} binding(s) have no dialect op:", extra)
+    print("\nRegenerate: tools/check-torch-mlir-python-bindings --fix", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

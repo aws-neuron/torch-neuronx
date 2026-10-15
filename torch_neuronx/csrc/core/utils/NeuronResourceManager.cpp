@@ -8,6 +8,7 @@
 #include "torch_neuronx/csrc/core/NeuronDevice.h"
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
+#include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
 #include "torch_neuronx/csrc/core/runtime/ModelHandleCache.h"
 
@@ -165,6 +166,13 @@ OperationExecutionEngine& NeuronResourceManager::GetOperationExecutionEngine() {
   return *operation_execution_engine_;
 }
 
+std::unique_ptr<OperationExecutionEngine> NeuronResourceManager::SetExecutionEngineForTesting(
+    std::unique_ptr<OperationExecutionEngine> engine) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::swap(operation_execution_engine_, engine);
+  return engine;
+}
+
 ResourceSemaphore& NeuronResourceManager::GetResourceSemaphore() {
   std::lock_guard<std::mutex> lock(mutex_);
   return *resource_semaphore_;
@@ -211,35 +219,68 @@ NeuronResourceManager::NeuronResourceManager() {
 }
 
 NeuronResourceManager::~NeuronResourceManager() {
-  // Shutdown execution engine first (stops worker threads)
+  // Producer-side fence: after this returns, every subsequent free() on the
+  // caching allocator short-circuits instead of submitting a kDealloc op.
+  c10_neuron::NeuronCachingAllocator::BeginShutdown();
+
+  // Drain anything the fence didn't already bar. Streams should be quiet
+  // at this point (module cleanup capsule already synced); the drain is
+  // the safety net for tensors that died between the capsule returning
+  // and this line.
+  at::neuron::drain_visible_device_streams("~NeuronResourceManager");
+
+  // Engine workers no longer needed — producers are fenced off, queue is drained.
   if (operation_execution_engine_) {
     operation_execution_engine_->Shutdown();
   }
-  // Now safe to cleanup stream pools
+
   CleanupStreamPools();
 }
 
-c10_neuron::NrtTensorPool& NeuronResourceManager::GetTensorPool(int device) {
+c10_neuron::NeuronSegmentPool& NeuronResourceManager::GetSegmentPool(int device) {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  if (tensor_pools_.empty()) {
+  if (segment_pools_.empty()) {
     int count = c10_neuron::device_count();
     if (count <= 0) {
       throw std::runtime_error("No Neuron devices available");
     }
-    tensor_pools_.resize(count);
+    segment_pools_.resize(count);
   }
 
-  if (device < 0 || device >= static_cast<int>(tensor_pools_.size())) {
+  if (device < 0 || device >= static_cast<int>(segment_pools_.size())) {
     throw std::runtime_error("Invalid device: " + std::to_string(device));
   }
 
-  auto& pool = tensor_pools_[device];
+  auto& pool = segment_pools_[device];
   if (!pool) {
-    pool = std::make_unique<c10_neuron::NrtTensorPool>(device);
+    pool = std::make_unique<c10_neuron::NeuronSegmentPool>(device);
   }
 
   return *pool;
+}
+
+c10_neuron::ScalarDeviceMemoryCache& NeuronResourceManager::GetScalarCache(int device) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  if (scalar_caches_.empty()) {
+    int count = c10_neuron::device_count();
+    if (count <= 0) {
+      throw std::runtime_error("No Neuron devices available");
+    }
+    scalar_caches_.resize(count);
+  }
+
+  if (device < 0 || device >= static_cast<int>(scalar_caches_.size())) {
+    throw std::runtime_error("Invalid device: " + std::to_string(device));
+  }
+
+  auto& cache = scalar_caches_[device];
+  if (!cache) {
+    cache = std::make_unique<c10_neuron::ScalarDeviceMemoryCache>(device);
+  }
+
+  return *cache;
 }
 
 bool ResourceSemaphore::TryAcquireImmediate() {

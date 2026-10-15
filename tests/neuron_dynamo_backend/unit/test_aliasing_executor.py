@@ -9,6 +9,38 @@ import pytest
 import torch
 import torch.nn as nn
 
+from torch_neuronx.neuron_dynamo_backend.exceptions import NEFFExecutionError
+from torch_neuronx.neuron_dynamo_backend.executor import Executor
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+    IOMutation,
+    MutationKind,
+    PassMutations,
+)
+from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import (
+    FunctionIO,
+    TensorSpec,
+)
+from torch_neuronx.neuron_dynamo_backend.wlo_contract import WLOContractError
+
+
+def _mutation_alias_mutations(out_to_in):
+    """PassMutations declaring each out_idx as a mutation alias of an input index."""
+    return [
+        PassMutations(
+            pass_name="test",
+            output_mutations=[
+                IOMutation(
+                    kind=MutationKind.ALIAS,
+                    indices=list(out_to_in),
+                    alias_input_indices=[out_to_in[o] for o in out_to_in],
+                    is_mutation=True,
+                    pass_name="test",
+                )
+            ],
+        )
+    ]
+
+
 # ============================================================================
 # FIXTURES
 # ============================================================================
@@ -645,6 +677,16 @@ class TestAliasingInfo:
         alias = next(iter(aliasing_info))
         assert alias.parameter_index is None
 
+    def test_add_duplicate_same_mapping_is_deduplicated(self):
+        """Test adding the same output→input mapping twice is silently deduplicated."""
+        from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+
+        aliasing_info = AliasingInfo()
+        aliasing_info.add(parameter_number=1, parameter_index=[], output_index=1)
+        aliasing_info.add(parameter_number=1, parameter_index=[], output_index=1)
+
+        assert len(aliasing_info) == 1
+
 
 # ============================================================================
 # TEST CLASS: Retain Device Mode with Mutations
@@ -691,6 +733,560 @@ class TestRetainDeviceMutation:
         torch.testing.assert_close(
             result, expected, atol=1e-5, rtol=1e-5, msg="Mutated output value mismatch"
         )
+
+
+# ============================================================================
+# TEST CLASS: Two Outputs Aliasing Same Input
+# ============================================================================
+
+
+class TwoOutputsSameInput(nn.Module):
+    """Model where two outputs both alias the same mutated input."""
+
+    def forward(self, cache, indices, new_values):
+        cache.scatter_(2, indices, new_values)
+        return cache, cache
+
+
+class TestDuplicateInputAlias:
+    """Verify that two outputs aliasing the same input works correctly."""
+
+    def test_two_outputs_alias_same_input(self, device):
+        """Both outputs should reflect the scattered update."""
+        model = TwoOutputsSameInput().eval().to(device)
+        cache = torch.ones(1, 1, 128, 16, device=device)
+        indices = torch.zeros(1, 1, 1, 16, dtype=torch.int64, device=device)
+        new_values = torch.full((1, 1, 1, 16), 5.0, device=device)
+
+        expected_cache = cache.clone()
+        expected_cache.scatter_(2, indices, new_values)
+
+        out1, out2 = compile_and_run(model, cache, indices, new_values)
+
+        torch.testing.assert_close(
+            out1.cpu(),
+            expected_cache.cpu(),
+            atol=1e-5,
+            rtol=1e-5,
+            msg="First output should reflect scattered update",
+        )
+        torch.testing.assert_close(
+            out2.cpu(),
+            expected_cache.cpu(),
+            atol=1e-5,
+            rtol=1e-5,
+            msg="Second output should reflect scattered update",
+        )
+        torch.testing.assert_close(
+            cache.cpu(),
+            expected_cache.cpu(),
+            atol=1e-5,
+            rtol=1e-5,
+            msg="Original input should be mutated in-place",
+        )
+
+
+# ============================================================================
+# TEST CLASS: Downcast (fp64) out= Aliasing
+# ============================================================================
+
+
+class FloatPowerScalarOutModel(nn.Module):
+    """float_power(scalar, tensor, out=) — result dtype is always float64, so the
+    out= buffer is fp64 and gets downcast to fp32 for the NEFF."""
+
+    def forward(self, exponent, out):
+        return torch.float_power(2.0, exponent, out=out)
+
+
+class PowScalarOutModel(nn.Module):
+    """pow(scalar, tensor, out=) into a caller-provided buffer of arbitrary dtype."""
+
+    def forward(self, exponent, out):
+        return torch.pow(2, exponent, out=out)
+
+
+class TestDowncastOutAliasing:
+    """An fp64 out= buffer is downcast to fp32 (a *copy*) before execution, so the
+    NEFF writes an fp32 shadow, not the caller's fp64 tensor. Verify the result is
+    cast back into the caller's fp64 buffer. int64 (a *view* downcast, shared
+    storage) must keep working and must not be corrupted by the fp64 write-back.
+    """
+
+    def test_float_power_scalar_out_fp64(self, device):
+        """float_power.Scalar_out with an fp64 out= buffer: the caller's buffer must
+        be written in place (the bug left it holding its pre-call sentinel)."""
+        model = FloatPowerScalarOutModel().eval().to(device)
+
+        exp_cpu = torch.randn(256, 4096)
+        expected = torch.float_power(2.0, exp_cpu)
+        assert expected.dtype == torch.float64
+
+        exp = exp_cpu.clone().to(device)
+        # Pre-fill the out buffer with a sentinel; if the write-back is missing the
+        # buffer keeps the sentinel (this is exactly the aliasing/downcast bug).
+        out = torch.full((256, 4096), 7.0, dtype=torch.float64, device=device)
+
+        ret = compile_and_run(model, exp, out, fullgraph=True)
+
+        torch.testing.assert_close(
+            out.cpu(),
+            expected,
+            atol=1e-3,
+            rtol=1e-3,
+            msg="fp64 out= buffer not written back (downcast severed the alias)",
+        )
+        torch.testing.assert_close(ret.cpu(), expected, atol=1e-3, rtol=1e-3)
+        assert ret.dtype == torch.float64
+        # aten out= contract: the returned tensor IS the caller's out buffer.
+        assert ret is out
+
+    def test_pow_scalar_out_fp64(self, device):
+        """pow.Scalar_out into an fp64 buffer (fp32 compute, fp64 out): same
+        downcast-alias path, distinct op from float_power."""
+        model = PowScalarOutModel().eval().to(device)
+
+        exp_cpu = torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
+        expected = torch.pow(2, exp_cpu).to(torch.float64)
+
+        exp = exp_cpu.clone().to(device)
+        out = torch.full((6,), 7.0, dtype=torch.float64, device=device)
+
+        ret = compile_and_run(model, exp, out, fullgraph=True)
+
+        torch.testing.assert_close(
+            out.cpu(),
+            expected,
+            atol=1e-3,
+            rtol=1e-3,
+            msg="fp64 out= buffer not written back",
+        )
+        torch.testing.assert_close(ret.cpu(), expected, atol=1e-3, rtol=1e-3)
+        assert out.dtype == torch.float64
+
+    def test_pow_scalar_out_int64_not_corrupted(self, device):
+        """int64 out= downcasts via a storage-sharing .view(), so the NEFF mutates the
+        caller's buffer in place and the write-back must not copy over it: a value copy_
+        through the int32 view would corrupt it."""
+        model = PowScalarOutModel().eval().to(device)
+
+        exp_cpu = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.int64)
+        expected = torch.pow(2, exp_cpu)
+        assert expected.dtype == torch.int64
+
+        exp = exp_cpu.clone().to(device)
+        out = torch.full((6,), -1, dtype=torch.int64, device=device)
+
+        ret = compile_and_run(model, exp, out, fullgraph=True)
+
+        torch.testing.assert_close(
+            out.cpu(),
+            expected,
+            msg="int64 out= corrupted (fp64 write-back must not touch int64)",
+        )
+        torch.testing.assert_close(ret.cpu(), expected)
+        assert out.dtype == torch.int64
+
+
+class TestNonContiguousAliasedInput:
+    """A non-contiguous input is compacted by .contiguous() before execution, so the
+    NEFF writes that compacted buffer rather than the caller's storage. Verify the
+    mutation is copied back, and that a contiguous input is still written in place
+    without a redundant copy.
+    """
+
+    def test_index_copy_into_noncontiguous_input(self, device):
+        """A column slice has a row stride wider than its row, so it cannot be passed
+        to the NEFF directly; the mutation must still land in the caller's storage."""
+
+        def update(cache, idx):
+            cache.index_copy_(0, idx, cache.index_select(0, idx) + 100)
+
+        run = torch.compile(update, backend="neuron", fullgraph=True, dynamic=False)
+        idx = torch.tensor([3, 1, 2], dtype=torch.long, device=device)
+
+        base = torch.zeros((8, 4096), dtype=torch.bfloat16, device=device)
+        view = base[:, 0:768]
+        assert not view.is_contiguous()
+
+        expected = torch.zeros((8, 4096), dtype=torch.bfloat16)
+        expected[:, 0:768].index_copy_(
+            0, idx.cpu(), expected[:, 0:768].index_select(0, idx.cpu()) + 100
+        )
+
+        run(view, idx)
+        torch.neuron.synchronize()
+
+        torch.testing.assert_close(
+            base.cpu(),
+            expected,
+            msg="mutation of a non-contiguous input never reached the caller's storage",
+        )
+
+    def test_index_copy_into_contiguous_input_with_storage_offset(self, device):
+        """A row slice is contiguous even at a non-zero storage offset, so it is passed
+        through untouched and mutated in place."""
+
+        def update(cache, idx):
+            cache.index_copy_(0, idx, cache.index_select(0, idx) + 100)
+
+        run = torch.compile(update, backend="neuron", fullgraph=True, dynamic=False)
+        idx = torch.tensor([3, 1, 2], dtype=torch.long, device=device)
+
+        base = torch.zeros((8, 4096), dtype=torch.bfloat16, device=device)
+        view = base[4:8, :]
+        assert view.is_contiguous()
+        assert view.storage_offset() != 0
+
+        expected = torch.zeros((8, 4096), dtype=torch.bfloat16)
+        expected[4:8, :].index_copy_(
+            0, idx.cpu(), expected[4:8, :].index_select(0, idx.cpu()) + 100
+        )
+
+        run(view, idx)
+        torch.neuron.synchronize()
+
+        torch.testing.assert_close(base.cpu(), expected)
+
+    def test_noncontiguous_input_leaves_neighbouring_storage_intact(self, device):
+        """The copy-back must honour the view's strides, not blit a compacted block
+        over the rows it interleaves with."""
+
+        def bump(x):
+            x.add_(1)
+
+        run = torch.compile(bump, backend="neuron", fullgraph=True, dynamic=False)
+
+        base_cpu = torch.arange(8 * 16, dtype=torch.float32).reshape(8, 16)
+        base = base_cpu.clone().to(device)
+        view = base[:, 0:4]
+        assert not view.is_contiguous()
+
+        expected = base_cpu.clone()
+        expected[:, 0:4] += 1
+
+        run(view)
+        torch.neuron.synchronize()
+
+        torch.testing.assert_close(
+            base.cpu(),
+            expected,
+            msg="copy-back ignored the view's strides and overwrote untouched columns",
+        )
+
+    def test_permuted_input_mutation_reaches_caller(self, device):
+        """A permuted view has non-descending strides rather than a gap from slicing,
+        and is the layout real callers hit by transposing a model output."""
+
+        def bump(x):
+            x.add_(1)
+
+        run = torch.compile(bump, backend="neuron", fullgraph=True, dynamic=False)
+
+        base_cpu = torch.randn(2, 3, 4, 5, dtype=torch.bfloat16)
+        base = base_cpu.clone().to(device)
+        view = base.permute(0, 2, 1, 3)
+        assert not view.is_contiguous()
+
+        expected = base_cpu.clone()
+        expected.permute(0, 2, 1, 3).add_(1)
+
+        run(view)
+        torch.neuron.synchronize()
+
+        torch.testing.assert_close(base.cpu(), expected)
+
+    def test_noncontiguous_int64_input_not_corrupted(self, device):
+        """int64 takes two substitutions: compaction, then a storage-sharing view() to
+        int32 that doubles the trailing dim. The copy-back must use the result after
+        the dtype and shape have been restored, or it writes int32 halves into int64.
+        """
+
+        def bump(x):
+            x.add_(1)
+
+        run = torch.compile(bump, backend="neuron", fullgraph=True, dynamic=False)
+
+        base_cpu = torch.arange(8 * 16, dtype=torch.int64).reshape(8, 16)
+        base = base_cpu.clone().to(device)
+        view = base[:, 0:4]
+        assert not view.is_contiguous()
+
+        expected = base_cpu.clone()
+        expected[:, 0:4] += 1
+
+        run(view)
+        torch.neuron.synchronize()
+
+        result = base.cpu()
+        assert result.dtype == torch.int64
+        torch.testing.assert_close(
+            result, expected, msg="int64 copy-back corrupted the caller's storage"
+        )
+
+    def test_noncontiguous_fp64_input_written_back(self, device):
+        """fp64 is compacted and then converted to fp32, so two separate buffers stand
+        between the caller's tensor and the NEFF. Values are chosen to be exact in
+        fp32 so the comparison isolates the write-back from precision loss."""
+
+        def bump(x):
+            x.add_(1)
+
+        run = torch.compile(bump, backend="neuron", fullgraph=True, dynamic=False)
+
+        base_cpu = torch.arange(8 * 16, dtype=torch.float64).reshape(8, 16)
+        base = base_cpu.clone().to(device)
+        view = base[:, 0:4]
+        assert not view.is_contiguous()
+
+        expected = base_cpu.clone()
+        expected[:, 0:4] += 1
+
+        run(view)
+        torch.neuron.synchronize()
+
+        result = base.cpu()
+        assert result.dtype == torch.float64
+        torch.testing.assert_close(result, expected)
+
+    def test_two_noncontiguous_inputs_both_written_back(self, device):
+        """Two shadowed inputs mutated in one call: each has to be copied back to its
+        own caller tensor, not just the first."""
+
+        def bump_both(a, b):
+            a.add_(1)
+            b.mul_(2)
+
+        run = torch.compile(bump_both, backend="neuron", fullgraph=True, dynamic=False)
+
+        a_cpu = torch.arange(8 * 16, dtype=torch.float32).reshape(8, 16)
+        b_cpu = torch.arange(6 * 12, dtype=torch.float32).reshape(6, 12)
+        a_base = a_cpu.clone().to(device)
+        b_base = b_cpu.clone().to(device)
+        a_view = a_base[:, 0:4]
+        b_view = b_base[:, 0:3]
+        assert not a_view.is_contiguous()
+        assert not b_view.is_contiguous()
+
+        a_expected = a_cpu.clone()
+        a_expected[:, 0:4] += 1
+        b_expected = b_cpu.clone()
+        b_expected[:, 0:3] *= 2
+
+        run(a_view, b_view)
+        torch.neuron.synchronize()
+
+        torch.testing.assert_close(a_base.cpu(), a_expected, msg="first input not written back")
+        torch.testing.assert_close(b_base.cpu(), b_expected, msg="second input not written back")
+
+    def test_mutated_host_output_carries_the_callers_device(self):
+        """A mutated output is the caller's own tensor, so it keeps the caller's device even
+        under retain_device=False."""
+        spec = TensorSpec(dtype=torch.float32, shape=[4])
+        io_specs = FunctionIO(inputs=[spec], outputs=[spec])
+        executor = Executor(
+            "g",
+            "k",
+            io_specs,
+            [spec],
+            pass_mutations=_mutation_alias_mutations({0: 0}),
+            alias_buffer_map={0: 0},
+        )
+        assert executor.retain_device is False
+
+        host = torch.zeros(4, dtype=torch.float32)
+        result = torch.ones(4, dtype=torch.float32)
+
+        out = executor._writeback_shadowed_aliases([host], [result])
+
+        assert out[0] is host
+        assert out[0].device.type == "cpu"
+        torch.testing.assert_close(host, torch.ones(4))
+
+    def test_non_mutated_sibling_output_keeps_the_execution_device(self):
+        """Only the mutated slot takes the caller's device. A sibling output must be left
+        alone, so the mixed-device tuple is confined to slots the caller owns."""
+        spec = TensorSpec(dtype=torch.float32, shape=[4])
+        io_specs = FunctionIO(inputs=[spec], outputs=[spec, spec])
+        executor = Executor(
+            "g",
+            "k",
+            io_specs,
+            [spec, spec],
+            pass_mutations=_mutation_alias_mutations({0: 0}),
+            alias_buffer_map={0: 0},
+        )
+
+        host = torch.zeros(4, dtype=torch.float32)
+        mutated_result = torch.ones(4, dtype=torch.float32)
+        sibling = torch.full((4,), 5.0, dtype=torch.float32)
+
+        out = executor._writeback_shadowed_aliases([host], [mutated_result, sibling])
+
+        assert out[0] is host
+        assert out[1] is sibling, "a non-mutated output must not be replaced"
+        torch.testing.assert_close(sibling, torch.full((4,), 5.0))
+
+    def test_shape_or_dtype_mismatch_copies_nothing(self):
+        """Validation happens before any copy, so a mismatch on the second output must not
+        leave the first one already written."""
+        spec = TensorSpec(dtype=torch.float32, shape=[4])
+        io_specs = FunctionIO(inputs=[spec, spec], outputs=[spec, spec])
+        executor = Executor(
+            "g",
+            "k",
+            io_specs,
+            [spec, spec],
+            pass_mutations=_mutation_alias_mutations({0: 0, 1: 1}),
+            alias_buffer_map={0: 0, 1: 1},
+        )
+
+        first = torch.zeros(4, dtype=torch.float32)
+        second = torch.zeros(4, dtype=torch.float32)
+        good = torch.ones(4, dtype=torch.float32)
+        mismatched = torch.ones(8, dtype=torch.float32)
+
+        with pytest.raises(NEFFExecutionError, match="refusing to copy back"):
+            executor._writeback_shadowed_aliases([first, second], [good, mismatched])
+
+        torch.testing.assert_close(first, torch.zeros(4))
+        torch.testing.assert_close(second, torch.zeros(4))
+
+    def test_destination_follows_copy_back_map_not_the_alias_map(self):
+        """copy_back_map is the authority on which caller tensor owns a mutated output, so
+        the result lands there even when alias_buffer_map names a different input."""
+        spec = TensorSpec(dtype=torch.float32, shape=[4])
+        io_specs = FunctionIO(inputs=[spec, spec], outputs=[spec])
+        executor = Executor(
+            "g",
+            "k",
+            io_specs,
+            [spec],
+            pass_mutations=_mutation_alias_mutations({0: 0}),
+            alias_buffer_map={0: 1},
+        )
+
+        owner = torch.zeros(4, dtype=torch.float32)
+        other = torch.zeros(4, dtype=torch.float32)
+        result = torch.ones(4, dtype=torch.float32)
+
+        out = executor._writeback_shadowed_aliases([owner, other], [result])
+
+        torch.testing.assert_close(owner, torch.ones(4))
+        torch.testing.assert_close(other, torch.zeros(4))
+        assert out[0] is owner
+
+    def test_result_already_in_the_callers_storage_is_not_copied(self):
+        """A result occupying the caller's storage with the same layout was written in place,
+        so it must not be copied onto itself. This covers a passed-through input and the
+        int64 view() downcast, which shares storage through a new tensor object."""
+        spec = TensorSpec(dtype=torch.float32, shape=[4])
+        io_specs = FunctionIO(inputs=[spec], outputs=[spec])
+        executor = Executor(
+            "g",
+            "k",
+            io_specs,
+            [spec],
+            pass_mutations=_mutation_alias_mutations({0: 0}),
+            alias_buffer_map={0: 0},
+        )
+
+        caller = torch.arange(4, dtype=torch.float32)
+        # A distinct tensor object over the same storage and layout, as view() produces.
+        same_storage = caller.view(4)
+        assert same_storage is not caller
+
+        out = executor._writeback_shadowed_aliases([caller], [same_storage])
+
+        torch.testing.assert_close(caller, torch.arange(4, dtype=torch.float32))
+        # aten out= identity is uniform across both paths, so the caller's tensor comes back
+        # even though no copy was needed.
+        assert out[0] is caller
+
+    def test_int64_view_roundtrip_is_not_self_copied(self):
+        """An int64 input reaches the NEFF as an int32 view of the same storage and comes back
+        through another view, so the result is a new object over the caller's own memory. The
+        write-back must recognise that and skip."""
+        spec = TensorSpec(dtype=torch.int64, shape=[4])
+        io_specs = FunctionIO(inputs=[spec], outputs=[spec])
+        executor = Executor(
+            "g",
+            "k",
+            io_specs,
+            [spec],
+            pass_mutations=_mutation_alias_mutations({0: 0}),
+            alias_buffer_map={0: 0},
+        )
+
+        caller = torch.arange(4, dtype=torch.int64)
+        roundtripped = caller.view(torch.int32).view(torch.int64).reshape(caller.shape)
+        assert roundtripped.data_ptr() == caller.data_ptr()
+        assert roundtripped is not caller
+
+        out = executor._writeback_shadowed_aliases([caller], [roundtripped])
+
+        torch.testing.assert_close(caller, torch.arange(4, dtype=torch.int64))
+        assert out[0] is caller
+
+    def test_out_of_range_caller_index_is_rejected(self):
+        """A copy-back index outside the call's inputs is stale metadata. A negative one would
+        otherwise resolve from the end and copy the result over an unrelated caller tensor."""
+        spec = TensorSpec(dtype=torch.float32, shape=[4])
+        io_specs = FunctionIO(inputs=[spec], outputs=[spec])
+        executor = Executor("g", "k", io_specs, [spec], alias_buffer_map={0: 0})
+
+        for bad in (5, -1):
+            executor.copy_back_map = {0: bad}
+            with pytest.raises(NEFFExecutionError, match="out of range"):
+                executor._validate_copy_back_targets([torch.zeros(4)])
+
+        # A non-tensor in that slot is stale metadata too, not something to skip silently.
+        executor.copy_back_map = {0: 0}
+        with pytest.raises(NEFFExecutionError, match="rather than a tensor"):
+            executor._validate_copy_back_targets([1.5])
+
+    def test_mutation_alias_on_relayout_input_is_rejected_at_construction(self):
+        """A weight-layout relayout permutes bytes while keeping the caller's shape, so it
+        is not a valid source to copy a mutation back from. Reject when the Executor is
+        built: by execution time the NEFF has already written buffers."""
+        spec = TensorSpec(dtype=torch.float32, shape=[4, 8])
+        io_specs = FunctionIO(inputs=[spec], outputs=[spec])
+        transform = {"input_index": 0, "reshape": [4, 8], "transpose": [1, 0]}
+        mutations = [
+            PassMutations(
+                pass_name="test",
+                output_mutations=[
+                    IOMutation(
+                        kind=MutationKind.ALIAS,
+                        indices=[0],
+                        alias_input_indices=[0],
+                        is_mutation=True,
+                        pass_name="test",
+                    )
+                ],
+            )
+        ]
+
+        with pytest.raises(WLOContractError, match="relaid out"):
+            Executor(
+                "g",
+                "k",
+                io_specs,
+                [spec],
+                pass_mutations=mutations,
+                alias_buffer_map={0: 0},
+                wlo_transforms=[transform],
+            )
+
+        # A passthrough alias on a relaid-out input is rejected for the same reason: the
+        # buffer would be handed to the NEFF as an output.
+        with pytest.raises(WLOContractError, match="relaid out"):
+            Executor(
+                "g", "k", io_specs, [spec], alias_buffer_map={0: 0}, wlo_transforms=[transform]
+            )
+
+        # A relayout on an input that is not aliased at all stays allowed.
+        Executor("g", "k", io_specs, [spec], wlo_transforms=[transform])
 
 
 # ============================================================================

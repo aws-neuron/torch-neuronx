@@ -8,16 +8,16 @@ replica groups so they compile to the same NEFF. This test calls the actual
 This test should FAIL with the old implementation and PASS after the fix.
 """
 
-import os
-
 import pytest
-import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 
 from tests.distributed.collective_ops.base_collective_op import BaseCollectiveOpTest
+from tests.distributed.utils import broadcast_object_from_rank0
 from torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization import (
     _get_process_group_ranks,
 )
+
+pytestmark = pytest.mark.neuron_cores(8)
 
 
 def run_spmd_replica_groups_test(rank, world_size, kwargs):
@@ -42,11 +42,9 @@ def run_spmd_replica_groups_test(rank, world_size, kwargs):
     fsdp_result = _get_process_group_ranks(fsdp_pg_name)
     tp_result = _get_process_group_ranks(tp_pg_name)
 
-    # Broadcast rank 0's results to all ranks
-    rank0_fsdp = [fsdp_result] if rank == 0 else [None]
-    rank0_tp = [tp_result] if rank == 0 else [None]
-    dist.broadcast_object_list(rank0_fsdp, src=0)
-    dist.broadcast_object_list(rank0_tp, src=0)
+    # Broadcast rank 0's results to all ranks (host-side; see helper docstring)
+    rank0_fsdp = [broadcast_object_from_rank0(fsdp_result, rank, world_size, tag="fsdp")]
+    rank0_tp = [broadcast_object_from_rank0(tp_result, rank, world_size, tag="tp")]
 
     # SPMD requirement: all ranks must produce identical results
     assert (
@@ -69,13 +67,14 @@ def run_spmd_replica_groups_test(rank, world_size, kwargs):
     assert len(fsdp_result) == tp_size, f"Expected {tp_size} FSDP groups, got {len(fsdp_result)}"
 
 
-def _verify_spmd_and_structure(rank, results, expected_num_groups, expected_group_size, dim_name):
+def _verify_spmd_and_structure(
+    rank, world_size, results, expected_num_groups, expected_group_size, dim_name
+):
     """Helper to verify SPMD and structure for a dimension."""
     result = results[dim_name]
 
-    # Broadcast rank 0's result
-    rank0_result = [result] if rank == 0 else [None]
-    dist.broadcast_object_list(rank0_result, src=0)
+    # Broadcast rank 0's result (host-side; see helper docstring)
+    rank0_result = [broadcast_object_from_rank0(result, rank, world_size, tag=f"verify_{dim_name}")]
 
     # SPMD check
     assert result == rank0_result[0], f"{dim_name} not SPMD: rank 0 vs rank {rank}"
@@ -100,11 +99,11 @@ def run_3d_mesh_spmd_test(rank, world_size, kwargs):
     }
 
     # dp (dim 0): 2*2=4 groups of 2 ranks
-    _verify_spmd_and_structure(rank, results, 4, 2, "dp")
+    _verify_spmd_and_structure(rank, world_size, results, 4, 2, "dp")
     # fsdp (dim 1): 2*2=4 groups of 2 ranks
-    _verify_spmd_and_structure(rank, results, 4, 2, "fsdp")
+    _verify_spmd_and_structure(rank, world_size, results, 4, 2, "fsdp")
     # tp (dim 2): 2*2=4 groups of 2 ranks
-    _verify_spmd_and_structure(rank, results, 4, 2, "tp")
+    _verify_spmd_and_structure(rank, world_size, results, 4, 2, "tp")
 
 
 class TestSPMDReplicaGroups(BaseCollectiveOpTest):

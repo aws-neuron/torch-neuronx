@@ -34,6 +34,20 @@ class TestPow:
 
         torch.testing.assert_close(output, expected)
 
+    @pytest.mark.parametrize("exponent", [False, True])
+    def test_pow_bool_tensor_bool_scalar_out(self, exponent):
+        generator = torch.Generator().manual_seed(42)
+        inputs_cpu = [
+            torch.randint(0, 2, (size, size), dtype=torch.bool, generator=generator)
+            for size in range(20, 0, -1)
+        ]
+
+        for input_cpu in inputs_cpu:
+            output = torch.empty_like(input_cpu, device="neuron")
+            torch.pow(input_cpu.to("neuron"), exponent, out=output)
+
+            torch.testing.assert_close(output.cpu(), torch.pow(input_cpu, exponent))
+
     def test_pow_tensor_scalar_inplace(self):
         """Test in-place pow operation"""
         tensor = torch.tensor([2.0, 4.0, 8.0], device="neuron")

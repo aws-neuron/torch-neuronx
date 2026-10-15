@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -55,3 +56,51 @@ template <typename T>
 inline constexpr bool is_neuron_runtime_exception_v = is_neuron_runtime_exception<T>::value;
 
 }  // namespace torch_neuronx
+
+#define EXECUTION_RUNTIME_CHECK(cond, ...)                                                      \
+  do {                                                                                          \
+    if (C10_UNLIKELY(!(cond))) {                                                                \
+      throw torch_neuronx::ExecutionRuntimeException(                                           \
+          std::string(__FILE__) + ":" + std::to_string(__LINE__) + ": " + #cond + " FAILED. " + \
+          ::torch_neuronx::detail::ConcatMsg(__VA_ARGS__));                                     \
+    }                                                                                           \
+  } while (false)
+
+// Like EXECUTION_RUNTIME_CHECK but preserves an NRT_STATUS so error recovery
+#define EXECUTION_RUNTIME_CHECK_STATUS(cond, status, ...)                                       \
+  do {                                                                                          \
+    if (C10_UNLIKELY(!(cond))) {                                                                \
+      throw torch_neuronx::ExecutionRuntimeException(                                           \
+          std::string(__FILE__) + ":" + std::to_string(__LINE__) + ": " + #cond + " FAILED. " + \
+              ::torch_neuronx::detail::ConcatMsg(__VA_ARGS__),                                  \
+          (status));                                                                            \
+    }                                                                                           \
+  } while (false)
+
+#define COMPILE_RUNTIME_CHECK(cond, ...)                                                        \
+  do {                                                                                          \
+    if (C10_UNLIKELY(!(cond))) {                                                                \
+      throw torch_neuronx::CompilationRuntimeException(                                         \
+          std::string(__FILE__) + ":" + std::to_string(__LINE__) + ": " + #cond + " FAILED. " + \
+          ::torch_neuronx::detail::ConcatMsg(__VA_ARGS__));                                     \
+    }                                                                                           \
+  } while (false)
+
+namespace torch_neuronx::detail {
+// Helper to concatenate variadic message arguments into a single string.
+inline std::string ConcatMsg() { return {}; }
+
+template <typename T>
+inline std::string ConcatMsg(const T& v) {
+  std::ostringstream oss;
+  oss << v;
+  return oss.str();
+}
+
+template <typename T, typename... Args>
+inline std::string ConcatMsg(const T& first, const Args&... rest) {
+  std::ostringstream oss;
+  oss << first;
+  return oss.str() + ConcatMsg(rest...);
+}
+}  // namespace torch_neuronx::detail

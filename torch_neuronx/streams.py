@@ -9,19 +9,24 @@ _NeuronEventBase = _C._NeuronEventBase
 
 
 class Stream(_NeuronStreamBase):
-    """Wrapper around a Neuron stream.
+    """Represent a logical sequence of Neuron device execution.
 
-    A Neuron stream is a linear sequence of execution that belongs to a specific
-    device, independent from other streams. It supports with statement as a
-    context manager to ensure the operators within the with block are running
-    on the corresponding stream.
+    Use a stream as a context manager to submit operators in its execution sequence.
 
     Args:
-        device(torch.device or int, optional): a device on which to allocate
-            the stream. If device is None (default) or a negative integer,
-            this will use the current device.
-        priority(int, optional): priority of the stream. Lower numbers
-            represent higher priorities.
+        device (torch.device or int, optional): Neuron device on which to allocate
+            the stream. Defaults to ``None`` (the current device); negative uses the current device.
+        priority (int, optional): Priority value encoded in the stream identifier. Defaults to
+            ``0``.
+        **kwargs (Any): Existing ``stream_id``, ``device_index``, and ``device_type`` fields used
+            to reconstruct a stream.
+
+    Note:
+        ``TORCH_NEURONX_ENABLE_STREAMS=0`` aliases new streams to the default stream. When
+        enabled, logical stream IDs select from a fixed pool containing one underlying queue.
+        ``TORCH_NEURONX_ENABLE_HOST_CC`` separately controls collectives on non-default streams.
+        Priority uses two signed identifier bits, is recorded as metadata rather than consumed for
+        scheduling, and wraps outside ``[-2, 1]`` when read back.
     """
 
     def __new__(cls, device=None, priority=0, **kwargs):
@@ -45,29 +50,33 @@ class Stream(_NeuronStreamBase):
                 return super().__new__(cls, priority=priority)
 
     def wait_event(self, event: "Event") -> None:
-        """Make all future work submitted to the stream wait for an event.
+        """Make future work submitted to this stream wait for an event.
 
         Args:
-            event: The event to wait for
+            event (Event): Event that must complete before subsequent work can run.
+
+        Raises:
+            RuntimeError: If ``event`` is not a Neuron event.
         """
         super().wait_event(event)
 
     def wait_stream(self, stream: "Stream") -> None:
-        """Synchronize with another stream.
+        """Make future work submitted to this stream wait for another stream.
 
         Args:
-            stream: The stream to wait for
+            stream (Stream): Stream whose previously submitted work must complete.
         """
         self.wait_event(stream.record_event())
 
     def record_event(self, event: Optional["Event"] = None) -> "Event":
-        """Record an event.
+        """Record an event after work already submitted to this stream.
 
         Args:
-            event: Event to record (None to create new event)
+            event (Event, optional): Event to record. Defaults to ``None``, which
+                creates a new event.
 
         Returns:
-            The recorded event
+            Event: Recorded event, including the supplied object when one is provided.
         """
         if event is None:
             event = Event()
@@ -75,27 +84,41 @@ class Stream(_NeuronStreamBase):
         return event
 
     def query(self) -> bool:
-        """Check if all the work submitted has been completed."""
+        """Check whether all work submitted to this stream has completed.
+
+        Returns:
+            bool: ``True`` when the stream has no outstanding work.
+        """
         return super().query()
 
     def synchronize(self) -> None:
-        """Wait for all the kernels in this stream to complete."""
+        """Wait for all work submitted to this stream to complete."""
         return super().synchronize()
 
     @property
     def device(self):
-        """Return the device associated with this stream."""
+        """Return the Neuron device associated with this stream.
+
+        Returns:
+            torch.device: Neuron device containing this stream.
+        """
         return torch.device("neuron", self.device_index)
 
 
 class Event(_NeuronEventBase):
-    """Wrapper around a Neuron event.
+    """Represent a synchronization marker for Neuron device work.
 
-    Neuron events are synchronization markers that can be used to monitor
-    device execution, accurately measure timing, and synchronize streams.
+    Use events to monitor completion, measure elapsed time, and order work across streams.
 
     Args:
-        enable_timing (bool, optional): indicates if the event should measure time
+        enable_timing (bool, optional): Whether the event records timing data. Defaults to
+            ``False``.
+        blocking (bool, optional): Stored synchronization preference, currently unused.
+            Defaults to ``False``.
+
+    Note:
+        A timed event stamps its steady-clock time when the marker completes: immediately for an
+        idle stream or when the queued event signal retires for a busy stream.
     """
 
     def __new__(cls, enable_timing=False, blocking=False):
@@ -106,10 +129,11 @@ class Event(_NeuronEventBase):
         )
 
     def record(self, stream: Optional["Stream"] = None) -> None:
-        """Record the event in a given stream.
+        """Record this event after work already submitted to a stream.
 
         Args:
-            stream: Stream to record on (None for current stream)
+            stream (Stream, optional): Stream on which to record. Defaults to
+                ``None``, which uses the current stream.
         """
         if stream is None:
             # Import here to avoid circular import
@@ -119,10 +143,14 @@ class Event(_NeuronEventBase):
         super().record(stream)
 
     def wait(self, stream: Optional["Stream"] = None) -> None:
-        """Make all future work submitted to the given stream wait for this event.
+        """Make future work submitted to a stream wait for this event.
 
         Args:
-            stream: Stream to wait on (None for current stream)
+            stream (Stream, optional): Waiting stream. Defaults to ``None``, which uses
+                the current stream.
+
+        Raises:
+            RuntimeError: If ``stream`` is not a Neuron stream.
         """
         if stream is None:
             # Import here to avoid circular import
@@ -132,20 +160,31 @@ class Event(_NeuronEventBase):
         super().wait(stream)
 
     def query(self) -> bool:
-        """Check if all work currently captured by event has completed."""
+        """Check whether all work captured by this event has completed.
+
+        Returns:
+            bool: ``True`` when the event is unrecorded or its recorded work has completed.
+        """
         return super().query()
 
     def elapsed_time(self, end_event: "Event") -> float:
-        """Return the time elapsed in milliseconds between the event and end_event.
+        """Return elapsed time between two completed event markers.
 
         Args:
-            end_event: The end event to measure elapsed time to
+            end_event (Event): Event marking the end of the measured interval.
 
         Returns:
-            Elapsed time in milliseconds
+            float: Milliseconds between the events' completion timestamps.
+
+        Raises:
+            RuntimeError: If ``end_event`` is not a Neuron event, timing is disabled, either
+                event is unrecorded or incomplete, or the events use different devices.
+
+        Note:
+            This method does not synchronize; call ``synchronize`` on incomplete events first.
         """
         return super().elapsed_time(end_event)
 
     def synchronize(self) -> None:
-        """Wait for the event to complete."""
+        """Wait for all work captured by this event to complete."""
         super().synchronize()

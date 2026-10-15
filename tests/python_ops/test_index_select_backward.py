@@ -14,6 +14,13 @@ from torch_neuronx.utils import use_mlir_aten_ops
 
 TEST_CONFIGS = [
     # Test different tensor shapes and dimensions
+    # 1-d case: regression for movedim(dim, -2) crashing on low-rank grad.
+    pytest.param(
+        (10,),
+        0,
+        [0, 2, 4],
+        id="1d_dim0",
+    ),
     pytest.param(
         (10, 5),
         0,
@@ -158,6 +165,90 @@ class TestIndexSelectBackward:
 
         torch.testing.assert_close(neuron_grad.cpu(), cpu_grad)
         assert_op_runs_on_neuron("aten::index_select_backward")
+
+    def test_index_select_backward_0d_input(self):
+        """Test index_select_backward with 0-d (scalar) input.
+
+        Regression test: 0-d input makes input_sizes empty, which previously
+        crashed with IndexError on input_sizes[dim].
+        """
+        input_shape = ()
+        dim = 0
+        indices = torch.tensor([0], dtype=torch.long)
+        grad_output = torch.tensor(1.5, dtype=torch.float32)
+
+        cpu_grad = torch.ops.aten.index_select_backward(grad_output, input_shape, dim, indices)
+        with track_neuron_ops():
+            neuron_grad = torch.ops.aten.index_select_backward(
+                grad_output.to("neuron"), input_shape, dim, indices.to("neuron")
+            )
+        torch.testing.assert_close(neuron_grad.cpu(), cpu_grad)
+        assert_op_runs_on_neuron("aten::index_select_backward")
+
+    def test_index_select_0d_input_autograd(self):
+        """End-to-end: 0-d forward + backward through autograd.
+
+        Exercises the full forward -> backward chain (not just the aten call),
+        validating both the 0-d forward guard and the 0-d backward short-circuit.
+        """
+        with track_neuron_ops():
+            x = torch.tensor(3.14, requires_grad=True, device="neuron")
+            idx = torch.tensor([0], device="neuron")
+            y = torch.index_select(x, 0, idx)
+            y.backward(torch.tensor(1.5, device="neuron"))
+
+        x_cpu = torch.tensor(3.14, requires_grad=True)
+        idx_cpu = torch.tensor([0])
+        y_cpu = torch.index_select(x_cpu, 0, idx_cpu)
+        y_cpu.backward(torch.tensor(1.5))
+
+        torch.testing.assert_close(y.cpu(), y_cpu)
+        torch.testing.assert_close(x.grad.cpu(), x_cpu.grad)
+        assert_op_runs_on_neuron("aten::index_select")
+        assert_op_runs_on_neuron("aten::index_select_backward")
+
+    @assert_raises(IndexError, match=r"index 5 is out of bounds for dimension 0 with size 1")
+    def test_index_select_backward_0d_input_oob(self):
+        """Test index_select_backward with 0-d input and out-of-range index.
+
+        Regression test for the 0-d bounds check — previously the
+        `len(input_sizes) > 0` guard short-circuited the entire check and
+        Neuron silently returned grad instead of raising. Now 0-d is treated
+        as dim_size=1 so only index 0 is valid.
+
+        Exercises the precondition path — the op never dispatches to Neuron,
+        so no `assert_op_runs_on_neuron` here by design.
+        """
+        device = "neuron"
+        grad_output = torch.tensor(1.0, dtype=torch.float32)
+        input_shape = ()
+        dim = 0
+        indices = torch.tensor([5], dtype=torch.long)
+        torch.ops.aten.index_select_backward(
+            grad_output.to(device), input_shape, dim, indices.to(device)
+        )
+
+    @assert_raises(
+        IndexError,
+        match=r"Index to scalar can have only 1 value, got 2 value\(s\)",
+    )
+    def test_index_select_backward_0d_input_multiple_indices(self):
+        """Test index_select_backward with 0-d input and multiple indices.
+
+        A scalar grad has exactly one value — multiple indices is invalid.
+        Matches the forward-path check for symmetry.
+
+        Exercises the precondition path — the op never dispatches to Neuron,
+        so no `assert_op_runs_on_neuron` here by design.
+        """
+        device = "neuron"
+        grad_output = torch.tensor(1.0, dtype=torch.float32)
+        input_shape = ()
+        dim = 0
+        indices = torch.tensor([0, 0], dtype=torch.long)
+        torch.ops.aten.index_select_backward(
+            grad_output.to(device), input_shape, dim, indices.to(device)
+        )
 
     @pytest.mark.xfail(
         condition=not use_mlir_aten_ops(), reason="Scalar index not supported without MLIR aten ops"

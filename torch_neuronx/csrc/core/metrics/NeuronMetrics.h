@@ -248,6 +248,10 @@ class TimedSection {
   explicit TimedSection(NeuronMetric* metric);
   ~TimedSection();
 
+  // Discard this section so it records nothing, for a scope that turns out to do work
+  // the metric must not contain.
+  void Cancel();
+
   // Get elapsed time in seconds
   double Elapsed() const;
 
@@ -315,12 +319,18 @@ void SetMetricsEnabled(bool enabled);
     }                                                                                              \
   } while (0)
 
-#define TORCH_NEURONX_TIMED_SECTION(name)                                                      \
-  static ::at::neuron::metrics::NeuronMetric* __timed_metric =                                 \
-      ::at::neuron::metrics::IsMetricsEnabled()                                                \
-          ? new ::at::neuron::metrics::NeuronMetric(name, ::at::neuron::metrics::MetricFnTime) \
-          : nullptr;                                                                           \
+// Do not gate this static on IsMetricsEnabled(). It runs once, so a first call
+// made while metrics were off would leave __timed_metric null for the process.
+// TimedSection checks enablement when it starts and when it records.
+//
+// The names are fixed, so two of these in one scope will not compile.
+#define TORCH_NEURONX_TIMED_SECTION(name)                                                 \
+  static ::at::neuron::metrics::NeuronMetric* __timed_metric =                            \
+      new ::at::neuron::metrics::NeuronMetric(name, ::at::neuron::metrics::MetricFnTime); \
   ::at::neuron::metrics::TimedSection __timed_section(__timed_metric)
+
+// Discard the enclosing TORCH_NEURONX_TIMED_SECTION, so it records nothing.
+#define TORCH_NEURONX_TIMED_SECTION_CANCEL() __timed_section.Cancel()
 
 // =============================================================================
 // Memory Statistics Classes
@@ -335,18 +345,25 @@ struct MemoryStatistics {
   /**
    * Increase the stat by the given amount.
    * Updates current, peak (if new max), and allocated (historical total).
+   * If bumped is non-null, sets *bumped = true if this call updated peak.
    */
-  void increase(size_t amount) {
+  void increase(size_t amount, bool* bumped = nullptr) {
     int64_t new_current =
         current.fetch_add(static_cast<int64_t>(amount), std::memory_order_relaxed) +
         static_cast<int64_t>(amount);
     allocated.fetch_add(static_cast<int64_t>(amount), std::memory_order_relaxed);
 
     // Update peak using compare-exchange loop
+    bool updated_peak = false;
     int64_t prev_peak = peak.load(std::memory_order_relaxed);
-    while (new_current > prev_peak &&
-           !peak.compare_exchange_weak(prev_peak, new_current, std::memory_order_relaxed)) {
-      // prev_peak is updated by compare_exchange_weak on failure
+    while (new_current > prev_peak) {
+      if (peak.compare_exchange_weak(prev_peak, new_current, std::memory_order_relaxed)) {
+        updated_peak = true;
+        break;
+      }
+    }
+    if (bumped) {
+      *bumped = updated_peak;
     }
   }
 
@@ -410,25 +427,45 @@ struct MemoryStatInfo {
 
 /**
  * Per-device memory statistics.
- * Simplified for Neuron - no pool type distinction (small/large).
  * All operations are thread-safe using atomic operations.
  *
  * Memory stat semantics (matching CUDA API):
- * - allocated_bytes: Total memory obtained from NRT (via nrt_tensor_alloc)
- * - reserved_bytes: Memory held in cache for reuse (currently always 0, no caching)
- * - active_bytes: Memory in active use by tensors (currently equals allocated_bytes)
+ * - reserved_bytes: Physical device memory held by allocator (NRT segment tensors).
+ *                   Includes both active blocks and free (cached) blocks within segments.
+ *                   Increases on nrt_tensor_allocate (new segment), decreases on
+ *                   nrt_tensor_free (EmptyCache releases unused segments).
+ * - allocated_bytes: Memory occupied by allocated blocks (rounded/split sizes).
+ *                    Includes internal fragmentation from size rounding.
+ *                    reserved >= allocated >= active.
+ * - active_bytes: Memory requested by user tensors (original requested sizes).
+ *                 The difference (allocated - active) is internal fragmentation.
  */
 struct DeviceMemoryStats {
   // Byte-level statistics with current and peak tracking
-  MemoryStatistics allocated_bytes;  // Total memory obtained from NRT
-  MemoryStatistics reserved_bytes;   // Memory held in cache (currently unused)
-  MemoryStatistics active_bytes;     // Memory in active use by tensors
+  MemoryStatistics allocated_bytes;  // Block sizes (rounded), includes fragmentation
+  MemoryStatistics reserved_bytes;   // Segment sizes (cached physical device memory)
+  MemoryStatistics active_bytes;     // Memory in active use by tensors (requested sizes)
 
   // Simple counters for events
   std::atomic<int64_t> num_alloc_retries{0};    // OOM retries after cache flush
   std::atomic<int64_t> num_ooms{0};             // Final OOM failures
   std::atomic<int64_t> num_tensor_frees{0};     // neuron_deleter calls
   std::atomic<int64_t> allocation_requests{0};  // Total allocation requests
+
+  // Cache-behavior counters.
+  std::atomic<int64_t> num_allocator_cache_hits{0};
+  std::atomic<int64_t> num_allocator_cache_misses{0};
+  std::atomic<int64_t> num_splits{0};
+  std::atomic<int64_t> num_merges{0};
+
+  std::atomic<int64_t> num_alloc_deferred{0};          // Fresh kAlloc OOM parked as Deferred
+  std::atomic<int64_t> num_alloc_drain_retry_ok{0};    // RetryReady Schedule succeeded
+  std::atomic<int64_t> num_alloc_drain_retry_fail{0};  // RetryReady Schedule OOM'd again
+
+  // Scalar device memory cache counters.
+  std::atomic<int64_t> num_scalar_cache_hits{0};
+  std::atomic<int64_t> num_scalar_cache_misses{0};
+  std::atomic<int64_t> scalar_cache_size{0};
 
   void reset_peak() {
     allocated_bytes.reset_peak();
@@ -441,6 +478,16 @@ struct DeviceMemoryStats {
     num_ooms.store(0, std::memory_order_relaxed);
     num_tensor_frees.store(0, std::memory_order_relaxed);
     allocation_requests.store(0, std::memory_order_relaxed);
+    num_allocator_cache_hits.store(0, std::memory_order_relaxed);
+    num_allocator_cache_misses.store(0, std::memory_order_relaxed);
+    num_splits.store(0, std::memory_order_relaxed);
+    num_merges.store(0, std::memory_order_relaxed);
+    num_alloc_deferred.store(0, std::memory_order_relaxed);
+    num_alloc_drain_retry_ok.store(0, std::memory_order_relaxed);
+    num_alloc_drain_retry_fail.store(0, std::memory_order_relaxed);
+    num_scalar_cache_hits.store(0, std::memory_order_relaxed);
+    num_scalar_cache_misses.store(0, std::memory_order_relaxed);
+    scalar_cache_size.store(0, std::memory_order_relaxed);
   }
 
   void reset_accumulated() {
@@ -472,6 +519,28 @@ struct DeviceMemoryStatsInfo {
   int64_t num_ooms = 0;
   int64_t num_tensor_frees = 0;
   int64_t allocation_requests = 0;
+  // Cache-behavior counters.
+  int64_t num_allocator_cache_hits = 0;
+  int64_t num_allocator_cache_misses = 0;
+  int64_t num_splits = 0;
+  int64_t num_merges = 0;
+  int64_t num_alloc_deferred = 0;
+  int64_t num_alloc_drain_retry_ok = 0;
+  int64_t num_alloc_drain_retry_fail = 0;
+  // Scalar device memory cache counters.
+  int64_t num_scalar_cache_hits = 0;
+  int64_t num_scalar_cache_misses = 0;
+  int64_t scalar_cache_size = 0;
+};
+
+/**
+ * Snapshot of memory stats captured at the moment allocated_bytes.current
+ * exceeds its previous peak. Cached per-device and dumped on OOM.
+ */
+struct PeakMemoryStats {
+  DeviceMemoryStatsInfo stats;
+  int64_t timestamp_ns = 0;  // When peak was recorded
+  bool valid = false;        // Whether a peak has been captured
 };
 
 // =============================================================================
@@ -482,35 +551,70 @@ struct DeviceMemoryStatsInfo {
 // =============================================================================
 
 /**
- * Record stats for a new allocation from NRT.
- * Updates allocated_bytes and active_bytes.
- * If snapshot params provided, also records SEGMENT_ALLOC trace.
+ * Record stats for a new allocation.
+ * @param size_bytes Requested size (user-facing) — updates active_bytes.
+ * @param block_size_bytes Rounded block size (includes internal fragmentation) —
+ *                         updates allocated_bytes.
+ * @param tensor_data_ptr NRT VA for recording in the ALLOC trace.
+ * If snapshot params provided, also records ALLOC trace.
  */
 void RecordNewAllocation(
-    int device_id, size_t size_bytes, void* tensor_data_ptr = nullptr, c10::StreamId stream_id = 0,
-    const std::shared_ptr<c10_neuron::NeuronMemorySnapshot::StackContext>& context = nullptr);
+    int device_id, size_t size_bytes, size_t block_size_bytes, void* tensor_data_ptr = nullptr,
+    c10::StreamId stream_id = 0,
+    const std::shared_ptr<c10_neuron::NeuronMemorySnapshot::StackContext>& context = nullptr,
+    uint64_t trace_id = 0);
 
 /**
- * Record stats for a deallocation (memory freed back to NRT).
- * Increments num_tensor_frees and decreases active_bytes and allocated_bytes.
+ * Record stats for a deallocation.
+ * @param size_bytes Requested size (user-facing) — decreases active_bytes.
+ * @param block_size_bytes Rounded block size — decreases allocated_bytes.
+ * @param tensor_data_ptr NRT VA recorded in the FREE_REQUESTED trace.
+ * Increments num_tensor_frees.
  */
 void RecordDeallocation(
-    int device_id, size_t size_bytes, void* tensor_data_ptr = nullptr, c10::StreamId stream_id = 0,
+    int device_id, size_t size_bytes, size_t block_size_bytes, void* tensor_data_ptr = nullptr,
+    c10::StreamId stream_id = 0,
     const std::shared_ptr<c10_neuron::NeuronMemorySnapshot::StackContext>& context = nullptr);
 
 /**
- * Record deallocation completed trace (called after cache operation completes).
+ * Record deallocation completed (called after cache operation completes):
+ * block has been returned to the allocator's free pool.
  * Only records FREE_COMPLETED trace if snapshot recording is enabled.
  */
 void RecordDeallocationCompleted(
-    int device_id, size_t size_bytes, void* tensor_data_ptr, c10::StreamId stream_id,
+    int device_id, size_t size_bytes, size_t block_size_bytes, void* tensor_data_ptr,
+    c10::StreamId stream_id,
     const std::shared_ptr<c10_neuron::NeuronMemorySnapshot::StackContext>& context);
+
+/**
+ * Record a new segment reservation from NRT. Increments reserved_bytes and emits a
+ * SEGMENT_ALLOC trace entry (no-op when memory history recording disabled).
+ *
+ * Call once per nrt_tensor_allocate that returns a new segment to the pool.
+ * segment_base/segment_size are paired with the later RecordSegmentUnreserve to
+ * enable segment lifetime reconstruction.
+ */
+void RecordSegmentReserve(int device_id, void* segment_base, size_t segment_size,
+                          uint64_t trace_id = 0);
+
+/**
+ * Record a segment return to NRT. Decrements reserved_bytesand emits a
+ * SEGMENT_FREE trace entry (no-op when memory history recording disabled).
+ *
+ * Call once per nrt_tensor_free that drops a segment. segment_base/size
+ * must match the earlier RecordSegmentReserve for the same segment.
+ */
+void RecordSegmentUnreserve(int device_id, void* segment_base, size_t segment_size);
 
 /**
  * Record an OOM retry attempt (cache cleared, retrying allocation).
  * Increments num_alloc_retries.
+ *
+ * When memory history recording is enabled, emits an ALLOC_CACHE_DRAIN_RETRY
+ * trace entry tagged with the requesting op's size and stream so the retry
+ * can be correlated with its originating alloc on the timeline.
  */
-void RecordOOMRetry(int device_id);
+void RecordOOMRetry(int device_id, size_t size_bytes, c10::StreamId stream_id);
 
 /**
  * Record an OOM failure (allocation failed even after retry).
@@ -519,6 +623,49 @@ void RecordOOMRetry(int device_id);
 void RecordOOMFailure(
     int device_id, size_t requested_size, c10::StreamId stream_id,
     const std::shared_ptr<c10_neuron::NeuronMemorySnapshot::StackContext>& context);
+
+/**
+ * Cache-behavior helpers.
+ *
+ * Hit/miss/split/merge are single relaxed-increment counter updates on
+ * DeviceMemoryStats; safe to call under an allocator's mutex.
+ *
+ */
+
+// Record a successful cache hit (free-set hit or exact-size LIFO hit).
+void RecordAllocatorCacheHit(int device_id);
+
+// Record a cache miss that was satisfied by a new NRT segment allocation.
+// Called after the NRT alloc succeeds so it reflects real NRT calls.
+void RecordAllocatorCacheMiss(int device_id);
+
+// Record a split event in MaybeSplit. Caller increments once per split.
+void RecordSplit(int device_id);
+
+// Record a merge event in MergeNeighbors. Caller increments once per absorbed
+// neighbor (so a block that merges with both prev and next counts twice).
+void RecordMerge(int device_id);
+
+// Scalar device memory cache counters. Called by ScalarDeviceMemoryCache.
+// A hit reuses an existing slot; a miss allocates a new slot (and increments
+// the live size). RecordScalarCacheClear zeroes the live size when the cache
+// is drained.
+void RecordScalarCacheHit(int device_id);
+void RecordScalarCacheMiss(int device_id);
+void RecordScalarCacheClear(int device_id);
+
+/**
+ * Lazy-alloc defer-retry counters. Called from the Fresh/Deferred/RetryReady
+ * state machine in ScheduleAllocOperation. Distinct from num_alloc_retries
+ * above (which is the 3rd-stage AttemptOOMRecovery cache-drain retry).
+ *
+ * When size_bytes != 0 and memory history recording is enabled, these also
+ * emit ALLOC_DEFERRED / ALLOC_DRAIN_RETRY_OK / ALLOC_DRAIN_RETRY_FAIL trace
+ * entries so the retry lifecycle can be reconstructed next to the alloc.
+ */
+void RecordAllocDeferred(int device_id, size_t size_bytes, c10::StreamId stream_id);
+void RecordAllocDrainRetryOk(int device_id, size_t size_bytes, c10::StreamId stream_id);
+void RecordAllocDrainRetryFail(int device_id, size_t size_bytes, c10::StreamId stream_id);
 
 /**
  * Global registry for per-device memory statistics.
@@ -559,11 +706,25 @@ class DeviceMemoryStatsRegistry {
    */
   void ResetAccumulatedStats(int device_index);
 
+  /**
+   * Cache a peak stats snapshot for a device.
+   * Called from RecordNewAllocation when allocated_bytes.increase() reports
+   * that this thread bumped the peak (via the bumped out-param).
+   * Only the thread that actually updated peak calls this, avoiding redundant snapshots.
+   */
+  void CachePeakStats(int device_index);
+
+  /**
+   * Get the cached peak stats for a device.
+   */
+  PeakMemoryStats GetPeakStats(int device_index);
+
  private:
   DeviceMemoryStatsRegistry() = default;
 
   std::mutex mutex_;  // Protects device_stats_ vector access
   std::vector<std::unique_ptr<DeviceMemoryStats>> device_stats_;
+  std::vector<PeakMemoryStats> peak_stats_;  // Per-device peak snapshots
 };
 
 }  // namespace at::neuron::metrics

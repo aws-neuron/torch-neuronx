@@ -27,11 +27,17 @@ def _row_major_strides(shape: list[int]) -> tuple[int, ...]:
 def detect_slice_pattern(
     shape: list[int], strides: list[int], storage_offset: int
 ) -> tuple[int, int, int] | None:
-    """Detect if tensor is a slice of a single axis.
+    """Detect whether strides describe a slice along one axis.
 
-    Returns (axis, original_size, start_offset) or None if not a simple single-axis slice.
+    Args:
+        shape (list[int]): Sizes of the tensor dimensions.
+        strides (list[int]): Storage stride for each dimension.
+        storage_offset (int): Tensor offset within its storage.
+
+    Returns:
+        tuple[int, int, int] or None: Slice axis, original axis size, and start
+        index within that axis, or ``None``.
     """
-
     # Check if storage_offset indicates slicing in multiple dimensions
     if storage_offset > 0:
         remaining_offset = storage_offset
@@ -100,10 +106,23 @@ def _has_contiguous_strides_for_shape(
 
 
 class ContiguousSliceImpl(OperationImplementation):
-    """slice-based implementation for contiguous operation."""
+    """Implement contiguous copies of single-axis slices."""
 
     def can_handle(self, self_tensor, memory_format=None) -> bool:
-        """Check if this implementation can handle the tensor."""
+        """Determine whether the implementation supports a tensor.
+
+        Args:
+            self_tensor (torch.Tensor): Tensor to make contiguous.
+            memory_format (torch.memory_format, optional): Requested memory format. Defaults to
+                ``None``.
+
+        Returns:
+            bool: ``True`` for a nonempty, noncomplex Neuron device single-axis
+            slice whose reconstructed base occupies less than 4 GiB.
+
+        Raises:
+            RuntimeError: If a nonscalar tensor is not on the Neuron device.
+        """
         if not super().can_handle(self_tensor, memory_format=memory_format):
             return False
 
@@ -147,12 +166,9 @@ class ContiguousSliceImpl(OperationImplementation):
 
         slice_axis, original_size, start_offset = slice_info
 
-        # Create base view with original shape and contiguous strides
         implied_shape = list(shape)
         implied_shape[slice_axis] = original_size
         base_strides = _row_major_strides(implied_shape)
-
-        # Calculate the base storage offset (start of the original tensor)
         base_storage_offset = self_tensor.storage_offset() - start_offset * strides[slice_axis]
 
         base_view = self_tensor.as_strided(
@@ -191,7 +207,17 @@ class ContiguousSliceImpl(OperationImplementation):
             return ExecutionResult(success=False, error_msg=f"Slice implementation failed: {e}")
 
     def execute(self, self_tensor, memory_format=None) -> ExecutionResult:
-        """Execute the operation with autograd support."""
+        """Execute a contiguous copy with optional autograd support.
+
+        Args:
+            self_tensor (torch.Tensor): Tensor to make contiguous.
+            memory_format (torch.memory_format, optional): Requested memory format. Defaults to
+                ``None``.
+
+        Returns:
+            ExecutionResult: Successful contiguous output or failure details. For an empty input,
+                the successful output aliases ``self_tensor``.
+        """
         if self_tensor.numel() == 0:
             return ExecutionResult(success=True, output=self_tensor)
 
@@ -210,11 +236,24 @@ class ContiguousSliceImpl(OperationImplementation):
 
 @neuron_op("aten::contiguous", priority=90)
 class ContiguousSliceMLIRImpl(ContiguousSliceImpl):  # lower priority than ContiguousBroadcastImpl
-    """MLIR implementation for slice-based contiguous operation."""
+    """Implement slice-based contiguous copies through MLIR lowering."""
 
     _kernel: TorchMlirKernel | None = None
 
     def can_handle(self, self_tensor, memory_format=None) -> bool:
+        """Delegate slice compatibility checks to the base implementation.
+
+        Args:
+            self_tensor (torch.Tensor): Tensor to check.
+            memory_format (torch.memory_format, optional): Requested memory format. Defaults to
+                ``None``.
+
+        Returns:
+            bool: Whether the base slice implementation can handle the tensor.
+
+        Raises:
+            RuntimeError: If a nonscalar tensor is not on the Neuron device.
+        """
         return super().can_handle(self_tensor, memory_format)
 
     def __init__(self):
@@ -222,6 +261,17 @@ class ContiguousSliceMLIRImpl(ContiguousSliceImpl):  # lower priority than Conti
         if ContiguousSliceMLIRImpl._kernel is None:
 
             def slice_fn(x, axis, start_idx, end_idx):
+                """Clone a selected range along one tensor axis.
+
+                Args:
+                    x (torch.Tensor): Source tensor.
+                    axis (int): Axis to slice.
+                    start_idx (int): Inclusive start index.
+                    end_idx (int): Exclusive end index.
+
+                Returns:
+                    torch.Tensor: Cloned slice.
+                """
                 slices = [slice(None)] * x.ndim
                 slices[axis] = slice(start_idx, end_idx)
                 return x[tuple(slices)].clone()
@@ -233,14 +283,128 @@ class ContiguousSliceMLIRImpl(ContiguousSliceImpl):  # lower priority than Conti
     def _get_kernel(self):
         return ContiguousSliceMLIRImpl._kernel
 
+    def get_lower_func(self):
+        """Create an ATen-to-kernel lowering function.
+
+        Returns:
+            Callable: Function that lowers a contiguous slice to MLIR.
+        """
+        kernel = self._get_kernel()
+
+        def contiguous_slice_lower(*args, **kwargs):
+            """Lower a contiguous-slice call through the cached kernel.
+
+            Args:
+                *args (Any): Positional ATen arguments, beginning with the input tensor.
+                **kwargs (Any): Unused keyword ATen arguments.
+
+            Returns:
+                LoweringResult: Lowered kernel result for the reconstructed base view.
+            """
+            self_tensor = args[0]
+            shape = list(self_tensor.shape)
+            strides = list(self_tensor.stride())
+            slice_axis, original_size, start_offset = detect_slice_pattern(
+                shape, strides, self_tensor.storage_offset()
+            )
+            implied_shape = list(shape)
+            implied_shape[slice_axis] = original_size
+            base_strides = _row_major_strides(implied_shape)
+            base_storage_offset = self_tensor.storage_offset() - start_offset * strides[slice_axis]
+            base_view = self_tensor.as_strided(
+                size=tuple(implied_shape),
+                stride=tuple(base_strides),
+                storage_offset=base_storage_offset,
+            )
+            end_offset = start_offset + shape[slice_axis]
+            return kernel.lower(base_view, slice_axis, start_offset, end_offset)
+
+        return contiguous_slice_lower
+
+    def get_infer_func(self):
+        """Create an ATen-to-kernel dtype inference function.
+
+        Returns:
+            Callable: Function that infers contiguous-slice output dtypes.
+        """
+        kernel = self._get_kernel()
+
+        def contiguous_slice_infer(*args, **kwargs):
+            """Infer output dtypes through the cached slice kernel.
+
+            Args:
+                *args (Any): Positional ATen arguments, beginning with the input tensor.
+                **kwargs (Any): Unused keyword ATen arguments.
+
+            Returns:
+                list[torch.dtype | None]: Output dtype metadata for the selected
+                contiguous slice.
+            """
+            self_tensor = args[0]
+            shape = list(self_tensor.shape)
+            strides = list(self_tensor.stride())
+            slice_axis, original_size, start_offset = detect_slice_pattern(
+                shape, strides, self_tensor.storage_offset()
+            )
+            implied_shape = list(shape)
+            implied_shape[slice_axis] = original_size
+            base_strides = _row_major_strides(implied_shape)
+            base_storage_offset = self_tensor.storage_offset() - start_offset * strides[slice_axis]
+            base_view = self_tensor.as_strided(
+                size=tuple(implied_shape),
+                stride=tuple(base_strides),
+                storage_offset=base_storage_offset,
+            )
+            end_offset = start_offset + shape[slice_axis]
+            return kernel.infer_output_dtypes(base_view, slice_axis, start_offset, end_offset)
+
+        return contiguous_slice_infer
+
 
 class ContiguousSliceFunction(torch.autograd.Function):
-    """Autograd function for slice-based contiguous implementation."""
+    """Implement autograd propagation for slice-based contiguous copies."""
 
     @staticmethod
     def forward(ctx, self_tensor: torch.Tensor, memory_format, impl: ContiguousSliceImpl):
+        """Run the slice implementation for the autograd forward pass.
+
+        Args:
+            ctx (torch.autograd.function.FunctionCtx): Autograd context, which is unused.
+            self_tensor (torch.Tensor): Tensor to make contiguous.
+            memory_format (torch.memory_format | None): Requested memory format.
+            impl (ContiguousSliceImpl): Slice implementation to execute.
+
+        Returns:
+            torch.Tensor | ExecutionResult: Contiguous slice output, or failure details when no
+                valid slice pattern is detected.
+        """
         return impl._execute_impl_internal(self_tensor, memory_format)
 
     @staticmethod
+    def jvp(ctx, grad_self, grad_memory_format, grad_impl):
+        """Propagate the tensor tangent through the contiguous copy.
+
+        Args:
+            ctx (torch.autograd.function.FunctionCtx): Autograd context, which is unused.
+            grad_self (torch.Tensor): Tangent for the input tensor.
+            grad_memory_format (Any): Memory-format tangent, which is ignored.
+            grad_impl (Any): Implementation tangent, which is ignored.
+
+        Returns:
+            torch.Tensor: Unchanged input tangent.
+        """
+        return grad_self
+
+    @staticmethod
     def backward(ctx, grad_output):
+        """Propagate the output gradient to the input tensor.
+
+        Args:
+            ctx (torch.autograd.function.FunctionCtx): Autograd context, which is unused.
+            grad_output (torch.Tensor): Gradient of the contiguous output.
+
+        Returns:
+            tuple[torch.Tensor, None, None]: ``grad_output`` itself and placeholders for
+                nondifferentiable inputs.
+        """
         return grad_output, None, None

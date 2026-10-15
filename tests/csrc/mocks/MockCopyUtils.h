@@ -21,6 +21,7 @@ class MockCopyUtils {
   MOCK_METHOD(void, copy_cpu_to_neuron, (const at::Tensor&, at::Tensor&, bool));
   MOCK_METHOD(void, copy_neuron_to_cpu, (const at::Tensor&, at::Tensor&, bool));
   MOCK_METHOD(void, copy_neuron_to_neuron, (const at::Tensor&, at::Tensor&));
+  MOCK_METHOD(void, cast_neuron_to_neuron, (const at::Tensor&, at::Tensor&));
   MOCK_METHOD(nrt_tensor_t*, get_nrt_tensor, (const at::Tensor&, bool));
 
  private:

@@ -108,3 +108,36 @@ class TestEyeRegistration:
             cpu_tensor = tensor.cpu()
             expected = torch.eye(3)
             assert torch.allclose(cpu_tensor, expected)
+
+    @pytest.mark.parametrize("shape", [(0, 0), (0, 3)])
+    def test_eye_empty_out_resizes(self, shape):
+        out = torch.empty(0, device="neuron")
+        if shape[0] == shape[1]:
+            result = torch.eye(shape[0], device="neuron", out=out)
+        else:
+            result = torch.eye(*shape, device="neuron", out=out)
+
+        assert result is out
+        assert tuple(out.shape) == shape
+
+    def test_eye_noncontiguous_out(self):
+        out = torch.empty(2, 2, device="neuron").t()[:1]
+        assert not out.is_contiguous()
+
+        result = torch.eye(1, 2, device="neuron", out=out)
+
+        assert result is out
+        torch.testing.assert_close(out.cpu(), torch.eye(1, 2))
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.int32])
+    def test_eye_out_dtype_inherited(self, dtype):
+        """Verify eye inherits dtype from out tensor when dtype is not specified."""
+        out_cpu = torch.empty(3, 3, dtype=dtype)
+        out_neuron = torch.empty(3, 3, dtype=dtype, device="neuron")
+
+        result_cpu = torch.eye(3, out=out_cpu)
+        result_neuron = torch.eye(3, out=out_neuron)
+
+        assert (
+            result_neuron.dtype == result_cpu.dtype
+        ), f"dtype mismatch: neuron={result_neuron.dtype}, cpu={result_cpu.dtype}"

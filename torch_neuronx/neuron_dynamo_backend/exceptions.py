@@ -4,12 +4,12 @@ Exceptions for Neuron backend
 
 
 class NEFFCompilationError(Exception):
-    """Exception raised when NEFF compilation fails"""
+    """Signal a failure while compiling a NEFF artifact."""
 
     pass
 
 
 class NEFFExecutionError(Exception):
-    """Exception raised when NEFF execution fails"""
+    """Signal a failure while executing a NEFF artifact."""
 
     pass

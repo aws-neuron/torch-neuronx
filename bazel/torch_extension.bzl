@@ -42,4 +42,5 @@ def _torch_extension_impl(module_ctx):
 
 torch_extension = module_extension(
     implementation = _torch_extension_impl,
+    environ = ["PYTORCH_LOCAL_PATH", "PYTORCH_USE_EXTERNAL", "PYTORCH_VERSION", "PYTHON_VERSION"],
 )

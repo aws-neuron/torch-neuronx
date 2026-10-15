@@ -1,3 +1,6 @@
+# CodeGraph local index (per-machine; built via `codegraph init .`)
+.codegraph/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -31,6 +34,7 @@ build/docs/
 *.a
 *.dylib
 *.dll
+*.log
 
 # Bazel
 bazel-*
@@ -66,8 +70,7 @@ file.neff
 torch_neuronx/protos/*.py
 torch_neuronx/protos/xla/*.py
 
-# Ignore the pytorch test directory
-tests/pytorch_tests/test/
+# Ignore generated upstream PyTorch test files.
 tests/pytorch_tests_native/torch/
 tests/pytorch_tests_native/test/
 
@@ -76,3 +79,13 @@ MODULE.bazel.lock
 uv.lock
 .clangd
 build
+
+# Agent skills live only in .external/skills (public) and .internal/skills (private).
+# Agent client folders are local-only; see .internal/README.md to set them up.
+.claude/
+.kiro/
+.agents/
+.codex/
+
+# Agent scratch directory - skills write temporary evidence under agent_space/.
+agent_space/

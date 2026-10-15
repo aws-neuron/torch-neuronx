@@ -215,20 +215,41 @@ def run_wrong_list_size_test(rank, world_size, kwargs):
     dist.all_to_all(output_tensor_list, input_tensor_list)
 
 
-def run_shape_mismatch_test(rank, world_size, kwargs):
-    """Test alltoall with mismatched tensor shapes."""
+def run_trailing_dim_mismatch_test(rank, world_size, kwargs):
+    """alltoall where chunks disagree on a dim >= 1 (the per-row feature size).
+
+    Only dim 0 may vary across chunks (variable-split all-to-all); a mismatch in a
+    trailing dim is unrepresentable and must raise. Uses 2D chunks so dim 0 is equal
+    (rows=2) but dim 1 differs (4 vs 3)."""
     input_tensor_list = []
     for dst_rank in range(world_size):
         if dst_rank == 0:
-            # Different shape for first tensor
+            input_tensor_list.append(torch.ones(2, 4).to("neuron"))
+        else:
+            input_tensor_list.append(torch.ones(2, 3).to("neuron"))
+
+    output_tensor_list = [torch.zeros(2, 3).to("neuron") for _ in range(world_size)]
+
+    dist.all_to_all(output_tensor_list, input_tensor_list)
+
+
+def run_dim0_mismatch_flag_off_test(rank, world_size, kwargs):
+    """alltoall with unequal dim-0 chunk shapes and the NKI a2a-v flag OFF.
+
+    Variable-split all-to-all (unequal dim 0) requires the native NKI all_to_all_v
+    path. With the flag off it must raise an actionable error telling the user to
+    enable NEURON_USE_NKI_ALLTOALLV, NOT the old cryptic 'same shape' assert."""
+    input_tensor_list = []
+    for dst_rank in range(world_size):
+        if dst_rank == 0:
             input_tensor_list.append(torch.ones(5).to("neuron"))
         else:
-            # Different shape for other tensors
             input_tensor_list.append(torch.ones(3).to("neuron"))
 
     output_tensor_list = [torch.zeros(3).to("neuron") for _ in range(world_size)]
 
-    dist.all_to_all(output_tensor_list, input_tensor_list)
+    with patch.dict(os.environ, {"NEURON_USE_NKI_ALLTOALLV": "0"}):
+        dist.all_to_all(output_tensor_list, input_tensor_list)
 
 
 def run_dtype_mismatch_test(rank, world_size, kwargs):
@@ -298,7 +319,40 @@ def run_partial_group_alltoall_test(rank, world_size, kwargs):
         # Ranks not in partial_group don't participate
         pass
 
-    dist.barrier()
+
+def run_strided_group_alltoall_test(rank, world_size, kwargs):
+    """Every rank runs alltoall in its own strided group.
+
+    The groups partition the world: rank i joins the ranks i + k * stride. The runtime needs
+    every rank to load the collective. On trn2 a group that spans two chips fails in the
+    replica-group validation when another rank stays idle.
+    """
+    stride = kwargs["stride"]
+    groups = [list(range(i, world_size, stride)) for i in range(stride)]
+    # dist.new_group is collective. Every rank must create every group.
+    process_groups = [dist.new_group(g) for g in groups]
+    group_ranks = groups[rank % stride]
+    # On trn2 a cross-chip pair needs a chunk of 4*k elements. The runtime asserts otherwise.
+    chunk = 8
+
+    input_tensor_list = [
+        torch.full((chunk,), rank * 10 + i + 1, dtype=torch.float32).to("neuron")
+        for i in range(len(group_ranks))
+    ]
+    output_tensor_list = [
+        torch.zeros(chunk, dtype=torch.float32).to("neuron") for _ in range(len(group_ranks))
+    ]
+
+    dist.all_to_all(output_tensor_list, input_tensor_list, group=process_groups[rank % stride])
+
+    rank_idx_in_group = group_ranks.index(rank)
+    for src_idx, src_rank in enumerate(group_ranks):
+        expected_value = src_rank * 10 + rank_idx_in_group + 1
+        expected_tensor = torch.full((chunk,), expected_value, dtype=torch.float32)
+        assert torch.allclose(output_tensor_list[src_idx].cpu(), expected_tensor), (
+            f"Rank {rank}: Expected {expected_tensor} from rank {src_rank}, "
+            f"got {output_tensor_list[src_idx].cpu()}"
+        )
 
 
 def run_5gb_tensor_test(rank, world_size, kwargs):
@@ -385,10 +439,23 @@ class TestAllToAll(BaseCollectiveOpTest):
         """Test alltoall error handling with wrong list sizes."""
         self.distributed_tester.run_test(run_wrong_list_size_test)
 
-    @assert_raises(RuntimeError, match=r".*all input tensors must have same shape.*but found.*")
-    def test_shape_mismatch_error(self):
-        """Test alltoall error handling with shape mismatch."""
-        self.distributed_tester.run_test(run_shape_mismatch_test)
+    @assert_raises(
+        RuntimeError,
+        match=r".*must have identical shape in dims >= 1.*only dim 0 may vary.*",
+    )
+    def test_trailing_dim_mismatch_error(self):
+        """Chunks disagreeing on a dim >= 1 (per-row feature size) must raise; only
+        dim 0 may vary for variable-split all-to-all."""
+        self.distributed_tester.run_test(run_trailing_dim_mismatch_test)
+
+    @assert_raises(
+        RuntimeError,
+        match=r".*unequal shapes.*NEURON_USE_NKI_ALLTOALLV.*",
+    )
+    def test_dim0_mismatch_flag_off_error(self):
+        """Unequal dim-0 chunks with the NKI a2a-v flag OFF raise an actionable
+        error (enable NEURON_USE_NKI_ALLTOALLV), not the old 'same shape' assert."""
+        self.distributed_tester.run_test(run_dim0_mismatch_flag_off_test)
 
     @assert_raises(
         RuntimeError,
@@ -401,7 +468,11 @@ class TestAllToAll(BaseCollectiveOpTest):
         """Test alltoall error handling with dtype mismatch. Error thrown by torch directly"""
         self.distributed_tester.run_test(run_dtype_mismatch_test)
 
-    @assert_raises(RuntimeError, match=r".*Expected neuron device, got cpu.*")
+    @assert_raises(
+        RuntimeError,
+        match=r".*(Expected neuron device, got cpu"
+        r"|No backend type associated with device type cpu).*",
+    )
     def test_different_devices_error(self):
         """Test alltoall with tensors on different devices."""
         self.distributed_tester.run_test(run_different_device_test)
@@ -412,8 +483,9 @@ class TestAllToAll(BaseCollectiveOpTest):
         self.distributed_tester.run_test(run_5gb_tensor_test)
 
 
+@pytest.mark.neuron_cores(8)
 class TestAllToAllWorldSize8(BaseCollectiveOpTest):
-    """Test cases for alltoall with partial groups in world size 16 (hardware supported)."""
+    """Test cases for alltoall with partial groups in world size 8 (hardware supported)."""
 
     @property
     def world_size(self) -> int:
@@ -438,38 +510,36 @@ class TestAllToAllWorldSize8(BaseCollectiveOpTest):
             partial_group=partial_group,
         )
 
-    @assert_raises(RuntimeError, match=r".*unsupported world size.*supported sizes.*")
-    def test_alltoall_partial_group_unsupported_world_size(self):
-        """Test alltoall with unsupported world size."""
-        partial_group = [0, 1]
-        os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
+    @pytest.mark.parametrize("partial_group", [[1, 3]])
+    def test_alltoall_partial_group_unaligned_start(self, partial_group):
+        """Groups whose start rank is not a multiple of the group size still work.
+
+        NeuronBackend::alltoall used to reject these up front. Which groups the device
+        interconnect can form an alltoall over is a topology property that a start-rank
+        rule cannot express: it excluded these working groups while still admitting
+        [0, 2, 4, 6], which the runtime rejects (see below), so the check was removed and
+        the runtime is now the only arbiter.
+        """
         self.distributed_tester.run_test(
             run_partial_group_alltoall_test,
             partial_group=partial_group,
         )
 
-    @pytest.mark.parametrize(
-        "group_config",
-        [
-            {
-                "partial_group": [0, 2, 4, 6],
-            },
-            {
-                "partial_group": [2, 3, 4, 5],
-            },
-        ],
+    def test_alltoall_strided_group(self):
+        """Pairs of rank i and rank i + 4 across two chips.
+
+        On trn2 the fabric links rank i to rank i + 4 only. The pair works only when every
+        rank in the world takes part in some group, so all four pairs run at once.
+        """
+        self.distributed_tester.run_test(run_strided_group_alltoall_test, stride=4)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="the device interconnect cannot form an alltoall over these groups; the "
+        "runtime rejects them with 'NRT model scheduling failed'",
     )
-    @assert_raises(
-        RuntimeError,
-        match=(
-            r".*replica group start ranks must be "
-            r"multiples of world size.*found.*group.*starts at rank.*"
-        ),
-    )
-    def test_alltoall_partial_group_supported_fail_cases(self, group_config):
-        partial_group = group_config["partial_group"]
-        lnc = group_config.get("NEURON_LOGICAL_NC_CONFIG", "2")
-        os.environ["NEURON_LOGICAL_NC_CONFIG"] = lnc
+    @pytest.mark.parametrize("partial_group", [[0, 2, 4, 6], [2, 3, 4, 5]])
+    def test_alltoall_partial_group_unsupported_topology(self, partial_group):
         self.distributed_tester.run_test(
             run_partial_group_alltoall_test,
             partial_group=partial_group,

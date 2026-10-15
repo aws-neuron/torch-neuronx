@@ -1,4 +1,5 @@
-from .cache import CompilationCache
-from .hlo_compiler import HloCompiler
+"""Compilation-support utilities for the torch-mlir eager path.
 
-__all__ = ["CompilationCache", "HloCompiler"]
+The persistent StableHLO cache lives in :mod:`hlo_cache`; import it directly
+(``from torch_neuronx.python_ops.compilation import hlo_cache``).
+"""

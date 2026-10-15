@@ -20,7 +20,7 @@ namespace at::neuron::debug {
 // Args:
 //   hlo_bytes: The HLO/MLIR module bytes to dump
 //   config: Compilation configuration
-//   ir_type: "XLA" (HLO protobuf) or "StableHLO" (MLIR) — determines file extension
+//   ir_type: "StableHLO" (MLIR) — determines file extension
 //   cache_key: Cache key for the compilation (contains op name, shapes, etc.)
 //   kernel_class_name: Name of the kernel class (optional, defaults to "UnknownKernel")
 // Returns true when IR dumping is enabled (TORCH_NEURONX_DUMP_HLO_PB=1).

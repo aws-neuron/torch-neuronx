@@ -78,6 +78,18 @@ class TestNeuronDevice(unittest.TestCase):
                 x.storage().device.index == device_idx
             ), f"Device {device_idx}: Storage device changed to {x.storage().device}"
 
+    def test_complex_conj_copy_across_devices(self):
+        """A peer complex copy_ keeps the D2H/H2D route: the on-device path would
+        reach GetTargetDeviceId, which rejects a mismatched device index."""
+        device_count = torch_neuronx.device_count()
+        if device_count < 2:
+            pytest.skip("Need at least 2 neuron devices")
+
+        src_cpu = torch.randn(8, 4, dtype=torch.complex64)
+        dst = torch.empty(8, 4, dtype=torch.complex64, device="neuron:1")
+        dst.copy_(src_cpu.to("neuron:0").conj())
+        torch.testing.assert_close(dst.cpu(), src_cpu.conj().resolve_conj())
+
     def test_ones_explicit_device_index(self):
         """Test that explicit device argument is respected, not overridden by current device."""
         device_count = torch_neuronx.device_count()

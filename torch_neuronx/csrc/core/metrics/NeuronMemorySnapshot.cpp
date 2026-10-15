@@ -113,6 +113,12 @@ std::atomic<bool> g_record_enabled{false};
 std::atomic<RecordContext> g_record_context{RecordContext::NEVER};
 std::atomic<bool> g_include_cpp_frames{false};
 
+// Clock domain offset: system_clock - steady_clock (in microseconds).
+// Applied to all memory trace timestamps so they align with the framework profiler
+// and runtime system trace (both use system_clock / CLOCK_REALTIME).
+// Computed once when recording is enabled.
+static std::atomic<int64_t> g_clock_domain_offset_us{0};
+
 // Per-device trace buffers (lazily initialized)
 std::mutex g_buffers_mutex;
 std::vector<std::unique_ptr<TraceBuffer>> g_device_buffers;
@@ -159,7 +165,14 @@ void setAllBuffersMaxEntries(size_t max_entries) {
 // Public API Implementation
 // =============================================================================
 
-int64_t GetCurrentTimestampUs() { return at::neuron::metrics::GetCurrentTimeNs() / 1000; }
+int64_t GetCurrentTimestampUs() {
+  return at::neuron::metrics::GetCurrentTimeNs() / 1000 +
+         g_clock_domain_offset_us.load(std::memory_order_relaxed);
+}
+
+int64_t GetClockDomainOffsetUs() {
+  return g_clock_domain_offset_us.load(std::memory_order_relaxed);
+}
 
 const char* TraceActionToString(TraceAction action) {
   switch (action) {
@@ -181,6 +194,14 @@ const char* TraceActionToString(TraceAction action) {
       return "snapshot";
     case TraceAction::OOM:
       return "oom";
+    case TraceAction::ALLOC_DEFERRED:
+      return "alloc_deferred";
+    case TraceAction::ALLOC_DRAIN_RETRY_OK:
+      return "alloc_drain_retry_ok";
+    case TraceAction::ALLOC_DRAIN_RETRY_FAIL:
+      return "alloc_drain_retry_fail";
+    case TraceAction::ALLOC_CACHE_DRAIN_RETRY:
+      return "alloc_cache_drain_retry";
     default:
       return "unknown";
   }
@@ -205,6 +226,17 @@ void RecordHistory(bool enabled, RecordContext when, bool include_cpp_frames, si
   g_record_context.store(when, std::memory_order_release);
   g_include_cpp_frames.store(include_cpp_frames, std::memory_order_release);
 
+  if (enabled) {
+    // Compute clock domain offset: system_clock - steady_clock.
+    // This aligns memory trace timestamps with the framework profiler and runtime
+    // system trace, which both use system_clock (CLOCK_REALTIME).
+    auto steady_now_ns = at::neuron::metrics::GetCurrentTimeNs();
+    auto sys_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
+    g_clock_domain_offset_us.store((sys_now_ns - steady_now_ns) / 1000, std::memory_order_relaxed);
+  }
+
   if (max_entries > 0) {
     setAllBuffersMaxEntries(max_entries);
   }
@@ -212,16 +244,23 @@ void RecordHistory(bool enabled, RecordContext when, bool include_cpp_frames, si
   if (clear_history) {
     clearAllBuffers();
   }
+
+  // Recording only toggles the framework-side snapshot buffer; it does not start a
+  // runtime system-trace session. The framework-side trace id (nrt_tensor_get_trace_id)
+  // is captured into the snapshot only while recording is enabled, matching the rest of
+  // the snapshot data; the runtime independently stamps the same id on its events, so
+  // the two correlate. Runtime events are captured only under profile().
 }
 
 void RecordTrace(TraceAction action, int device, size_t addr, size_t size, c10::StreamId stream,
-                 std::shared_ptr<StackContext> context, size_t device_free) {
+                 std::shared_ptr<StackContext> context, size_t device_free, size_t block_size,
+                 uint64_t trace_id) {
   if (!g_record_enabled.load(std::memory_order_acquire)) {
     return;
   }
 
   TraceEntry entry(action, device, addr, size, stream, GetCurrentTimestampUs(), std::move(context),
-                   device_free);
+                   device_free, block_size, trace_id);
 
   getDeviceBuffer(device).insert(std::move(entry));
 }
@@ -336,7 +375,7 @@ SnapshotInfo snapshot() {
   // Record a SNAPSHOT trace event for correlation
   if (g_record_enabled.load(std::memory_order_acquire)) {
     // Record on device 0 by default
-    RecordTrace(TraceAction::SNAPSHOT, 0, 0, 0, 0, nullptr, 0);
+    RecordTrace(TraceAction::SNAPSHOT, 0, 0, 0, 0, nullptr, 0, 0);
   }
 
   // Get segments from the allocator - already in unified SegmentInfo format

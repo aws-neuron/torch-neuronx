@@ -12,7 +12,7 @@ from functools import lru_cache
 from torch._dynamo.utils import compilation_time_metrics, counters, cumulative_time_spent_ns
 
 import torch_neuronx
-from torch_neuronx.neuron_dynamo_backend.config import get_rank
+from torch_neuronx.utils import get_rank
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +43,14 @@ _compilation_metrics: list["NeuronCompilationMetrics"] = []
 
 
 class LazyTimingList(list):
-    """A list that lazily resolves its values on access, re-resolving if count changes.
+    """Resolve deferred compilation timings whenever the compilation count changes.
 
-    Used to defer torch_neuronx_compile timing retrieval until someone actually
-    reads from compilation_time_metrics. Re-resolves if new compilations occurred.
+    Args:
+        resolver (Callable[[], list[float]]): Callback that returns current timings.
+        get_count (Callable[[], int]): Callback that returns the compilation count.
+
+    Note:
+        Reads defer ``torch_neuronx_compile`` timing retrieval until values are accessed.
     """
 
     def __init__(self, resolver: Callable[[], list[float]], get_count: Callable[[], int]):
@@ -152,18 +156,23 @@ def _get_compilation_time_ms(cache_key: str) -> int:
 
 @dataclass
 class NeuronCompilationMetrics:
-    """Per-graph compilation metrics.
+    """Store compilation metrics for one FX graph.
 
-    Attributes:
-        graph_id: Unique identifier (cache key) for the compiled graph.
-        graph_name: Human-readable name in format {model_name}_{aot_id}_{graph_type}_{nth}.
-        model_name: User-provided or auto-generated model name.
-        has_collectives: Whether the graph contains collective operations (e.g., all-reduce).
-        graph_node_count: Number of nodes in the FX graph before lowering.
-        timestamp: Compilation timestamp/segment ID for ordering.
-        torch_neuronx_fx_passes_us: Time for FX graph-level passes (microseconds).
-        torch_neuronx_lower_us: Time for torch-mlir lowering to StableHLO (microseconds).
-        torch_neuronx_compile_us: Time to compile StableHLO to NEFF (microseconds, lazy).
+    Args:
+        graph_id (str): Cache key identifying the compiled graph.
+        graph_name (str, optional): Name formatted as
+            ``{model_name}_{aot_id}_{graph_type}_{nth}``. Defaults to ``""``.
+        model_name (str, optional): User-provided or generated model name. Defaults to ``""``.
+        has_collectives (bool, optional): Whether the graph contains collective operations.
+            Defaults to ``False``.
+        graph_node_count (int, optional): FX graph node count before lowering. Defaults to ``0``.
+        timestamp (str, optional): Compilation segment identifier. Defaults to ``""``.
+        torch_neuronx_fx_passes_us (int, optional): FX graph-pass time in microseconds.
+            Defaults to ``0``.
+        torch_neuronx_lower_us (int, optional): StableHLO lowering time in microseconds.
+            Defaults to ``0``.
+        torch_neuronx_compile_us (int, optional): Lazily resolved NEFF compilation time in
+            microseconds. Defaults to ``0``.
     """
 
     graph_id: str
@@ -182,10 +191,15 @@ _register_metric_table("graph_stats", [f.name for f in fields(NeuronCompilationM
 
 
 def record_compilation(metrics: NeuronCompilationMetrics) -> None:
-    """Record compilation metrics for a graph.
+    """Populate and record compilation metrics for a graph.
 
-    torch_neuronx_fx_passes and torch_neuronx_lower timing are captured immediately (sync).
-    torch_neuronx_compile timing is populated lazily on get (async operation).
+    Args:
+        metrics (NeuronCompilationMetrics): Record whose FX-pass and lowering timings are
+            overwritten before the same object is stored.
+
+    Note:
+        Increments ``counters["neuron"]["compiled_graphs"]`` and, when applicable,
+        ``counters["neuron"]["graphs_with_collectives"]``. NEFF timing resolves lazily.
     """
     # Ensure lazy list is registered (may have been cleared by torch._dynamo.reset())
     _register_lazy_timing_list()
@@ -215,9 +229,14 @@ def _populate_compile_timing(metrics: NeuronCompilationMetrics) -> None:
 
 
 def get_dynamo_metrics() -> list[NeuronCompilationMetrics]:
-    """Get all torch.compile compilation metrics with timing.
+    """Return all Dynamo backend compilation metrics with resolved timing.
 
-    Syncs to ensure async compilation timing is populated.
+    Returns:
+        list[NeuronCompilationMetrics]: Shallow list copy of recorded per-graph metrics.
+
+    Note:
+        Synchronizes the Neuron device, then populates unresolved NEFF timings in the
+        stored metric objects before returning aliases to those objects.
     """
     torch_neuronx.synchronize()
     with _lock:
@@ -299,10 +318,10 @@ def _register_lazy_timing_list() -> None:
 
 
 def reset_dynamo_metrics() -> None:
-    """Reset all torch.compile compilation metrics.
+    """Reset all recorded Dynamo backend compilation metrics and counters.
 
-    Clears recorded metrics and counters. Call this between test runs
-    or when starting a new profiling session.
+    Note:
+        Clears process-wide stored records and ``counters["neuron"]``.
     """
     with _lock:
         _compilation_metrics.clear()

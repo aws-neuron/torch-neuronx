@@ -8,29 +8,24 @@ import io
 from dataclasses import dataclass
 
 import torch
-from torch_mlir._mlir_libs._mlir import ir
 
 
 def compute_cache_key(stablehlo_mlir) -> str:
-    """Generate a cache key from a StableHLO graph.
-
-    Creates a SHA-256 hash from the StableHLO module text and I/O specifications.
-
-    Note: Non-deterministic attributes (e.g., torch.debug_dump_path) should be
-    stripped before calling this function.
+    """Compute a cache key from a StableHLO graph.
 
     Args:
-        stablehlo_mlir: Compiled StableHLO MLIR module.
+        stablehlo_mlir (mlir.ir.Module): StableHLO MLIR module to hash.
 
     Returns:
-        str: 64-character hex cache key for C++ consumption.
+        str: 64-character SHA-256 hexadecimal digest.
 
     Raises:
-        RuntimeError: If cache key generation fails.
+        RuntimeError: If printing or parsing the module fails.
 
-    Example:
-        >>> stablehlo_mlir = convert_fx_to_stablehlo(gm, example_inputs)
-        >>> cache_key = compute_cache_key(stablehlo_mlir)
+    Note:
+        The hash includes module text without debug locations plus input and
+        output shapes and dtypes. Strip nondeterministic attributes such as
+        ``torch.debug_dump_path`` before calling this function.
     """
     try:
         hasher = hashlib.sha256()
@@ -77,10 +72,19 @@ MLIR_TO_TORCH_DTYPE = {
     "f8E4M3FN": torch.float8_e4m3fn,
 }
 
+if hasattr(torch, "float8_e8m0fnu"):
+    MLIR_TO_TORCH_DTYPE["f8E8M0FNU"] = torch.float8_e8m0fnu
+
 
 @dataclass(frozen=True)
 class TensorSpec:
-    """Tensor shape and dtype specification."""
+    """Describe a tensor shape and dtype.
+
+    Args:
+        shape (tuple[int, ...]): Tensor dimensions, with negative values marking
+            dynamic dimensions.
+        dtype (torch.dtype): Tensor element dtype.
+    """
 
     shape: tuple[int, ...]
     dtype: torch.dtype
@@ -91,83 +95,41 @@ class TensorSpec:
         return f"<{shape_str}x{dtype_str}>" if shape_str else f"<{dtype_str}>"
 
     def to_torch_size(self) -> torch.Size:
+        """Convert the stored shape to a ``torch.Size``.
+
+        Returns:
+            torch.Size: Size containing the stored dimensions.
+        """
         return torch.Size(self.shape)
 
     def is_dynamic(self) -> bool:
-        return any(d < 0 for d in self.shape)
-
-
-# =============================================================================
-# Random Op Descriptors
-# =============================================================================
-
-
-@dataclass(frozen=True)
-class NativeDropoutOp:
-    """Descriptor for native_dropout operation with all info needed to generate mask.
-
-    Attributes:
-        input_position: Position in the graph's input list (after original inputs)
-        shape: Shape of the mask tensor
-        dtype: Data type of the mask tensor
-        probability: Dropout probability (probability of zeroing an element)
-        train: Whether dropout is in training mode
-    """
-
-    input_position: int
-    shape: tuple[int, ...]
-    dtype: torch.dtype
-    probability: float
-    train: bool
-
-    def sample(self, device: str | torch.device) -> torch.Tensor:
-        """Generate a boolean dropout mask tensor.
-
-        Args:
-            device: Target device
+        """Check whether the shape contains a dynamic dimension.
 
         Returns:
-            Boolean dropout mask tensor where True = keep, False = drop.
-            The scaling by 1/(1-p) is done in the compiled graph, not here.
+            bool: ``True`` if any dimension is negative; otherwise ``False``.
         """
-        zeros = torch.zeros(self.shape, dtype=self.dtype, device="cpu")
-        _, mask = torch.ops.aten.native_dropout(zeros, p=self.probability, train=self.train)
-        return mask.to(device)
-
-
-@dataclass
-class RandomInputInfo:
-    """Metadata to track random inputs added to the graph.
-
-    Attributes:
-        ops: List of random op descriptors
-        original_input_count: Number of inputs before pass
-        new_input_count: Number of inputs after pass
-    """
-
-    ops: list[NativeDropoutOp]
-    original_input_count: int
-    new_input_count: int
+        return any(d < 0 for d in self.shape)
 
 
 @dataclass(frozen=True)
 class FunctionIO:
-    """Input/Output specification for a function."""
+    """Store the input and output tensor specifications for a function.
+
+    Args:
+        inputs (tuple[TensorSpec, ...]): Input tensor specifications.
+        outputs (tuple[TensorSpec, ...]): Output tensor specifications.
+    """
 
     inputs: tuple[TensorSpec, ...]
     outputs: tuple[TensorSpec, ...]
-    random_input_info: RandomInputInfo | None = None
 
     def __repr__(self) -> str:
         inputs_str = ", ".join(str(t) for t in self.inputs)
         outputs_str = ", ".join(str(t) for t in self.outputs)
-        base = f"Inputs: [{inputs_str}] → Outputs: [{outputs_str}]"
-        if self.random_input_info:
-            base += f" | {self.random_input_info}"
-        return base
+        return f"Inputs: [{inputs_str}] → Outputs: [{outputs_str}]"
 
 
-def _parse_mlir_type(mlir_type: ir.Type) -> TensorSpec:
+def _parse_mlir_type(mlir_type) -> TensorSpec:
     """Parse an MLIR type into a TensorSpec.
 
     Extracts shape and dtype information from MLIR tensor types.
@@ -195,20 +157,22 @@ def _parse_mlir_type(mlir_type: ir.Type) -> TensorSpec:
 
 
 def parse_module_io(
-    module: ir.Module,
+    module,
     func_name: str = "main",
-    random_input_info: RandomInputInfo | None = None,
 ) -> FunctionIO:
-    """
-    Parse input/output specs from a StableHLO module's function.
+    """Parse tensor specifications from a StableHLO module function.
 
     Args:
-        module: torch_mlir MLIR module
-        func_name: Target function name (default: "main")
-        random_input_info: Optional metadata about random inputs added to the graph
+        module (mlir.ir.Module): StableHLO MLIR module to inspect.
+        func_name (str, optional): Target symbol name. Defaults to ``"main"``.
 
     Returns:
-        FunctionIO with input and output TensorSpecs
+        FunctionIO | None: Parsed specifications when the first operation is the
+        target function, or ``None`` when the module has no operations.
+
+    Raises:
+        ValueError: If the first operation is not the target function or an
+            element dtype is unsupported.
     """
     for op in module.body.operations:
         if (
@@ -218,52 +182,55 @@ def parse_module_io(
             func_type = op.attributes["function_type"].value
             inputs = tuple(_parse_mlir_type(i) for i in func_type.inputs)
             outputs = tuple(_parse_mlir_type(o) for o in func_type.results)
-            return FunctionIO(
-                inputs=inputs,
-                outputs=outputs,
-                random_input_info=random_input_info,
-            )
+            return FunctionIO(inputs=inputs, outputs=outputs)
         raise ValueError(f"Function '{func_name}' not found in module")
 
 
-def get_input_specs(module: ir.Module, func_name: str = "main") -> list[TensorSpec]:
-    """Get input tensor specifications from a StableHLO module.
+def get_input_specs(module, func_name: str = "main") -> list[TensorSpec]:
+    """Get input tensor specifications from a StableHLO module function.
 
     Args:
-        module (ir.Module): MLIR module to parse.
-        func_name (str): Target function name. Defaults to "main".
+        module (mlir.ir.Module): StableHLO MLIR module to inspect.
+        func_name (str, optional): Target symbol name. Defaults to ``"main"``.
 
     Returns:
-        list[TensorSpec]: List of input tensor specifications.
+        list[TensorSpec]: Input tensor specifications in parameter order.
+
+    Raises:
+        ValueError: If the target function cannot be parsed.
+        AttributeError: If parsing returns no function data, including when the module has no
+            operations.
     """
     return list(parse_module_io(module, func_name).inputs)
 
 
-def get_output_specs(module: ir.Module, func_name: str = "main") -> list[TensorSpec]:
-    """Get output tensor specifications from a StableHLO module.
+def get_output_specs(module, func_name: str = "main") -> list[TensorSpec]:
+    """Get output tensor specifications from a StableHLO module function.
 
     Args:
-        module (ir.Module): MLIR module to parse.
-        func_name (str): Target function name. Defaults to "main".
+        module (mlir.ir.Module): StableHLO MLIR module to inspect.
+        func_name (str, optional): Target symbol name. Defaults to ``"main"``.
 
     Returns:
-        list[TensorSpec]: List of output tensor specifications.
+        list[TensorSpec]: Output tensor specifications in result order.
+
+    Raises:
+        ValueError: If the target function cannot be parsed.
+        AttributeError: If the module has no operations.
     """
     return list(parse_module_io(module, func_name).outputs)
 
 
 def shapes_match(shape1: TensorSpec, shape2: TensorSpec) -> bool:
-    """Check if two tensor specifications match exactly.
-
-    Compares both shape and dtype for equality. Used to validate
-    aliasing relationships where input and output must have identical specs.
+    """Check whether two tensor specifications match exactly.
 
     Args:
-        shape1 (TensorSpec): First tensor specification.
-        shape2 (TensorSpec): Second tensor specification.
+        shape1 (TensorSpec | None): First tensor specification, or ``None``.
+        shape2 (TensorSpec | None): Second tensor specification, or ``None``.
 
     Returns:
-        bool: True if both specs are non-None and equal, False otherwise.
+        bool: ``True`` if both non-``None`` specifications have equal shapes
+            and dtypes; otherwise ``False``.
     """
     if shape1 is None or shape2 is None:
         return False

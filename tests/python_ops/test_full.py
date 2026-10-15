@@ -177,3 +177,13 @@ class TestFull:
             assert torch.all(result == 2.0)
             assert result.layout == torch.strided
             assert_op_runs_on_neuron("aten::full")
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.int32])
+    def test_full_dtype_static(self, dtype):
+        """Verify full respects the dtype parameter."""
+        result = torch.full((3, 4), 2.0, dtype=dtype, device="neuron")
+        expected = torch.full((3, 4), 2.0, dtype=dtype)
+
+        assert (
+            result.dtype == expected.dtype
+        ), f"dtype mismatch: neuron={result.dtype}, cpu={expected.dtype}"

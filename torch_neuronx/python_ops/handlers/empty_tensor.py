@@ -8,18 +8,20 @@ logger = logging.getLogger(__name__)
 
 
 class BaseEmptyTensorHandler:
-    """Handles operations on empty tensors.
-    Note: Not all the APIs are ported over from jax's empty tensor handler.
+    """Detect empty tensors in operation arguments.
+
+    Note:
+        This handler does not implement every API from the legacy empty-tensor handler.
     """
 
     def check_for_empty(self, *args) -> bool:
-        """Check if any tensor arguments are empty.
+        """Check recursively for empty tensor arguments.
 
         Args:
-            *args: Arguments to check
+            *args (object): Values to inspect; lists and tuples are traversed recursively.
 
         Returns:
-            True if any tensor is empty
+            bool: ``True`` if any tensor has zero elements; otherwise ``False``.
         """
         for arg in args:
             if isinstance(arg, torch.Tensor):

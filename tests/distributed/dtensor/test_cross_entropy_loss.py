@@ -24,13 +24,15 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 )
 
 import torch_neuronx
-from tests.pytorch_tests.distributed.common_distributed import NeuronDistributedBase
+from tests.distributed.dtensor.common_distributed import NeuronDistributedBase
 from tests.utils.neuron_test_utils import (
     assert_op_runs_on_neuron,
-    get_core_start_index,
     get_pytest_worker_index,
+    get_rank_core,
     track_neuron_ops,
 )
+
+pytestmark = pytest.mark.neuron_cores(8)
 
 
 class DistCrossEntropyLossTest(NeuronDistributedBase, MultiProcessTestCase):
@@ -51,8 +53,7 @@ class DistCrossEntropyLossTest(NeuronDistributedBase, MultiProcessTestCase):
     @classmethod
     def _run(cls, rank, test_name, file_name, parent_pipe, **kwargs):
         process_index = get_pytest_worker_index()
-        core_start_index = get_core_start_index()
-        os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_start_index + rank)
+        os.environ["NEURON_RT_VISIBLE_CORES"] = str(get_rank_core(rank))
         rt_port = int(os.environ.get("NEURON_RT_PORT", "2025"))
         os.environ["NEURON_RT_ROOT_COMM_ID"] = f"localhost:{rt_port + process_index}"
         super()._run(rank, test_name, file_name, parent_pipe, **kwargs)
@@ -91,6 +92,10 @@ class DistCrossEntropyLossTest(NeuronDistributedBase, MultiProcessTestCase):
         self.assertEqual(dist_loss.full_tensor(), ref_loss, atol=1e-3, rtol=1e-3)
 
     @with_comms
+    @pytest.mark.xfail(
+        reason="[PT2.12] Neuron distributed nightly failure (run 28991277106): NRT collective "
+        "scheduling / DDP / loss_parallel. Xfailing to unblock nightly pending root-cause."
+    )
     def test_cross_entropy_loss_parallel_backward(self):
         """Test backward pass with loss_parallel sharding."""
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))

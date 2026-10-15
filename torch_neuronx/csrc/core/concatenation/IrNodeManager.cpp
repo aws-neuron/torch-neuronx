@@ -6,6 +6,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -353,7 +354,7 @@ std::unique_ptr<IrNode> IrNodeManager::CreateNodeFromOperationContext(
         "create_node_from_operation_context requires XLACompilableKernelExecution");
   }
 
-  const std::string& cache_key = xla_kernel->GetCacheKey();
+  const std::string& cache_key = xla_kernel->GetCompileKey();
 
   TORCH_NEURONX_DEBUG("Creating IrNode from validated OperationContext",
                       "op_name:", xla_kernel->GetOpName(), "cache_key:", cache_key,
@@ -378,24 +379,9 @@ std::unique_ptr<IrNode> IrNodeManager::CreateNodeFromOperationContext(
         ir_resource->op_name, std::move(cache_key), ir_resource->module, ir_resource->ir_serialized,
         std::move(input_data_ptr), std::move(output_data_ptr), ir_resource->has_collectives);
 
-    // Populate TensorDataRef from the XLA kernel (preserves NeuronTensorPtr for NRT execution)
-    auto src_ptrs = xla_kernel->GetSrcDataPtrs();
-    result_node->input_data_refs.reserve(src_ptrs.size());
-    for (size_t i = 0; i < src_ptrs.size(); ++i) {
-      // Create TensorDataRef with the nrt_tensor_t pointer using a no-op deleter
-      // since ownership is retained by the original kernel
-      result_node->input_data_refs.emplace_back(
-          c10_neuron::NeuronCachingAllocator::TensorPtr(src_ptrs[i], [](nrt_tensor_t*) {}),
-          xla_kernel->GetSrcPtrs()[i]);
-    }
-
-    auto dst_ptrs = xla_kernel->GetDstDataPtrs();
-    result_node->output_data_refs.reserve(dst_ptrs.size());
-    for (size_t i = 0; i < dst_ptrs.size(); ++i) {
-      result_node->output_data_refs.emplace_back(
-          c10_neuron::NeuronCachingAllocator::TensorPtr(dst_ptrs[i], [](nrt_tensor_t*) {}),
-          xla_kernel->GetDstPtrs()[i]);
-    }
+    // Copy TensorDataRef from the XLA kernel (preserves NeuronTensorPtr for NRT execution).
+    result_node->input_data_refs = xla_kernel->GetSrcRefs();
+    result_node->output_data_refs = xla_kernel->GetDstRefs();
 
     // Copy TensorContexts from the XLA kernel
     result_node->input_contexts = xla_kernel->GetInputContexts();
@@ -408,22 +394,9 @@ std::unique_ptr<IrNode> IrNodeManager::CreateNodeFromOperationContext(
   // even if this is a friend class
   auto node = std::unique_ptr<StableHloNode>(new StableHloNode(*operation_context, context.get()));
 
-  // Populate TensorDataRef for the new node (cache miss case)
-  auto src_ptrs = xla_kernel->GetSrcDataPtrs();
-  node->input_data_refs.reserve(src_ptrs.size());
-  for (size_t i = 0; i < src_ptrs.size(); ++i) {
-    node->input_data_refs.emplace_back(
-        c10_neuron::NeuronCachingAllocator::TensorPtr(src_ptrs[i], [](nrt_tensor_t*) {}),
-        xla_kernel->GetSrcPtrs()[i]);
-  }
-
-  auto dst_ptrs = xla_kernel->GetDstDataPtrs();
-  node->output_data_refs.reserve(dst_ptrs.size());
-  for (size_t i = 0; i < dst_ptrs.size(); ++i) {
-    node->output_data_refs.emplace_back(
-        c10_neuron::NeuronCachingAllocator::TensorPtr(dst_ptrs[i], [](nrt_tensor_t*) {}),
-        xla_kernel->GetDstPtrs()[i]);
-  }
+  // Copy TensorDataRef from the XLA kernel (preserves NeuronTensorPtr for NRT execution).
+  node->input_data_refs = xla_kernel->GetSrcRefs();
+  node->output_data_refs = xla_kernel->GetDstRefs();
 
   // Copy TensorContexts from the XLA kernel
   node->input_contexts = xla_kernel->GetInputContexts();
@@ -578,6 +551,15 @@ void IrNodeManager::SerializeMlirModule(StableHloNode* node) {
 
 void IrNodeManager::CacheIrResource(StableHloNode* node, const std::string& cache_key,
                                     std::unique_ptr<MergeMapping> merge_mapping) {
+  // Invariant: callers must explicitly provide merge_mapping for concatenated nodes.
+  if (!merge_mapping && node->merge_mapping) {
+    throw std::runtime_error(
+        "CacheIrResource: merge_mapping not provided but node has one. "
+        "Callers must explicitly pass merge_mapping for concatenated nodes. "
+        "cache_key=" +
+        cache_key);
+  }
+
   auto ir_resource = std::make_unique<IrResource>(
       node->module, std::move(merge_mapping), node->op_name, node->cache_key, node->ir_serialized,
       node->ir_type, node->has_collectives);
@@ -585,6 +567,10 @@ void IrNodeManager::CacheIrResource(StableHloNode* node, const std::string& cach
 }
 
 bool IrNodeManager::PruneMlirFunction(StableHloNode* node, void* dealloc_address) {
+  // Clone the module so in-place pruning does not mutate shared cached entries.
+  auto original_module = node->module;
+  node->module = std::make_shared<mlir::OwningOpRef<mlir::ModuleOp>>((*node->module)->clone());
+
   // Build indices to keep (all except those matching dealloc_address)
   std::unordered_set<size_t> indicesToKeep;
   for (size_t i = 0; i < node->outputs.size(); ++i) {
@@ -596,7 +582,8 @@ bool IrNodeManager::PruneMlirFunction(StableHloNode* node, void* dealloc_address
   // Find the 'main' function in the MLIR module
   auto funcOp = (*node->module)->lookupSymbol<mlir::func::FuncOp>("main");
   if (!funcOp) {
-    TORCH_NEURONX_WARN("[PRUNE_MLIR] Could not find 'main' function in module");
+    node->module = std::move(original_module);
+    TORCH_NEURONX_WARN("Could not find 'main' function in module during MLIR prune");
     return false;
   }
 
@@ -604,67 +591,193 @@ bool IrNodeManager::PruneMlirFunction(StableHloNode* node, void* dealloc_address
   try {
     pruneFunctionResultsByIndices(funcOp, indicesToKeep);
   } catch (const std::exception& e) {
-    TORCH_NEURONX_WARN("[PRUNE_MLIR] Failed to prune MLIR function", "error:", e.what());
+    node->module = std::move(original_module);
+    TORCH_NEURONX_WARN("Failed to prune MLIR function", "error:", e.what());
     return false;
   }
+
+  // Remap mhlo.input_output_alias output indices after pruning. Drop entries for
+  // pruned outputs. Update both FuncOp and ModuleOp (alias can be on either).
+  auto remapAliasAttr = [&](mlir::Operation* op) {
+    if (!op->hasAttr("mhlo.input_output_alias")) return;
+
+    // Build old→new index mapping for kept outputs
+    std::unordered_map<size_t, size_t> old_to_new;
+    size_t new_idx = 0;
+    for (size_t i = 0; i < node->outputs.size(); i++) {
+      if (indicesToKeep.count(i)) {
+        old_to_new[i] = new_idx++;
+      }
+    }
+
+    mlir::OpBuilder builder(op->getContext());
+    auto oldAliasAttr = op->getAttrOfType<mlir::ArrayAttr>("mhlo.input_output_alias");
+    llvm::SmallVector<mlir::Attribute> newAliasList;
+
+    for (auto attr : oldAliasAttr) {
+      auto dictAttr = mlir::dyn_cast<mlir::DictionaryAttr>(attr);
+      if (!dictAttr) continue;
+
+      auto outputIdxAttr = dictAttr.getAs<mlir::DenseI64ArrayAttr>("output_index");
+      if (!outputIdxAttr || outputIdxAttr.empty()) continue;
+
+      size_t old_out_idx = static_cast<size_t>(outputIdxAttr[0]);
+
+      // If this aliased output was pruned, drop the entry
+      if (old_to_new.find(old_out_idx) == old_to_new.end()) {
+        TORCH_NEURONX_DEBUG("Removing alias entry for pruned output[", old_out_idx, "]");
+        continue;
+      }
+
+      // Remap to new index
+      size_t new_out_idx = old_to_new[old_out_idx];
+      auto aliasInner = dictAttr.getAs<mlir::DictionaryAttr>("alias");
+      auto newOutputIdxAttr = builder.getDenseI64ArrayAttr({static_cast<int64_t>(new_out_idx)});
+      auto newEntry =
+          builder.getDictionaryAttr({builder.getNamedAttr("alias", aliasInner),
+                                     builder.getNamedAttr("output_index", newOutputIdxAttr)});
+      newAliasList.push_back(newEntry);
+    }
+
+    if (newAliasList.empty()) {
+      op->removeAttr("mhlo.input_output_alias");
+    } else {
+      op->setAttr("mhlo.input_output_alias", builder.getArrayAttr(newAliasList));
+    }
+  };
+
+  // Remap alias on the FuncOp (set by ConcatAll overlap detection)
+  remapAliasAttr(funcOp.getOperation());
+  // Remap alias on the ModuleOp (set by OpConcatUtils during merge)
+  remapAliasAttr((*node->module)->getOperation());
 
   return true;
 }
 
-bool IrNodeManager::PruneSingleOutput(StableHloNode* node, void* dealloc_address) {
+std::unique_ptr<MergeMapping> IrNodeManager::RebuildMergeMappingAfterPrune(
+    const MergeMapping& old_mapping, const std::unordered_set<size_t>& pruned_set) {
+  // Start from a full copy — input_mapping and other fields are unchanged by pruning.
+  auto new_mapping = std::make_unique<MergeMapping>(old_mapping);
+
+  // Rebuild output_mapping: skip pruned indices, re-index remaining sequentially
+  new_mapping->output_mapping.clear();
+  size_t expected_remaining = old_mapping.total_outputs - pruned_set.size();
+  new_mapping->output_mapping.reserve(expected_remaining);
+  size_t new_idx = 0;
+  for (size_t old_idx = 0; old_idx < old_mapping.total_outputs; ++old_idx) {
+    if (pruned_set.count(old_idx)) {
+      continue;
+    }
+    auto it = old_mapping.output_mapping.find(old_idx);
+    if (it == old_mapping.output_mapping.end()) {
+      throw std::runtime_error(
+          "RebuildMergeMappingAfterPrune: Missing output_mapping for non-pruned index " +
+          std::to_string(old_idx));
+    }
+    new_mapping->output_mapping[new_idx] = it->second;
+    ++new_idx;
+  }
+  new_mapping->total_outputs = new_idx;
+  return new_mapping;
+}
+
+void IrNodeManager::ValidatePostPruneConsistency(const StableHloNode* node) {
+  auto funcOp = (*node->module)->lookupSymbol<mlir::func::FuncOp>("main");
+  if (!funcOp) {
+    throw std::runtime_error(
+        "Post-prune validation: Cannot find 'main' function in pruned module, cache_key=" +
+        node->cache_key);
+  }
+  size_t mlir_results = funcOp.getNumResults();
+  size_t output_count = node->outputs.size();
+  if (mlir_results != output_count) {
+    throw std::runtime_error("Post-prune validation: MLIR result count (" +
+                             std::to_string(mlir_results) + ") != outputs size (" +
+                             std::to_string(output_count) + "), cache_key=" + node->cache_key);
+  }
+  if (!node->output_data_refs.empty() && node->output_data_refs.size() != output_count) {
+    throw std::runtime_error("Post-prune validation: output_data_refs size (" +
+                             std::to_string(node->output_data_refs.size()) + ") != outputs size (" +
+                             std::to_string(output_count) + "), cache_key=" + node->cache_key);
+  }
+  if (!node->output_contexts.empty() && node->output_contexts.size() != output_count) {
+    throw std::runtime_error("Post-prune validation: output_contexts size (" +
+                             std::to_string(node->output_contexts.size()) + ") != outputs size (" +
+                             std::to_string(output_count) + "), cache_key=" + node->cache_key);
+  }
+}
+
+bool IrNodeManager::PruneSingleOutput(StableHloNode* node, void* dealloc_address,
+                                      PruneSource source) {
   if (!node || !node->module) {
-    TORCH_NEURONX_WARN("[PRUNE_SINGLE] Invalid node or module for pruning");
+    TORCH_NEURONX_WARN("Invalid node or module for pruning");
     return false;
   }
 
-  // Find indices to prune (all matching dealloc_address in CURRENT outputs)
   auto pruned_indices = FindIndicesToPrune(node, dealloc_address);
 
-  // If nothing to prune (address not in outputs), return success
   if (pruned_indices.empty()) {
-    TORCH_NEURONX_DEBUG("[PRUNE_SINGLE] Address not found in outputs - nothing to prune",
-                        "addr:", dealloc_address, "outputs_count:", node->outputs.size());
     return true;
   }
 
-  // Generate new cache key by appending pruning suffix to current key
-  std::string new_cache_key = GeneratePruningCacheKey(node->cache_key, pruned_indices);
-  std::unordered_set<size_t> pruned_set(pruned_indices.begin(), pruned_indices.end());
+  if (pruned_indices.size() >= node->outputs.size()) {
+    TORCH_NEURONX_INFO("Would prune all outputs — aborting concatenation",
+                       "dealloc_addr:", dealloc_address, "op_name:", node->op_name,
+                       "cache_key:", node->cache_key, "outputs_count:", node->outputs.size(),
+                       "pruned_count:", pruned_indices.size());
+    return false;
+  }
 
-  TORCH_NEURONX_DEBUG("[PRUNE_SINGLE] Pruning outputs at address", "addr:", dealloc_address,
-                      "pruned_indices_count:", pruned_indices.size(),
-                      "outputs_before:", node->outputs.size(), "old_cache_key:", node->cache_key,
-                      "new_cache_key:", new_cache_key);
+  // Save the original cache key before any mutations for cache lookup
+  std::string original_cache_key = node->cache_key;
+  // Differentiate prune source in the key to prevent collisions between
+  // ConcatAll skip-intermediates and double-buffer lookahead pruning.
+  std::string source_prefix = (source == PruneSource::kDoubleBuffer) ? "|db_pruned" : "|pruned";
+  std::vector<size_t> sorted_indices = pruned_indices;
+  std::sort(sorted_indices.begin(), sorted_indices.end());
+  std::string new_cache_key = original_cache_key + source_prefix;
+  for (size_t idx : sorted_indices) {
+    new_cache_key += "_" + std::to_string(idx);
+  }
+  std::unordered_set<size_t> pruned_set(pruned_indices.begin(), pruned_indices.end());
 
   // Check cache for already-pruned MLIR
   if (auto* cached = GetByKey(new_cache_key)) {
-    TORCH_NEURONX_DEBUG("[PRUNE_SINGLE] Cache HIT - restoring from cache",
-                        "cache_key:", new_cache_key);
     node->module = cached->module;
     node->ir_serialized = cached->ir_serialized;
     node->cache_key = new_cache_key;
     UpdateNodeOutputVectors(node, pruned_set);
+
+    auto funcOp_hit = (*node->module)->lookupSymbol<mlir::func::FuncOp>("main");
+    if (funcOp_hit && funcOp_hit.getNumResults() != node->outputs.size()) {
+      throw std::runtime_error("PruneSingleOutput cache-hit mismatch: mlir_results=" +
+                               std::to_string(funcOp_hit.getNumResults()) +
+                               " outputs=" + std::to_string(node->outputs.size()) +
+                               " cache_key=" + new_cache_key);
+    }
     return true;
   }
 
-  TORCH_NEURONX_DEBUG("[PRUNE_SINGLE] Cache MISS - performing actual pruning",
-                      "cache_key:", new_cache_key);
-
-  // Perform actual MLIR function pruning
+  // Clone + prune MLIR (PruneMlirFunction handles clone internally)
   if (!PruneMlirFunction(node, dealloc_address)) {
     return false;
   }
 
-  // Update node state
+  // Rebuild MergeMapping from the original (pre-prune) cache entry
+  std::unique_ptr<MergeMapping> new_merge_mapping;
+  if (auto* original_cached = GetByKey(original_cache_key)) {
+    if (original_cached->merge_mapping) {
+      new_merge_mapping =
+          RebuildMergeMappingAfterPrune(*original_cached->merge_mapping, pruned_set);
+    }
+  }
+
   UpdateNodeOutputVectors(node, pruned_set);
   SerializeMlirModule(node);
-  node->cache_key = new_cache_key;
-  CacheIrResource(node, new_cache_key);
+  ValidatePostPruneConsistency(node);
 
-  TORCH_NEURONX_DEBUG("[PRUNE_SINGLE] Successfully pruned, re-serialized, and cached MLIR",
-                      "outputs_after:", node->outputs.size(),
-                      "ir_serialized_size:", node->ir_serialized.size(),
-                      "cache_key:", new_cache_key, "cache_size:", ir_resource_cache_.size());
+  node->cache_key = new_cache_key;
+  CacheIrResource(node, new_cache_key, std::move(new_merge_mapping));
 
   return true;
 }
@@ -792,6 +905,14 @@ static void validateAliasingAttributes(IrNode* node) {
   TORCH_NEURONX_DEBUG("Aliasing validation PASSED: ", expected_aliases.size(), " aliases match");
 }
 
+void IrNodeManager::DiscardMergedNode(ConcatState& state) {
+  if (state.merged) {
+    Evict(state.merged->cache_key);
+  }
+  state.merged = nullptr;
+  state.merged_owned.reset();
+}
+
 void IrNodeManager::ProcessIrNode(IrNode* node, ConcatState& state) {
   if (node->ir_type == IrNodeType::ALLOC_HINT) {
     // ALLOC: Remove address from pruned set (it's been reallocated)
@@ -814,12 +935,8 @@ void IrNodeManager::ProcessIrNode(IrNode* node, ConcatState& state) {
       bool prune_success =
           PruneSingleOutput(static_cast<StableHloNode*>(state.merged), hint_node->dealloc_address);
       if (!prune_success) {
-        // Pruning failed - throw exception to trigger fallback in ConcatenationCore
-        TORCH_NEURONX_WARN("[TYPE_DISPATCH] Pruning failed - falling back to individual ops",
-                           "dealloc_addr:", hint_node->dealloc_address);
-        std::ostringstream oss;
-        oss << "Pruning failed for dealloc_address " << hint_node->dealloc_address;
-        throw std::runtime_error(oss.str());
+        DiscardMergedNode(state);
+        throw std::runtime_error("Pruning failed for dealloc_address");
       }
     }
 
@@ -870,25 +987,63 @@ IrConcatResult IrNodeManager::ConcatAll(const std::list<IrNode*>& input_ir_list)
 
   // Build result
   if (state.merged_owned) {
-    // Check for input-output overlap (controlled by member variable)
+    // Annotate remaining input-output address overlap with mhlo.input_output_alias
+    // on the ModuleOp so the compiler knows these buffers are shared.
     bool has_overlap = false;
     if (check_overlap_enabled_) {
+      auto* hlo_node = static_cast<StableHloNode*>(state.merged);
       std::unordered_set<void*> input_addrs;
-      std::unordered_set<void*> output_addrs;
-
-      for (void* addr : state.merged->inputs) {
+      for (void* addr : hlo_node->inputs) {
         if (addr) input_addrs.insert(addr);
       }
 
-      for (void* addr : state.merged->outputs) {
-        if (addr) output_addrs.insert(addr);
-      }
-
-      for (void* addr : output_addrs) {
-        if (input_addrs.count(addr)) {
-          TORCH_NEURONX_DEBUG("Concatenated IR has input-output address overlap, addr=", addr);
+      std::vector<std::pair<size_t, size_t>> overlap_pairs;  // (output_idx, input_idx)
+      for (size_t out_idx = 0; out_idx < hlo_node->outputs.size(); out_idx++) {
+        void* out_addr = hlo_node->outputs[out_idx];
+        if (!out_addr) continue;
+        if (input_addrs.count(out_addr)) {
+          // Find the matching input index
+          for (size_t in_idx = 0; in_idx < hlo_node->inputs.size(); in_idx++) {
+            if (hlo_node->inputs[in_idx] == out_addr) {
+              overlap_pairs.emplace_back(out_idx, in_idx);
+              break;
+            }
+          }
           has_overlap = true;
         }
+      }
+
+      if (has_overlap && aliasing_enabled_) {
+        // Add mhlo.input_output_alias for overlapping pairs on the ModuleOp.
+        // Convention: alias attribute lives on the ModuleOp (matching OpConcatUtils
+        // addAliasingForConcatenatedModule and what neuronx-cc reads).
+        mlir::OpBuilder builder((*hlo_node->module)->getContext());
+        llvm::SmallVector<mlir::Attribute> aliasList;
+
+        for (auto& [out_idx, in_idx] : overlap_pairs) {
+          auto paramNumAttr = builder.getI64IntegerAttr(static_cast<int64_t>(in_idx));
+          auto paramIdxAttr = builder.getDenseI64ArrayAttr({});
+          auto kindAttr = builder.getStringAttr("must_alias");
+          auto aliasInner =
+              builder.getDictionaryAttr({builder.getNamedAttr("kind", kindAttr),
+                                         builder.getNamedAttr("parameter_number", paramNumAttr),
+                                         builder.getNamedAttr("parameter_index", paramIdxAttr)});
+          auto outputIdxAttr = builder.getDenseI64ArrayAttr({static_cast<int64_t>(out_idx)});
+          auto aliasOuter =
+              builder.getDictionaryAttr({builder.getNamedAttr("alias", aliasInner),
+                                         builder.getNamedAttr("output_index", outputIdxAttr)});
+          aliasList.push_back(aliasOuter);
+
+          TORCH_NEURONX_DEBUG("Added input_output_alias: output[", out_idx, "] -> input[", in_idx,
+                              "] addr=", hlo_node->outputs[out_idx]);
+        }
+
+        if (!aliasList.empty()) {
+          auto moduleOp = (*hlo_node->module)->getOperation();
+          moduleOp->setAttr(builder.getStringAttr("mhlo.input_output_alias"),
+                            builder.getArrayAttr(aliasList));
+        }
+        has_overlap = false;  // Handled via aliasing — don't discard
       }
     }
 

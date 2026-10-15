@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -170,7 +172,7 @@ TEST_F(NeuronMemorySnapshotTest, RecordTraceWhenDisabled) {
   EXPECT_FALSE(IsRecordingEnabled());
 
   // Record a trace - should be ignored
-  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000, 4096, 0, nullptr, 0);
+  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000, 4096, 0, nullptr, 0, 0);
 
   // Take snapshot - should have no traces
   auto snap = snapshot();
@@ -192,9 +194,9 @@ TEST_F(NeuronMemorySnapshotTest, RecordTraceWhenEnabled) {
   EXPECT_TRUE(IsRecordingEnabled());
 
   // Record some traces
-  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000, 4096, 0, nullptr, 0);
-  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x2000, 8192, 0, nullptr, 0);
-  RecordTrace(TraceAction::FREE_REQUESTED, 0, 0x1000, 4096, 0, nullptr, 0);
+  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000, 4096, 0, nullptr, 0, 0);
+  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x2000, 8192, 0, nullptr, 0, 0);
+  RecordTrace(TraceAction::FREE_REQUESTED, 0, 0x1000, 4096, 0, nullptr, 0, 0);
 
   // Take snapshot
   auto snap = snapshot();
@@ -212,8 +214,8 @@ TEST_F(NeuronMemorySnapshotTest, ClearHistory) {
 
   // Enable recording and add traces
   RecordHistory(true, RecordContext::ALLOC, false, 100, true);
-  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000, 4096, 0, nullptr, 0);
-  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x2000, 8192, 0, nullptr, 0);
+  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000, 4096, 0, nullptr, 0, 0);
+  RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x2000, 8192, 0, nullptr, 0, 0);
 
   // Clear history
   RecordHistory(true, RecordContext::ALLOC, false, 100, true);
@@ -245,7 +247,7 @@ TEST_F(NeuronMemorySnapshotTest, RingBufferCapacity) {
 
   // Record 10 traces (more than capacity)
   for (int i = 0; i < 10; i++) {
-    RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000 + i * 0x1000, 4096, 0, nullptr, 0);
+    RecordTrace(TraceAction::SEGMENT_ALLOC, 0, 0x1000 + i * 0x1000, 4096, 0, nullptr, 0, 0);
   }
 
   // Take snapshot
@@ -274,7 +276,7 @@ TEST_F(NeuronMemorySnapshotTest, TraceEntryDefaultConstructor) {
 
 TEST_F(NeuronMemorySnapshotTest, TraceEntryParameterizedConstructor) {
   auto ctx = std::make_shared<StackContext>();
-  TraceEntry entry(TraceAction::OOM, 1, 0x5000, 1024, 42, 123456, ctx, 999);
+  TraceEntry entry(TraceAction::OOM, 1, 0x5000, 1024, 42, 123456, ctx, 999, 0);
 
   EXPECT_EQ(entry.action, TraceAction::OOM);
   EXPECT_EQ(entry.device, 1);
@@ -284,6 +286,7 @@ TEST_F(NeuronMemorySnapshotTest, TraceEntryParameterizedConstructor) {
   EXPECT_EQ(entry.timestamp_us, 123456);
   EXPECT_EQ(entry.context, ctx);
   EXPECT_EQ(entry.device_free, 999u);
+  EXPECT_EQ(entry.block_size, 1024u);  // defaults to size when blk_sz=0
 }
 
 // =============================================================================
@@ -340,7 +343,7 @@ TEST_F(NeuronMemorySnapshotTest, SegmentInfoDefaults) {
   EXPECT_EQ(seg.allocated_size, 0u);
   EXPECT_EQ(seg.active_size, 0u);
   EXPECT_EQ(seg.stream, 0);
-  EXPECT_TRUE(seg.is_large);
+  EXPECT_FALSE(seg.is_small);
   EXPECT_TRUE(seg.blocks.empty());
 }
 
@@ -358,6 +361,57 @@ TEST_F(NeuronMemorySnapshotTest, GetCurrentTimestampUs) {
   EXPECT_GT(ts1, 0);
   EXPECT_GT(ts2, 0);
   EXPECT_GE(ts2, ts1);
+}
+
+TEST_F(NeuronMemorySnapshotTest, ClockDomainOffsetAlignsTimestampToSystemClock) {
+  // Enabling recording computes the clock domain offset so memory timestamps
+  // align with the runtime system trace (both use system_clock).
+  RecordHistory(true, RecordContext::ALLOC, false, 100, true);
+
+  int64_t sys_now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+  int64_t ts = GetCurrentTimestampUs();
+
+  // The offset shifts the steady-clock reading into the system-clock domain.
+  // Allow 1 second of slack for scheduling jitter.
+  EXPECT_NEAR(static_cast<double>(ts), static_cast<double>(sys_now_us), 1000000.0);
+}
+
+// =============================================================================
+// Trace ID Correlation Tests
+// =============================================================================
+
+TEST_F(NeuronMemorySnapshotTest, TraceEntryStoresTraceId) {
+  TraceEntry entry(TraceAction::ALLOC, 0, 0x1000, 4096, 0, 123, nullptr, 0, 4096, 0xDEADBEEF);
+  EXPECT_EQ(entry.trace_id, 0xDEADBEEFu);
+}
+
+TEST_F(NeuronMemorySnapshotTest, TraceEntryTraceIdDefaultsToZero) {
+  TraceEntry entry;
+  EXPECT_EQ(entry.trace_id, 0u);
+}
+
+TEST_F(NeuronMemorySnapshotTest, RecordTracePropagatesTraceId) {
+  EXPECT_CALL(*mock_nrt_, nrt_get_visible_vnc_count(_))
+      .WillRepeatedly(DoAll(SetArgPointee<0>(1), Return(NRT_SUCCESS)));
+
+  RecordHistory(true, RecordContext::ALLOC, false, 100, true);
+
+  const uint64_t kTraceId = 0xABCDEF;
+  RecordTrace(TraceAction::ALLOC, 0, 0x3000, 4096, 0, nullptr, 0, 4096, kTraceId);
+
+  auto snap = snapshot();
+  ASSERT_GE(snap.device_traces.size(), 1u);
+
+  bool found = false;
+  for (const auto& entry : snap.device_traces[0]) {
+    if (entry.addr == 0x3000u) {
+      EXPECT_EQ(entry.trace_id, kTraceId);
+      found = true;
+    }
+  }
+  EXPECT_TRUE(found);
 }
 
 }  // namespace

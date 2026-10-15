@@ -16,31 +16,48 @@ from typing import ClassVar
 
 import torch
 from torch.fx import Node
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
 
-from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+    IOMutation,
+    MutationKind,
+    PassMutations,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
+    NeuronFXPass,
+    NeuronFXPassState,
+)
+from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasInfo, AliasingInfo
 
 logger = logging.getLogger(__name__)
 
 
-class AliasingAnalysis(PassBase):
-    """Aliasing and Mutation Analysis Pass for PyTorch FX Graphs.
+class AliasingAnalysis(NeuronFXPass):
+    """Analyze FX graph input mutations and output aliases.
 
-    This pass analyzes a PyTorch FX GraphModule to identify:
-    1. Output tensors that alias input tensors (via view operations)
-    2. Input tensors that are mutated in-place (via setitem or in-place methods)
+    Args:
+        state (NeuronFXPassState | None, optional): Shared state used for pass artifact
+            dumping. Defaults to ``None``.
 
-    The output aliasing information is transformed to match AOTAutograd's
-    output convention where mutated inputs appear first (sorted by input index),
-    followed by non-aliased explicit outputs.
+    Note:
+        Recognizes view and slice aliases plus setitem, in-place method or operator,
+        mutable custom-op, and NKI mutations. Results follow AOTAutograd order:
+        mutated inputs sorted by input index, then explicit outputs except aliases of
+        mutated inputs, which are deduplicated.
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, state: NeuronFXPassState | None = None):
+        super().__init__(state)
         self.result: AliasingInfo | None = None
+        self._pass_mutations = None
 
     @property
     def name(self) -> str:
+        """Return the pass name.
+
+        Returns:
+            str: The ``aliasing_analysis`` identifier.
+        """
         return "aliasing_analysis"
 
     # =========================================================================
@@ -69,6 +86,10 @@ class AliasingAnalysis(PassBase):
         "select",
         "unflatten",
         "flatten",
+        "movedim",
+        "swapaxes",
+        "swapdims",
+        "broadcast_to",
     }
 
     ALIASING_ATEN_OPS: ClassVar[set[str]] = {
@@ -94,27 +115,29 @@ class AliasingAnalysis(PassBase):
         "view_as",
         "reshape_as",
         "expand_as",
+        "movedim",
+        "broadcast_to",
     }
 
-    INPLACE_METHODS: ClassVar[set[str]] = {
-        "add_",
-        "sub_",
-        "mul_",
-        "div_",
-        "copy_",
-        "fill_",
-        "zero_",
-        "scatter_",
-        "index_copy_",
-        "index_fill_",
-        "index_put_",
-        "masked_fill_",
-        "masked_scatter_",
-        "clamp_",
-        "relu_",
-        "pow_",
-        "abs_",
-    }
+    # In-place operator functions (x += y -> operator.iadd(x, y), etc.).
+    # Dynamo traces augmented assignment to these call_function targets.
+    INPLACE_OPERATORS: ClassVar[frozenset] = frozenset(
+        {
+            operator.iadd,
+            operator.isub,
+            operator.imul,
+            operator.itruediv,
+            operator.ifloordiv,
+            operator.imod,
+            operator.ipow,
+            operator.imatmul,
+            operator.iand,
+            operator.ior,
+            operator.ixor,
+            operator.ilshift,
+            operator.irshift,
+        }
+    )
 
     # =========================================================================
     # Operation Detection Methods
@@ -136,6 +159,15 @@ class AliasingAnalysis(PassBase):
         """Check if a node is a setitem operation (in-place mutation)."""
         return node.op == "call_function" and node.target == operator.setitem
 
+    def _is_inplace_operator(self, node: Node) -> bool:
+        """Check if a node is an in-place operator call (e.g. operator.iadd).
+
+        Augmented assignment on a tensor (x += y, x -= y, ...) is traced by
+        Dynamo as a call_function targeting operator.iadd / isub / imul / etc.
+        which mutates args[0] in place.
+        """
+        return node.op == "call_function" and node.target in self.INPLACE_OPERATORS
+
     def _is_inplace_method(self, node: Node) -> bool:
         """Check if a node is an in-place method call."""
         if node.op != "call_method":
@@ -143,7 +175,7 @@ class AliasingAnalysis(PassBase):
         target = node.target
         if not isinstance(target, str):
             return False
-        return target.endswith("_") or target in self.INPLACE_METHODS
+        return target.endswith("_") and not target.startswith("__")
 
     def _is_aten_aliasing_op(self, node: Node) -> bool:
         """
@@ -180,7 +212,14 @@ class AliasingAnalysis(PassBase):
         return node.target in self.ALIASING_METHODS
 
     def is_aliasing_op(self, node: Node) -> bool:
-        """Determine if a node creates a view/alias."""
+        """Determine whether an FX node creates a tensor alias.
+
+        Args:
+            node: FX node to classify.
+
+        Returns:
+            bool: ``True`` for recognized slice, method, or ATen aliasing operations.
+        """
         return (
             self._is_slice_operation(node)
             or self._is_method_aliasing_op(node)
@@ -188,8 +227,19 @@ class AliasingAnalysis(PassBase):
         )
 
     def is_mutating_op(self, node: Node) -> bool:
-        """Determine if a node mutates a tensor in-place."""
-        return self._is_setitem_operation(node) or self._is_inplace_method(node)
+        """Determine whether an FX node mutates a tensor in place.
+
+        Args:
+            node: FX node to classify.
+
+        Returns:
+            bool: ``True`` for recognized setitem, method, or operator mutations.
+        """
+        return (
+            self._is_setitem_operation(node)
+            or self._is_inplace_method(node)
+            or self._is_inplace_operator(node)
+        )
 
     def _is_custom_op_with_mutations(self, node: Node) -> bool:
         """Check if node is a custom op with mutable arguments."""
@@ -259,6 +309,56 @@ class AliasingAnalysis(PassBase):
 
         return mutated
 
+    def _is_nki_call_with_mutations(self, node: Node) -> bool:
+        """Check if a node is an NKI HOP with write-aliased operands."""
+        if node.op != "call_function":
+            return False
+        from torch_neuronx.nki_hop import NKIKernelWrapper
+
+        if not isinstance(node.target, NKIKernelWrapper):
+            return False
+        return bool(node.kwargs.get("operand_output_aliases", {}))
+
+    def _get_nki_kernel_mutated_inputs(
+        self,
+        node: Node,
+        alias_chain: dict[Node, Node],
+        input_nodes: set[Node],
+        input_nodes_list: list[Node],
+        input_names_list: list[str],
+    ) -> list[int]:
+        """Return input placeholder indices mutated by an NKI kernel HOP.
+
+        Reads node.kwargs["operand_output_aliases"] {tensor_operand_idx:
+        output_idx} and traces each aliased operand back to its root placeholder.
+        The keys index the tensor-only operand list, so filter kwargs["args"] to
+        tensors before indexing (kwargs["args"] may carry interleaved non-tensor
+        constants on cached dispatches).
+        """
+        operand_output_aliases: dict[int, int] = node.kwargs.get("operand_output_aliases", {})
+        if "args" not in node.kwargs:
+            logger.warning("NKI HOP %s: no 'args' kwarg, skipping", node.name)
+            return []
+        kernel_args = node.kwargs["args"]
+        kernel_tensor_args = [arg for arg in kernel_args if isinstance(arg, Node)]
+        mutated: list[int] = []
+
+        for input_tensor_idx in operand_output_aliases:
+            if input_tensor_idx >= len(kernel_tensor_args):
+                continue
+            kernel_arg_node = kernel_tensor_args[input_tensor_idx]
+            root_input = self._find_root_input(kernel_arg_node, alias_chain, input_nodes)
+            if root_input is not None and root_input in input_nodes:
+                placeholder_idx = input_nodes_list.index(root_input)
+                if placeholder_idx not in mutated:
+                    mutated.append(placeholder_idx)
+                    logger.debug(
+                        f"NKI HOP mutation detected: input[{placeholder_idx}] "
+                        f"({input_names_list[placeholder_idx]}) via "
+                        f"operand_output_aliases[{input_tensor_idx}]"
+                    )
+        return mutated
+
     def _extract_placeholder_name(self, node: Node) -> str | None:
         """
         Convert Dynamo's mangled placeholder target names to human-readable names.
@@ -306,10 +406,11 @@ class AliasingAnalysis(PassBase):
         if not node.args:
             return None
 
-        if self._is_setitem_operation(node):
-            return node.args[0] if isinstance(node.args[0], Node) else None
-
-        if self._is_inplace_method(node):
+        if (
+            self._is_setitem_operation(node)
+            or self._is_inplace_method(node)
+            or self._is_inplace_operator(node)
+        ):
             return node.args[0] if isinstance(node.args[0], Node) else None
 
         return None
@@ -503,19 +604,19 @@ class AliasingAnalysis(PassBase):
     # =========================================================================
 
     def call(self, gm: torch.fx.GraphModule) -> PassResult:
-        """Execute the aliasing analysis pass.
-
-        Analyzes the graph and produces aliasing information that matches
-        AOTAutograd's output convention.
+        """Analyze graph aliases and mutations without modifying the graph.
 
         Args:
-            gm: The GraphModule to analyze (not modified).
+            gm: Graph module to analyze.
 
         Returns:
-            PassResult with modified=False. Results stored in self.result.
+            PassResult: The unchanged graph module with ``modified`` set to ``False``.
 
         Raises:
-            RuntimeError: If analysis fails.
+            RuntimeError: If the graph is malformed or alias analysis fails.
+
+        Note:
+            Detailed output-to-input relationships are stored in ``self.result``.
         """
         try:
             alias_chain: dict[Node, Node] = {}
@@ -568,6 +669,21 @@ class AliasingAnalysis(PassBase):
                         alias_chain[node] = source_node
                         logger.debug(f"Alias: {node.name} -> {source_node.name}")
 
+                # Handle NKI HOP mutations — declared via operand_output_aliases
+                # kwarg, not via schema is_write=True.
+                elif self._is_nki_call_with_mutations(node):
+                    logger.debug(f"NKI HOP with mutations detected: {node.name}")
+                    nki_mutated = self._get_nki_kernel_mutated_inputs(
+                        node,
+                        alias_chain,
+                        input_nodes,
+                        input_nodes_list,
+                        input_names_list,
+                    )
+                    for idx in nki_mutated:
+                        if idx not in mutated_input_indices:
+                            mutated_input_indices.append(idx)
+
                 # Handle custom ops with mutable arguments (pre-AOT - NKI)
                 elif self._is_custom_op_with_mutations(node):
                     logger.debug(f"Custom op with mutations detected: {node.name}")
@@ -617,8 +733,18 @@ class AliasingAnalysis(PassBase):
                     continue
 
                 # Traces back to input through alias chain
+                # Skip getitem-slice nodes: they return a subset of the buffer
+                # and cannot alias the full input in HLO even when shapes match.
+                # Other shape mismatches are caught downstream by _set_module_alias.
                 root = self._find_root_input(output_item, alias_chain, input_nodes)
                 if root is not None and root in input_nodes:
+                    if self._is_slice_operation(output_item):
+                        logger.debug(
+                            f"Pre-AOT output[{output_index}] derives from "
+                            f"input[{input_nodes_list.index(root)}] "
+                            f"but is a slice — skipping alias"
+                        )
+                        continue
                     input_index = input_nodes_list.index(root)
                     explicit_output_to_input[output_index] = input_index
                     logger.debug(
@@ -640,6 +766,31 @@ class AliasingAnalysis(PassBase):
             logger.info(
                 f"Mutated inputs: {sorted(mutated_input_indices)}, "
                 f"Explicit outputs: {explicit_output_count}"
+            )
+
+            # Build PassMutations from the AliasingInfo result.
+            # Only entries where the input was mutated (inplace) → is_mutation=True.
+            # Passthrough aliases are detected and emitted by
+            # FunctionalizeCopyInplacePass which sees the post-AOT graph.
+            out_muts = []
+            if self.result is not None:
+                mutation_aliases: list[AliasInfo] = []
+                for a in self.result.aliases:
+                    if a.parameter_number in mutated_input_indices:
+                        mutation_aliases.append(a)
+                if mutation_aliases:
+                    out_muts.append(
+                        IOMutation(
+                            kind=MutationKind.ALIAS,
+                            indices=[a.output_index for a in mutation_aliases],
+                            alias_input_indices=[a.parameter_number for a in mutation_aliases],
+                            is_mutation=True,
+                            pass_name="AliasingAnalysis",
+                        )
+                    )
+            self._pass_mutations = PassMutations(
+                pass_name="AliasingAnalysis",
+                output_mutations=out_muts,
             )
 
             return PassResult(gm, modified=False)

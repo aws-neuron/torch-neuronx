@@ -15,17 +15,20 @@ from torch_neuronx.neuron_dynamo_backend.fx.passes.aliasing_analysis import Alia
 
 
 def run_aliasing_analysis(gm: GraphModule):
-    """Run AliasingAnalysis FX pass on a GraphModule."""
+    """Run AliasingAnalysis FX pass on a GraphModule and return the alias buffer map."""
+    from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import get_alias_output_buffer_map
+
     analysis = AliasingAnalysis()
     PassManager(passes=[analysis])(gm)
-    return analysis.result
+    pre_aot_pass_mutations = [analysis._pass_mutations] if analysis._pass_mutations else []
+    return get_alias_output_buffer_map(pre_aot_pass_mutations)
 
 
 def compile_to_stablehlo(captured: CapturedGraphs) -> Module:
     """Convert captured graphs to StableHLO MLIR with aliasing info."""
     pre_aot = captured.pre_aot_graph
     post_aot = captured.post_aot_forward_graph
-    aliasing_info = run_aliasing_analysis(pre_aot)
+    alias_buffer_map = run_aliasing_analysis(pre_aot)
     job = CompilationJob(op_name="torch_compile_test")
 
     stablehlo_mlir, *_ = backend._compile_fx_to_stablehlo(
@@ -34,7 +37,7 @@ def compile_to_stablehlo(captured: CapturedGraphs) -> Module:
         model_name="test_model",
         segment_id="segment_123",
         job=job,
-        aliasing_info=aliasing_info,
+        alias_buffer_map=alias_buffer_map,
     )
     return stablehlo_mlir
 
@@ -161,6 +164,7 @@ class TestAliasingPropagation:
         aliases = get_aliases(transposed, x)
         assert_alias_count(aliases, 0)
 
+    @pytest.mark.xfail(reason="Pre-AOT passthrough rebase temporarily disabled")
     def test_double_transpose(self):
         """
         Transpose changes dimension order - shape mismatch.
@@ -562,3 +566,78 @@ class TestAliasingPropagation:
         aliases = get_aliases(model, pos, new_kv)
         assert_alias_count(aliases, 1)
         assert_has_alias(aliases, param_num=1, output_idx=[0])
+
+
+class TestMutationAliasPropagatesToMlir:
+    """Verify that in-place mutations and dunder/slice handling produce correct
+    mhlo.input_output_alias entries end-to-end through StableHLO lowering.
+    """
+
+    def test_slice_of_mutated_input_produces_no_extra_alias_in_mlir(self):
+        """buf.add_(x); return buf[:3] — slice must not add a second alias entry.
+
+        The mutation writeback produces one alias (buf → output[0]).
+        The returned slice is shape-mismatched ([3] vs [5]) and must not
+        produce a second alias entry in mhlo.input_output_alias.
+        """
+
+        class Model(torch.nn.Module):
+            def forward(self, buf, x):
+                buf.add_(x)
+                return buf[:3]
+
+        model = Model()
+        buf = torch.zeros(5)
+        x = torch.ones(5)
+        aliases = get_aliases(model, buf, x)
+
+        # Exactly one alias: the mutation writeback for buf (input[0]).
+        # The slice output must not produce a second entry.
+        assert_alias_count(aliases, 1)
+        assert_has_alias(aliases, param_num=0, output_idx=[0])
+
+    def test_dunder_iadd_produces_no_alias_in_mlir(self):
+        """__iadd__ (+=) must not produce any mhlo.input_output_alias entry."""
+
+        def model(x, y):
+            x.__iadd__(y)
+            return x + y
+
+        x = torch.zeros(4)
+        y = torch.zeros(4)
+        aliases = get_aliases(model, x, y)
+        assert_alias_count(aliases, 0)
+
+
+class TestViewMutationAliasPropagatesToMlir:
+    """Verify that mutations through movedim/swapaxes views produce
+    mhlo.input_output_alias entries end-to-end through StableHLO lowering.
+    """
+
+    def test_mutation_through_swapaxes_produces_alias_in_mlir(self):
+        """add_ through swapaxes must produce one mhlo.input_output_alias entry."""
+
+        def model(x, y):
+            v = x.swapaxes(0, 1)
+            v.add_(y)
+            return x
+
+        x = torch.zeros(4, 8)
+        y = torch.zeros(8, 4)
+        aliases = get_aliases(model, x, y)
+        assert_alias_count(aliases, 1)
+        assert_has_alias(aliases, param_num=0, output_idx=[0])
+
+    def test_mutation_through_movedim_produces_alias_in_mlir(self):
+        """add_ through movedim must produce one mhlo.input_output_alias entry."""
+
+        def model(x, y):
+            v = x.movedim(0, -1)
+            v.add_(y)
+            return x
+
+        x = torch.zeros(4, 8)
+        y = torch.zeros(8, 4)
+        aliases = get_aliases(model, x, y)
+        assert_alias_count(aliases, 1)
+        assert_has_alias(aliases, param_num=0, output_idx=[0])

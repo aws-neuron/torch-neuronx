@@ -9,7 +9,9 @@ does not support boolean scalars in arithmetic contexts.
 import logging
 
 import torch
-from torch.fx.passes.infra.pass_base import PassBase, PassResult
+from torch.fx.passes.infra.pass_base import PassResult
+
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import NeuronFXPass
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +34,23 @@ _ARITHMETIC_OPS = {
 }
 
 
-class LegalizeBoolScalars(PassBase):
-    """Replace True/False scalar args with 1/0 in arithmetic ops."""
+class LegalizeBoolScalars(NeuronFXPass):
+    """Replace positional Boolean scalars with integers in arithmetic operations.
+
+    Args:
+        state (NeuronFXPassState, optional): Shared FX-pass state used for artifact dumping.
+            Defaults to ``None``.
+    """
 
     def call(self, gm: torch.fx.GraphModule) -> PassResult:
+        """Legalize positional Boolean scalar arguments in an FX graph.
+
+        Args:
+            gm (torch.fx.GraphModule): FX graph module to update.
+
+        Returns:
+            PassResult: Graph module and whether any Boolean argument changed.
+        """
         graph = gm.graph
         modified = False
 

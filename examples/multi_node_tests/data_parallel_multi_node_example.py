@@ -18,6 +18,13 @@ import torch_neuronx
 
 
 class FakeDataset(Dataset):
+    """Create a random dataset for distributed training.
+
+    Args:
+        num_samples (int): Number of samples to create.
+        input_dim (int): Size of each sample's final dimension.
+    """
+
     def __init__(self, num_samples, input_dim):
         self.data = torch.randn(num_samples, input_dim)
 
@@ -29,6 +36,8 @@ class FakeDataset(Dataset):
 
 
 class ToyModel(nn.Module):
+    """Implement a two-layer model for distributed training."""
+
     def __init__(self):
         super().__init__()
         self.net1 = nn.Linear(10, 10)
@@ -36,11 +45,27 @@ class ToyModel(nn.Module):
         self.net2 = nn.Linear(10, 5)
 
     def forward(self, x):
+        """Compute predictions for an input batch.
+
+        Args:
+            x (torch.Tensor): Input whose final dimension has size ``10``.
+
+        Returns:
+            torch.Tensor: Predictions with the same leading dimensions as ``x`` and final
+                dimension size ``5``.
+        """
         return self.net2(self.relu(self.net1(x)))
 
 
 def save_params_to_disk(model, rank, param_type):
-    """Saves gradients or weights to local disk."""
+    """Save gradients or weights to local disk.
+
+    Args:
+        model (nn.Module): Model whose parameters to save.
+        rank (int): Process rank included in the output filename.
+        param_type (str): Parameter data to save; ``"grad"`` saves available gradients,
+            ``"weight"`` saves the model state, and other values save nothing.
+    """
     if param_type == "grad":
         grads = {
             name: param.grad.cpu()
@@ -53,7 +78,18 @@ def save_params_to_disk(model, rank, param_type):
 
 
 def compare_params_across_ranks(model, world_size, param_type, rank):
-    """Compares gradients or weights across all ranks."""
+    """Compare rank-zero saved gradients or weights with every other rank.
+
+    Args:
+        model (nn.Module): Model argument accepted but not used.
+        world_size (int): Number of rank files to compare.
+        param_type (str): File prefix selector; ``"grad"`` reads ``grads_rank_*.pt`` and
+            ``"weight"`` reads ``weights_rank_*.pt``.
+        rank (int): Process rank included in status and error messages.
+
+    Raises:
+        AssertionError: If a parameter is missing or differs from the rank-zero value.
+    """
     base_filename = f"{param_type}s_rank_0.pt"
     base_params = torch.load(base_filename, map_location="cpu")
 
@@ -75,7 +111,16 @@ def compare_params_across_ranks(model, world_size, param_type, rank):
 
 
 def cleanup_saved_files(model, world_size, rank):
-    """Removes all saved gradient and weight files."""
+    """Attempt to remove saved gradient and weight files.
+
+    Args:
+        model (nn.Module): Model argument accepted but not used.
+        world_size (int): World-size argument accepted but not used.
+        rank (int): Process rank included in warning messages.
+
+    Note:
+        Cleanup errors are printed as warnings and suppressed.
+    """
     import glob
 
     try:
@@ -93,7 +138,21 @@ def cleanup_saved_files(model, world_size, rank):
 
 
 def train_epoch(model, optimizer, dataloader, device, rank, steps_to_run=1, log_interval=10):
-    """Performs training for specified number of steps."""
+    """Train a model for a bounded number of steps.
+
+    Args:
+        model (nn.Module): Model to train.
+        optimizer (torch.optim.Optimizer): Optimizer used to update model parameters.
+        dataloader (DataLoader): Batches to consume.
+        device (torch.device or str): Device to which each batch is moved.
+        rank (int): Process rank used to restrict progress logging to rank zero.
+        steps_to_run (int, optional): Number of steps to run; values below ``1`` still run
+            one step. Defaults to ``1``.
+        log_interval (int, optional): Number of steps between loss messages. Defaults to ``10``.
+
+    Raises:
+        ValueError: If ``dataloader`` is empty.
+    """
     model.train()
 
     if not dataloader:
@@ -116,7 +175,18 @@ def train_epoch(model, optimizer, dataloader, device, rank, steps_to_run=1, log_
 
 
 def check_and_cleanup_params(model, world_size, rank, cleanup=True):
-    """Saves, compares, and optionally cleans up gradients and weights."""
+    """Save parameters on every rank and compare them on rank zero.
+
+    Args:
+        model (nn.Module): Model whose gradients and weights to compare.
+        world_size (int): Number of rank files to compare.
+        rank (int): Current process rank.
+        cleanup (bool, optional): On rank zero, remove saved files after comparison. Defaults
+            to ``True``.
+
+    Note:
+        Errors are printed and suppressed.
+    """
     try:
         save_params_to_disk(model, rank, "grad")
         save_params_to_disk(model, rank, "weight")
@@ -135,7 +205,11 @@ def check_and_cleanup_params(model, world_size, rank, cleanup=True):
 
 
 def parse_args():
-    """Parse command line arguments."""
+    """Parse command-line arguments for the distributed training example.
+
+    Returns:
+        argparse.Namespace: Parsed training and parameter-comparison options.
+    """
     parser = argparse.ArgumentParser(description="Multi-node data parallel training example")
     parser.add_argument("--num-samples", type=int, default=512, help="Number of samples in dataset")
     parser.add_argument("--input-dim", type=int, default=10, help="Input dimension")

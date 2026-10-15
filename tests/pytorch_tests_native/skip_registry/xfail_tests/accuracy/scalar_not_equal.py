@@ -1,0 +1,15 @@
+ACCURACY_SCALAR_NOT_EQUAL = [
+    "ErrorMessagesTest::test_assert_failure_in_generic_ctx_mgr",
+    "HOPCacheTests::test_same_sac_policy_causes_cache_hit",
+    "LoggingTests::test_kernel_code",
+    "LoggingTests::test_output_code",
+    "*ReproTests::test_clone_not_memory_dense*",
+    "TestGuardSerializationFSDP::test_guard_serialization_fsdp_module",
+    "test_linalg.py::TestLinalgNEURON::test_pinv_errors_and_warnings_neuron_float64",
+    "test_ops.py::TestCommonNEURON::test_out_log_softmax_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_out_log_softmax_with_dtype_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_out_softmax_neuron_float32",
+    "test_ops.py::TestCommonNEURON::test_out_softmax_with_dtype_neuron_float32",
+    "test_torch.py::TestTorchDeviceTypeNEURON::test_strides_propagation_neuron",
+    "test_meta.py::TestMetaKernelRegistrations::test_linalg_eig_strides",
+]

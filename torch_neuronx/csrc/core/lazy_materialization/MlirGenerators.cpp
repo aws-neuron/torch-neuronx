@@ -13,6 +13,7 @@
 #include "torch_neuronx/csrc/core/opbuilder/module_builder/BroadcastOpBuilder.h"
 #include "torch_neuronx/csrc/core/opbuilder/module_builder/EmptyOpBuilder.h"
 #include "torch_neuronx/csrc/core/opbuilder/module_builder/ReshapeOpBuilder.h"
+#include "torch_neuronx/csrc/core/opbuilder/module_builder/ScatterIotaOpBuilder.h"
 #include "torch_neuronx/csrc/core/opbuilder/module_builder/SliceOpBuilder.h"
 #include "torch_neuronx/csrc/core/opbuilder/module_builder/TransposeOpBuilder.h"
 #include "torch_neuronx/csrc/core/opbuilder/utility/StableHloUtils.h"
@@ -407,6 +408,58 @@ std::string GenerateBroadcast(const std::vector<int64_t>& input_shape,
     return result;
   } catch (const std::exception& e) {
     TORCH_NEURONX_DEBUG("Failed to generate broadcast MLIR", "error=", e.what());
+    throw;
+  }
+}
+
+// ============================================================================
+// SCATTER_IOTA Implementation
+// ============================================================================
+
+std::string GenerateScatterIota(const std::vector<int64_t>& view_shape,
+                                const std::vector<int64_t>& view_strides, int64_t storage_offset,
+                                int64_t storage_span, const std::string& element_type) {
+  TORCH_NEURONX_DEBUG("MlirGenerators::GenerateScatterIota", "view_shape_size=", view_shape.size(),
+                      "storage_span=", storage_span, "element_type=", element_type);
+
+  // Build cache key
+  std::stringstream cache_key_ss;
+  cache_key_ss << "scatter_iota_";
+  for (auto s : view_shape) cache_key_ss << s << "_";
+  cache_key_ss << "strides_";
+  for (auto s : view_strides) cache_key_ss << s << "_";
+  cache_key_ss << "off_" << storage_offset << "_span_" << storage_span << "_" << element_type;
+  std::string cache_key = cache_key_ss.str();
+
+  {
+    std::lock_guard<std::mutex> lock(g_mlir_cache_mutex);
+    auto it = g_mlir_cache.find(cache_key);
+    if (it != g_mlir_cache.end()) {
+      TORCH_NEURONX_DEBUG("MlirGenerators::GenerateScatterIota: Cache HIT",
+                          "cache_key=", cache_key);
+      return it->second;
+    }
+  }
+
+  TORCH_NEURONX_DEBUG("MlirGenerators::GenerateScatterIota: Cache MISS", "cache_key=", cache_key);
+
+  try {
+    torch_neuronx::ScatterIotaOpBuilder builder(view_shape, view_strides, storage_offset,
+                                                storage_span, element_type);
+    auto mlir_module = builder.build();
+    std::string result = torch_neuronx::stablehlo_utils::moduleToString(mlir_module.get());
+
+    {
+      std::lock_guard<std::mutex> lock(g_mlir_cache_mutex);
+      g_mlir_cache[cache_key] = result;
+      TORCH_NEURONX_DEBUG("MlirGenerators::GenerateScatterIota: Cached MLIR",
+                          "cache_key=", cache_key);
+    }
+
+    TORCH_NEURONX_DEBUG("MlirGenerators::GenerateScatterIota: Successfully generated MLIR");
+    return result;
+  } catch (const std::exception& e) {
+    TORCH_NEURONX_DEBUG("Failed to generate scatter_iota MLIR", "error=", e.what());
     throw;
   }
 }

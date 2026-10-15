@@ -2,10 +2,12 @@
 
 #include <climits>
 #include <cstdlib>
+#include <limits>
 #include <list>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -58,6 +60,12 @@ ConcatenationEngine::ConcatenationEngine()
     skip_intermediate_enabled_ = false;
     TORCH_NEURONX_DEBUG("Using TORCH_NEURONX_APPLY_SKIP_INTERMEDIATE=0 (disabled)");
   }
+
+  const char* aliasing_env = std::getenv("TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING");
+  if (aliasing_env && std::string(aliasing_env) == "1") {
+    aliasing_enabled_ = true;
+    TORCH_NEURONX_DEBUG("Using TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING=1 (enabled)");
+  }
 }
 
 // Destructor
@@ -69,13 +77,8 @@ bool ConcatenationEngine::IsNonFusibleBoundaryOperation(const OperationContext* 
     return false;
   }
 
-  // Only kHLO operations can be concatenated
-  // All other kernel types are boundary operations that trigger implicit flush
-  // Exception: kHint operations (allocation/deallocation hints) are not boundaries
   auto kernel_type = operation->kernel_execution->GetKernelType();
-
-  bool is_boundary_by_type =
-      (kernel_type != KernelTypeEnum::kHLO && kernel_type != KernelTypeEnum::kHint);
+  bool is_boundary_by_type = !IsConcatBufferableKernelType(kernel_type);
 
   if (is_boundary_by_type) {
     return true;
@@ -111,39 +114,50 @@ bool ConcatenationEngine::IsNonFusibleBoundaryOperation(const OperationContext* 
 }
 
 std::list<OperationContext*> ConcatenationEngine::FlushStreamBuffer(StreamImpl* stream) {
-  std::list<OperationContext*> result;
-
   auto& buffer = buffering_impl_->operation_buffer_;
   if (buffer.empty()) {
-    return result;
+    return {};
   }
 
   TORCH_NEURONX_COUNTER("Concatenation.BoundaryFlushes", 1);
   TORCH_NEURONX_METRIC("Concatenation.BufferSize", static_cast<double>(buffer.size()));
 
-  // Attempt concatenation on buffered operations
+  // IR analysis must see submission order (skip-intermediates / dealloc pruning
+  // depend on it); the partition below only changes execution order.
   uint64_t cutoff_index = 0;
   MaybeTryConcatenate(buffer, stream, &cutoff_index);
 
-  // Mark ALL buffered operations as completed (regardless of concatenation result)
+  // Partition for execution order allocs → compute → deallocs. Under lazy
+  // alloc the merged op resolves all I/O VAs at dispatch, so kAllocs must
+  // precede it and kDeallocs must follow.
+  std::list<OperationContext*> alloc_ops;
+  std::list<OperationContext*> compute_ops;
+  std::list<OperationContext*> dealloc_ops;
   for (auto* op : buffer) {
     op->CompleteConcatenation();
-    result.push_back(op);
+    auto kt = op->GetKernelType();
+    if (kt == KernelTypeEnum::kAlloc) {
+      alloc_ops.push_back(op);
+    } else if (kt == KernelTypeEnum::kDealloc) {
+      dealloc_ops.push_back(op);
+    } else {
+      compute_ops.push_back(op);
+    }
   }
 
-  // Clear buffer
   buffer.clear();
-
-  // Clear output address tracking
   buffering_impl_->output_ptrs_.clear();
 
-  // ASSERTION: After flush, buffer must be empty
   TORCH_CHECK(buffering_impl_->operation_buffer_.empty(),
               "[CONCATENATION_ENGINE] Buffer not empty after FlushStreamBuffer! "
               "remaining_ops=",
               buffering_impl_->operation_buffer_.size(),
               " This indicates a bug in buffer management.");
 
+  std::list<OperationContext*> result;
+  result.splice(result.end(), alloc_ops);
+  result.splice(result.end(), compute_ops);
+  result.splice(result.end(), dealloc_ops);
   return result;
 }
 
@@ -264,8 +278,13 @@ std::list<OperationContext*> ConcatenationEngine::ProcessConcatenationTask(
   // ========================================================================
   bool is_boundary;
   if (skip_intermediate_enabled_) {
-    // New behavior with skip intermediate enabled
-    is_boundary = IsNonFusibleBoundaryOperation(operation, stream) || IsInPlaceOperation(operation);
+    is_boundary = IsNonFusibleBoundaryOperation(operation, stream);
+    // In-place ops are only boundaries when aliasing is NOT enabled.
+    // With aliasing, the merge uses mhlo.input_output_alias to handle in-place
+    // outputs as intermediates that get overwritten.
+    if (!aliasing_enabled_) {
+      is_boundary = is_boundary || IsInPlaceOperation(operation);
+    }
   } else {
     // Old behavior without skip intermediate
     is_boundary =

@@ -494,6 +494,41 @@ class TestBarrier:
         expected = torch.ones(1, device="neuron") * sum(range(size))
         assert torch.allclose(tensor, expected)
 
+    def test_barrier_on_non_default_stream(self, dist_setup):
+        """Barrier on a non-default stream must defer for prior async work on
+        that stream and gate a subsequent collective issued on the same stream.
+        """
+        rank = dist.get_rank()
+        size = dist.get_world_size()
+
+        tensor = torch.ones(4, 4, device="neuron") * rank
+        post_tensor = torch.ones(1, device="neuron") * rank
+
+        stream = torch_neuronx.Stream()
+        stream.wait_stream(torch_neuronx.current_stream())
+        with torch_neuronx.stream(stream):
+            prior_work = dist.all_reduce(tensor, async_op=True)
+            assert prior_work is not None
+
+            barrier_work = dist.barrier(async_op=True)
+            assert barrier_work is not None
+
+            post_work = dist.all_reduce(post_tensor, async_op=True)
+            assert post_work is not None
+
+            barrier_work.wait()
+
+        post_work.wait()
+
+        expected_prior = torch.ones(4, 4, device="neuron") * ((size * (size - 1)) / 2)
+        expected_post = torch.ones(1, device="neuron") * sum(range(size))
+        assert torch.allclose(
+            tensor, expected_prior
+        ), "Prior all_reduce result incorrect on non-default stream after barrier"
+        assert torch.allclose(
+            post_tensor, expected_post
+        ), "Post-barrier all_reduce must not race past the barrier"
+
 
 class TestNonDefaultStream:
     """Test collectives on non-default streams.
@@ -512,6 +547,7 @@ class TestNonDefaultStream:
 
         # Create and use non-default stream (similar to NCCL's getStreamFromPool)
         stream = torch_neuronx.Stream()
+        stream.wait_stream(torch_neuronx.current_stream())
         with torch_neuronx.stream(stream):
             work = dist.all_reduce(tensor, async_op=True)
 
@@ -534,6 +570,7 @@ class TestNonDefaultStream:
             tensor = torch.zeros(4, 4, device="neuron")
 
         stream = torch_neuronx.Stream()
+        stream.wait_stream(torch_neuronx.current_stream())
         with torch_neuronx.stream(stream):
             work = dist.broadcast(tensor, src=root_rank, async_op=True)
 
@@ -557,6 +594,8 @@ class TestNonDefaultStream:
         # Create two different streams
         stream1 = torch_neuronx.Stream()
         stream2 = torch_neuronx.Stream()
+        stream1.wait_stream(torch_neuronx.current_stream())
+        stream2.wait_stream(torch_neuronx.current_stream())
 
         # Launch on different streams
         with torch_neuronx.stream(stream1):

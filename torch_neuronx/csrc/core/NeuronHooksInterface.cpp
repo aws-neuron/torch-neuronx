@@ -111,6 +111,11 @@ static void initNeuronGenVector() {
   });
 }
 
+int64_t getDefaultGeneratorCount() {
+  initNeuronGenVector();
+  return num_devices;
+}
+
 const at::Generator& getDefaultNeuronGenerator(c10::DeviceIndex device_index) {
   initNeuronGenVector();
   c10::DeviceIndex idx = device_index;
@@ -139,7 +144,8 @@ bool NeuronHooksInterface::hasPrimaryContext(c10::DeviceIndex device_index) cons
 }
 
 // Get default generator for the device
-at::Generator NeuronHooksInterface::getDefaultGenerator(c10::DeviceIndex device_index) {
+const at::Generator& NeuronHooksInterface::getDefaultGenerator(
+    c10::DeviceIndex device_index) const {
   return getDefaultNeuronGenerator(device_index);
 }
 

@@ -56,6 +56,25 @@ class TestNeuronAllocator:
         assert a.device.type == "neuron"
         assert "aten::empty_strided" not in torch_neuronx.get_fallback_ops()
 
+    def test_empty_strided_non_contiguous_storage_size(self):
+        """Storage size must cover all elements reachable via non-contiguous strides."""
+        shape = (1, 1, 512, 384)
+        strides = (589824, 589824, 1152, 1)
+        dtype = torch.bfloat16
+
+        cpu = torch.empty_strided(shape, strides, dtype=dtype, device="cpu")
+        neu = torch.empty_strided(shape, strides, dtype=dtype, device="neuron")
+
+        assert neu.untyped_storage().size() == cpu.untyped_storage().size(), (
+            f"storage size mismatch: neuron={neu.untyped_storage().size()} "
+            f"cpu={cpu.untyped_storage().size()}"
+        )
+
+        # copy_ must succeed (previously failed with out-of-bounds storage error)
+        src = torch.randn(shape, dtype=dtype, device="neuron")
+        neu.copy_(src)
+        assert torch.allclose(neu.cpu().float(), src.cpu().float())
+
 
 class TestPinnedMemory:
     def test_pinned_memory_allocation(self):
@@ -96,3 +115,74 @@ class TestPinnedMemory:
             x.pin_memory()
         except RuntimeError as e:
             assert "pin" in str(e)
+
+    def test_unpinned_cpu_tensor_is_not_pinned(self):
+        """Test that regular CPU tensors are NOT reported as pinned.
+        This is the core fix: previously isPinnedPtr always returned true."""
+        x = torch.empty(1000, device="cpu")
+        assert not x.is_pinned(), "Regular CPU tensor should not be pinned"
+
+    def test_neuron_to_cpu_is_not_pinned(self):
+        """Test that a tensor copied from Neuron to CPU is not pinned"""
+        x = torch.empty(1000, device="neuron")
+        y = x.to("cpu")
+        assert not y.is_pinned(), "Tensor moved from Neuron to CPU should not be pinned"
+
+    def test_multiple_pinned_allocations(self):
+        """Test that multiple concurrent pinned allocations are all tracked correctly"""
+        tensors = [torch.empty(100 * (i + 1), pin_memory=True) for i in range(5)]
+        for i, t in enumerate(tensors):
+            assert t.is_pinned(), f"Pinned tensor {i} should be pinned"
+
+    def test_pinned_memory_after_del(self):
+        """Test that is_pinned is correct after some pinned tensors are freed"""
+        a = torch.empty(1000, pin_memory=True)
+        b = torch.empty(2000, pin_memory=True)
+        assert a.is_pinned()
+        assert b.is_pinned()
+        del a
+        assert b.is_pinned(), "Remaining pinned tensor should still be pinned"
+
+    def test_data_ptr_returns_nonzero(self):
+        """data_ptr() on a neuron tensor should return a nonzero mmap VA."""
+        x = torch.empty(64, device="neuron")
+        assert x.data_ptr() != 0
+
+    def test_data_ptr_is_stable(self):
+        """Calling data_ptr() twice on the same tensor should return the same address."""
+        x = torch.empty(64, device="neuron")
+        assert x.data_ptr() == x.data_ptr()
+
+    def test_different_tensors_different_ptrs(self):
+        """Two distinct tensors should have different data_ptr values."""
+        a = torch.empty(64, device="neuron")
+        b = torch.empty(64, device="neuron")
+        assert a.data_ptr() != b.data_ptr()
+
+    def test_data_ptr_after_operation(self):
+        """The result of an operation should have a valid (nonzero) data_ptr."""
+        a = torch.ones(64, device="neuron")
+        b = torch.ones(64, device="neuron")
+        c = a + b
+        assert c.data_ptr() != 0
+
+    def test_data_ptr_various_sizes(self):
+        """data_ptr() should be nonzero for small, medium, and large tensors."""
+        for size in [1, 1024, 1_000_000]:
+            x = torch.empty(size, device="neuron")
+            assert x.data_ptr() != 0, f"data_ptr was zero for size {size}"
+
+    def test_data_ptr_after_del(self):
+        """After deleting a tensor, a newly created tensor should still get a valid data_ptr."""
+        x = torch.empty(64, device="neuron")
+        _ = x.data_ptr()
+        del x
+        y = torch.empty(64, device="neuron")
+        assert y.data_ptr() != 0
+
+    def test_data_ptr_with_empty_cache(self):
+        """data_ptr should remain valid after empty_cache is called."""
+        x = torch.empty(64, device="neuron")
+        ptr_before = x.data_ptr()
+        torch_neuronx._C.NeuronCachingAllocator.emptyCache()
+        assert x.data_ptr() == ptr_before

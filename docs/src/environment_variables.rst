@@ -29,12 +29,16 @@ This document provides an overview of the different environment variables availa
      - When ``1``, keeps compilation artifacts after execution. Useful for debugging via IR inspection.
    * - ``TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION``
      - bool
-     - ``False``
+     - ``True``
      - When ``1``, disables CPU fallback on Neuron execution failure. Fails fast instead.
    * - ``TORCH_NEURONX_RETAIN_DEVICE_MODE``
      - bool
      - ``False``
      - When ``1``, outputs retain original device placement instead of Neuron device.
+   * - ``TORCH_NEURONX_DYNAMO_TENSOR_DUMPS``
+     - str
+     - ``""``
+     - Configures input/output tensor dumping during execution. Format: semicolon-delimited ``key=value`` pairs. Keys: ``inputs``, ``outputs``. Values: ``all`` (dump for all ranks) or comma-separated rank integers. Example: ``inputs=all;outputs=0,1``.
 
 Artifact Directory Structure
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -43,19 +47,26 @@ Both ``torch.compile`` and eager execution use the same unified job-based artifa
 The working directory used by all neuronx-cc calls is preserved under ``TORCH_NEURONX_DEBUG_DIR``::
 
     {TORCH_NEURONX_DEBUG_DIR}/
-    ├── {job_id}/
-    │   ├── fx_graphs/{model}_{ts}.fx.txt
-    │   ├── transformed_fx/{model}_{ts}.transformed.fx.txt
-    │   ├── raw/{model}_{ts}.torch_raw.mlir
-    │   ├── stablehlo/{model}_{ts}.stablehlo.mlir
-    │   └── torch_mlir_error/{model}_{ts}.mlir  # Populated when torch-mlir fails
+    ├── torch_neuronx/
+    │   └── rank{rank}/
+    │       └── {job_id}/
+    │           ├── fx_graphs/{model}_{ts}.fx.txt
+    │           ├── transformed_fx/{model}_{ts}.transformed.fx.txt
+    │           ├── raw/{model}_{ts}.torch_raw.mlir
+    │           ├── stablehlo/{model}_{ts}.stablehlo.mlir
+    │           ├── torch_mlir_error/{model}_{ts}.mlir
+    │           ├── inputs/inp-{rank_3digit}-{count}.p
+    │           └── outputs/out-{rank_3digit}-{count}.p
     └── neuronx-cc/
         └── {hash}/
             ├── log-neuron-cc.txt
-            ├── module.mlir (or module.hlo.pb)
+            ├── module.mlir
             ├── module.neff
             ├── metadata.txt
             └── compiler_args.txt
+
+Input/output dump files (``inp-*.p``, ``out-*.p``) are only written when ``TORCH_NEURONX_DYNAMO_TENSOR_DUMPS`` is set.
+Each file is a pickled dict mapping ``"input0"``, ``"input1"``, ... (or ``"output0"``, ...) to numpy arrays.
 
 When ``TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS=1``, all directories and their contents are preserved for debugging and analysis.
 
@@ -97,6 +108,39 @@ These variables affect eager execution (non-compiled operations).
      - int
      - ``0``
      - When ``3``, enable debug logs.
+   * - ``TORCH_NEURONX_MODULE_AUTO_COMPILE``
+     - bool
+     - ``False``
+     - When ``1``, enables bounded AutoCompile discovery for eager modules.
+   * - ``TORCH_NEURONX_MODULE_AUTO_COMPILE_DEBUG``
+     - bool
+     - ``False``
+     - When ``1``, prints AutoCompile diagnostics to stderr.
+
+Module AutoCompile
+~~~~~~~~~~~~~~~~~~
+
+``Module.to``, ``Module.to_empty``, and ``Module.neuron`` seed bounded
+module-tree discovery. A module that starts directly on Neuron needs a later
+tree seed. Without that seed, the module stays on the exact eager path.
+
+AutoCompile uses one static Dynamo signature with the Neuron backend. Eligible
+leaf modules are compile regions. Parent modules and checkpoint owners stay
+eager. Distributed lifecycle hooks also stay eager. An eligible leaf compiles
+inside the active checkpoint or SAC mode. The compiled partition applies the
+active SAC policy.
+
+An inference candidate needs a real Neuron forward executor. A training
+candidate needs real Neuron forward and backward executors.
+
+A graph break, compiler fallback, unprofitable graph, guard miss,
+checkpoint-kind change, or SAC-policy change makes the candidate terminal
+eager. AutoCompile returns the current result once. It does not replay the
+module call.
+
+A retained or higher-order eager graph makes the candidate terminal eager.
+After promotion, higher-order autograd uses the captured differentiable eager
+backward. Normal calls remain compiled.
 
 Neuron Runtime
 --------------

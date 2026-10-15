@@ -7,6 +7,7 @@ import re
 import numpy as np
 from torch_mlir.dialects.stablehlo._stablehlo_ops_gen import ConstantOp
 from torch_mlir.ir import (
+    ComplexType,
     F32Type,
     InsertionPoint,
     RankedTensorType,
@@ -15,10 +16,20 @@ from torch_mlir.ir import (
 )
 
 
+def _demoted_element_type(element_type):
+    """
+    f32-family replacement for a demotable 64-bit element type, else None.
+    """
+    s = str(element_type)
+    if s == "f64":
+        return F32Type.get()
+    if s == "complex<f64>":
+        return ComplexType.get(F32Type.get())
+    return None
+
+
 class DTypeConstantConverter:
-    """
-    Converts f64 constants to f32 in MLIR module
-    """
+    """Convert MLIR ``f64`` and ``complex<f64>`` values to f32-family types."""
 
     def _need_op_conversion(self, op):
         """Check if an operation needs f64 to f32 conversion.
@@ -32,12 +43,12 @@ class DTypeConstantConverter:
         Returns:
             bool: True if any result has f64 element type.
         """
-        # Check if any result needs conversion
+        # Check if any result needs conversion (f64 or complex<f64>)
         for result in op.results:
             result_type = result.type
-            if hasattr(result_type, "element_type") and str(result_type.element_type) in [
-                "f64",
-            ]:
+            if hasattr(result_type, "element_type") and (
+                _demoted_element_type(result_type.element_type) is not None
+            ):
                 return True
         return False
 
@@ -54,11 +65,9 @@ class DTypeConstantConverter:
         Raises:
             TypeError: If element type is not f64.
         """
-        elem_type = str(result_type.element_type)
-        if elem_type == "f64":
-            new_elem_type = F32Type.get()
-        else:
-            raise TypeError(f"Invalid dtype ({elem_type}) for conversion")
+        new_elem_type = _demoted_element_type(result_type.element_type)
+        if new_elem_type is None:
+            raise TypeError(f"Invalid dtype ({result_type.element_type}) for conversion")
 
         if hasattr(result_type, "shape"):
             new_type = RankedTensorType.get(result_type.shape, new_elem_type, loc=op.location)
@@ -90,6 +99,8 @@ class DTypeConstantConverter:
         elem_type = str(result_type.element_type)
         if elem_type == "f64":
             target_dtype = np.float32
+        elif elem_type == "complex<f64>":
+            target_dtype = np.complex64
         else:
             raise TypeError(f"Invalid dtype ({elem_type}) for conversion")
 
@@ -99,18 +110,15 @@ class DTypeConstantConverter:
         return new_value_attr
 
     def convert_dense_attr(self, old_attr, new_type, target_dtype):
-        """Convert a DenseElementsAttr to a target numpy dtype.
-
-        Extracts values from the attribute, converts to target dtype,
-        and creates a new attribute with the converted values.
+        """Convert values in a dense MLIR attribute to a target data type.
 
         Args:
-            old_attr: Original DenseElementsAttr.
-            new_type: Target MLIR type for the new attribute.
-            target_dtype: Target numpy dtype (e.g., np.float32).
+            old_attr: Dense elements attribute to convert.
+            new_type: MLIR type assigned to the converted attribute.
+            target_dtype: NumPy data type used for the converted values.
 
         Returns:
-            DenseElementsAttr: New attribute with converted values.
+            object: Dense attribute of the original attribute class with converted values.
         """
         # Extract numpy array from DenseElementsAttr
         np_array = np.array(old_attr)
@@ -160,8 +168,17 @@ class DTypeConstantConverter:
         old_op.operation.erase()
 
     def run(self, module):
-        """
-        Run the conversion pass on the entire module
+        """Convert ``f64`` and ``complex<f64>`` values in an MLIR module.
+
+        Args:
+            module: MLIR module to mutate.
+
+        Returns:
+            object: The converted input module.
+
+        Note:
+            Converts operation results, constants, block arguments, and function signatures;
+            other operation attributes are not converted.
         """
         with module.context:
             ops_to_replace = []
@@ -170,6 +187,11 @@ class DTypeConstantConverter:
             # Walk through all operations
             def walk_op(op):
                 # Convert function signatures
+                """Convert f64-family types reachable from an MLIR operation.
+
+                Args:
+                    op: Operation whose results, regions, and nested operations are inspected.
+                """
                 if op.operation.name == "func.func" and self._needs_func_conversion(op):
                     funcs_to_update.append(op)
 
@@ -260,9 +282,8 @@ class DTypeConstantConverter:
         for region in func_op.regions:
             for block in region:
                 for i, arg in enumerate(block.arguments):
-                    arg_type = str(arg.type)
-                    if arg_type == "f64":
-                        new_type = F32Type.get()
+                    new_type = _demoted_element_type(arg.type)
+                    if new_type is not None:
                         block.arguments[i].set_type(new_type)
 
 
@@ -270,7 +291,12 @@ dtype_converter = DTypeConstantConverter()
 
 
 def dtype_conversion_pass(module):
-    """
-    Main entry point: convert all f64 constants to f32
+    """Convert ``f64`` and ``complex<f64>`` values in an MLIR module.
+
+    Args:
+        module: MLIR module to convert in place.
+
+    Returns:
+        object: The same mutated input module.
     """
     return dtype_converter.run(module)

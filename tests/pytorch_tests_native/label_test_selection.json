@@ -1,0 +1,96 @@
+{
+  "_description": "PR-label \u2192 upstream-test-subset mapping for label-driven post-merge runs. Consumed by runner/label_selection.py via emit_upstream_matrix.py. See runner/label_selection.py for the matching algorithm.",
+  "_kinds": {
+    "full_suite": "Terminator \u2014 when any matching label has this kind, the dist config passes through unfiltered. Use for labels that imply 'this could affect anything' (runtime-core). For other broad-impact PRs (build, ci), reviewers can manually add ciflow:run-full-suite.",
+    "items": "Subset selection \u2014 the union of `items` across matching labels filters the dist config nodes. A node is kept if any of its items appears in the union."
+  },
+  "labels": {
+    "module:aten-ops": {
+      "items": [
+        "test_ops.py",
+        "test_meta.py",
+        "test_decomp.py",
+        "test_ops_gradients.py",
+        "test_ops_fwd_gradients.py",
+        "test_modules.py",
+        "test_foreach.py",
+        "test_unary_ufuncs.py",
+        "test_binary_ufuncs.py",
+        "test_linalg.py",
+        "test_reductions.py",
+        "dynamo",
+        "tests/pytorch_tests_native/neuron_compile_ops/test_neuron_compile_ops.py"
+      ],
+      "kind": "items"
+    },
+    "module:build": {
+      "_comment": "Build-config changes (setup.py, pyproject, CMake, Bazel) usually break loudly: an import-time failure will surface in any test that loads torch_neuronx, so the smallest representative subset is enough to validate. For a build change that only affects a specific code path's compile flags, reviewers can manually add ciflow:run-full-suite.",
+      "items": [
+        "profiler"
+      ],
+      "kind": "items"
+    },
+    "module:distributed": {
+      "items": [
+        "distributed",
+        "distributed/fsdp",
+        "distributed/tensor",
+        "distributed/_composable"
+      ],
+      "kind": "items"
+    },
+    "module:dynamo": {
+      "items": [
+        "test_ops.py",
+        "test_meta.py",
+        "test_decomp.py",
+        "test_ops_gradients.py",
+        "test_ops_fwd_gradients.py",
+        "test_modules.py",
+        "test_foreach.py",
+        "test_unary_ufuncs.py",
+        "test_binary_ufuncs.py",
+        "test_linalg.py",
+        "test_reductions.py",
+        "dynamo",
+        "tests/pytorch_tests_native/neuron_compile_ops/test_neuron_compile_ops.py"
+      ],
+      "kind": "items"
+    },
+    "module:memory": {
+      "items": [
+        "test_torch.py",
+        "test_autograd.py",
+        "test_tensor_creation_ops.py"
+      ],
+      "kind": "items"
+    },
+    "module:profiler": {
+      "items": [
+        "profiler"
+      ],
+      "kind": "items"
+    },
+    "module:runtime-core": {
+      "kind": "full_suite"
+    },
+    "module:torch-mlir": {
+      "items": [
+        "test_ops.py",
+        "test_meta.py",
+        "test_decomp.py",
+        "test_unary_ufuncs.py",
+        "test_binary_ufuncs.py",
+        "dynamo"
+      ],
+      "kind": "items"
+    },
+    "module:upstream-test-infra": {
+      "_comment": "Upstream test-infra changes (runner, conftest, dist config under tests/pytorch_tests_native/, excluding skip_registry which is metadata-only and labeled as module:ci). Plumbing rather than behavior \u2014 the smallest representative subset is enough to validate. Reviewers can manually add ciflow:run-full-suite when a runner-internals change warrants the safety net.",
+      "items": [
+        "profiler"
+      ],
+      "kind": "items"
+    }
+  }
+}

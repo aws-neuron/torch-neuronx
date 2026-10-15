@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <cstdlib>
 #include <filesystem>
@@ -18,7 +19,13 @@ class TensorizerCompilerTest : public ::testing::Test {
     std::filesystem::create_directories(test_dir_);
   }
 
-  void TearDown() override { std::filesystem::remove_all(test_dir_); }
+  void TearDown() override {
+    // Use system command instead of std::filesystem::remove_all to avoid hang
+    if (!test_dir_.empty() && std::filesystem::exists(test_dir_)) {
+      std::string cmd = "rm -rf " + test_dir_.string();
+      std::system(cmd.c_str());
+    }
+  }
 
   // Wrappers to access private methods via friend
   static void RenameBirTensors(const std::string& path) {
@@ -86,3 +93,9 @@ TEST_F(TensorizerCompilerTest, CompileLinalgToNeffThrowsOnEmptyInput) {
 }
 
 }  // namespace at::neuron
+
+int main(int argc, char** argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  int result = RUN_ALL_TESTS();
+  _exit(result);
+}

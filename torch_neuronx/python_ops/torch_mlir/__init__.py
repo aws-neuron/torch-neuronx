@@ -8,23 +8,20 @@ logger = logging.getLogger(__name__)
 from . import ops
 
 
-def initialize_torch_mlir_backend(aten_lib=None, verbose: bool = False):
-    """Initialize torch-mlir backend and register operations.
+def initialize_torch_mlir_backend(verbose: bool = False):
+    """Initialize the Torch-MLIR backend and register pending operations.
+
+    Operations are registered through the C++ Neuron dispatcher.
 
     Args:
-        aten_lib: PyTorch library to register operations with
-        verbose: If True, print registration progress
+        verbose (bool, optional): Print registration progress when ``True``. Defaults
+            to ``False``.
 
     Returns:
-        Number of operations registered
+        int: Number of operations registered.
     """
+    from .operation_registry import finalize_registrations_cpp
 
-    # Finalize PyTorch registrations
-    from .operation_registry import finalize_registrations
-
-    count = finalize_registrations(aten_lib, verbose)
-
-    # if verbose:
-    logger.info(f"Registered {count} torch-mlir operations")
-
+    count = finalize_registrations_cpp(verbose=verbose)
+    logger.info(f"Registered {count} torch-mlir operations via C++ NeuronDispatcher")
     return count

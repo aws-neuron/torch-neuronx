@@ -11,6 +11,12 @@ namespace at::neuron {
 // Forward declaration to resolve circular dependency.
 class CompilationCache;
 
+// Result of a single HLO→NEFF compilation.
+struct CompileResult {
+  std::vector<uint8_t> neff_bytes;
+  std::vector<uint8_t> wrapped_neff_hlo;
+};
+
 /**
  * @brief Cache entry containing compiled NEFF data with access metadata.
  *
@@ -21,6 +27,9 @@ class CompilationCache;
 struct CacheEntry {
   // Compiled NEFF binary data.
   std::vector<uint8_t> neff_bytes;
+
+  // WLO (Weight Layout Optimization) only.
+  std::vector<uint8_t> wrapped_neff_hlo;
 
   // Key for persistent cache (disk). XXH3_128 hash of cache_key + hlo_bytes.
   std::string persistent_cache_key;

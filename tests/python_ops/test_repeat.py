@@ -122,3 +122,19 @@ class TestRepeat:
             assert neuron_result.device.type == "neuron"
             torch.testing.assert_close(neuron_result.cpu(), cpu_result)
             assert_op_runs_on_neuron("aten::repeat")
+
+    @pytest.mark.parametrize("shape,repeats", [((2, 3), [2, 4]), ((4, 8), [1, 3])])
+    def test_repeat_out_variant(self, device, shape, repeats):
+        """Test aten::repeat.out writes correct result to pre-allocated tensor."""
+        x_cpu = torch.randn(shape)
+        expected = x_cpu.repeat(repeats)
+
+        x_neuron = x_cpu.to(device)
+        out = torch.empty(expected.shape, device=device)
+
+        with track_neuron_ops():
+            result = torch.ops.aten.repeat.out(x_neuron, repeats, out=out)
+            assert_op_runs_on_neuron("aten::repeat")
+
+        assert out.data_ptr() == result.data_ptr()
+        torch.testing.assert_close(out.cpu(), expected)

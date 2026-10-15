@@ -34,36 +34,34 @@ def native_multi_head_attention_neuron(
     average_attn_weights=True,
     mask_type=None,
 ):
-    """
-    Implements PyTorch's _native_multi_head_attention for Neuron devices.
-
-    This function orchestrates three sub-operations:
-    1. prefix: QKV projection and transformation
-    2. mid: Attention computation with optional causal masking
-    3. suffix: Output projection back to model dimension
+    """Compute native attention and return empty weights when weights are disabled.
 
     Args:
-        query: Query tensor of shape [batch, seq_len, embed_dim]
-        key: Key tensor of shape [batch, seq_len, embed_dim]
-        value: Value tensor of shape [batch, seq_len, embed_dim]
-        embed_dim: Total embedding dimension
-        num_head: Number of attention heads
-        qkv_weight: Combined QKV weight matrix [3*embed_dim, embed_dim]
-        qkv_bias: Combined QKV bias [3*embed_dim]
-        proj_weight: Output projection weight [embed_dim, embed_dim]
-        proj_bias: Output projection bias [embed_dim]
-        mask: Optional attention mask (currently not fully supported)
-        need_weights: Whether to return attention weights
-        average_attn_weights: Whether to average attention weights across heads
-        mask_type: Type of mask (0: attention mask, 1: causal mask)
+        query (torch.Tensor): Query shaped ``[batch, sequence, embedding]``.
+        key (torch.Tensor): Key shaped ``[batch, sequence, embedding]``.
+        value (torch.Tensor): Value shaped ``[batch, sequence, embedding]``.
+        embed_dim (int): Total embedding dimension.
+        num_head (int): Number of attention heads.
+        qkv_weight (torch.Tensor): Combined QKV projection weight.
+        qkv_bias (torch.Tensor): Combined QKV projection bias.
+        proj_weight (torch.Tensor): Output projection weight.
+        proj_bias (torch.Tensor): Output projection bias.
+        mask (torch.Tensor, optional): Unsupported arbitrary mask. Defaults to ``None``.
+        need_weights (bool, optional): Request unsupported attention weights. Defaults to ``True``.
+        average_attn_weights (bool, optional): Unsupported head-averaging option; ignored
+            when ``need_weights`` is ``False``. Defaults to ``True``.
+        mask_type (int, optional): Value ``1`` enables causal masking; all other
+            values disable it. Defaults to ``None``.
 
     Returns:
-        Tuple of (output, attn_weights) where:
-        - output: Attention output of shape [batch, seq_len, embed_dim]
-        - attn_weights: Empty tensor (attention weights not yet supported)
+        tuple[torch.Tensor, torch.Tensor]: Attention output and an empty weight tensor.
 
     Raises:
-        NotImplementedError: For unsupported features
+        ValueError: If ``query`` is not on a Neuron device or heads do not divide the embedding.
+        NotImplementedError: If ``mask`` is set or ``need_weights`` is ``True``.
+
+    Example::
+        >>> result = native_multi_head_attention_neuron(*x, need_weights=False)  # doctest: +SKIP
     """
     # Validate inputs
     if query.device.type != "neuron":
@@ -155,12 +153,30 @@ def native_multi_head_attention_out_neuron(
     mask_type=None,
     out=None,
 ):
-    """
-    Out-variant of native_multi_head_attention that writes to pre-allocated tensors.
+    """Compute native multi-head attention and optionally copy it into ``out``.
 
-    Note: Currently, this implementation doesn't use the out parameter for the
-    intermediate operations, as they allocate their own outputs. Future optimization
-    could propagate the out parameter through the sub-operations.
+    Args:
+        query (torch.Tensor): Query shaped ``[batch, sequence, embedding]``.
+        key (torch.Tensor): Key shaped ``[batch, sequence, embedding]``.
+        value (torch.Tensor): Value shaped ``[batch, sequence, embedding]``.
+        embed_dim (int): Total embedding dimension.
+        num_head (int): Number of attention heads.
+        qkv_weight (torch.Tensor): Combined QKV projection weight.
+        qkv_bias (torch.Tensor): Combined QKV projection bias.
+        proj_weight (torch.Tensor): Output projection weight.
+        proj_bias (torch.Tensor): Output projection bias.
+        mask (torch.Tensor, optional): Unsupported arbitrary mask. Defaults to ``None``.
+        need_weights (bool, optional): Request unsupported attention weights. Defaults to ``True``.
+        average_attn_weights (bool, optional): Unsupported. Defaults to ``True``.
+        mask_type (int, optional): Only ``1`` enables causal masking. Defaults to ``None``.
+        out (Any, optional): Destination or sequence receiving output. Defaults to ``None``.
+
+    Returns:
+        Any: ``out`` after copying, or output and empty weights.
+
+    Raises:
+        ValueError: If ``query`` is not on a Neuron device or heads do not divide the embedding.
+        NotImplementedError: If ``mask`` is set or ``need_weights`` is ``True``.
     """
     # Compute the result using the standard function
     output, attn_weights = native_multi_head_attention_neuron(

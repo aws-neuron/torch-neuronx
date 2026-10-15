@@ -212,7 +212,7 @@ class TestPermute:
             _test_duplicate_dims()
 
     @pytest.mark.xfail(
-        reason="JAX doesn't support negative indices in permutation tuples unlike PyTorch"
+        reason="Backend doesn't support negative indices in permutation tuples unlike PyTorch"
     )
     def test_permute_negative_dims(self):
         """Test permute with negative dimensions."""
@@ -264,7 +264,7 @@ class TestPermute:
             assert torch.all(p == x)
             assert_op_runs_on_neuron("aten::empty_strided")
 
-    @pytest.mark.xfail(reason="JAX has limitations with empty tensors during tracing")
+    @pytest.mark.xfail(reason="Backend has limitations with empty tensors during tracing")
     def test_permute_empty_tensor(self):
         """Test permute on tensor with empty dimensions matches CPU behavior."""
         # Check what PyTorch does with empty tensors

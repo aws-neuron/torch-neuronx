@@ -125,18 +125,13 @@ struct IrNode {
   IrNodeStatus status;                      ///< Execution lifecycle state
   bool has_collectives;                     ///< Collective communication requirement flag
 
-  /// Input TensorDataRef for runtime execution (contains NeuronTensorPtr for NRT)
-  /// These are populated from original operations and propagated through concatenation
+  /// TensorDataRef: runtime pointers (NeuronTensorPtr for NRT). Propagated through concatenation.
   std::vector<at::neuron::TensorDataRef> input_data_refs;
-
-  /// Output TensorDataRef for runtime execution (contains NeuronTensorPtr for NRT)
-  /// These are populated from original operations and propagated through concatenation
   std::vector<at::neuron::TensorDataRef> output_data_refs;
 
-  /// Input TensorContext for slicing metadata (needed for contiguous tensor handling)
+  /// TensorContext: slicing metadata (offset, size, shape) for HandleContiguousSlicing.
+  /// Must be propagated alongside TensorDataRef during concatenation.
   std::vector<at::neuron::TensorContext> input_contexts;
-
-  /// Output TensorContext for slicing metadata
   std::vector<at::neuron::TensorContext> output_contexts;
 
   virtual ~IrNode() = default;

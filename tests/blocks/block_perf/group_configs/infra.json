@@ -1,0 +1,37 @@
+{
+  "tests": [
+    {
+      "benchmark_runs": 20,
+      "blocks": [
+        "qwen3_torchtitan",
+        "gpt_oss_transformer"
+      ],
+      "id": "singlecore",
+      "n_layers": 4,
+      "runner": "singlecore",
+      "warmup_runs": 20
+    },
+    {
+      "benchmark_runs": 20,
+      "blocks": [
+        "qwen3_torchtitan",
+        "gpt_oss_transformer"
+      ],
+      "exec_mode": "compile",
+      "id": "singlecore-compile",
+      "n_layers": 4,
+      "runner": "singlecore",
+      "warmup_runs": 20
+    },
+    {
+      "benchmark_runs": 5,
+      "dtype": "float32",
+      "id": "collective-perf",
+      "nproc": 64,
+      "op": "all",
+      "runner": "collective",
+      "sizes": "512K",
+      "warmup_runs": 3
+    }
+  ]
+}

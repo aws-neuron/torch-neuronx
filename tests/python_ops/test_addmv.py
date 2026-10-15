@@ -108,3 +108,23 @@ class TestAddmv:
 
         size_mismatch = torch.randn(4).to("neuron")
         torch.addmv(size_mismatch, mat, vec)
+
+    @pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32, torch.uint8])
+    def test_addmv_integer_dtype_preserved(self, dtype):
+        """Verify output dtype matches input dtype for integer inputs with float alpha/beta."""
+        self_vec = torch.ones(5, dtype=dtype)
+        mat = torch.ones(5, 10, dtype=dtype)
+        vec = torch.ones(10, dtype=dtype)
+
+        result = torch.addmv(
+            self_vec.to("neuron"),
+            mat.to("neuron"),
+            vec.to("neuron"),
+            beta=0.2,
+            alpha=0.6,
+        )
+        expected = torch.addmv(self_vec, mat, vec, beta=0.2, alpha=0.6)
+
+        assert (
+            result.dtype == expected.dtype
+        ), f"dtype mismatch: neuron={result.dtype}, cpu={expected.dtype}"

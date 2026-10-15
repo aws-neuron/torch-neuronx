@@ -1,0 +1,16 @@
+RUNTIME_MISC_SHAPE_BROADCAST = [
+    "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcdiv_is_fastpath_False_neuron_bfloat16",
+    "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcdiv_is_fastpath_False_neuron_float16",
+    "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcdiv_is_fastpath_True_neuron_bool",
+    "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcdiv_is_fastpath_True_neuron_float16",
+    "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcdiv_is_fastpath_True_neuron_float32",
+    "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcdiv_is_fastpath_True_neuron_int32",
+    "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcmul_is_fastpath_False_neuron_bfloat16",
+    "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcmul_is_fastpath_False_neuron_float16",
+    "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcmul_is_fastpath_False_neuron_float32",
+    "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcmul_is_fastpath_False_neuron_int32",
+    "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcmul_is_fastpath_True_neuron_bfloat16",
+    "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcmul_is_fastpath_True_neuron_float16",
+    "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcmul_is_fastpath_True_neuron_int32",
+    "test_ops.py::TestCommonNEURON::test_errors_nn_functional_gaussian_nll_loss_neuron",
+]

@@ -6,6 +6,8 @@
 #include <c10/core/Storage.h>
 #include <c10/util/Optional.h>
 
+#include "torch_neuronx/csrc/core/allocator/NeuronHostAllocator.h"
+
 namespace torch_neuronx {
 
 // NeuronHooksInterface implements the PrivateUse1HooksInterface to enable
@@ -22,8 +24,8 @@ class NeuronHooksInterface : public at::PrivateUse1HooksInterface {
   // Initialize the Neuron runtime if needed
   void init() const override;
 
-  // Check if a pointer is pinned memory (always true for Neuron) as all the tensors are pinned
-  bool isPinnedPtr(const void* data) const override { return true; }
+  // Check if a pointer was allocated through the Neuron pinned host allocator.
+  bool isPinnedPtr(const void* data) const override { return IsNeuronPinnedPtr(data); }
 
   // Get the device index
   c10::DeviceIndex getDeviceIndex(c10::DeviceIndex device_index) const { return device_index; }
@@ -37,7 +39,7 @@ class NeuronHooksInterface : public at::PrivateUse1HooksInterface {
   }
 
   // Get the default generator for random number generation
-  at::Generator getDefaultGenerator(c10::DeviceIndex device_index);
+  const at::Generator& getDefaultGenerator(c10::DeviceIndex device_index) const override;
 
   // Get a new generator for a specific device
   at::Generator getNewGenerator(c10::DeviceIndex device_index) const;
@@ -54,5 +56,9 @@ at::PrivateUse1HooksInterface* get_neuron_hooks();
 
 // Get the default generator for a Neuron device
 const at::Generator& getDefaultNeuronGenerator(c10::DeviceIndex device_index = -1);
+
+// Number of per-device default generators this process can access. Captured
+// once at first generator access; valid indices are [0, count).
+int64_t getDefaultGeneratorCount();
 
 }  // namespace torch_neuronx

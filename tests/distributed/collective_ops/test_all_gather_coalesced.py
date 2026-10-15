@@ -587,7 +587,6 @@ class TestAllGatherCoalesced(BaseCollectiveOpTest):
         """Test all_gather_coalesced with process groups."""
         self.distributed_tester.run_test(run_process_group_test)
 
-    @pytest.mark.xfail(reason="Our implementation will construct a correct output_list.")
     @assert_raises(RuntimeError)
     def test_mismatched_sizes_error(self):
         """Test error handling with mismatched input/output lengths."""

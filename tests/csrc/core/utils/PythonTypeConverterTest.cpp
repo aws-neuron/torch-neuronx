@@ -25,37 +25,31 @@ class PythonTypeConverterTest : public ::testing::Test {
 // ============================================================================
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_None) {
-  std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<nrt_tensor_t*> tensor_data_ptrs;
+  at::neuron::CPUFallbackContext ctx;
 
-  auto result =
-      at::neuron::utils::ConvertToInputMetadata(py::none(), tensor_metadata, tensor_data_ptrs);
+  auto result = at::neuron::utils::ConvertToInputMetadata(py::none(), ctx);
 
   EXPECT_TRUE(at::neuron::IsScalar(result));
   EXPECT_TRUE(at::neuron::GetScalarValue(result).isNone());
-  EXPECT_TRUE(tensor_metadata.empty());
-  EXPECT_TRUE(tensor_data_ptrs.empty());
+  EXPECT_TRUE(ctx.tensor_metadata.empty());
+  EXPECT_TRUE(ctx.tensor_data_ptrs.empty());
 }
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_Bool) {
-  std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<nrt_tensor_t*> tensor_data_ptrs;
+  at::neuron::CPUFallbackContext ctx;
 
-  auto result =
-      at::neuron::utils::ConvertToInputMetadata(py::bool_(true), tensor_metadata, tensor_data_ptrs);
+  auto result = at::neuron::utils::ConvertToInputMetadata(py::bool_(true), ctx);
 
   EXPECT_TRUE(at::neuron::IsScalar(result));
   EXPECT_TRUE(at::neuron::GetScalarValue(result).isBool());
   EXPECT_EQ(at::neuron::GetScalarValue(result).toBool(), true);
-  EXPECT_TRUE(tensor_metadata.empty());
+  EXPECT_TRUE(ctx.tensor_metadata.empty());
 }
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_Int) {
-  std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<nrt_tensor_t*> tensor_data_ptrs;
+  at::neuron::CPUFallbackContext ctx;
 
-  auto result =
-      at::neuron::utils::ConvertToInputMetadata(py::int_(42), tensor_metadata, tensor_data_ptrs);
+  auto result = at::neuron::utils::ConvertToInputMetadata(py::int_(42), ctx);
 
   EXPECT_TRUE(at::neuron::IsScalar(result));
   EXPECT_TRUE(at::neuron::GetScalarValue(result).isInt());
@@ -63,11 +57,9 @@ TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_Int) {
 }
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_Double) {
-  std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<nrt_tensor_t*> tensor_data_ptrs;
+  at::neuron::CPUFallbackContext ctx;
 
-  auto result = at::neuron::utils::ConvertToInputMetadata(py::float_(3.14), tensor_metadata,
-                                                          tensor_data_ptrs);
+  auto result = at::neuron::utils::ConvertToInputMetadata(py::float_(3.14), ctx);
 
   EXPECT_TRUE(at::neuron::IsScalar(result));
   EXPECT_TRUE(at::neuron::GetScalarValue(result).isDouble());
@@ -75,11 +67,9 @@ TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_Double) {
 }
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_String) {
-  std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<nrt_tensor_t*> tensor_data_ptrs;
+  at::neuron::CPUFallbackContext ctx;
 
-  auto result = at::neuron::utils::ConvertToInputMetadata(py::str("hello"), tensor_metadata,
-                                                          tensor_data_ptrs);
+  auto result = at::neuron::utils::ConvertToInputMetadata(py::str("hello"), ctx);
 
   EXPECT_TRUE(at::neuron::IsScalar(result));
   EXPECT_TRUE(at::neuron::GetScalarValue(result).isString());
@@ -87,16 +77,14 @@ TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_String) {
 }
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_IntList) {
-  std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<nrt_tensor_t*> tensor_data_ptrs;
+  at::neuron::CPUFallbackContext ctx;
 
   py::list int_list;
   int_list.append(py::int_(1));
   int_list.append(py::int_(2));
   int_list.append(py::int_(3));
 
-  auto result =
-      at::neuron::utils::ConvertToInputMetadata(int_list, tensor_metadata, tensor_data_ptrs);
+  auto result = at::neuron::utils::ConvertToInputMetadata(int_list, ctx);
 
   EXPECT_TRUE(at::neuron::IsScalar(result));
   EXPECT_TRUE(at::neuron::GetScalarValue(result).isIntList());
@@ -108,59 +96,51 @@ TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_IntList) {
 }
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_BoolList) {
-  std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<nrt_tensor_t*> tensor_data_ptrs;
+  at::neuron::CPUFallbackContext ctx;
 
   py::list bool_list;
   bool_list.append(py::bool_(true));
   bool_list.append(py::bool_(false));
 
-  auto result =
-      at::neuron::utils::ConvertToInputMetadata(bool_list, tensor_metadata, tensor_data_ptrs);
+  auto result = at::neuron::utils::ConvertToInputMetadata(bool_list, ctx);
 
   EXPECT_TRUE(at::neuron::IsScalar(result));
   EXPECT_TRUE(at::neuron::GetScalarValue(result).isBoolList());
 }
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_DoubleList) {
-  std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<nrt_tensor_t*> tensor_data_ptrs;
+  at::neuron::CPUFallbackContext ctx;
 
   py::list double_list;
   double_list.append(py::float_(1.5));
   double_list.append(py::float_(2.5));
 
-  auto result =
-      at::neuron::utils::ConvertToInputMetadata(double_list, tensor_metadata, tensor_data_ptrs);
+  auto result = at::neuron::utils::ConvertToInputMetadata(double_list, ctx);
 
   EXPECT_TRUE(at::neuron::IsScalar(result));
   EXPECT_TRUE(at::neuron::GetScalarValue(result).isDoubleList());
 }
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_MixedTuple) {
-  std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<nrt_tensor_t*> tensor_data_ptrs;
+  at::neuron::CPUFallbackContext ctx;
 
   py::list mixed_list;
   mixed_list.append(py::int_(1));
   mixed_list.append(py::str("hello"));
   mixed_list.append(py::float_(3.14));
 
-  auto result =
-      at::neuron::utils::ConvertToInputMetadata(mixed_list, tensor_metadata, tensor_data_ptrs);
+  auto result = at::neuron::utils::ConvertToInputMetadata(mixed_list, ctx);
 
   EXPECT_TRUE(at::neuron::IsScalar(result));
   EXPECT_TRUE(at::neuron::GetScalarValue(result).isTuple());
 }
 
 TEST_F(PythonTypeConverterTest, ConvertToInputMetadata_EmptyList) {
-  std::vector<at::neuron::TensorContext> tensor_metadata;
-  std::vector<nrt_tensor_t*> tensor_data_ptrs;
+  at::neuron::CPUFallbackContext ctx;
 
   py::list empty_list;
 
-  auto result =
-      at::neuron::utils::ConvertToInputMetadata(empty_list, tensor_metadata, tensor_data_ptrs);
+  auto result = at::neuron::utils::ConvertToInputMetadata(empty_list, ctx);
 
   EXPECT_TRUE(at::neuron::IsScalar(result));
   EXPECT_TRUE(at::neuron::GetScalarValue(result).isIntList());

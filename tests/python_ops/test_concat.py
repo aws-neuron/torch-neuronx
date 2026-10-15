@@ -224,6 +224,17 @@ class TestConcat:
         assert result.dtype == torch.float16
         assert result is out
 
+    def test_concat_single_tensor_with_out_functional(self):
+        """Single-input cat.out must populate and return the requested output tensor."""
+        input_cpu = torch.arange(100, dtype=torch.float32)
+        input_neuron = input_cpu.to("neuron")
+        out = torch.empty_like(input_neuron)
+
+        result = torch.concat((input_neuron,), dim=0, out=out)
+
+        assert result is out
+        torch.testing.assert_close(result.cpu(), input_cpu)
+
     @pytest.mark.xfail(
         condition=os.environ.get("NEURON_LAUNCH_BLOCKING") == "1"
         or os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") == "1",
@@ -606,3 +617,61 @@ class TestConcat:
             assert_op_runs_on_neuron("aten::cat")
 
         torch.testing.assert_close(out_neuron.cpu(), out_cpu)
+
+    def test_concat_all_empty_2d_tensors_preserve_shape(self):
+        """Test cat with all-empty multi-dimensional tensors preserves correct shape.
+
+        Regression: torch_cat returned torch.empty(0) (shape [0]) instead of
+        the correct concatenated shape [0, 4096] when all inputs were empty.
+        """
+        device = "neuron"
+        a = torch.randn(0, 2048, device=device)
+        b = torch.randn(0, 2048, device=device)
+
+        out_cpu = torch.cat([a.cpu(), b.cpu()], dim=-1)
+        out_neuron = torch.cat([a, b], dim=-1)
+
+        assert (
+            out_neuron.shape == out_cpu.shape
+        ), f"Expected shape {out_cpu.shape}, got {out_neuron.shape}"
+        assert out_neuron.shape == torch.Size([0, 4096])
+
+    def test_concat_all_empty_2d_dim0(self):
+        """Test cat along dim=0 with all-empty 2D tensors."""
+        device = "neuron"
+        a = torch.randn(0, 2048, device=device)
+        b = torch.randn(0, 2048, device=device)
+
+        out_cpu = torch.cat([a.cpu(), b.cpu()], dim=0)
+        out_neuron = torch.cat([a, b], dim=0)
+
+        assert out_neuron.shape == out_cpu.shape
+        assert out_neuron.shape == torch.Size([0, 2048])
+
+    def test_chunk_backward_with_empty_tensors(self):
+        """Test backward through chunk/split on empty tensors.
+
+        Regression: SplitBackward0 internally calls cat to concatenate gradients.
+        With empty tensors, cat produced wrong shape [0] instead of [0, 4096],
+        causing 'got [0] but expected shape compatible with [0, 4096]' error.
+        """
+        device = "neuron"
+        x = torch.randn(0, 4096, device=device, requires_grad=True)
+        y1, y2 = torch.chunk(x, 2, dim=-1)
+        (y1.sum() + y2.sum()).backward()
+        assert x.grad.shape == x.shape, f"Expected grad shape {x.shape}, got {x.grad.shape}"
+
+    def test_silu_gate_backward_with_empty_tensors(self):
+        """Test full MoE-style SwiGLU backward with empty expert batch."""
+        device = "neuron"
+        x = torch.randn(0, 4096, device=device, requires_grad=True)
+        y1, y2 = torch.chunk(x, 2, dim=-1)
+        loss = (torch.nn.functional.silu(y1) * y2).sum()
+        loss.backward()
+        assert x.grad.shape == x.shape, f"Expected grad shape {x.shape}, got {x.grad.shape}"
+
+        # CPU reference
+        x_cpu = torch.randn(0, 4096, requires_grad=True)
+        y1_cpu, y2_cpu = torch.chunk(x_cpu, 2, dim=-1)
+        (torch.nn.functional.silu(y1_cpu) * y2_cpu).sum().backward()
+        assert x_cpu.grad.shape == x.grad.shape

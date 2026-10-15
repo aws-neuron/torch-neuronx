@@ -369,3 +369,77 @@ class TestTopK:
 
             # Should run on Neuron
             assert_op_runs_on_neuron("aten::topk")
+
+    def test_topk_scalar_tensor(self):
+        """Test topk with 0-d scalar tensor input"""
+        with track_neuron_ops():
+            input_tensor = torch.tensor(5.0, device="neuron")
+            values, indices = torch.topk(input_tensor, k=1)
+
+            assert values.shape == torch.Size([])
+            assert indices.shape == torch.Size([])
+            assert values.device.type == "neuron"
+            assert indices.device.type == "neuron"
+
+            expected_values = torch.tensor(5.0, device="neuron")
+            expected_indices = torch.tensor(0, dtype=torch.int64, device="neuron")
+            torch.testing.assert_close(values, expected_values)
+            torch.testing.assert_close(indices, expected_indices)
+
+    @assert_raises(RuntimeError, match="k.*not in range|selected index k out of range")
+    def test_topk_scalar_tensor_k_too_large(self):
+        """Test topk with 0-d scalar tensor and k>1 raises error"""
+        with track_neuron_ops():
+            input_tensor = torch.tensor(5.0, device="neuron")
+            torch.topk(input_tensor, k=2)
+
+    @pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32, torch.int64])
+    def test_topk_integer_dtypes(self, dtype):
+        """Test topk with integer dtypes (cast to float32 internally)"""
+        with track_neuron_ops():
+            input_cpu = torch.tensor([[5, 1, 4, 2, 3]], dtype=dtype)
+            input_neuron = input_cpu.to("neuron")
+            k = 3
+
+            cpu_values, cpu_indices = torch.topk(input_cpu, k=k)
+            neuron_values, neuron_indices = torch.topk(input_neuron, k=k)
+
+            assert neuron_values.dtype == dtype
+            assert neuron_values.device.type == "neuron"
+            torch.testing.assert_close(neuron_values.cpu(), cpu_values)
+            torch.testing.assert_close(neuron_indices.cpu(), cpu_indices)
+
+    def test_topk_bool_raises(self):
+        """Test that topk with bool dtype raises RuntimeError like CPU"""
+        with track_neuron_ops():
+            input_tensor = torch.tensor([True, False, True], device="neuron")
+            with pytest.raises(RuntimeError, match="topk does not support bool dtypes"):
+                torch.topk(input_tensor, k=2)
+
+    def test_topk_0d_tensor(self):
+        """Test topk handles 0-d (scalar) tensor input correctly."""
+        input_cpu = torch.tensor(5.0)
+        input_neuron = input_cpu.to("neuron")
+
+        cpu_values, cpu_indices = torch.topk(input_cpu, k=1)
+        neuron_values, neuron_indices = torch.topk(input_neuron, k=1)
+
+        torch.testing.assert_close(neuron_values.cpu(), cpu_values)
+        torch.testing.assert_close(neuron_indices.cpu(), cpu_indices)
+
+    def test_topk_values_out_variant(self):
+        """Test topk.values out variant dispatches correctly."""
+        input_cpu = torch.tensor([[3.0, 1.0, 4.0, 2.0, 5.0]])
+        input_neuron = input_cpu.to("neuron")
+        k = 3
+
+        cpu_values, cpu_indices = torch.topk(input_cpu, k=k)
+        values_out = torch.empty(1, k, device="neuron")
+        indices_out = torch.empty(1, k, dtype=torch.int64, device="neuron")
+
+        torch.ops.aten.topk.values(
+            input_neuron, k, -1, True, True, values=values_out, indices=indices_out
+        )
+
+        torch.testing.assert_close(values_out.cpu(), cpu_values)
+        torch.testing.assert_close(indices_out.cpu(), cpu_indices)

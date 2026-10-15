@@ -12,7 +12,8 @@
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/NeuronOpTracking.h"
 #include "torch_neuronx/csrc/core/NeuronStorageImpl.h"
-#include "torch_neuronx/csrc/utils/CopyUtils.h"
+#include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
+#include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 
 // Include Neuron Runtime headers
 extern "C" {
@@ -233,9 +234,20 @@ void CPUFallbackExecutor::LoadConfiguration() {
 void CPUFallbackExecutor::ExecuteCpuFallbackImpl(OperationContext* operation) {
   const auto& fallback_ctx = operation->cpu_fallback_context;
 
+  // Resolve each input's NRT tensor handle. This runs on the runtime
+  // worker after upstream kAlloc ops have completed, so the backing
+  // nrt_tensor_t is now registered with the allocator.
+  TORCH_CHECK(fallback_ctx.tensor_data_ptrs.size() == fallback_ctx.tensor_storage_ptrs.size(),
+              "CPU fallback context: tensor_data_ptrs/tensor_storage_ptrs size mismatch (",
+              fallback_ctx.tensor_data_ptrs.size(), " vs ", fallback_ctx.tensor_storage_ptrs.size(),
+              ")");
   std::vector<nrt_tensor_t*> src_ptrs;
   src_ptrs.reserve(fallback_ctx.tensor_data_ptrs.size());
-  for (nrt_tensor_t* nrt_ptr : fallback_ctx.tensor_data_ptrs) {
+  for (size_t i = 0; i < fallback_ctx.tensor_data_ptrs.size(); ++i) {
+    nrt_tensor_t* nrt_ptr = fallback_ctx.tensor_data_ptrs[i];
+    if (!nrt_ptr) {
+      nrt_ptr = c10_neuron::NeuronCachingAllocator::findTensor(fallback_ctx.tensor_storage_ptrs[i]);
+    }
     TORCH_CHECK(nrt_ptr, "Invalid input data tensor pointer for CPU fallback");
     src_ptrs.push_back(nrt_ptr);
   }
@@ -380,7 +392,33 @@ std::vector<c10::IValue> CPUFallbackExecutor::ConstructNativeStack(
           stack.emplace_back(torch::scalar_tensor(scalar_val.toScalar(), torch::kCPU));
         } else {
           // Use the IValue directly (handles None, int, double, bool, lists, etc.)
-          stack.emplace_back(scalar_val);
+          // GenericList containing ints must be converted to IntList for schemas
+          // that expect SymInt[]. The boxed dispatcher stores SymInt[] as GenericList
+          // but cpu_op->callBoxed expects the typed IntList representation.
+          auto ivalue = scalar_val;
+          if (ivalue.isList() && !ivalue.isIntList() &&
+              (arg_type->isSubtypeOf(*c10::ListType::ofSymInts()) ||
+               arg_type->isSubtypeOf(*c10::ListType::ofInts()))) {
+            auto generic_list = ivalue.toListRef();
+            std::vector<int64_t> int_list;
+            int_list.reserve(generic_list.size());
+            for (const auto& elem : generic_list) {
+              int_list.push_back(elem.toInt());
+            }
+            stack.emplace_back(c10::IValue(int_list));
+          } else if (!ivalue.isScalar() && arg_type->isSubtypeOf(*c10::AnyType::get()) == false &&
+                     arg_type->isSubtypeOf(*c10::NumberType::get())) {
+            // Wrap plain int/double as Scalar when the schema expects Scalar type
+            if (ivalue.isInt()) {
+              stack.emplace_back(c10::IValue(c10::Scalar(ivalue.toInt())));
+            } else if (ivalue.isDouble()) {
+              stack.emplace_back(c10::IValue(c10::Scalar(ivalue.toDouble())));
+            } else {
+              stack.emplace_back(ivalue);
+            }
+          } else {
+            stack.emplace_back(ivalue);
+          }
         }
       }
     } else if (arg.default_value().has_value()) {

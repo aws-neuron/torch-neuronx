@@ -23,15 +23,19 @@ namespace NeuronMemorySnapshot {
  * TraceAction - Types of memory events that can be recorded.
  */
 enum class TraceAction {
-  ALLOC,           // Memory allocated to user (adds to active memory)
-  FREE_REQUESTED,  // Tensor freed by user (subtracts from active memory)
-  FREE_COMPLETED,  // Memory freed to NRT (nrt_tensor_free completed)
-  SEGMENT_ALLOC,   // Reserved for future use (segment-level tracking)
-  SEGMENT_FREE,    // Reserved for future use (segment-level tracking)
-  SEGMENT_MAP,     // Reserved for future use
-  SEGMENT_UNMAP,   // Reserved for future use
-  SNAPSHOT,        // Snapshot taken (for correlation with traces)
-  OOM              // Out of memory error
+  ALLOC,                    // Memory allocated to user (adds to active memory)
+  FREE_REQUESTED,           // Tensor freed by user (subtracts from active memory)
+  FREE_COMPLETED,           // Memory freed to NRT (nrt_tensor_free completed)
+  SEGMENT_ALLOC,            // Segment super-tensor allocated from NRT
+  SEGMENT_FREE,             // Segment super-tensor released back to NRT
+  SEGMENT_MAP,              // Reserved for future use
+  SEGMENT_UNMAP,            // Reserved for future use
+  SNAPSHOT,                 // Snapshot taken (for correlation with traces)
+  OOM,                      // Out of memory error (final, post-recovery)
+  ALLOC_DEFERRED,           // Stage-1: kAlloc OOM'd, parked as Deferred
+  ALLOC_DRAIN_RETRY_OK,     // Stage-2: stream drained, retry succeeded
+  ALLOC_DRAIN_RETRY_FAIL,   // Stage-2: stream drained, retry still OOM'd
+  ALLOC_CACHE_DRAIN_RETRY,  // Stage-3: AttemptOOMRecovery cache-drain retry
 };
 
 /**
@@ -86,23 +90,28 @@ struct TraceEntry {
   TraceAction action;
   int device = 0;
   size_t addr = 0;                        // Memory address (for OOM: requested size that failed)
-  size_t size = 0;                        // Allocation size
+  size_t size = 0;                        // User-visible allocation size (requested bytes).
+  size_t block_size = 0;                  // Rounded/carved block size (>= size). Equal to
+                                          // size when the allocator doesn't carve (naive path).
   c10::StreamId stream = 0;               // NeuronStream ID
   int64_t timestamp_us = 0;               // Timestamp in microseconds
   std::shared_ptr<StackContext> context;  // Optional stack trace
   size_t device_free = 0;                 // Only for OOM: free memory at failure time
+  uint64_t trace_id = 0;  // NRT system trace correlation ID (from nrt_tensor_get_trace_id)
 
   TraceEntry() = default;
   TraceEntry(TraceAction act, int dev, size_t address, size_t sz, c10::StreamId str, int64_t ts,
-             std::shared_ptr<StackContext> ctx = nullptr, size_t dev_free = 0)
+             std::shared_ptr<StackContext> ctx, size_t dev_free, size_t blk_sz, uint64_t tid = 0)
       : action(act),
         device(dev),
         addr(address),
         size(sz),
+        block_size(blk_sz ? blk_sz : sz),
         stream(str),
         timestamp_us(ts),
         context(std::move(ctx)),
-        device_free(dev_free) {}
+        device_free(dev_free),
+        trace_id(tid) {}
 };
 
 // =============================================================================
@@ -111,19 +120,18 @@ struct TraceEntry {
 
 /**
  * BlockInfo - Information about a memory block within a segment.
- * For Neuron: each segment has exactly 1 block (no splitting).
  */
 struct BlockInfo {
   size_t size = 0;
-  size_t requested_size = 0;  // Same as size for Neuron (no rounding)
+  size_t requested_size = 0;
   size_t address = 0;
   bool allocated = false;  // true = active_allocated, false = inactive
   std::shared_ptr<StackContext> context;
 };
 
 /**
- * SegmentInfo - Information about a memory segment.
- * For Neuron: each NRT allocation = 1 segment with 1 block.
+ * SegmentInfo - Information about a memory segment (NRT super tensor).
+ * Each segment contains one or more blocks from splitting.
  */
 struct SegmentInfo {
   int device = 0;
@@ -131,8 +139,8 @@ struct SegmentInfo {
   size_t total_size = 0;
   size_t allocated_size = 0;
   size_t active_size = 0;
-  c10::StreamId stream = 0;  // NeuronStream ID where allocation was made
-  bool is_large = true;      // Always true for Neuron (no small/large pools)
+  c10::StreamId stream = 0;
+  bool is_small = false;  // true for small pool (< kPoolBoundary)
   std::vector<BlockInfo> blocks;
 };
 
@@ -173,7 +181,8 @@ void RecordHistory(bool enabled, RecordContext when = RecordContext::NEVER,
  * @param device_free Free memory (only for OOM events)
  */
 void RecordTrace(TraceAction action, int device, size_t addr, size_t size, c10::StreamId stream,
-                 std::shared_ptr<StackContext> context = nullptr, size_t device_free = 0);
+                 std::shared_ptr<StackContext> context, size_t device_free, size_t block_size,
+                 uint64_t trace_id = 0);
 
 /**
  * Capture current memory snapshot.
@@ -204,6 +213,14 @@ bool ShouldIncludeCppFrames();
  * Reuses GetCurrentTimeNs() from NeuronMetrics and converts to microseconds.
  */
 int64_t GetCurrentTimestampUs();
+
+/**
+ * Get the clock domain offset (system_clock - steady_clock) in microseconds.
+ * This offset is applied to all trace timestamps so they align with the
+ * framework profiler and runtime system trace (both use system_clock).
+ * Returns 0 if recording has not been enabled.
+ */
+int64_t GetClockDomainOffsetUs();
 
 /**
  * Convert TraceAction to string for serialization.

@@ -58,11 +58,12 @@ fi
 
 # Get the latest release version from GitHub API
 print_info "Fetching latest bazelisk release information..."
-LATEST_VERSION=$(curl -s https://api.github.com/repos/bazelbuild/bazelisk/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+LATEST_VERSION=$(curl -sSfL --max-time 30 https://api.github.com/repos/bazelbuild/bazelisk/releases/latest \
+    | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)
 
 if [[ -z "$LATEST_VERSION" ]]; then
-    print_error "Failed to fetch latest version information"
-    exit 1
+    LATEST_VERSION=v1.28.1
+    print_warning "Could not fetch latest bazelisk version; falling back to pinned $LATEST_VERSION"
 fi
 
 print_info "Latest version: $LATEST_VERSION"
@@ -80,7 +81,7 @@ install_and_verify() {
 
     # Download bazelisk
     TEMP_FILE=$(mktemp)
-    if ! curl -L -o "$TEMP_FILE" "$DOWNLOAD_URL"; then
+    if ! curl -L --retry 3 --retry-delay 5 --retry-all-errors --max-time 120 -o "$TEMP_FILE" "$DOWNLOAD_URL"; then
         print_error "Failed to download bazelisk"
         rm -f "$TEMP_FILE"
         return 1

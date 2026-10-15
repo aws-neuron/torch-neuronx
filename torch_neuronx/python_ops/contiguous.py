@@ -13,9 +13,26 @@ from .nki_kernels.contiguous_generic import contiguous_generic_kernel
 
 
 class ContiguousFunction(torch.autograd.Function):
+    """Provide autograd support for making a Neuron tensor contiguous."""
+
     @staticmethod
     def forward(ctx, input, memory_format):
         # Call existing implementation
+        """Make an input tensor contiguous for the autograd forward pass.
+
+        Args:
+            ctx (Any): Autograd context, unused by this operation.
+            input (torch.Tensor): Tensor to make contiguous.
+            memory_format (torch.memory_format | None): Requested output memory format;
+                ``None`` selects contiguous format.
+
+        Returns:
+            torch.Tensor: The input itself when already contiguous, otherwise a
+                contiguous output tensor.
+
+        Raises:
+            RuntimeError: If the contiguous implementation fails.
+        """
         impl = ContiguousNKIImpl()
         result = impl.execute_internal(input, memory_format)
         if not result.success:
@@ -26,19 +43,62 @@ class ContiguousFunction(torch.autograd.Function):
         return output
 
     @staticmethod
+    def jvp(ctx, grad_input, grad_memory_format):
+        """Propagate the input tangent through the contiguous operation.
+
+        Args:
+            ctx (Any): Autograd context, unused by this operation.
+            grad_input (torch.Tensor): Tangent associated with the input tensor.
+            grad_memory_format (Any): Tangent for the non-tensor memory format, ignored.
+
+        Returns:
+            torch.Tensor: The same ``grad_input`` tensor, unchanged.
+        """
+        return grad_input
+
+    @staticmethod
     def backward(ctx, grad_output):
         # For contiguous operation, the gradient can flow back unchanged
         # since making a tensor contiguous doesn't change the mathematical operation
+        """Propagate the output gradient through the contiguous operation.
+
+        Args:
+            ctx (Any): Autograd context, unused by this operation.
+            grad_output (torch.Tensor): Gradient of the contiguous output.
+
+        Returns:
+            tuple: The same ``grad_output`` tensor and ``None`` for the memory format.
+        """
         return grad_output, None
 
 
 @neuron_op("aten::contiguous", disable_dtype_autocast=True)
 class ContiguousNKIImpl(OperationImplementation):
-    """NKI implementation of contiguous operation"""
+    """Implement contiguous layout conversion on a Neuron device.
+
+    Note:
+        Empty inputs are returned unchanged before memory-format validation. A nonempty
+        input already contiguous in the requested format is also returned unchanged.
+        Other nonempty paths allocate an output; channels-last conversion uses the
+        native NKI/NRT strided-copy path.
+    """
 
     def can_handle(self, self_tensor, memory_format=None) -> bool:
         # Accept any memory_format here; execute() will validate for Neuron and raise
         # a canonical error for unsupported formats to avoid CPU fallback.
+        """Check whether the contiguous implementation accepts the arguments.
+
+        Args:
+            self_tensor (torch.Tensor): Tensor to make contiguous.
+            memory_format (torch.memory_format, optional): Requested memory format;
+                accepted without validation until execution. Defaults to ``None``.
+
+        Returns:
+            bool: Whether the base Neuron device requirements are satisfied.
+
+        Raises:
+            RuntimeError: If a non-scalar tensor is not on a Neuron device.
+        """
         return super().can_handle(self_tensor, memory_format=memory_format)
 
     def _execute_impl(self, self_tensor, memory_format=None) -> ExecutionResult:
@@ -52,6 +112,17 @@ class ContiguousNKIImpl(OperationImplementation):
         return self.execute_internal(self_tensor, memory_format)
 
     def execute_internal(self, self_tensor, memory_format=None) -> ExecutionResult:
+        """Execute contiguous layout conversion and capture failures.
+
+        Args:
+            self_tensor (torch.Tensor): Tensor to make contiguous.
+            memory_format (torch.memory_format, optional): Requested memory
+                format. Defaults to ``None``.
+
+        Returns:
+            ExecutionResult: The input itself when already contiguous, a newly
+            allocated converted tensor, or a captured error message.
+        """
         try:
             # Validate memory_format for Neuron tensors and normalize preserve->contiguous
             from .cast_policy import validate_neuron_memory_format
@@ -133,7 +204,7 @@ class ContiguousNKIImpl(OperationImplementation):
             dtype=self_tensor.dtype,
             device=self_tensor.device,
         )
-        _C._nrt_copy_strided_neuron_to_neuron(src, output)
+        _C._nki_copy_strided_neuron_to_neuron(src, output)
         return ExecutionResult(success=True, output=output)
 
     def _channels_last_strides(self, shape, memory_format):
@@ -150,12 +221,42 @@ class ContiguousNKIImpl(OperationImplementation):
             raise ValueError(f"Unsupported memory_format {memory_format} for shape {shape}")
 
 
+@torch._dynamo.disable
 def contiguous_internal(self_tensor, memory_format=None):
-    """Internal contiguous implementation that can be called from C++ without dispatcher"""
-    from .cast_policy import validate_neuron_memory_format
+    """Make a tensor contiguous without dispatcher or Dynamo recursion.
 
-    validate_neuron_memory_format(memory_format, op_name="aten::contiguous")
+    Args:
+        self_tensor (torch.Tensor): Tensor to make contiguous.
+        memory_format (torch.memory_format, optional): Requested memory
+            format. Defaults to ``None``.
 
+    Returns:
+        torch.Tensor: The input tensor or a contiguous copy in the requested format.
+
+    Raises:
+        RuntimeError: If the memory format is unsupported, a nonscalar input is not
+            on a Neuron device, or no implementation succeeds.
+
+    Note:
+        This C++/pybind11 entry point explicitly clears the Dynamo evaluation frame
+        because the decorator may be bypassed; tracing it can corrupt side-effect-only
+        ``torch.compile`` subgraphs.
+    """
+    prior = torch._dynamo.eval_frame.set_eval_frame(None)
+    try:
+        # Explicitly disable dynamo tracing — the decorator may not take effect when
+        # called from C++ via pybind11, because pybind11 may resolve the underlying
+        # unwrapped function.
+        from .cast_policy import validate_neuron_memory_format
+
+        validate_neuron_memory_format(memory_format, op_name="aten::contiguous")
+        return _contiguous_internal_impl(self_tensor, memory_format)
+    finally:
+        torch._dynamo.eval_frame.set_eval_frame(prior)
+
+
+def _contiguous_internal_impl(self_tensor, memory_format=None):
+    """Implementation of contiguous_internal, runs with dynamo disabled."""
     implementations = [
         ContiguousTransposeMLIRImpl(),
         ContiguousBroadcastMLIRImpl(),
@@ -173,8 +274,3 @@ def contiguous_internal(self_tensor, memory_format=None):
                 continue
 
     raise RuntimeError("No contiguous implementation could handle this tensor configuration")
-
-
-# Register the internal function with C++ so it can be called directly
-# This needs to be done even with auto-registration
-_C._set_python_contiguous_op(contiguous_internal)

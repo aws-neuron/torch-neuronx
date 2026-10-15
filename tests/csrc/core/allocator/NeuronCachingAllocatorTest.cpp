@@ -1,416 +1,408 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include "tests/csrc/mocks/MockNRT.h"
+#include "tests/csrc/mocks/MockNeuronDevice.h"
+#include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
+#include "torch_neuronx/csrc/core/allocator/NeuronSegmentAllocator.h"
 #include "torch_neuronx/csrc/core/allocator/ShelvesCleanup.h"
+#include "torch_neuronx/csrc/core/metrics/NeuronMemorySnapshot.h"
+#include "torch_neuronx/csrc/core/utils/NeuronResourceManager.h"
 
 using namespace c10_neuron;
 using namespace torch_neuronx::testing;
 using ::testing::_;
+using ::testing::AnyNumber;
 using ::testing::DoAll;
-using ::testing::InSequence;
+using ::testing::Invoke;
 using ::testing::Return;
 using ::testing::SetArgPointee;
 
-class NrtTensorPoolTest : public ::testing::Test {
+class NeuronCachingAllocatorTest : public ::testing::Test {
  protected:
-  void SetUp() override { mock_session_ = std::make_unique<MockNRTSession>(); }
+  static bool streams_initialized_;
 
-  void TearDown() override { mock_session_.reset(); }
+  void SetUp() override {
+    mock_session_ = std::make_unique<MockNRTSession>();
+    next_addr_ = 0x10000;
+
+    // Mock device count: 1 fake Neuron device for testing
+    c10_neuron::testing::SetMockDeviceCount(1);
+
+    // Mock nrt_get_visible_vnc_count so stream pool init discovers 1 device
+    EXPECT_CALL(*MockNRT::GetInstance(), nrt_get_visible_vnc_count(_))
+        .Times(AnyNumber())
+        .WillRepeatedly(DoAll(SetArgPointee<0>(1u), Return(NRT_SUCCESS)));
+
+    // Initialize stream pools once (needed for NeuronEvent::record in neuron_deleter)
+    if (!streams_initialized_) {
+      at::neuron::InitializeStreamPools();
+      streams_initialized_ = true;
+    }
+
+    // Mock NRT tensor allocation: return fake tensor pointers with unique addresses
+    EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, _, _, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke(
+            [this](nrt_tensor_placement_t, int32_t, size_t size, const char*, nrt_tensor_t** out) {
+              auto* fake = reinterpret_cast<nrt_tensor_t*>(next_addr_);
+              next_addr_ += std::max(size, static_cast<size_t>(0x1000));
+              *out = fake;
+              return NRT_SUCCESS;
+            }));
+
+    // nrt_tensor_get_va: return address of the tensor itself (identity mapping)
+    EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(_))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke([](const nrt_tensor_t* t) {
+          return const_cast<void*>(reinterpret_cast<const void*>(t));
+        }));
+
+    // nrt_tensor_allocate_slice: return base + offset as fake slice handle
+    EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate_slice(_, _, _, _, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke(
+            [](const nrt_tensor_t* base, size_t offset, size_t, const char*, nrt_tensor_t** out) {
+              auto base_addr = reinterpret_cast<uintptr_t>(base);
+              *out = reinterpret_cast<nrt_tensor_t*>(base_addr + offset);
+              return NRT_SUCCESS;
+            }));
+
+    // nrt_tensor_free: just null out the pointer
+    EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_free(_))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke([](nrt_tensor_t** ptr) {
+          if (ptr) *ptr = nullptr;
+        }));
+
+    // Mock async NRT operations so the worker thread can process kAlloc/kDealloc.
+    // nrta_event_register_seq_id_completion: signal the eventfd immediately
+    // so the runtime worker wakes from read(efd) and processes completions.
+    EXPECT_CALL(*MockNRT::GetInstance(), nrta_event_register_seq_id_completion(_, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(Invoke([](nrta_seq_t, int fd) -> NRT_STATUS {
+          uint64_t val = 1;
+          ::write(fd, &val, sizeof(val));
+          return NRT_SUCCESS;
+        }));
+
+    // nrta_get_sequence: return UINT64_MAX to indicate all operations completed.
+    EXPECT_CALL(*MockNRT::GetInstance(), nrta_get_sequence(_, _, _, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(DoAll(SetArgPointee<3>(UINT64_MAX), Return(NRT_SUCCESS)));
+
+    // nrta_tensor_write: the scalar cache miss path submits a kWrite for the
+    // value. Set the async-status out-param (arg 6) to NRT_SUCCESS so the op's
+    // completion status isn't the fail-closed NRT_FAILURE default, and a nonzero
+    // sequence out-param (arg 7) to match how the other async NRT ops are mocked.
+    EXPECT_CALL(*MockNRT::GetInstance(), nrta_tensor_write(_, _, _, _, _, _, _, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(
+            DoAll(SetArgPointee<6>(NRT_SUCCESS), SetArgPointee<7>(1u), Return(NRT_SUCCESS)));
+
+    // Initialize the execution engine (needed for lazy alloc SubmitOperationContext)
+    at::neuron::NeuronResourceManager::Instance();
+  }
+
+  void TearDown() override {
+    // Synchronize all devices to complete pending async operations (lazy alloc kAlloc/kDealloc)
+    for (int device = 0; device < c10_neuron::testing::device_count(); ++device) {
+      at::neuron::synchronize(device);
+    }
+    // Drain segment pools back to NRT so state doesn't leak across tests.
+    NeuronCachingAllocator::emptyCache();
+    mock_session_.reset();
+  }
+
+  /// allocate and return the DataPtr.
+  c10::DataPtr allocate(size_t size) {
+    auto* allocator = NeuronCachingAllocator::get();
+    return allocator->allocate(size);
+  }
+
+  /// Synchronize device 0 to wait for pending kAlloc/kDealloc to complete.
+  /// Call this after allocate() for findTensors to work.
+  void syncDevice() { at::neuron::synchronize(0); }
+
+  // Get a valid non-default c10::Stream for device 0.
+  static c10::Stream getNonDefaultStream() {
+    return c10::Stream(c10::Stream::UNSAFE, c10::Device(c10::DeviceType::PrivateUse1, 0),
+                       /*stream_id=*/32);
+  }
 
   std::unique_ptr<MockNRTSession> mock_session_;
+  uintptr_t next_addr_ = 0x10000;
 };
 
-TEST_F(NrtTensorPoolTest, AllocateReturnsValidPointer) {
-  NrtTensorPool allocator(0);
+bool NeuronCachingAllocatorTest::streams_initialized_ = false;
 
-  nrt_tensor_t* dummy_tensor = reinterpret_cast<nrt_tensor_t*>(0x1000);
-  void* dummy_va = reinterpret_cast<void*>(0x5000);
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 1024, _, _))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy_tensor), Return(NRT_SUCCESS)));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy_tensor)).WillOnce(Return(dummy_va));
+TEST_F(NeuronCachingAllocatorTest, AllocateReturnsValidDataPtr) {
+  auto data_ptr = allocate(1024);
 
-  auto [tensor, data_ptr, dealloc_flag] = allocator.Allocate(1024, 0);
-  EXPECT_NE(tensor, nullptr);
-  EXPECT_EQ(tensor.get(), dummy_tensor);
-  EXPECT_EQ(data_ptr, dummy_va);
-  EXPECT_NE(dealloc_flag, nullptr);
-  EXPECT_FALSE(dealloc_flag->load());
+  EXPECT_NE(data_ptr.get(), nullptr);
+  EXPECT_EQ(data_ptr.device().type(), c10::DeviceType::PrivateUse1);
+  EXPECT_EQ(data_ptr.device().index(), 0);
 }
 
-TEST_F(NrtTensorPoolTest, AllocateZeroReturnsNull) {
-  NrtTensorPool allocator(0);
-  auto [tensor, data_ptr, dealloc_flag] = allocator.Allocate(0, 0);
-  EXPECT_EQ(tensor, nullptr);
-  EXPECT_EQ(data_ptr, nullptr);
-  EXPECT_EQ(dealloc_flag, nullptr);
+TEST_F(NeuronCachingAllocatorTest, AllocateZeroReturnsNull) {
+  auto data_ptr = allocate(0);
+
+  EXPECT_EQ(data_ptr.get(), nullptr);
 }
 
-TEST_F(NrtTensorPoolTest, RecycleAndReusesSameSize) {
-  NrtTensorPool allocator(0);
+TEST_F(NeuronCachingAllocatorTest, MultipleAllocationsReturnDistinctPointers) {
+  auto dp1 = allocate(1024);
+  auto dp2 = allocate(2048);
+  auto dp3 = allocate(512);
 
-  nrt_tensor_t* dummy_tensor = reinterpret_cast<nrt_tensor_t*>(0x1000);
-  void* dummy_va = reinterpret_cast<void*>(0x5000);
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 1024, _, _))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy_tensor), Return(NRT_SUCCESS)));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy_tensor))
-      .WillRepeatedly(Return(dummy_va));
+  EXPECT_NE(dp1.get(), nullptr);
+  EXPECT_NE(dp2.get(), nullptr);
+  EXPECT_NE(dp3.get(), nullptr);
 
-  auto [tensor1, data_ptr1, dealloc_flag1] = allocator.Allocate(1024, 0);
-  auto tensor1_copy = tensor1;
-
-  // Recycle the former original tensor
-  allocator.Recycle(std::move(tensor1), 1024, 0, data_ptr1, nullptr, dealloc_flag1);
-
-  // Next allocation should recycle the same original tensor
-  auto [tensor2, data_ptr2, dealloc_flag2] = allocator.Allocate(1024, 0);
-  EXPECT_EQ(tensor2.get(), dummy_tensor);
-  EXPECT_EQ(tensor2.get(), tensor1_copy.get());
-  EXPECT_EQ(data_ptr2, dummy_va);
+  // All pointers must be distinct
+  EXPECT_NE(dp1.get(), dp2.get());
+  EXPECT_NE(dp1.get(), dp3.get());
+  EXPECT_NE(dp2.get(), dp3.get());
 }
 
-TEST_F(NrtTensorPoolTest, ExpiredWeakPtrSkipped) {
-  NrtTensorPool allocator(0);
+TEST_F(NeuronCachingAllocatorTest, FindTensorReturnsNullForNullptr) {
+  EXPECT_EQ(NeuronCachingAllocator::findTensor(nullptr), nullptr);
+}
 
-  nrt_tensor_t* dummy_tensor1 = reinterpret_cast<nrt_tensor_t*>(0x1000);
-  nrt_tensor_t* dummy_tensor2 = reinterpret_cast<nrt_tensor_t*>(0x2000);
-  void* dummy_va1 = reinterpret_cast<void*>(0x5000);
-  void* dummy_va2 = reinterpret_cast<void*>(0x6000);
+TEST_F(NeuronCachingAllocatorTest, FindTensorReturnsNullForUnknownPtr) {
+  void* bogus = reinterpret_cast<void*>(0xDEADBEEF);
+  EXPECT_EQ(NeuronCachingAllocator::findTensor(bogus), nullptr);
+}
 
+TEST_F(NeuronCachingAllocatorTest, FindTensorReturnsHandleForAllocatedPtr) {
+  auto dp = allocate(1024);
+  void* ptr = dp.get();
+  ASSERT_NE(ptr, nullptr);
+
+  syncDevice();
+
+  nrt_tensor_t* handle = NeuronCachingAllocator::findTensor(ptr);
+  EXPECT_NE(handle, nullptr);
+}
+
+TEST_F(NeuronCachingAllocatorTest, FindTensorPtrReturnsSharedPtrForAllocatedPtr) {
+  auto dp = allocate(1024);
+  void* ptr = dp.get();
+  ASSERT_NE(ptr, nullptr);
+
+  syncDevice();
+
+  auto tensor_ptr = NeuronCachingAllocator::findTensorPtr(ptr);
+  EXPECT_NE(tensor_ptr, nullptr);
+
+  // The shared_ptr's deleter frees the NRT slice — should not crash
+  tensor_ptr.reset();
+}
+
+TEST_F(NeuronCachingAllocatorTest, FindTensorPtrReturnsNullForUnknownPtr) {
+  void* bogus = reinterpret_cast<void*>(0xDEADBEEF);
+  EXPECT_EQ(NeuronCachingAllocator::findTensorPtr(bogus), nullptr);
+}
+
+TEST_F(NeuronCachingAllocatorTest, GetTensorFromContextThrowsOnNull) {
+  EXPECT_THROW(NeuronCachingAllocator::getTensorFromContext(nullptr), c10::Error);
+}
+
+TEST_F(NeuronCachingAllocatorTest, GetTensorFromContextReturnsHandleForAllocatedPtr) {
+  auto dp = allocate(1024);
+  void* ctx = dp.get_context();
+  ASSERT_NE(ctx, nullptr);
+
+  syncDevice();
+
+  nrt_tensor_t* handle = NeuronCachingAllocator::getTensorFromContext(ctx);
+  EXPECT_NE(handle, nullptr);
+
+  // Should match findTensor for the same allocation
+  nrt_tensor_t* find_handle = NeuronCachingAllocator::findTensor(dp.get());
+  EXPECT_EQ(handle, find_handle);
+}
+
+TEST_F(NeuronCachingAllocatorTest, DeleterRemovesFromRegistryOnDestruction) {
+  void* ptr = nullptr;
   {
-    ::testing::InSequence seq;
-    EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 1024, _, _))
-        .WillOnce(DoAll(SetArgPointee<4>(dummy_tensor1), Return(NRT_SUCCESS)));
-    EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy_tensor1))
-        .WillOnce(Return(dummy_va1));
-    EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_free(_)).Times(1);
-    EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 1024, _, _))
-        .WillOnce(DoAll(SetArgPointee<4>(dummy_tensor2), Return(NRT_SUCCESS)));
-    EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy_tensor2))
-        .WillOnce(Return(dummy_va2));
-    EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_free(_)).Times(1);
-  }
+    auto dp = allocate(1024);
+    ptr = dp.get();
+    ASSERT_NE(ptr, nullptr);
 
-  // Allocate but deference the tensor entirely, so it gets deallocated
+    syncDevice();
+
+    // Should be findable while alive
+    EXPECT_NE(NeuronCachingAllocator::findTensor(ptr), nullptr);
+  }
+  // DataPtr destructed, neuron_deleter called, registry entry removed
+  // For lazy alloc, the deleter submits kDealloc; sync to let it complete
+  syncDevice();
+
+  EXPECT_EQ(NeuronCachingAllocator::findTensor(ptr), nullptr);
+}
+
+TEST_F(NeuronCachingAllocatorTest, RecordStreamOnNullPtrDoesNotCrash) {
+  c10::DataPtr empty_dp(nullptr, c10::Device(c10::DeviceType::PrivateUse1, 0));
+  auto stream = getNonDefaultStream();
+  EXPECT_NO_THROW(NeuronCachingAllocator::recordStream(empty_dp, stream));
+}
+
+TEST_F(NeuronCachingAllocatorTest, RecordStreamOnAllocatedPtrDoesNotCrash) {
+  auto dp = allocate(1024);
+  auto stream = getNonDefaultStream();
+  EXPECT_NO_THROW(NeuronCachingAllocator::recordStream(dp, stream));
+}
+
+TEST_F(NeuronCachingAllocatorTest, SnapshotEmptyWhenNoActiveAllocations) {
+  auto segments = NeuronCachingAllocator::getSnapshotSegments();
+  EXPECT_TRUE(segments.empty());
+}
+
+TEST_F(NeuronCachingAllocatorTest, SnapshotReflectsActiveAllocations) {
+  auto dp1 = allocate(1024);
+  auto dp2 = allocate(2048);
+
+  syncDevice();
+
+  auto segments = NeuronCachingAllocator::getSnapshotSegments();
+  // Should have at least one segment with active blocks
+  EXPECT_GE(segments.size(), 1u);
+
+  // Total active allocation size across all segments should account for dp1 + dp2
+  size_t total_allocated = 0;
+  for (const auto& seg : segments) {
+    total_allocated += seg.allocated_size;
+  }
+  // Should be at least 1024 + 2048 = 3072 (may be rounded up by allocator)
+  EXPECT_GE(total_allocated, 3072u);
+}
+
+TEST_F(NeuronCachingAllocatorTest, GetSegmentPoolReturnsSameInstanceForSameDevice) {
+  auto& pool1 = c10_neuron::GetSegmentPool(0);
+  auto& pool2 = c10_neuron::GetSegmentPool(0);
+  EXPECT_EQ(&pool1, &pool2);
+}
+
+TEST_F(NeuronCachingAllocatorTest, EmptyCacheDoesNotCrash) {
+  EXPECT_NO_THROW(NeuronCachingAllocator::emptyCache());
+}
+
+TEST_F(NeuronCachingAllocatorTest, RemoveUnknownPtrDoesNotCrash) {
+  void* bogus = reinterpret_cast<void*>(0xDEADBEEF);
+  EXPECT_NO_THROW(NeuronCachingAllocator::remove(bogus));
+}
+
+TEST_F(NeuronCachingAllocatorTest, FullLifecycleAllocFindRecordDestroy) {
+  void* ptr = nullptr;
+  nrt_tensor_t* handle = nullptr;
   {
-    auto [tensor1, data_ptr1, dealloc_flag1] = allocator.Allocate(1024, 0);
-    allocator.Recycle(tensor1, 1024, 0, data_ptr1, nullptr, dealloc_flag1);
+    auto dp = allocate(2048);
+    ptr = dp.get();
+    ASSERT_NE(ptr, nullptr);
+
+    syncDevice();
+
+    // findTensor returns valid handle
+    handle = NeuronCachingAllocator::findTensor(ptr);
+    EXPECT_NE(handle, nullptr);
+
+    // getTensorFromContext returns same handle
+    void* ctx = dp.get_context();
+    EXPECT_EQ(NeuronCachingAllocator::getTensorFromContext(ctx), handle);
+
+    // recordStream on a non-default stream
+    auto other_stream = getNonDefaultStream();
+    NeuronCachingAllocator::recordStream(dp, other_stream);
+
+    // Snapshot reflects the allocation
+    auto segs = NeuronCachingAllocator::getSnapshotSegments();
+    EXPECT_GE(segs.size(), 1u);
   }
+  // After destruction, sync to let kDealloc complete
+  syncDevice();
 
-  // Next allocation should allocate a fresh new tensor
-  auto [tensor2, data_ptr2, dealloc_flag2] = allocator.Allocate(1024, 0);
-  EXPECT_EQ(tensor2.get(), dummy_tensor2);
-  EXPECT_EQ(data_ptr2, dummy_va2);
+  // findTensor should return nullptr (removed from registry)
+  EXPECT_EQ(NeuronCachingAllocator::findTensor(ptr), nullptr);
 }
 
-TEST_F(NrtTensorPoolTest, DifferentSizesNotRecycled) {
-  NrtTensorPool allocator(0);
+TEST_F(NeuronCachingAllocatorTest, CachedScalarTensorIsResolvableByFindTensor) {
+  int32_t val = 7;
+  auto t =
+      NeuronCachingAllocator::createCachedScalarTensor(&val, sizeof(val), c10::ScalarType::Int, 0);
+  ASSERT_TRUE(t.has_value());
+  void* ptr = t->data_ptr();
+  ASSERT_NE(ptr, nullptr);
 
-  nrt_tensor_t* dummy_tensor1 = reinterpret_cast<nrt_tensor_t*>(0x1000);
-  nrt_tensor_t* dummy_tensor2 = reinterpret_cast<nrt_tensor_t*>(0x2000);
-  void* dummy_va1 = reinterpret_cast<void*>(0x5000);
-  void* dummy_va2 = reinterpret_cast<void*>(0x6000);
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 1024, _, _))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy_tensor1), Return(NRT_SUCCESS)));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy_tensor1))
-      .WillOnce(Return(dummy_va1));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 2048, _, _))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy_tensor2), Return(NRT_SUCCESS)));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy_tensor2))
-      .WillOnce(Return(dummy_va2));
+  syncDevice();
 
-  auto [tensor1, data_ptr1, dealloc_flag1] = allocator.Allocate(1024, 0);
-  auto tensor1_copy = tensor1;
-  allocator.Recycle(std::move(tensor1), 1024, 0, data_ptr1, nullptr, dealloc_flag1);
+  nrt_tensor_t* handle = NeuronCachingAllocator::findTensor(ptr);
+  EXPECT_NE(handle, nullptr);
 
-  // Different size, so allocate a new tensor
-  auto [tensor2, data_ptr2, dealloc_flag2] = allocator.Allocate(2048, 0);
-  EXPECT_EQ(tensor2.get(), dummy_tensor2);
+  // The storage context resolves to the same handle.
+  void* ctx = t->storage().data_ptr().get_context();
+  EXPECT_EQ(NeuronCachingAllocator::getTensorFromContext(ctx), handle);
 }
 
-TEST_F(NrtTensorPoolTest, FreelistSizeTracking) {
-  NrtTensorPool allocator(0);
+TEST_F(NeuronCachingAllocatorTest, IdenticalScalarsShareVAAndSlice) {
+  int32_t val = 123;
+  auto a =
+      NeuronCachingAllocator::createCachedScalarTensor(&val, sizeof(val), c10::ScalarType::Int, 0);
+  auto b =
+      NeuronCachingAllocator::createCachedScalarTensor(&val, sizeof(val), c10::ScalarType::Int, 0);
+  ASSERT_TRUE(a.has_value() && b.has_value());
 
-  nrt_tensor_t* dummy_tensor = reinterpret_cast<nrt_tensor_t*>(0x1000);
-  void* dummy_va = reinterpret_cast<void*>(0x5000);
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, _, _, _))
-      .WillRepeatedly(DoAll(SetArgPointee<4>(dummy_tensor), Return(NRT_SUCCESS)));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(_)).WillRepeatedly(Return(dummy_va));
+  syncDevice();
 
-  EXPECT_EQ(allocator.GetFreelistSize(), 0);
-
-  auto [tensor, data_ptr, dealloc_flag] = allocator.Allocate(1024, 0);
-  auto tensor_copy = tensor;
-  allocator.Recycle(std::move(tensor), 1024, 0, data_ptr, nullptr, dealloc_flag);
-
-  EXPECT_EQ(allocator.GetFreelistSize(), 1);
-
-  allocator.Clear();
-  EXPECT_EQ(allocator.GetFreelistSize(), 0);
+  // Identical bit patterns dedup to one shared placeholder VA (the second call
+  // is a cache hit that submits no new op) and resolve to the same slice.
+  EXPECT_EQ(a->data_ptr(), b->data_ptr());
+  EXPECT_EQ(NeuronCachingAllocator::findTensor(a->data_ptr()),
+            NeuronCachingAllocator::findTensor(b->data_ptr()));
 }
 
-TEST_F(NrtTensorPoolTest, LIFOOrder) {
-  NrtTensorPool allocator(0);
-
-  nrt_tensor_t* dummy1 = reinterpret_cast<nrt_tensor_t*>(0x1000);
-  nrt_tensor_t* dummy2 = reinterpret_cast<nrt_tensor_t*>(0x2000);
-  void* dummy_va1 = reinterpret_cast<void*>(0x5000);
-  void* dummy_va2 = reinterpret_cast<void*>(0x6000);
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 1024, _, _))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy1), Return(NRT_SUCCESS)))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy2), Return(NRT_SUCCESS)));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy1)).WillRepeatedly(Return(dummy_va1));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy2)).WillRepeatedly(Return(dummy_va2));
-
-  auto [tensor1, data_ptr1, dealloc_flag1] = allocator.Allocate(1024, 0);
-  auto [tensor2, data_ptr2, dealloc_flag2] = allocator.Allocate(1024, 0);
-  auto copy1 = tensor1;
-  auto copy2 = tensor2;
-
-  // Recycle in order: tensor1, then tensor2
-  allocator.Recycle(std::move(tensor1), 1024, 0, data_ptr1, nullptr, dealloc_flag1);
-  allocator.Recycle(std::move(tensor2), 1024, 0, data_ptr2, nullptr, dealloc_flag2);
-
-  // LIFO: should get tensor2 first (most recently recycled)
-  auto [recycled, recycled_ptr, recycled_flag] = allocator.Allocate(1024, 0);
-  EXPECT_EQ(recycled.get(), dummy2);
-}
-
-TEST_F(NrtTensorPoolTest, PruneExpiredEntries) {
-  NrtTensorPool allocator(0);
-
-  nrt_tensor_t* dummy1 = reinterpret_cast<nrt_tensor_t*>(0x1000);
-  nrt_tensor_t* dummy2 = reinterpret_cast<nrt_tensor_t*>(0x2000);
-  void* dummy_va1 = reinterpret_cast<void*>(0x5000);
-  void* dummy_va2 = reinterpret_cast<void*>(0x6000);
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 1024, _, _))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy1), Return(NRT_SUCCESS)))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy2), Return(NRT_SUCCESS)));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy1)).WillOnce(Return(dummy_va1));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy2)).WillOnce(Return(dummy_va2));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_free(_)).Times(2);
-
+TEST_F(NeuronCachingAllocatorTest, ScalarEntrySurvivesTensorDestructionUntilEmptyCache) {
+  int32_t val = 55;
+  void* ptr = nullptr;
   {
-    auto [tensor1, data_ptr1, dealloc_flag1] = allocator.Allocate(1024, 0);
-    auto [tensor2, data_ptr2, dealloc_flag2] = allocator.Allocate(1024, 0);
-    allocator.Recycle(tensor1, 1024, 0, data_ptr1, nullptr, dealloc_flag1);
-    allocator.Recycle(tensor2, 1024, 0, data_ptr2, nullptr, dealloc_flag2);
-    EXPECT_EQ(allocator.GetFreelistSize(), 2);
+    auto t = NeuronCachingAllocator::createCachedScalarTensor(&val, sizeof(val),
+                                                              c10::ScalarType::Int, 0);
+    ASSERT_TRUE(t.has_value());
+    ptr = t->data_ptr();
+    syncDevice();
+    EXPECT_NE(NeuronCachingAllocator::findTensor(ptr), nullptr);
   }
+  // The scalar entry is permanent (no-op deleter, shared across tensors), so
+  // destroying the tensor must not free it.
+  syncDevice();
+  EXPECT_NE(NeuronCachingAllocator::findTensor(ptr), nullptr);
 
-  // Prune should remove both expired entries
-  size_t pruned = allocator.PruneExpiredEntries();
-  EXPECT_EQ(pruned, 2);
-  EXPECT_EQ(allocator.GetFreelistSize(), 0);
+  // Only emptyCache tears it down.
+  NeuronCachingAllocator::emptyCache();
+  EXPECT_EQ(NeuronCachingAllocator::findTensor(ptr), nullptr);
 }
 
-TEST_F(NrtTensorPoolTest, AllocateOOMRecovery) {
-  NrtTensorPool allocator(0);
+TEST_F(NeuronCachingAllocatorTest, DistinctScalarsResolveToDistinctSlices) {
+  int32_t v1 = 1, v2 = 2;
+  auto a =
+      NeuronCachingAllocator::createCachedScalarTensor(&v1, sizeof(v1), c10::ScalarType::Int, 0);
+  auto b =
+      NeuronCachingAllocator::createCachedScalarTensor(&v2, sizeof(v2), c10::ScalarType::Int, 0);
+  ASSERT_TRUE(a.has_value() && b.has_value());
 
-  nrt_tensor_t* dummy1 = reinterpret_cast<nrt_tensor_t*>(0x1000);
-  nrt_tensor_t* dummy2 = reinterpret_cast<nrt_tensor_t*>(0x2000);
-  void* dummy_va1 = reinterpret_cast<void*>(0x5000);
-  void* dummy_va2 = reinterpret_cast<void*>(0x6000);
+  syncDevice();
 
-  // First allocation succeeds
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 1024, _, _))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy1), Return(NRT_SUCCESS)));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy1)).WillOnce(Return(dummy_va1));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_free(_)).Times(2);  // dummy1 + dummy2
-
-  {
-    auto [tensor1, data_ptr1, dealloc_flag1] = allocator.Allocate(1024, 0);
-    allocator.Recycle(tensor1, 1024, 0, data_ptr1, nullptr, dealloc_flag1);
-  }
-
-  // Allocate: first attempt fails with OOM, prune clears expired, retry succeeds
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 2048, _, _))
-      .WillOnce(Return(NRT_RESOURCE))                                   // First attempt: OOM
-      .WillOnce(DoAll(SetArgPointee<4>(dummy2), Return(NRT_SUCCESS)));  // Retry succeeds
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy2)).WillOnce(Return(dummy_va2));
-
-  auto [tensor2, data_ptr2, dealloc_flag2] = allocator.Allocate(2048, 0);
-  EXPECT_EQ(tensor2.get(), dummy2);
-  // Freelist should be empty after we prune expired entries
-  EXPECT_EQ(allocator.GetFreelistSize(), 0);
+  EXPECT_NE(a->data_ptr(), b->data_ptr());
+  EXPECT_NE(NeuronCachingAllocator::findTensor(a->data_ptr()),
+            NeuronCachingAllocator::findTensor(b->data_ptr()));
 }
 
-TEST_F(NrtTensorPoolTest, OOMRetryTriggersShelvesCleanup) {
-  NrtTensorPool allocator(0);
-
-  nrt_tensor_t* dummy = reinterpret_cast<nrt_tensor_t*>(0x1000);
-
-  // First attempt fails with OOM, retry succeeds
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 1024, _, _))
-      .WillOnce(Return(NRT_RESOURCE))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy), Return(NRT_SUCCESS)));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_free(_)).Times(1);
-
-  // Track cleanup trigger count
-  size_t before = torch_neuronx::distributed::ShelvesCleanupRegistry::instance().getTriggerCount();
-
-  auto tensor = allocator.Allocate(1024, 0);
-  EXPECT_NE(tensor.tensor_ptr, nullptr);
-
-  // Verify triggerShelvesCleanup was called once before alloc
-  size_t after = torch_neuronx::distributed::ShelvesCleanupRegistry::instance().getTriggerCount();
-  EXPECT_GE(after, before + 1);
-}
-
-TEST_F(NrtTensorPoolTest, AllocTriggersShelvesCleanup) {
-  NrtTensorPool allocator(0);
-
-  nrt_tensor_t* dummy = reinterpret_cast<nrt_tensor_t*>(0x1000);
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 1024, _, _))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy), Return(NRT_SUCCESS)));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_free(_)).Times(1);
-
-  size_t before = torch_neuronx::distributed::ShelvesCleanupRegistry::instance().getTriggerCount();
-
-  auto tensor = allocator.Allocate(1024, 0);
-  EXPECT_NE(tensor.tensor_ptr, nullptr);
-
-  // Cleanup is NOT called on normal allocation (only on OOM retry)
-  size_t after = torch_neuronx::distributed::ShelvesCleanupRegistry::instance().getTriggerCount();
-  EXPECT_EQ(after, before);
-}
-
-TEST_F(NrtTensorPoolTest, AllocateThrowsOnPersistentOOM) {
-  NrtTensorPool allocator(0);
-
-  // Both attempts fail with OOM
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 1024, _, _))
-      .WillOnce(Return(NRT_RESOURCE))
-      .WillOnce(Return(NRT_RESOURCE));
-
-  EXPECT_THROW(allocator.Allocate(1024, 0), std::runtime_error);
-}
-
-TEST_F(NrtTensorPoolTest, RecycledTensorSharedBetweenOldAndNewOwner) {
-  NrtTensorPool allocator(0);
-
-  nrt_tensor_t* dummy = reinterpret_cast<nrt_tensor_t*>(0x1000);
-  void* dummy_va = reinterpret_cast<void*>(0x5000);
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 1024, _, _))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy), Return(NRT_SUCCESS)));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy)).WillRepeatedly(Return(dummy_va));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_free(_)).Times(1);
-
-  auto [op_holds_tensor, data_ptr, dealloc_flag] =
-      allocator.Allocate(1024, 0);  // Simulates operation holding ref
-
-  // Recycled, but a reference is still maintained
-  allocator.Recycle(op_holds_tensor, 1024, 0, data_ptr, nullptr, dealloc_flag);
-
-  // New allocation gets the same recycled tensor
-  auto [new_owner, new_data_ptr, new_dealloc_flag] = allocator.Allocate(1024, 0);
-  EXPECT_EQ(new_owner.get(), dummy);
-
-  // Both point to same tensor
-  EXPECT_EQ(op_holds_tensor.get(), new_owner.get());
-  EXPECT_EQ(op_holds_tensor.use_count(), 2);
-
-  op_holds_tensor.reset();
-  EXPECT_EQ(new_owner.use_count(), 1);
-
-  // Tensor still valid for new owner
-  EXPECT_EQ(new_owner.get(), dummy);
-}
-
-TEST_F(NrtTensorPoolTest, RecycledTensorFreedWhenNoReferencesRemain) {
-  NrtTensorPool allocator(0);
-
-  nrt_tensor_t* dummy1 = reinterpret_cast<nrt_tensor_t*>(0x1000);
-  nrt_tensor_t* dummy2 = reinterpret_cast<nrt_tensor_t*>(0x2000);
-  void* dummy_va1 = reinterpret_cast<void*>(0x5000);
-  void* dummy_va2 = reinterpret_cast<void*>(0x6000);
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 1024, _, _))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy1), Return(NRT_SUCCESS)))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy2), Return(NRT_SUCCESS)));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy1)).WillOnce(Return(dummy_va1));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy2)).WillOnce(Return(dummy_va2));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_free(_)).Times(2);
-
-  {
-    auto [tensor, data_ptr, dealloc_flag] = allocator.Allocate(1024, 0);
-    EXPECT_EQ(tensor.use_count(), 1);
-    allocator.Recycle(tensor, 1024, 0, data_ptr, nullptr, dealloc_flag);
-    EXPECT_EQ(tensor.use_count(), 1);  // Recycle doesn't increase refcount
-  }
-
-  // Next allocation should not be recycled
-  auto [tensor2, data_ptr2, dealloc_flag2] = allocator.Allocate(1024, 0);
-  EXPECT_EQ(tensor2.get(), dummy2);  // Different pointer = fresh allocation
-}
-
-TEST_F(NrtTensorPoolTest, StreamAwareRecycle) {
-  NrtTensorPool allocator(0);
-
-  nrt_tensor_t* dummy1 = reinterpret_cast<nrt_tensor_t*>(0x1000);
-  nrt_tensor_t* dummy2 = reinterpret_cast<nrt_tensor_t*>(0x2000);
-  void* dummy_va1 = reinterpret_cast<void*>(0x5000);
-  void* dummy_va2 = reinterpret_cast<void*>(0x6000);
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 1024, _, _))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy1), Return(NRT_SUCCESS)))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy2), Return(NRT_SUCCESS)));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy1)).WillRepeatedly(Return(dummy_va1));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy2)).WillRepeatedly(Return(dummy_va2));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_free(_)).Times(2);
-
-  c10::StreamId stream1 = 1;
-  c10::StreamId stream2 = 2;
-
-  // Allocate on stream 1
-  auto [tensor1, data_ptr1, dealloc_flag1] = allocator.Allocate(1024, stream1);
-  auto tensor1_copy = tensor1;
-
-  // Recycle within stream 1
-  allocator.Recycle(std::move(tensor1), 1024, stream1, data_ptr1, nullptr, dealloc_flag1);
-
-  // Allocate on stream 2
-  auto [tensor2, data_ptr2, dealloc_flag2] = allocator.Allocate(1024, stream2);
-  EXPECT_EQ(tensor2.get(), dummy2);  // Fresh allocation, not recycled
-
-  // Ensure is recycled strictly within stream 1 (rather than 2)
-  auto [tensor3, data_ptr3, dealloc_flag3] = allocator.Allocate(1024, stream1);
-  EXPECT_EQ(tensor3.get(), dummy1);
-}
-
-TEST_F(NrtTensorPoolTest, MultipleStreamsIndependent) {
-  NrtTensorPool allocator(0);
-
-  nrt_tensor_t* dummy1 = reinterpret_cast<nrt_tensor_t*>(0x1000);
-  nrt_tensor_t* dummy2 = reinterpret_cast<nrt_tensor_t*>(0x2000);
-  void* dummy_va1 = reinterpret_cast<void*>(0x5000);
-  void* dummy_va2 = reinterpret_cast<void*>(0x6000);
-
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_allocate(_, _, 1024, _, _))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy1), Return(NRT_SUCCESS)))
-      .WillOnce(DoAll(SetArgPointee<4>(dummy2), Return(NRT_SUCCESS)));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy1)).WillRepeatedly(Return(dummy_va1));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_get_va(dummy2)).WillRepeatedly(Return(dummy_va2));
-  EXPECT_CALL(*MockNRT::GetInstance(), nrt_tensor_free(_)).Times(2);
-
-  c10::StreamId stream1 = 1;
-  c10::StreamId stream2 = 2;
-
-  // Allocate and recycle on both streams
-  auto [t1, t1_data_ptr, t1_dealloc_flag] = allocator.Allocate(1024, stream1);
-  auto t1_copy = t1;
-  allocator.Recycle(std::move(t1), 1024, stream1, t1_data_ptr, nullptr, t1_dealloc_flag);
-
-  auto [t2, t2_data_ptr, t2_dealloc_flag] = allocator.Allocate(1024, stream2);
-  auto t2_copy = t2;
-  allocator.Recycle(std::move(t2), 1024, stream2, t2_data_ptr, nullptr, t2_dealloc_flag);
-
-  // Each stream should recycle its own tensor
-  auto [t1_recycled, t1_recycled_ptr, t1_recycled_flag] = allocator.Allocate(1024, stream1);
-  EXPECT_EQ(t1_recycled.get(), dummy1);
-
-  auto [t2_recycled, t2_recycled_ptr, t2_recycled_flag] = allocator.Allocate(1024, stream2);
-  EXPECT_EQ(t2_recycled.get(), dummy2);
+TEST_F(NeuronCachingAllocatorTest, OversizedScalarReturnsNullopt) {
+  // Larger than kSlotSize (16 bytes) — not a real scalar; must fall back.
+  char buf[32] = {};
+  auto t =
+      NeuronCachingAllocator::createCachedScalarTensor(buf, sizeof(buf), c10::ScalarType::Float, 0);
+  EXPECT_FALSE(t.has_value());
 }

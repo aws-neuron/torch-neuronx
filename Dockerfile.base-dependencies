@@ -1,0 +1,219 @@
+# ============================================================
+# Multi-stage Dockerfile for Neuron CI (torch-neuronx)
+#
+# Stages:
+#   nightly-base  — Everything except torch-neuronx clone/build:
+#                   OS, Python, Neuron runtime/tools/compiler, EFA,
+#                   cmake, bazel, uv, torch-mlir (built from source),
+#                   test deps. Built nightly by the Nightly Image Trigger Lambda.
+#   complete      — Only torch-neuronx clone + build on top of nightly-base.
+#                   Default target for standalone/PR builds.
+#
+# Usage:
+#   Nightly base:  docker build --target nightly-base -t base .
+#   Full build:    docker build -t complete .
+#
+# Build args (resolved by nightly Lambda from DDB config):
+#   NEURON_APT_REPO_URL  — Full authenticated APT repo URL (https://user:pass@host)
+#   NEURON_PIP_REPO_URL  — Full authenticated PIP repo URL (https://user:pass@host)
+#   GITHUB_TOKEN         — GitHub token for cloning private repos (torch-mlir in base, torch-neuronx in complete)
+# ============================================================
+
+# ============================================================
+# Stage 1: nightly-base — everything except torch-neuronx
+# ============================================================
+FROM public.ecr.aws/ubuntu/ubuntu:22.04_stable AS nightly-base
+
+# Build arguments — full authenticated URLs constructed by nightly Lambda
+# Format: https://user:pass@hostname (no credentials in Dockerfile)
+ARG NEURON_APT_REPO_URL=""
+ARG NEURON_PIP_REPO_URL=""
+ARG GITHUB_TOKEN=""
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── Python 3.12 ──────────────────────────────────────────────
+RUN apt-get update -y && \
+    apt-get install -y \
+    wget curl gnupg lsb-release software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update -y && \
+    apt-get install -y \
+    python3.12 python3.12-dev python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -s /usr/bin/python3.12 /usr/bin/python && \
+    ln -sf /usr/bin/python3.12 /usr/bin/python3 && \
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
+
+# ── AWS CLI ──────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y \
+    less unzip jq \
+    && curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
+    && unzip awscliv2.zip && ./aws/install \
+    && rm -rf awscliv2.zip aws && apt-get clean
+
+# ── Neuron APT repository ───────────────────────────────────
+# Add authenticated repo if URL provided, otherwise use public
+RUN . /etc/os-release && \
+    if [ -n "${NEURON_APT_REPO_URL}" ]; then \
+      REPO_HOST=$(echo "${NEURON_APT_REPO_URL}" | sed 's|https://[^@]*@||') && \
+      REPO_CREDS=$(echo "${NEURON_APT_REPO_URL}" | sed 's|https://||;s|@.*||') && \
+      wget -qO - "https://${REPO_CREDS}@${REPO_HOST}/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB" \
+        | gpg --dearmor -o /usr/share/keyrings/neuron-keyring.gpg && \
+      echo "deb [signed-by=/usr/share/keyrings/neuron-keyring.gpg] ${NEURON_APT_REPO_URL} ${VERSION_CODENAME} main" \
+        > /etc/apt/sources.list.d/neuron.list; \
+    else \
+      wget -qO - https://apt.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB \
+        | gpg --dearmor -o /usr/share/keyrings/neuron-keyring.gpg && \
+      echo "deb [signed-by=/usr/share/keyrings/neuron-keyring.gpg] https://apt.repos.neuron.amazonaws.com ${VERSION_CODENAME} main" \
+        > /etc/apt/sources.list.d/neuron.list; \
+    fi
+
+# Also add public repo as fallback for tools
+RUN . /etc/os-release && \
+    wget -qO - https://apt.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB \
+      | gpg --dearmor -o /usr/share/keyrings/neuron-public-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/neuron-public-keyring.gpg] https://apt.repos.neuron.amazonaws.com ${VERSION_CODENAME} main" \
+      > /etc/apt/sources.list.d/neuron-public.list
+
+RUN apt-get update -y
+
+# ── Build dependencies ───────────────────────────────────────
+RUN apt-get install -y \
+    git build-essential python3.12-venv python3-numpy \
+    python3-setuptools python3-wheel \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── LLVM/Clang 18 ───────────────────────────────────────────
+RUN apt-get update -y && \
+    apt-get install -y python3-apt && \
+    wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | apt-key add - && \
+    echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" >> /etc/apt/sources.list && \
+    apt-get update -y && \
+    apt-get install -y clang-18 && \
+    rm -rf /var/lib/apt/lists/*
+
+# ── Neuron Runtime & Collectives ─────────────────────────────
+RUN apt-get update -y && \
+    apt-get install -y \
+    aws-neuronx-collectives \
+    aws-neuronx-runtime-lib \
+    aws-neuronx-dkms
+
+RUN echo "=== Neuron Runtime & Collectives ===" && dpkg -l | grep aws-neuronx
+
+# ── Neuron Tools ─────────────────────────────────────────────
+RUN apt-get update && apt-get install -y aws-neuronx-tools=2.*
+RUN echo "=== Neuron Tools ===" && dpkg -l | grep aws-neuronx-tools
+
+# ── EFA Driver ───────────────────────────────────────────────
+RUN curl -O https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz && \
+    wget https://efa-installer.amazonaws.com/aws-efa-installer.key && \
+    gpg --import aws-efa-installer.key && \
+    wget https://efa-installer.amazonaws.com/aws-efa-installer-latest.tar.gz.sig && \
+    gpg --verify ./aws-efa-installer-latest.tar.gz.sig && \
+    tar -xvf aws-efa-installer-latest.tar.gz && \
+    cd aws-efa-installer && bash efa_installer.sh --yes --skip-kmod && \
+    cd / && rm -rf aws-efa-installer-latest.tar.gz aws-efa-installer
+
+# ── CMake, Ninja, patchelf ───────────────────────────────────
+RUN apt-get update -y && \
+    apt-get install -y cmake ninja-build patchelf \
+    && rm -rf /var/lib/apt/lists/*
+RUN python -m pip install cmake ninja
+
+# ── MKL (for PyTorch CPU build) ──────────────────────────────
+RUN python -m pip install mkl-static mkl-include
+
+# ── Bazelisk ─────────────────────────────────────────────────
+RUN cd /tmp && \
+    wget https://github.com/bazelbuild/bazelisk/releases/download/v1.19.0/bazelisk-linux-amd64 && \
+    chmod +x bazelisk-linux-amd64 && \
+    mv bazelisk-linux-amd64 /usr/local/bin/bazel && \
+    bazel --version
+
+# ── uv (fast pip) ───────────────────────────────────────────
+RUN pip install uv
+
+# ── Neuron PIP repository ───────────────────────────────────
+# Configure authenticated pip repo if URL provided, otherwise use public
+RUN if [ -n "${NEURON_PIP_REPO_URL}" ]; then \
+      python -m pip config set global.extra-index-url \
+        "${NEURON_PIP_REPO_URL} ${NEURON_PIP_REPO_URL}/private"; \
+    else \
+      python -m pip config set global.extra-index-url \
+        "https://pip.repos.neuron.amazonaws.com"; \
+    fi
+
+# ── Neuron Compiler ──────────────────────────────────────────
+RUN pip install --force-reinstall neuronx_cc neuronx_cc_stubs nki && \
+    echo "=== neuronxcc ===" && pip list | grep -i neuron && \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 python3 -c "import neuronxcc; print('neuronxcc OK')"
+
+# ── Install torch-mlir from private release ──────────────────
+# Much faster than building from source (~2 min vs ~30-45 min)
+# Requires GITHUB_TOKEN with access to aws-neuron/torch-mlir releases
+RUN if [ -n "${GITHUB_TOKEN}" ]; then \
+      echo "Installing torch-mlir from private release..." && \
+      PYTHON_TAG="cp$(python -c 'import sys; print(f"{sys.version_info.major}{sys.version_info.minor}")')" && \
+      PLATFORM="manylinux_2_28_x86_64" && \
+      RELEASE_DATA=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+        "https://api.github.com/repos/aws-neuron/torch-mlir/releases/latest") && \
+      VERSION=$(echo "$RELEASE_DATA" | jq -r '.tag_name') && \
+      echo "Latest torch-mlir release: $VERSION" && \
+      FILENAME=$(echo "$RELEASE_DATA" | jq -r ".assets[] | select(.name | test(\"torch_mlir.*${PYTHON_TAG}.*${PLATFORM}\")) | .name" | head -1) && \
+      echo "Downloading wheel: $FILENAME" && \
+      ASSET_ID=$(echo "$RELEASE_DATA" | jq -r ".assets[] | select(.name==\"$FILENAME\") | .id") && \
+      curl -L -H "Authorization: token ${GITHUB_TOKEN}" \
+        -H "Accept: application/octet-stream" \
+        -o "$FILENAME" \
+        "https://api.github.com/repos/aws-neuron/torch-mlir/releases/assets/$ASSET_ID" && \
+      pip3 install --no-cache-dir --no-deps "$FILENAME" && \
+      rm -f "$FILENAME" && \
+      echo "torch-mlir installed successfully from release"; \
+    else \
+      echo "WARNING: GITHUB_TOKEN not set, skipping torch-mlir installation"; \
+      echo "The nightly-base image will not include torch-mlir"; \
+    fi
+
+# ── Set up uv venv for torch-neuronx ─────────────────────────
+# Create the venv in nightly-base so complete stage just clones + builds
+RUN mkdir -p /opt/torch-neuronx && \
+    uv venv /opt/torch-neuronx/.venv
+
+ENV UV_PROJECT_ENVIRONMENT=/opt/torch-neuronx/.venv
+ENV PATH="/opt/torch-neuronx/.venv/bin:/opt/aws/neuron/bin:$PATH"
+ENV NRT_LOCAL_PATH="/opt/aws/neuron"
+ENV BAZELISK_BASE_URL=https://github.com/bazelbuild/bazel/releases/download
+
+RUN uv pip install -U pip
+
+# ── Install torch into venv (needed for building torch-neuronx C++ extension) ──
+RUN uv pip install torch
+
+# ── Make neuronx-cc and stubs available in the venv ──────────
+# neuronx-cc was installed into system Python; install into venv too
+RUN /opt/torch-neuronx/.venv/bin/pip install neuronx-cc neuronx-cc-stubs nki
+
+# ── Symlink torch-mlir from system Python into the venv ──────
+# torch-mlir was installed into system Python with pip3 install --no-deps
+RUN if [ -d /usr/local/lib/python3.12/dist-packages/torch_mlir ]; then \
+      ln -s /usr/local/lib/python3.12/dist-packages/torch_mlir \
+            /opt/torch-neuronx/.venv/lib/python3.12/site-packages/torch_mlir && \
+      echo "Symlinked torch_mlir into venv"; \
+    else \
+      echo "WARNING: torch_mlir not found in system Python, skipping symlink"; \
+    fi
+
+# ── Install test dependencies ────────────────────────────────
+RUN uv pip install einops boto3
+
+# ── Clean up ─────────────────────────────────────────────────
+# Remove authenticated repo URLs from apt sources (security)
+RUN rm -f /etc/apt/sources.list.d/neuron.list 2>/dev/null; true
+
+RUN mkdir -p /workspace
+WORKDIR /workspace
+CMD ["/bin/bash"]

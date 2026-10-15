@@ -3,15 +3,18 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <thread>
 #include <vector>
 
 #include "tests/csrc/mocks/MockCopyUtils.h"
+#include "tests/csrc/mocks/MockKernelExecution.h"
 #include "tests/csrc/mocks/MockNRT.h"
 #include "tests/csrc/mocks/MockOperationExecutionEngine.h"
 #include "tests/csrc/utils/TestUtils.h"
 #include "torch_neuronx/csrc/core/NeuronDevice.h"
+#include "torch_neuronx/csrc/core/NeuronGuardImpl.h"
 #include "torch_neuronx/csrc/distributed/NeuronWork.h"
 
 using namespace at::neuron;
@@ -391,6 +394,138 @@ TEST_F(NeuronWorkTest, AbortSetsExceptionAndCompletes) {
   work->abort();
 
   EXPECT_TRUE(work->isCompleted());
+}
+
+class PublicEventWorkTest : public NeuronWorkTest {
+ protected:
+  void SetUp() override {
+    NeuronWorkTest::SetUp();
+    // This binary does not link the extension that registers the real device guard.
+    static c10::impl::DeviceGuardImplRegistrar guard_registrar(c10::DeviceType::PrivateUse1,
+                                                               new c10_neuron::NeuronGuardImpl());
+    engine_->Shutdown();
+    NeuronResourceManager::Instance().GetOperationExecutionEngine().Shutdown();
+    scoped_engine_ = std::make_unique<ScopedTestEngine>(&compilation_cache_, &model_cache_);
+    stream_impl_ = NeuronStream::getDefaultStream(0).get_stream_impl();
+    auto kernel = std::make_unique<::testing::NiceMock<MockEventDirectKernelExecution>>(
+        "record_blocker", EventDirectKernelExecution::EventAction::kSignal, 0);
+    auto blocker = std::make_shared<OperationContext>(std::move(kernel));
+    blocker->MarkExecutionReady();
+    scoped_engine_->engine().InjectIntoRuntimeQueue(stream_impl_, std::move(blocker));
+    const char* blocking = std::getenv("NEURON_LAUNCH_BLOCKING");
+    if (blocking != nullptr && std::string(blocking) == "1") {
+      GTEST_SKIP() << "Pending-record tests require NEURON_LAUNCH_BLOCKING=0";
+    }
+  }
+
+  void TearDown() override {
+    if (scoped_engine_) {
+      scoped_engine_->engine().Shutdown();
+      scoped_engine_->engine().ClearRuntimeQueue(stream_impl_);
+      scoped_engine_->engine().dispatch_queue_.clear();
+      scoped_engine_.reset();
+    }
+    NeuronWorkTest::TearDown();
+  }
+
+  CompilationCache compilation_cache_;
+  ModelHandleCache model_cache_;
+  std::unique_ptr<ScopedTestEngine> scoped_engine_;
+  StreamImpl* stream_impl_{nullptr};
+};
+
+TEST_F(PublicEventWorkTest, AbortCompletesOwnRecordAfterPublicEndEventRerecord) {
+  auto stream = NeuronStream::getDefaultStream(0);
+  auto work = createWork();
+  work->recordEndEvent(&stream);
+  auto public_event = work->getEndEvent();
+  auto original = public_event.capture();
+  ASSERT_FALSE(original.query());
+  ASSERT_FALSE(work->isCompleted());
+  ASSERT_NE(work->getFuture(), nullptr);
+
+  public_event.record(stream);
+  scoped_engine_->engine().Shutdown();
+  ASSERT_NE(original.get_impl(), public_event.get_impl());
+  EXPECT_FALSE(original.query());
+  EXPECT_FALSE(public_event.query());
+
+  work->abort();
+  EXPECT_TRUE(original.query());
+  EXPECT_FALSE(public_event.query());
+  EXPECT_EQ(work->getEndEvent().get_impl(), original.get_impl());
+  EXPECT_NE(work->getEndEvent().get_impl(), public_event.get_impl());
+  EXPECT_TRUE(work->getEndEvent().query());
+  EXPECT_TRUE(work->isCompleted());
+}
+
+TEST_F(PublicEventWorkTest, PublicEndEventCompletionDoesNotCompleteWorkRecord) {
+  auto stream = NeuronStream::getDefaultStream(0);
+  auto work = createWork();
+  work->recordEndEvent(&stream);
+  auto public_event = work->getEndEvent();
+  auto original = public_event.capture();
+  public_event.record(stream);
+  scoped_engine_->engine().Shutdown();
+  ASSERT_NE(original.get_impl(), public_event.get_impl());
+
+  EventDirectKernelExecution public_signal("public_signal", public_event,
+                                           EventDirectKernelExecution::EventAction::kSignal, 0);
+  public_signal.CompleteWithoutExecution();
+  EXPECT_TRUE(public_event.query());
+  EXPECT_FALSE(original.query());
+  EXPECT_FALSE(work->isCompleted());
+
+  EventDirectKernelExecution original_signal("original_signal", original,
+                                             EventDirectKernelExecution::EventAction::kSignal, 0);
+  original_signal.CompleteWithoutExecution();
+  EXPECT_TRUE(work->isCompleted());
+}
+
+TEST_F(PublicEventWorkTest, ExplicitWorkRerecordPreservesEarlierSnapshot) {
+  auto stream = NeuronStream::getDefaultStream(0);
+  auto work = createWork();
+  work->recordEndEvent(&stream);
+  auto first = work->getEndEvent();
+  work->recordEndEvent(&stream);
+  auto second = work->getEndEvent();
+  scoped_engine_->engine().Shutdown();
+  ASSERT_NE(first.get_impl(), second.get_impl());
+  ASSERT_FALSE(first.query());
+  ASSERT_FALSE(second.query());
+
+  EventDirectKernelExecution first_signal("first_signal", first,
+                                          EventDirectKernelExecution::EventAction::kSignal, 0);
+  first_signal.CompleteWithoutExecution();
+  EXPECT_TRUE(first.query());
+  EXPECT_FALSE(second.query());
+  EXPECT_FALSE(work->isCompleted());
+
+  EventDirectKernelExecution second_signal("second_signal", second,
+                                           EventDirectKernelExecution::EventAction::kSignal, 0);
+  second_signal.CompleteWithoutExecution();
+  EXPECT_TRUE(work->isCompleted());
+  EXPECT_TRUE(work->getEndEvent().query());
+}
+
+TEST_F(PublicEventWorkTest, KernelSnapshotRerecordDoesNotRetargetWorkCompletion) {
+  auto stream = NeuronStream::getDefaultStream(0);
+  auto work = createWork();
+  work->recordEndEvent(&stream);
+  auto completion = work->getEndEvent();
+  EventDirectKernelExecution signal("work_signal", completion,
+                                    EventDirectKernelExecution::EventAction::kSignal, 0);
+  auto snapshot = signal.GetEvent();
+  snapshot.record(stream);
+  scoped_engine_->engine().Shutdown();
+
+  EXPECT_NE(snapshot.get_impl(), completion.get_impl());
+  EXPECT_FALSE(work->isCompleted());
+  signal.CompleteWithoutExecution();
+  EXPECT_TRUE(work->isCompleted());
+  EXPECT_TRUE(completion.query());
+  EXPECT_EQ(work->getEndEvent().get_impl(), completion.get_impl());
+  EXPECT_FALSE(snapshot.query());
 }
 
 // Test getFuture returns nullptr before recordEndEvent

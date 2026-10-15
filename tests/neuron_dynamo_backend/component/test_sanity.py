@@ -2,7 +2,9 @@
 Trivial 1 core sanity tests for torch.compile functionality on neuron backend.
 """
 
+import io
 import os
+from contextlib import redirect_stdout
 from typing import ClassVar
 
 import pytest
@@ -17,6 +19,14 @@ class TestTorchCompileBackend:
     """Test trivial torch.compile tests with neuron backend."""
 
     COMPILE_OPTIONS: ClassVar[dict] = {}  # Subclasses can override
+
+    @staticmethod
+    def _capture_stdout(fn, *args):
+        """Run fn(*args) and return (result, captured_stdout)."""
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            result = fn(*args)
+        return result, buf.getvalue()
 
     def _compile(self, fn, **kwargs):
         """Compile with backend options. Subclasses override COMPILE_OPTIONS."""
@@ -212,7 +222,7 @@ class TestTorchCompileBackend:
         os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") != "1",
         reason="Requires TORCH_NEURONX_MLIR_ATEN_OPS=1",
     )
-    def test_print_with_cpu_conversion(self, capsys):
+    def test_print_with_cpu_conversion(self):
         """Test that printing tensors with .cpu() works inside compiled functions."""
 
         def fn(x, y):
@@ -224,7 +234,7 @@ class TestTorchCompileBackend:
         x = torch.tensor([3.0, 4.0], dtype=torch.float32, device="neuron")
         y = torch.tensor([1.0, 2.0], dtype=torch.float32, device="neuron")
 
-        result = fn(x, y)
+        result, out = self._capture_stdout(fn, x, y)
 
         # Verify output is correct
         assert result.device.type == "neuron"
@@ -232,15 +242,14 @@ class TestTorchCompileBackend:
         torch.testing.assert_close(result.cpu(), expected.cpu(), rtol=1e-4, atol=1e-4)
 
         # Verify print output contains our message and tensor values
-        captured = capsys.readouterr()
-        assert "Output from print:" in captured.out
-        assert "4." in captured.out and "6." in captured.out
+        assert "Output from print:" in out
+        assert "4." in out and "6." in out
 
     @pytest.mark.skipif(
         os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") != "1",
         reason="Requires TORCH_NEURONX_MLIR_ATEN_OPS=1",
     )
-    def test_print_cpu_tensor_operations(self, capsys):
+    def test_print_cpu_tensor_operations(self):
         """Test various operations on CPU tensors inside compiled functions."""
 
         def fn(x):
@@ -263,46 +272,42 @@ class TestTorchCompileBackend:
 
         fn = self._compile(fn)
         x = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32, device="neuron")
-        result = fn(x)
+        result, out = self._capture_stdout(fn, x)
 
         assert result.device.type == "neuron"
-        captured = capsys.readouterr()
-        assert "CPU arithmetic:" in captured.out
-        assert "CPU comparison:" in captured.out
-        assert "CPU sum:" in captured.out
+        assert "CPU arithmetic:" in out
+        assert "CPU comparison:" in out
+        assert "CPU sum:" in out
 
     @pytest.mark.skipif(
         os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") != "1",
         reason="Requires TORCH_NEURONX_MLIR_ATEN_OPS=1",
     )
-    def test_print_multiple_cpu_conversions(self, capsys):
+    def test_print_multiple_cpu_conversions(self):
         """Test multiple .cpu() calls in compiled function."""
 
         def fn(x, y):
             tmp1 = x + y
             print(f"First: {tmp1.cpu()}")
-
             tmp2 = tmp1 * 2
             print(f"Second: {tmp2.cpu()}")
-
             return tmp2
 
         fn = self._compile(fn)
         x = torch.tensor([1.0, 2.0], dtype=torch.float32, device="neuron")
         y = torch.tensor([3.0, 4.0], dtype=torch.float32, device="neuron")
 
-        result = fn(x, y)
+        result, out = self._capture_stdout(fn, x, y)
 
         assert result.device.type == "neuron"
-        captured = capsys.readouterr()
-        assert "First:" in captured.out
-        assert "Second:" in captured.out
+        assert "First:" in out
+        assert "Second:" in out
 
     @pytest.mark.skipif(
         os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") != "1",
         reason="Requires TORCH_NEURONX_MLIR_ATEN_OPS=1",
     )
-    def test_print_cpu_tensor_indexing(self, capsys):
+    def test_print_cpu_tensor_indexing(self):
         """Test indexing CPU tensors inside compiled functions."""
 
         def fn(x):
@@ -320,18 +325,17 @@ class TestTorchCompileBackend:
 
         fn = self._compile(fn)
         x = torch.tensor([10.0, 20.0, 30.0], dtype=torch.float32, device="neuron")
-        result = fn(x)
+        result, out = self._capture_stdout(fn, x)
 
         assert result.device.type == "neuron"
-        captured = capsys.readouterr()
-        assert "First element:" in captured.out
-        assert "Slice:" in captured.out
+        assert "First element:" in out
+        assert "Slice:" in out
 
     @pytest.mark.skipif(
         os.environ.get("TORCH_NEURONX_MLIR_ATEN_OPS") != "1",
         reason="Requires TORCH_NEURONX_MLIR_ATEN_OPS=1",
     )
-    def test_print_cpu_tensor_with_item(self, capsys):
+    def test_print_cpu_tensor_with_item(self):
         """Test .item() on CPU tensors inside compiled functions."""
 
         def fn(x):
@@ -345,11 +349,10 @@ class TestTorchCompileBackend:
 
         fn = self._compile(fn)
         x = torch.tensor([5.0], dtype=torch.float32, device="neuron")
-        result = fn(x)
+        result, out = self._capture_stdout(fn, x)
 
         assert result.device.type == "neuron"
-        captured = capsys.readouterr()
-        assert "Scalar value: 5" in captured.out
+        assert "Scalar value: 5" in out
 
 
 class TestEmptyTensorConsistency:

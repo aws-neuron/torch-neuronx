@@ -30,7 +30,6 @@ CompilationConfig CompilationConfig::FromEnvironment() {
 namespace {
 
 // File names used during compilation process.
-constexpr const char* kHloFilename = "module.hlo.pb";
 constexpr const char* kMlirFilename = "module.mlir";
 constexpr const char* kBirFilename = "bir.json";
 constexpr const char* kNeffFilename = "module.neff";
@@ -46,37 +45,48 @@ constexpr const char* kLogicalNeuronCoresFlag = "--lnc";
 constexpr const char* kOutputFlag = "--output";
 constexpr const char* kWorkingDirFlag = "--workdir";
 
-}  // namespace
+// Split additional_args on spaces, keeping single-quoted spans as one token, and
+// append each to compiler_args (handles values like --flag 'a b').
+void AppendAdditionalArgs(const std::string& args, std::vector<std::string>& compiler_args) {
+  std::string current;
+  bool in_quotes = false;
+  for (char c : args) {
+    if (c == '\'') {
+      in_quotes = !in_quotes;
+    } else if (c == ' ' && !in_quotes) {
+      if (!current.empty()) {
+        compiler_args.push_back(current);
+        current.clear();
+      }
+    } else {
+      current += c;
+    }
+  }
+  if (!current.empty()) {
+    compiler_args.push_back(current);
+  }
+}
 
-std::vector<uint8_t> NeuronCompiler::CompileHloToNeff(const std::vector<uint8_t>& hlo_bytes,
-                                                      const CompilationConfig& config,
-                                                      const std::string& ir_type,
-                                                      const std::string& op_name,
-                                                      const std::string& cache_key,
-                                                      const std::string& kernel_class_name) {
+CompileResult CompileHloToNeffImpl(const std::vector<uint8_t>& hlo_bytes,
+                                   const CompilationConfig& config, const std::string& ir_type,
+                                   const std::string& op_name, const std::string& cache_key,
+                                   const std::string& kernel_class_name, bool want_wrapped_hlo) {
   std::string workdir = cache_utils::GetCompilationWorkdir();
   bool preserve = cache_utils::ShouldPreserveCompilationArtifacts();
   TempDirectory temp_compilation_dir(workdir, /*is_full_path=*/true, preserve);
   const std::string& workdir_str = temp_compilation_dir.path();
 
-  // Determine file format based on ir_type parameter
-  // "BIR" requires sg00/ subdirectory, "StableHLO" uses MLIR format, "XLA" (default) uses HLO
-  // protobuf
+  // "BIR" requires sg00/ subdirectory; everything else is StableHLO (MLIR).
   std::string hlo_input_file;
   if (ir_type == "BIR") {
     std::filesystem::create_directories(temp_compilation_dir.path() + "/sg00");
     hlo_input_file = std::string("sg00/") + kBirFilename;
-  } else if (ir_type == "StableHLO") {
-    hlo_input_file = kMlirFilename;
   } else {
-    hlo_input_file = kHloFilename;
+    hlo_input_file = kMlirFilename;
   }
 
-  // Write HLO bytes to temporary file
   temp_compilation_dir.WriteFile(hlo_input_file, hlo_bytes);
 
-  // Build neuronx-cc command arguments using config
-  // execvp will search PATH automatically
   std::vector<std::string> compiler_args = {kNeuronxCCExecutable,  kCompileCommand,  hlo_input_file,
                                             kFrameworkFlag,        config.framework, kTargetFlag,
                                             config.platform_target};
@@ -89,12 +99,7 @@ std::vector<uint8_t> NeuronCompiler::CompileHloToNeff(const std::vector<uint8_t>
     compiler_args.push_back(config.optimization_level);
   }
 
-  // Parse and add additional compiler arguments
-  std::istringstream additional_args_stream(config.additional_args);
-  std::string single_arg;
-  while (additional_args_stream >> single_arg) {
-    compiler_args.push_back(single_arg);
-  }
+  AppendAdditionalArgs(config.additional_args, compiler_args);
 
   compiler_args.push_back(kOutputFlag);
   compiler_args.push_back(kNeffFilename);
@@ -111,35 +116,67 @@ std::vector<uint8_t> NeuronCompiler::CompileHloToNeff(const std::vector<uint8_t>
       metadata << config.logical_neuron_cores << "\n";
       metadata << config.optimization_level << "\n";
       metadata << ir_type << "\n";
+      metadata << (want_wrapped_hlo ? "wlo_enabled" : "wlo_disabled") << "\n";
     }
 
-    std::string compiler_args_path = workdir_str + "/compiler_args.txt";
+    std::string compiler_args_path = workdir_str + "/compiler.txt";
     std::ofstream compiler_args_file(compiler_args_path);
     if (compiler_args_file) {
       for (const auto& arg : compiler_args) {
-        compiler_args_file << arg << "\n";
+        if (arg.find(' ') != std::string::npos) {
+          compiler_args_file << "'" << arg << "' ";
+        } else {
+          compiler_args_file << arg << " ";
+        }
       }
     }
   }
 
-  // Execute neuronx-cc in the workdir
   ProcessExecutor::Execute(compiler_args, std::string(kNeuronxCCExecutable) + " compilation",
                            workdir_str);
 
-  return temp_compilation_dir.ReadFile(kNeffFilename);
+  CompileResult result;
+  result.neff_bytes = temp_compilation_dir.ReadFile(kNeffFilename);
+
+  // WLO: recover the wrapped_neff.hlo sidecar (weight transform computations) before the temp
+  // workdir is destroyed. Absent when the compiler chose no relayout — left empty.
+  if (want_wrapped_hlo) {
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(workdir_str)) {
+      if (entry.is_regular_file() && entry.path().filename() == "wrapped_neff.hlo") {
+        std::ifstream ifs(entry.path(), std::ios::binary);
+        if (ifs) {
+          result.wrapped_neff_hlo = std::vector<uint8_t>(std::istreambuf_iterator<char>(ifs),
+                                                         std::istreambuf_iterator<char>());
+        }
+        break;
+      }
+    }
+  }
+
+  return result;
 }
 
-bool NeuronCompiler::IsStableHLOEnabled() {
-  static const bool enabled = []() {
-    const char* env = std::getenv("TORCH_NEURONX_ENABLE_STABLEHLO");
-    // Default to enabled (true). Only disable if explicitly set to "0" or "false"
-    if (!env) {
-      return true;  // Default: enabled
-    }
-    std::string env_str(env);
-    return !(env_str == "0" || env_str == "false");
-  }();
-  return enabled;
+}  // namespace
+
+std::vector<uint8_t> NeuronCompiler::CompileHloToNeff(const std::vector<uint8_t>& hlo_bytes,
+                                                      const CompilationConfig& config,
+                                                      const std::string& ir_type,
+                                                      const std::string& op_name,
+                                                      const std::string& cache_key,
+                                                      const std::string& kernel_class_name) {
+  return CompileHloToNeffImpl(hlo_bytes, config, ir_type, op_name, cache_key, kernel_class_name,
+                              /*want_wrapped_hlo=*/false)
+      .neff_bytes;
+}
+
+CompileResult NeuronCompiler::CompileHloToNeffWithWlo(const std::vector<uint8_t>& hlo_bytes,
+                                                      const CompilationConfig& config,
+                                                      const std::string& ir_type,
+                                                      const std::string& op_name,
+                                                      const std::string& cache_key,
+                                                      const std::string& kernel_class_name) {
+  return CompileHloToNeffImpl(hlo_bytes, config, ir_type, op_name, cache_key, kernel_class_name,
+                              /*want_wrapped_hlo=*/true);
 }
 
 }  // namespace at::neuron

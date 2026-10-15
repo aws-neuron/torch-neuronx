@@ -17,13 +17,16 @@ def _to_copy_fn(src, out_dtype=None, out=None):
     tensor<Nxindex> constant in StableHLO).
     """
     if out_dtype is not None:
+        # Float-to-int requires explicit truncation to match PyTorch semantics
+        if out_dtype in (torch.int32, torch.int16, torch.int8) and src.is_floating_point():
+            src = src.trunc()
         return src.to(out_dtype)
     return src.clone()
 
 
 @neuron_op("aten::_to_copy", disable_dtype_autocast=True, priority=90)
 class ToCopyMLIRImpl(TorchMlirOpImpl):
-    """MLIR-based implementation for neuron-to-neuron to_copy operations."""
+    """Implement ``aten::_to_copy`` between Neuron devices with Torch-MLIR."""
 
     def __init__(self):
         super().__init__(
@@ -32,13 +35,34 @@ class ToCopyMLIRImpl(TorchMlirOpImpl):
             output_params=None,
             static_argnames=("out_dtype",),
         )
+        # Override the kernel's infer_output_dtypes with _to_copy-specific logic:
+        # output dtype is the target dtype kwarg, or src dtype if not specified.
+        self.kernel.infer_output_dtypes = self._infer_to_copy_output_dtypes
+
+    def _infer_to_copy_output_dtypes(self, *args, **kwargs):
+        """For _to_copy, output dtype is kwargs['dtype'] or src dtype."""
+        dtype = kwargs.get("dtype")
+        if dtype is None and args:
+            src = args[0]
+            if isinstance(src, torch.Tensor):
+                dtype = src.dtype
+        return [dtype] if dtype is not None else []
 
     def can_handle(self, *args, **kwargs) -> bool:
-        """Only handle neuron-to-neuron tensor copies.
+        """Check device, dtype, and stream eligibility for the Torch-MLIR copy path.
 
         Args:
-            args[0]: source tensor
-            kwargs: dtype, layout, device, pin_memory, non_blocking, memory_format
+            *args (Any): Positional arguments with the source tensor first.
+            **kwargs (Any): Copy options such as ``dtype`` and ``device``.
+
+        Returns:
+            bool: ``True`` when source and target use Neuron devices, dtypes are
+                supported, and stream state is eligible.
+
+        Note:
+            Float64, int64, and uint64 source or target dtypes are rejected. When
+            host-side collective communication is enabled, copies on a non-default
+            stream are also rejected.
         """
         src = args[0]
 
@@ -57,10 +81,8 @@ class ToCopyMLIRImpl(TorchMlirOpImpl):
 
         # Only handle neuron-to-neuron copies, excluding dtypes that need special handling:
         # - float64: Not natively supported on device, handled by NRT-based implementation
-        # - bool: Requires special handling, handled by NRT-based implementation
-        # - int32: Requires special handling, handled by NRT-based implementation
         # - int64/uint64: Not natively supported on device, handled by NRT-based implementation
-        unsupported_dtypes = (torch.float64, torch.bool, torch.int32, torch.int64, torch.uint64)
+        unsupported_dtypes = (torch.float64, torch.int64, torch.uint64)
         if not (
             src.device.type == "neuron"
             and target_device.type == "neuron"
@@ -75,11 +97,18 @@ class ToCopyMLIRImpl(TorchMlirOpImpl):
         return not (is_host_cc_enabled() and current_stream() != default_stream())
 
     def execute(self, *args, **kwargs):
-        """Execute to_copy operation using MLIR backend.
+        """Execute a tensor copy between Neuron devices through Torch-MLIR.
 
         Args:
-            args[0]: source tensor
-            kwargs: dtype, layout, device, pin_memory, non_blocking, memory_format
+            *args (Any): Positional arguments with the source tensor first.
+            **kwargs (Any): Copy options; only ``dtype`` and ``device`` are consumed here.
+
+        Returns:
+            ExecutionResult: The copied tensor or a captured execution failure.
+
+        Note:
+            Empty inputs allocate empty outputs. Non-overlapping dense source strides
+            are preserved; source layouts with gaps produce contiguous outputs.
         """
         src = args[0]
         dtype = kwargs.get("dtype")
@@ -102,7 +131,15 @@ class ToCopyMLIRImpl(TorchMlirOpImpl):
 
             src_prepared = ensure_contiguous_on_device(src)
 
-        out = io_tensor.empty(src.shape, dtype=target_dtype, device=target_device)
+        # Preserve source strides in output (matches PyTorch .to(dtype) semantics)
+        # PyTorch preserves strides only for non-overlapping-and-dense tensors (e.g. transpose);
+        # for tensors with gaps (e.g. slices), output is contiguous.
+        if not src.is_contiguous() and torch.ops.aten.is_non_overlapping_and_dense(src):
+            out = torch.empty_strided(
+                src.shape, src.stride(), dtype=target_dtype, device=target_device
+            )
+        else:
+            out = io_tensor.empty(src.shape, dtype=target_dtype, device=target_device)
 
         mlir_kwargs = {}
         if src_prepared.dtype != target_dtype:
@@ -110,3 +147,37 @@ class ToCopyMLIRImpl(TorchMlirOpImpl):
         mlir_kwargs["out"] = out
 
         return super().execute(src_prepared, **mlir_kwargs)
+
+    def get_lower_func(self):
+        """Return a lowering function that translates raw ATen copy arguments.
+
+        Returns:
+            Callable: Function that maps ``dtype`` to the kernel's ``out_dtype`` argument.
+
+        Note:
+            C++ dispatch supplies raw ``aten::_to_copy`` keyword arguments, while the kernel
+            consumes only the source tensor and an optional output dtype.
+        """
+        kernel = self.kernel
+
+        def to_copy_lower(*args, **kwargs):
+            """Lower a raw ``aten::_to_copy`` invocation.
+
+            Args:
+                *args (Any): Positional arguments with the source tensor first.
+                **kwargs (Any): Raw ATen copy keywords; only ``dtype`` affects lowering.
+
+            Returns:
+                LoweringResult: Lowered kernel metadata for the requested dtype.
+            """
+            src = args[0]
+            target_dtype = kwargs.get("dtype", src.dtype)
+
+            # Translate to kernel kwargs
+            translated_kwargs = {}
+            if target_dtype != src.dtype:
+                translated_kwargs["out_dtype"] = target_dtype
+
+            return kernel.lower(src, **translated_kwargs)
+
+        return to_copy_lower

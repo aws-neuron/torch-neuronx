@@ -13,16 +13,17 @@ from torch_mlir.ir import Module
 
 from torch_neuronx.kernels.cache_utils import CompilationJob
 from torch_neuronx.neuron_dynamo_backend.config import get_model_name
+from torch_neuronx.neuron_dynamo_backend.fx.dynamic_dim_constraints import (
+    DynamicDimConstraints,
+    build_dynamic_dim_constraints,
+)
 from torch_neuronx.neuron_dynamo_backend.fx.fx_hooks import CustomFxImporterHooks
 from torch_neuronx.neuron_dynamo_backend.fx.fx_importer import NeuronFxImporter
 from torch_neuronx.neuron_dynamo_backend.fx.passes.dtype_conversion import dtype_conversion_pass
-from torch_neuronx.neuron_dynamo_backend.utils.alias_info import AliasingInfo
 from torch_neuronx.neuron_dynamo_backend.utils.stablehlo_utils import (
     FunctionIO,
-    RandomInputInfo,
     TensorSpec,
     parse_module_io,
-    shapes_match,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,57 +55,46 @@ def _is_tuple_return(module: Module) -> bool:
     return False
 
 
-def _set_module_alias(module: Module, aliasing_info: AliasingInfo) -> None:
+def _set_module_alias(module: Module, alias_buffer_map: dict[int, int] | None) -> None:
     """Set aliasing attributes on the MLIR module for input-output tensor aliasing.
 
     Attaches mhlo.input_output_alias attributes to the module operation,
     informing the compiler which output tensors should alias input tensors.
 
+    Takes a pre-computed {neff_output_index: neff_input_index} map from
+    get_alias_output_buffer_map().
+
     Args:
         module (Module): MLIR Module to modify.
-        aliasing_info (AliasingInfo): Aliasing relationships to apply.
-
-    Raises:
-        IndexError: If parameter_number or output_index is out of bounds.
+        alias_buffer_map (dict[int, int]): NEFF output→input index pairs to alias.
     """
-    if aliasing_info is None:
+    if not alias_buffer_map:
         return
 
     is_tuple_output = _is_tuple_return(module)
-    alias_dicts = []
 
     with module.context:
         function_io = parse_module_io(module)
         inputs = function_io.inputs
         outputs = function_io.outputs
 
-        for alias in aliasing_info:
-            param_num = alias.parameter_number
-            param_idx = alias.parameter_index
-            output_idx = alias.output_index
+        # MLIR output index -> (input param_num, parameter_index) to alias.
+        output_to_alias: dict[int, tuple[int, list[int]]] = {}
+        for output_idx, param_num in alias_buffer_map.items():
+            assert (0 <= param_num < len(inputs)) and (0 <= output_idx < len(outputs)), (
+                f"Alias index out of range for lowered MLIR IO: "
+                f"param_num={param_num} output_idx={output_idx} "
+                f"(inputs={len(inputs)}, outputs={len(outputs)})"
+            )
+            output_to_alias[output_idx] = (param_num, [])
 
-            if param_num < 0 or param_num >= len(inputs):
-                raise IndexError(
-                    f"param_num {param_num} is out of bounds for inputs array "
-                    f"of length {len(inputs)}"
-                )
-            input_shape = inputs[param_num]
+        if not output_to_alias:
+            return
 
-            # Bounds check for outputs
-            if output_idx < 0 or output_idx >= len(outputs):
-                raise IndexError(
-                    f"output_idx {output_idx} is out of bounds for outputs array "
-                    f"of length {len(outputs)}"
-                )
-            output_shape = outputs[output_idx]
-
-            # If there's a shape mismatch, skip this alias
-            # StableHLO does not recognize mismatch-shaped
-            # alias relationship.
-            if not shapes_match(input_shape, output_shape):
-                continue
-
-            # Build inner alias dict
+        # Emit mhlo.input_output_alias from the validated map.
+        alias_dicts = []
+        for output_idx in sorted(output_to_alias):
+            param_num, param_idx = output_to_alias[output_idx]
             param_index_attr = mlir_ir.DenseI64ArrayAttr.get(param_idx if param_idx else [])
             param_number_attr = mlir_ir.IntegerAttr.get(
                 mlir_ir.IntegerType.get_signed(64), param_num
@@ -121,11 +111,7 @@ def _set_module_alias(module: Module, aliasing_info: AliasingInfo) -> None:
 
             # Build output_index based on return type
             if is_tuple_output:
-                # Tuple output: index into the tuple
-                # output_idx could be int or list
-                output_index_attr = mlir_ir.DenseI64ArrayAttr.get(
-                    [output_idx] if isinstance(output_idx, int) else output_idx
-                )
+                output_index_attr = mlir_ir.DenseI64ArrayAttr.get([output_idx])
             else:
                 # Single tensor output: must use empty index
                 output_index_attr = mlir_ir.DenseI64ArrayAttr.get([])
@@ -141,35 +127,66 @@ def _set_module_alias(module: Module, aliasing_info: AliasingInfo) -> None:
         module.operation.attributes["mhlo.input_output_alias"] = final_attr
 
 
+def _set_dynamic_dim_constraints(module: Module, constraints: DynamicDimConstraints) -> None:
+    """Attach dynamic dimension constraint metadata as MLIR attributes on the module.
+
+    Encodes two attributes:
+      - "neuron.dynamic_dim_symbols": DictAttr {symbol_name -> IntegerAttr(arg_index)}
+      - "neuron.dynamic_dim_exprs": DictAttr {arg_index -> DictAttr {dim_index -> StringAttr(expr)}}
+
+    These survive lowering as module-level attributes and inform the downstream
+    compiler which runtime scalar args provide dynamic dimension sizes.
+    """
+    with module.context:
+        # Symbol-to-arg-index mapping: {"s0": 0, "s1": 3, ...}
+        i64 = mlir_ir.IntegerType.get_signless(64)
+        symbol_dict = {
+            name: mlir_ir.IntegerAttr.get(i64, idx)
+            for name, idx in constraints.symbol_to_arg_index.items()
+        }
+        module.operation.attributes["neuron.dynamic_dim_symbols"] = mlir_ir.DictAttr.get(
+            symbol_dict
+        )
+
+        # Tensor-dim expressions: {arg_idx: {dim_idx: expr_str}}
+        outer_dict = {}
+        for arg_idx, dim_map in constraints.tensor_dim_exprs.items():
+            inner_dict = {
+                str(dim_idx): mlir_ir.StringAttr.get(expr_str)
+                for dim_idx, expr_str in dim_map.items()
+            }
+            outer_dict[str(arg_idx)] = mlir_ir.DictAttr.get(inner_dict)
+        module.operation.attributes["neuron.dynamic_dim_exprs"] = mlir_ir.DictAttr.get(outer_dict)
+
+
 def convert_fx_to_stablehlo(
     gm: torch.fx.GraphModule,
     example_inputs,
-    aliasing_info: AliasingInfo = None,
+    aliasing_info: dict[int, int] | None = None,
     *,
     job: CompilationJob | None = None,
-    random_input_info: RandomInputInfo | None = None,
+    static_input_indices: list[int] | None = None,
 ) -> tuple[str, FunctionIO, list[TensorSpec]]:
-    """
-    Convert FX GraphModule to StableHLO using torch-mlir with collective support
-
-    Pipeline:
-    1. Apply FX graph-level collective transformations
-    2. Import FX to RAW Torch dialect
-    3. Apply custom Neuron transformations/lowerings
-    4. Lower to Torch backend IR
-    5. Lower to StableHLO IR
+    """Lower an FX graph module to StableHLO with torch-MLIR.
 
     Args:
-        gm: FX GraphModule with Aten operations (from AOTAutograd)
-        example_inputs: Example input tensors
-        job: CompilationJob for artifact management. If None, artifact dumping is skipped.
-        random_input_info: Optional metadata about random inputs added to the graph
+        gm (torch.fx.GraphModule): Post-AOTAutograd graph with ATen operations.
+        example_inputs (Any): Accepted for API compatibility but currently unused.
+        aliasing_info (dict[int, int] | None, optional): NEFF output-to-input index
+            map. Defaults to ``None``.
+        job (CompilationJob | None, optional): Artifact dumper. Defaults to ``None``.
+        static_input_indices (list[int] | None, optional): Input indices to stamp as
+            transposable weights, or ``None`` to omit the metadata. Defaults to ``None``.
 
     Returns:
-        tuple: (stablehlo_module, io_spec, cast_spec)
-            - stablehlo_module (Module): StableHLO MLIR module.
-            - io_spec (FunctionIO): Input/output specifications for Executor.
-            - cast_spec (list[TensorSpec]): Output specifications for dtype preservation.
+        tuple[Module, FunctionIO, list[TensorSpec]]: StableHLO module, executor IO
+        specification, and output dtype specification captured before f64-to-f32 conversion.
+
+    Raises:
+        ValueError: If lowering produces a module without outputs.
+
+    Note:
+        Adds hierarchy, dynamic-dimension, aliasing, and transposable-weight metadata.
     """
     model_name = get_model_name()
 
@@ -180,13 +197,15 @@ def convert_fx_to_stablehlo(
     # Torch-MLIR lowering: FX → RAW → Torch Backend → StableHLO
     with dynamo_timed("torch_neuronx_lower"):
         logger.debug("Importing FX to RAW Torch dialect")
+        fx_importer = NeuronFxImporter(hooks=CustomFxImporterHooks())
         raw_module = fx.stateless_fx_import(
             gm,
             output_type=OutputType.RAW,  # RAW = no backend pipeline
-            fx_importer=NeuronFxImporter(hooks=CustomFxImporterHooks()),
+            fx_importer=fx_importer,
             verbose=IR_DEBUG_PRINT,
             enable_ir_printing=IR_DEBUG_PRINT,
         )
+        has_hierarchy = fx_importer.has_hierarchy
 
         # Save RAW module for debugging
         if job is not None:
@@ -233,7 +252,7 @@ def convert_fx_to_stablehlo(
         raw_module = dtype_conversion_pass(raw_module)
 
     # Spec for executor.
-    io_spec = parse_module_io(raw_module, random_input_info=random_input_info)
+    io_spec = parse_module_io(raw_module)
     # Module should have at least one output
     if len(io_spec.outputs) == 0:
         raise ValueError(
@@ -241,6 +260,21 @@ def convert_fx_to_stablehlo(
             "modify your code to have at least one output."
         )
     logger.debug("FX Graph -> StableHLO conversion successful")
+    # Mark module as hierarchy-splitter compatible if hierarchy metadata was used
+    if has_hierarchy:
+        raw_module.operation.attributes["stablehlo.hierarchy_splitter_compatible"] = (
+            mlir_ir.StringAttr.get("true", raw_module.context)
+        )
+    # Attach dynamic dimension constraint metadata
+    dynamic_dim_constraints = build_dynamic_dim_constraints(gm.graph)
+    if dynamic_dim_constraints is not None:
+        _set_dynamic_dim_constraints(raw_module, dynamic_dim_constraints)
     # Set the aliasing attributes on the MLIR module
     _set_module_alias(raw_module, aliasing_info)
+    if static_input_indices:
+        idx_str = ",".join(str(i) for i in static_input_indices)
+        with raw_module.context:
+            raw_module.operation.attributes["mhlo.frontend_attributes"] = mlir_ir.DictAttr.get(
+                {"transposable_weight_idx": mlir_ir.StringAttr.get(idx_str)}
+            )
     return raw_module, io_spec, cast_spec

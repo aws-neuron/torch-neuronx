@@ -37,9 +37,10 @@ class ModelHandleCache {
                                                int device_index, bool has_collectives);
 
   /**
-   * Generate a cache key from NEFF bytes and device index
+   * Compose the cache key for a (compile_key, device) pair.
+   * Format: "dev{device_index}_{compile_key}".
    */
-  std::string GenerateCacheKey(const std::vector<uint8_t>& neff_bytes, int device_index) const;
+  std::string MakeCacheKey(const std::string& compile_key, int device_index) const;
 
   /**
    * Get detailed cache entry information for debugging

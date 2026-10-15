@@ -46,16 +46,6 @@ class TestDistributedUtilities:
     """Test distributed computing utility functions"""
 
     @patch("torch.distributed.is_initialized")
-    @patch("torch.distributed.get_rank")
-    def test_get_rank(self, mock_get_rank, mock_torch_dist_init):
-        """Test get_rank function"""
-        mock_get_rank.return_value = 5
-        mock_torch_dist_init.return_value = True
-        result = config.get_rank()
-        assert result == 5
-        mock_get_rank.assert_called_once()
-
-    @patch("torch.distributed.is_initialized")
     @patch("torch.distributed.get_node_local_rank")
     def test_get_local_rank(self, mock_get_local_rank, mock_torch_dist_init):
         """Test get_local_rank function"""

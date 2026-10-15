@@ -14,14 +14,28 @@ from torch.distributed.tensor._op_schema import (
     RuntimeSchemaInfo,
 )
 from torch.distributed.tensor._ops import (
-    expand_to_full_mesh_op_strategy,
-    generate_redistribute_costs,
-    infer_broadcast_dims_map,
-    is_tensor_shardable,
-    map_placements_after_broadcast,
     register_op_strategy,
 )
 from torch.distributed.tensor._ops._einsum_strategy import gen_einsum_strategies
+
+# PT 2.14 moved these utils from torch.distributed.tensor._ops to
+# torch.distributed.tensor._ops.utils
+try:
+    from torch.distributed.tensor._ops.utils import (
+        expand_to_full_mesh_op_strategy,
+        generate_redistribute_costs,
+        infer_broadcast_dims_map,
+        is_tensor_shardable,
+        map_placements_after_broadcast,
+    )
+except ImportError:
+    from torch.distributed.tensor._ops import (
+        expand_to_full_mesh_op_strategy,
+        generate_redistribute_costs,
+        infer_broadcast_dims_map,
+        is_tensor_shardable,
+        map_placements_after_broadcast,
+    )
 from torch.distributed.tensor.placement_types import (
     Partial,
     Placement,
@@ -36,23 +50,31 @@ aten = torch.ops.aten
     aten._scaled_dot_product_fused_attention_overrideable.default, schema_info=RuntimeSchemaInfo(4)
 )
 def scaled_dot_product_fused_attention_overrideable_strategy(op_schema: OpSchema) -> OpStrategy:
-    """Sharding strategy for _scaled_dot_product_fused_attention_overrideable.
+    """Generate fused overrideable attention sharding strategies.
 
-    Based on the CUDNN attention strategy but adapted for the overrideable signature:
-    (query, key, value, attn_bias?, dropout_p, is_causal, return_debug_mask, scale?) ->
-    (output, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k, philox_seed, philox_offset,
-    debug_attn_mask)
+    Args:
+        op_schema (OpSchema): Runtime schema containing attention inputs and flags.
+
+    Returns:
+        OpStrategy: Expanded replicated, head-, batch-, and sequence-sharded strategies.
+
+    Raises:
+        AssertionError: If the query schema is not an ``OpStrategy``.
+
+    Note:
+        Output placements follow ``(output, logsumexp, cum_seq_q, cum_seq_k, max_q,
+        max_k, philox_seed, philox_offset, debug_attn_mask)``. Head, batch, and
+        sequence strategies shard dimensions 1, 0, and 2, respectively.
     """
     mesh = op_schema.get_mesh_from_args()
 
     # Parse arguments based on the signature
-    (
-        query_strategy,  # query
-        _,  # key
-        _,  # value
-        attn_bias_strategy,  # attn_bias (optional)
-        *rest_args,  # dropout_p, is_causal, return_debug_mask, scale
-    ) = op_schema.args_schema
+    query_strategy = op_schema.args_schema[0]  # query
+    # skip `key` and `value` at position 1 and 2
+    attn_bias_strategy = (
+        op_schema.args_schema[3] if len(op_schema.args_schema) > 3 else None
+    )  # avoid out of bonadary error
+    rest_args = op_schema.args_schema[4:]  # dropout_p, is_causal, return_debug_mask, scale
 
     # Extract boolean flags from rest_args
     return_debug_mask = len(rest_args) >= 3 and rest_args[2]  # return_debug_mask
@@ -146,8 +168,10 @@ def scaled_dot_product_fused_attention_overrideable_strategy(op_schema: OpSchema
         None,  # cum_seq_k
         None,  # max_q
         None,  # max_k
-        Replicate(),  # philox_seed
-        Replicate(),  # philox_offset
+        # None, not Replicate(): under compile the fwd decomposition emits philox=None
+        # at dropout_p=0, and a non-None placement would demand a TensorMeta that isn't there.
+        None,  # philox_seed
+        None,  # philox_offset
         debug_attn_mask_sharding_cp,  # debug_attn_mask
         cp_sharding,  # q
         cp_sharding,  # k
@@ -166,12 +190,23 @@ def scaled_dot_product_fused_attention_overrideable_strategy(op_schema: OpSchema
 def scaled_dot_product_fused_attention_overrideable_backward_strategy(
     op_schema: OpSchema,
 ) -> OpStrategy:
-    """Sharding strategy for _scaled_dot_product_fused_attention_overrideable_backward.
+    """Generate fused overrideable attention backward sharding strategies.
 
-    Backward signature:
-    (grad_out, query, key, value, attn_bias, grad_input_mask, out, logsumexp,
-     cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, philox_seed, philox_offset,
-    scale?) -> (grad_query, grad_key, grad_value, grad_attn_bias)
+    Args:
+        op_schema (OpSchema): Runtime schema containing backward attention inputs.
+
+    Returns:
+        OpStrategy: Expanded replicated, head-, batch-, and sequence-sharded strategies.
+
+    Raises:
+        AssertionError: If the query schema is not an ``OpStrategy``.
+
+    Note:
+        Input placements follow ``(grad_out, query, key, value, attn_bias,
+        grad_input_mask, out, logsumexp, cum_seq_q, cum_seq_k, max_q, max_k,
+        dropout_p, is_causal, philox_seed, philox_offset, scale?)``. Outputs are
+        ``(grad_query, grad_key, grad_value, grad_attn_bias)``. Head, batch, and
+        sequence strategies shard dimensions 1, 0, and 2, respectively.
     """
     # Backward op doesn't need to validate the mesh since forward already did
     mesh = op_schema.get_mesh_from_args(validate=False)
@@ -182,6 +217,20 @@ def scaled_dot_product_fused_attention_overrideable_backward_strategy(
 
     # Check if attn_bias exists (input 4)
     has_attn_bias = op_schema.args_schema[4] is not None
+
+    # philox_seed (14) / philox_offset (15): placement only when the arg is a real tensor
+    # (OpStrategy). Under compile philox_seed may be None (dropout_p=0); a non-None placement
+    # would over-count vs expand_to_full_mesh_op_strategy's OpStrategy-arg count and raise.
+    def _philox_placement(idx: int) -> Placement | None:
+        return (
+            Replicate()
+            if idx < len(op_schema.args_schema)
+            and isinstance(op_schema.args_schema[idx], OpStrategy)
+            else None
+        )
+
+    philox_seed_p = _philox_placement(14)
+    philox_offset_p = _philox_placement(15)
 
     single_mesh_dim_strategies = []
 
@@ -210,8 +259,8 @@ def scaled_dot_product_fused_attention_overrideable_backward_strategy(
         None,  # max_k (SymInt)
         None,  # dropout_p (float)
         None,  # is_causal (bool)
-        Replicate(),  # philox_seed (tensor)
-        Replicate(),  # philox_offset (tensor)
+        philox_seed_p,  # philox_seed (tensor)
+        philox_offset_p,  # philox_offset (tensor)
     ]
 
     # Add scale if present (optional)
@@ -246,8 +295,8 @@ def scaled_dot_product_fused_attention_overrideable_backward_strategy(
         None,  # max_k
         None,  # dropout_p
         None,  # is_causal
-        Replicate(),  # philox_seed
-        Replicate(),  # philox_offset
+        philox_seed_p,  # philox_seed
+        philox_offset_p,  # philox_offset
     ]
 
     if len(op_schema.args_schema) > 16:
@@ -281,8 +330,8 @@ def scaled_dot_product_fused_attention_overrideable_backward_strategy(
         None,  # max_k
         None,  # dropout_p
         None,  # is_causal
-        Replicate(),  # philox_seed
-        Replicate(),  # philox_offset
+        philox_seed_p,  # philox_seed
+        philox_offset_p,  # philox_offset
     ]
 
     if len(op_schema.args_schema) > 16:
@@ -291,6 +340,44 @@ def scaled_dot_product_fused_attention_overrideable_backward_strategy(
     batch_strategy: PlacementList = batch_out + batch_inp
     single_mesh_dim_strategies.append(batch_strategy)
 
+    # Strategy 4: Context parallelism (shard on sequence dim)
+    # Required so the CP ring handler's `not needs_redistribute` assert passes
+    # for Shard(2) inputs. The handler computes gradients via ring attention;
+    # this strategy only declares the placement spec used to wrap results.
+    cp_sharding = Shard(2)
+
+    cp_out: PlacementList = [
+        cp_sharding,  # grad_query
+        cp_sharding,  # grad_key
+        cp_sharding,  # grad_value
+        cp_sharding if has_attn_bias else None,  # grad_attn_bias
+    ]
+
+    cp_inp: PlacementList = [
+        cp_sharding,  # grad_out
+        cp_sharding,  # query
+        cp_sharding,  # key
+        cp_sharding,  # value
+        cp_sharding if has_attn_bias else None,  # attn_bias
+        None,  # grad_input_mask
+        cp_sharding,  # out
+        cp_sharding,  # logsumexp
+        None,  # cum_seq_q
+        None,  # cum_seq_k
+        None,  # max_q
+        None,  # max_k
+        None,  # dropout_p
+        None,  # is_causal
+        philox_seed_p,  # philox_seed
+        philox_offset_p,  # philox_offset
+    ]
+
+    if len(op_schema.args_schema) > 16:
+        cp_inp.append(None)  # scale
+
+    cp_strategy: PlacementList = cp_out + cp_inp
+    single_mesh_dim_strategies.append(cp_strategy)
+
     return expand_to_full_mesh_op_strategy(
         mesh, op_schema, single_mesh_dim_strategies, input_index=4
     )
@@ -298,11 +385,22 @@ def scaled_dot_product_fused_attention_overrideable_backward_strategy(
 
 @register_op_strategy(aten.linear.default)
 def linear_out_strategy(op_schema: OpSchema) -> OpStrategy:
-    """
-    Linear strategy following the einsum-based approach used in addmm.
+    """Generate einsum-based sharding strategies for linear operations.
 
-    linear(input, weight, bias) computes: input @ weight.T + bias
-    where weight has shape (out_features, in_features)
+    Args:
+        op_schema (OpSchema): Runtime schema containing input, weight, and optional bias.
+
+    Returns:
+        OpStrategy: Shardable matrix-multiplication strategies with redistribution costs.
+
+    Raises:
+        AssertionError: If an input, weight, or present bias schema is not an
+            ``OpStrategy``.
+
+    Note:
+        Models ``linear(input, weight, bias)`` as ``input @ weight.T + bias``, where
+        weight has shape ``(out_features, in_features)``. Bias placements are mapped
+        from the output's final dimension after broadcasting.
     """
     mesh = op_schema.get_mesh_from_args(validate=False)
     input_strategy, weight_strategy = op_schema.args_schema[:2]
@@ -378,23 +476,28 @@ def linear_out_strategy(op_schema: OpSchema) -> OpStrategy:
     return mm_strategy
 
 
-@register_op_strategy(aten.linear_backward.default)
+@register_op_strategy(aten.linear_backward.default, schema_info=RuntimeSchemaInfo(3))
 def linear_backward_strategy(op_schema: OpSchema) -> OpStrategy:
-    """
-    Sharding strategy for linear_backward.
+    """Generate sharding strategies for linear backward operations.
 
-    linear_backward(input[*,k], grad_output[*,n], weight[n,k], output_mask)
-    -> (grad_input[*,k], grad_weight[n,k], grad_bias[n])
+    Args:
+        op_schema (OpSchema): Runtime schema containing inputs and the output mask.
 
-    Three computations:
-      grad_input  = einsum("...j, ji -> ...i", grad_output, weight)   contracts n
-      grad_weight = einsum("...j, ...i -> ji", grad_output, input)    contracts batch
-      grad_bias   = einsum("...j -> j", grad_output)                  contracts batch
+    Returns:
+        OpStrategy: Expanded strategies for input, weight, and bias gradients.
 
-    Dimensions:
-      batch dims (0..ndim-2): free in grad_input, contracting in grad_weight/grad_bias
-      n (out_features):       contracting in grad_input, free in grad_weight/grad_bias
-      k (in_features):        free in grad_input/grad_weight, not in grad_bias
+    Raises:
+        AssertionError: If an input, gradient-output, or weight schema is not an
+            ``OpStrategy``.
+
+    Note:
+        Models ``grad_input = grad_output @ weight``, ``grad_weight = grad_output.T @
+        input``, and ``grad_bias = sum(grad_output)`` across batch dimensions. Batch
+        sharding makes weight and bias gradients partial; output-feature sharding makes
+        the input gradient partial. Input-feature sharding preserves the final input
+        dimension. ``output_mask`` suppresses the input gradient independently but
+        includes both weight and bias gradients whenever either is requested. Sum and
+        average ``Partial`` inputs receive linearity strategies.
     """
     mesh = op_schema.get_mesh_from_args(validate=False)
     input_strategy, grad_output_strategy, weight_strategy, output_mask = op_schema.args_schema
