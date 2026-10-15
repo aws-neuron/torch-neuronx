@@ -1,0 +1,35 @@
+# Source of truth for the public agent-skill bundle.
+# tools/agent-skills/validate.py checks this file against the skill directories and README.md.
+# Regenerate README.md with: python3 tools/agent-skills/validate.py --write-readme
+version: 1
+canonical_root: .external/skills
+
+skills:
+  - name: torch-neuronx-docs
+    status: stable
+    summary: Answer questions about how torch-neuronx works and where code lives.
+    hardware: none
+  - name: pr-review
+    status: stable
+    summary: Review a torch-neuronx pull request or local branch and report findings.
+    hardware: none
+  - name: pytorch-upstream-test-debugger
+    status: stable
+    summary: Find and fix the root cause of failing or xfailed upstream PyTorch tests on Neuron.
+    hardware: neuron
+  - name: aten-lowering-orchestrator
+    status: stable
+    summary: Lower a list of ATen operators in parallel, grade each one, and open a draft PR for each that passes.
+    hardware: neuron
+  - name: aten-op-lowering
+    status: stable
+    summary: Add a native Neuron lowering for one ATen operator with tests and verification.
+    hardware: neuron
+  - name: compiler-artifact-repro
+    status: stable
+    summary: Isolate a Neuron compiler failure and package a minimal reproducer with artifacts.
+    hardware: neuron
+  - name: agent-isolation
+    status: stable
+    summary: Run several agents in parallel on one Neuron host with separate cores, ports, caches, and worktrees.
+    hardware: neuron

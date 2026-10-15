@@ -1,14 +1,8 @@
-"""Packed physical storage for 64-bit dtypes on Neuron.
+"""Provide packed physical storage helpers for ``torch.int64`` tensors.
 
-Neuron HW doesn't natively support 64-bit tensor payloads. This module provides
-the layout computation and view helpers to represent logical 64-bit tensors in
-narrower 32-bit physical storage.
-
-Layout rules:
-  - float64 → float32: same shape, same strides (lossy truncation)
-  - int64 → int32: appends trailing dimension of 2, strides doubled
-    Each int64 element is stored as [low_word, high_word] in little-endian order.
-  - complex128 → complex64: same shape (lossy truncation)
+The sole supported mapping represents each logical ``torch.int64`` value as
+low and high ``torch.int32`` words in a trailing lane of two. Nonscalar shapes
+map from ``S`` to ``(*S, 2)``, while a scalar maps from ``()`` to ``(2,)``.
 """
 
 from __future__ import annotations
@@ -22,12 +16,26 @@ _PACKED_PHYSICAL_DTYPE: dict[torch.dtype, torch.dtype] = {
 
 
 def packed_physical_dtype(dtype: torch.dtype) -> torch.dtype | None:
-    """Return the physical dtype for a packed logical dtype, or None if not packed."""
+    """Return the physical dtype for a packed logical dtype.
+
+    Args:
+        dtype (torch.dtype): Logical dtype to query.
+
+    Returns:
+        torch.dtype or None: Packed physical dtype, or ``None`` when unmapped.
+    """
     return _PACKED_PHYSICAL_DTYPE.get(dtype)
 
 
 def is_packed_logical_dtype(dtype: torch.dtype) -> bool:
-    """Return True if dtype requires packed physical storage on Neuron."""
+    """Check whether a dtype uses packed storage on a Neuron device.
+
+    Args:
+        dtype (torch.dtype): Logical dtype to query.
+
+    Returns:
+        bool: ``True`` when ``dtype`` has a packed physical mapping.
+    """
     return dtype in _PACKED_PHYSICAL_DTYPE
 
 
@@ -38,13 +46,23 @@ def packed_physical_layout(
     stride: tuple[int, ...],
     storage_offset: int = 0,
 ) -> tuple[tuple[int, ...], tuple[int, ...], int]:
-    """Compute the physical (shape, stride, storage_offset) for a packed tensor.
+    """Compute physical layout metadata for a packed logical tensor.
 
-    For int64: appends trailing dim of 2, doubles all strides, doubles offset.
-    For float64/complex128: shape and strides unchanged (same element count).
+    Args:
+        dtype (torch.dtype): Packed logical dtype.
+        shape (tuple[int, ...]): Logical tensor shape.
+        stride (tuple[int, ...]): Logical tensor strides.
+        storage_offset (int, optional): Logical storage offset. Defaults to ``0``.
 
     Returns:
-        (physical_shape, physical_stride, physical_storage_offset)
+        tuple: Physical shape, stride, and storage offset.
+
+    Raises:
+        TypeError: If ``dtype`` has no supported packed layout.
+
+    Note:
+        For ``torch.int64``, this appends a two-word lane, doubles strides and
+        offset, and maps a scalar shape to ``(2,)``.
     """
     if dtype == torch.int64:
         if len(shape) == 0:
@@ -64,18 +82,19 @@ def packed_physical_layout(
 
 
 def is_packed_physical_view(physical: torch.Tensor, logical: torch.Tensor) -> bool:
-    """Return True if ``physical`` is the packed physical view of ``logical``.
+    """Check whether a tensor matches another tensor's packed physical layout.
 
-    i.e. ``logical`` has a packed physical representation (int64/float64/
-    complex128) and ``physical`` matches its physical dtype and shape per
-    :func:`packed_physical_layout` (e.g. int64 ``S`` ↔ int32 ``(*S, 2)``, and
-    scalar ``()`` ↔ ``(2,)``).
+    Args:
+        physical (torch.Tensor): Candidate physical tensor.
+        logical (torch.Tensor): Logical tensor whose layout is expected.
 
-    Single source of truth for "is this int32 tensor the packed view of that
-    logical tensor?", shared by the graph-boundary gather (``_gather_arg``), the
-    output reinterpret (``_reinterpret_packed_int64_output``), and the
-    provided/inplace-output preparation (``_prepare_execution_tensors``). Works
-    on meta tensors (uses only dtype/shape).
+    Returns:
+        bool: ``True`` when dtype and shape match the computed physical layout.
+
+    Note:
+        Only ``torch.int64`` is packed: nonscalar tensors map to ``torch.int32``
+        with a trailing lane of two, while scalars map from ``()`` to ``(2,)``.
+        This checks only dtype and shape, so it also works with meta tensors.
     """
     if not (isinstance(physical, torch.Tensor) and isinstance(logical, torch.Tensor)):
         return False
@@ -91,12 +110,17 @@ def is_packed_physical_view(physical: torch.Tensor, logical: torch.Tensor) -> bo
 def packed_physical_view(t: torch.Tensor) -> torch.Tensor:
     """Create a zero-copy physical view of a packed logical tensor.
 
-    The returned tensor shares storage with the input but has the physical
-    dtype and layout. For int64 tensors, this means dtype=int32 with an
-    extra trailing dimension of 2.
+    Args:
+        t (torch.Tensor): Packed logical tensor to reinterpret.
+
+    Returns:
+        torch.Tensor: Storage-sharing tensor with the physical dtype and layout.
 
     Raises:
-        TypeError: if the tensor's dtype doesn't have a packed physical dtype.
+        TypeError: If the tensor dtype has no packed physical mapping.
+
+    Note:
+        An ``int64`` input becomes ``int32`` with a trailing dimension of two.
     """
     physical_dtype = packed_physical_dtype(t.dtype)
     if physical_dtype is None:
@@ -121,22 +145,20 @@ def packed_physical_view(t: torch.Tensor) -> torch.Tensor:
 def packed_logical_view(
     physical: torch.Tensor, logical_dtype: torch.dtype, logical_shape: tuple[int, ...]
 ) -> torch.Tensor:
-    """Reinterpret a contiguous physical tensor back to its logical dtype and shape.
-
-    Inverse of :func:`packed_physical_view`. ``torch.view(logical_dtype)`` alone
-    is not enough for int64/complex128: viewing an int32 ``(*, 2)`` tensor as
-    int64 collapses the trailing lane dim to ``(*, 1)`` rather than dropping it,
-    so the result must be reshaped back to ``logical_shape``. For float64 (same
-    element count) this reshape is a no-op.
+    """Reinterpret a contiguous physical tensor as its logical dtype and shape.
 
     Args:
-        physical: contiguous tensor in the physical dtype (e.g. int32 pairs).
-        logical_dtype: target logical dtype (e.g. torch.int64).
-        logical_shape: the logical tensor's shape to restore.
+        physical (torch.Tensor): Contiguous tensor in the physical dtype.
+        logical_dtype (torch.dtype): Logical dtype to restore.
+        logical_shape (tuple[int, ...]): Logical shape to restore.
 
     Returns:
-        Tensor with dtype=logical_dtype and shape=logical_shape, sharing
-        ``physical``'s storage (zero-copy reinterpretation).
+        torch.Tensor: Zero-copy logical view sharing ``physical`` storage.
+
+    Note:
+        For the supported packed mapping, viewing ``int32`` ``(*S, 2)`` storage
+        as ``int64`` leaves a trailing singleton ``(*S, 1)``; the final reshape
+        removes that lane and restores ``S``.
     """
     if physical.dtype == logical_dtype:
         return physical.reshape(tuple(logical_shape))
@@ -144,11 +166,20 @@ def packed_logical_view(
 
 
 def packed_int64_low_word_alias(t: torch.Tensor) -> torch.Tensor:
-    """Return a strided int32 view selecting only the low words from packed int64 storage.
+    """Return a strided view of the low words in packed ``int64`` storage.
 
-    The result has the same logical shape as the input but dtype=int32 and
-    stride pattern that skips the high words (stride * 2, offset on lane 0).
-    This view is non-contiguous when the original has >0 dimensions.
+    Args:
+        t (torch.Tensor): Packed ``int64`` tensor.
+
+    Returns:
+        torch.Tensor: Storage-sharing ``int32`` view with the logical shape.
+
+    Raises:
+        TypeError: If ``t`` is not an ``int64`` tensor.
+
+    Note:
+        Each returned stride is twice the corresponding logical stride, so
+        elements in non-size-one dimensions skip their high words.
     """
     if t.dtype != torch.int64:
         raise TypeError(f"expected int64 tensor, got {t.dtype}")
@@ -169,7 +200,17 @@ def packed_int64_low_word_alias(t: torch.Tensor) -> torch.Tensor:
 
 
 def packed_int64_high_word_alias(t: torch.Tensor) -> torch.Tensor:
-    """Return a strided int32 view selecting only the high words from packed int64 storage."""
+    """Return a strided view of the high words in packed ``int64`` storage.
+
+    Args:
+        t (torch.Tensor): Packed ``int64`` tensor.
+
+    Returns:
+        torch.Tensor: Storage-sharing ``int32`` view with the logical shape.
+
+    Raises:
+        TypeError: If ``t`` is not an ``int64`` tensor.
+    """
     if t.dtype != torch.int64:
         raise TypeError(f"expected int64 tensor, got {t.dtype}")
 
@@ -185,21 +226,24 @@ def packed_int64_high_word_alias(t: torch.Tensor) -> torch.Tensor:
 
 
 def packed_int64_execution_view(t: torch.Tensor, *, contiguous: bool = True) -> torch.Tensor:
-    """Extract the low 32 bits from a packed int64 tensor for execution.
-
-    When contiguous=True (default), returns a contiguous int32 tensor with
-    the same logical shape, containing a copy of the low words. This is the
-    tensor that gets passed to compiled graphs.
-
-    When contiguous=False, returns the non-contiguous low-word alias (no copy).
+    """Extract low words from packed ``int64`` storage for graph execution.
 
     Args:
-        t: int64 tensor in packed storage.
-        contiguous: If True, perform device-side DMA gather to produce
-            contiguous output.
+        t (torch.Tensor): Packed ``int64`` tensor.
+        contiguous (bool, optional): Copy into contiguous ``int32`` storage.
+            Defaults to ``True``; ``False`` returns a zero-copy alias.
 
     Returns:
-        int32 tensor with same logical shape as input.
+        torch.Tensor: ``int32`` tensor with the input's logical shape.
+
+    Raises:
+        TypeError: If ``t`` is not an ``int64`` tensor.
+
+    Note:
+        Contiguous Neuron-device inputs route through ``nki_strided_copy_``, which
+        uses an NKI gather kernel for eligible uniform-stride aliases and otherwise
+        falls back to an NRT copy. Non-contiguous inputs use ``copy_``; CPU and meta
+        inputs call ``contiguous`` on the low-word alias.
     """
     if not contiguous:
         return packed_int64_low_word_alias(t)
@@ -229,22 +273,23 @@ def materialize_int64_from_i32(
     *,
     zero_extend: bool = False,
 ) -> torch.Tensor:
-    """Write int32 execution result back into packed int64 storage.
-
-    Takes the int32 result from a compiled graph and packs it into the
-    (low, high) word pairs expected by the packed int64 layout.
-
-    The high word is either sign-extended (default) or zero-extended from
-    the low word.
+    """Write an ``int32`` execution result into packed ``int64`` storage.
 
     Args:
-        dst: Target int64 tensor (will be modified in-place via its packed view).
-        low_words: int32 tensor with execution results (same logical shape as dst).
-        zero_extend: If True, high word is zero. If False, sign-extend (arithmetic
-            right shift by 31).
+        dst (torch.Tensor): Destination ``int64`` tensor modified in place.
+        low_words (torch.Tensor): ``int32`` results matching ``dst`` shape.
+        zero_extend (bool, optional): Fill high words with zero instead of
+            sign-extending. Defaults to ``False``.
 
     Returns:
-        dst tensor (modified in-place).
+        torch.Tensor: The modified ``dst`` tensor.
+
+    Raises:
+        TypeError: If ``dst`` is not ``int64`` or ``low_words`` is not ``int32``.
+        ValueError: If source and destination shapes differ.
+
+    Note:
+        Sign extension uses an arithmetic right shift by 31.
     """
     if dst.dtype != torch.int64:
         raise TypeError(f"expected int64 dst, got {dst.dtype}")

@@ -49,7 +49,13 @@ from torch_neuronx.neuron_dynamo_backend.fx.passes.vocab_sharding_spmd import (
 
 
 class PostAOTProcessingResults(NamedTuple):
-    """Result of graph preprocessing."""
+    """Store post-AOTAutograd graph processing results.
+
+    Args:
+        graph_module (torch.fx.GraphModule): Graph after all configured passes.
+        analysis (dict): Mapping whose ``"pass_mutations"`` entry contains the
+            per-pass mutation records.
+    """
 
     graph_module: torch.fx.GraphModule
     analysis: dict
@@ -61,16 +67,18 @@ def post_aot_processing(
     model_name: str,
     pre_aot_pass_mutations: PassMutations | None = None,
 ) -> PostAOTProcessingResults:
-    """
-    Apply FX graph analysis and transformations after AOTAutograd.
+    """Apply FX passes after AOTAutograd processing.
 
     Args:
-        gm: Input GraphModule
-        job: CompilationJob for dumping FX graph after each pass.
-        model_name: model name for artifact filenames.
+        gm (torch.fx.GraphModule): Graph module to transform.
+        job (CompilationJob): Compilation job that controls artifact preservation.
+        model_name (str): Model name to use in artifact filenames.
+        pre_aot_pass_mutations (PassMutations | None, optional): Mutations recorded
+            before AOTAutograd. Defaults to ``None``.
 
     Returns:
-        PostAOTProcessingResults containing the graph and analysis results
+        PostAOTProcessingResults: Transformed graph and an analysis mapping whose
+            ``"pass_mutations"`` entry contains the per-pass mutation records.
     """
     config = NeuronFXPassState(
         job=job,

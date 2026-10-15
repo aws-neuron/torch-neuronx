@@ -20,17 +20,21 @@ import nki.language as nl
 
 @nki.jit()
 def where_kernel(condition, input_a, input_b, num_m_tiles):
-    """
-    where: output = condition ? input_a : input_b, elementwise.
+    """Select elements from two tensors using a packed condition mask.
 
     Args:
-        condition: [m_static, hidden // 2] int16 on HBM — a bool[m_static, hidden]
-                   mask viewed as int16 (2 bool bytes per element)
-        input_a:   [m_static, hidden] on HBM (selected where condition is true)
-        input_b:   [m_static, hidden] on HBM (selected where condition is false)
-        num_m_tiles: [1, 1] int32 — number of 128-row tiles per program
+        condition (nki.language.ndarray): Int16 view of a bool ``[m_static, hidden]`` mask.
+        input_a (nki.language.ndarray): Values selected where the condition is true.
+        input_b (nki.language.ndarray): Values selected where the condition is false.
+        num_m_tiles (nki.language.ndarray): Number of 128-row tiles per program.
+
     Returns:
-        output: [m_static, hidden], input_a.dtype, on HBM
+        nki.language.ndarray: Selected values with the shape and dtype of ``input_a``.
+
+    Note:
+        ``condition`` has shape ``[m_static, hidden // 2]`` because it packs two
+        bool bytes into each int16 element for correctly offset dynamic DMA reads.
+        Rows not covered by the per-program tile count are not initialized.
     """
     m_static, hidden = input_a.shape
     hidden_half = condition.shape[1]
@@ -69,6 +73,11 @@ def where_kernel(condition, input_a, input_b, num_m_tiles):
         # Load the whole condition row as int16 (2-byte -> correct dynamic offset),
         # then reinterpret to uint8 [128, hidden] in SBUF — same bytes, so column j
         # of the uint8 view is condition bit j. Sliced per h-segment below.
+        """Select values for one interleaved 128-row tile.
+
+        Args:
+            _i (int): Loop index required by ``fori_loop`` and otherwise unused.
+        """
         cond16 = nl.ndarray((tile_size_m, hidden_half), nl.int16, nl.sbuf)
         nisa.dma_copy(
             dst=cond16[0:tile_size_m, 0:hidden_half],

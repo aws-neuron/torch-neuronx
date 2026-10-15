@@ -4,7 +4,7 @@
  * The end-to-end CPU-fallback behavior (out=, inplace, multi-return) is
  * driven by ``at::native::cpu_fallback`` (PyTorch) and exercised by the
  * Python integration tests in
- * ``tests/python_ops/test_int64_integration.py::TestPythonCpuFallback*``.
+ * ``tests/python_ops/test_int64_integration.py::TestCpuFallback*``.
  *
  * These C++ tests pin only the project-specific glue: op-name parsing
  * and OperatorHandle resolution. The pybind layer is intentionally not

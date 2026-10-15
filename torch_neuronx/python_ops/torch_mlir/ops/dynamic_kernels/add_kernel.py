@@ -11,15 +11,19 @@ import nki.language as nl
 
 @nki.jit()
 def add_kernel(input_a, input_b, num_m_tiles):
-    """
-    Elementwise add: output = input_a + input_b
+    """Add two tensors over a runtime-dynamic row dimension.
 
     Args:
-        input_a: [m_static, hidden] bf16 on HBM
-        input_b: [m_static, hidden] bf16 on HBM
-        num_m_tiles: [1, 1] int32, number of 128-row tiles per program
+        input_a (tensor): First ``[m_static, hidden]`` HBM operand.
+        input_b (tensor): Second HBM operand with the first operand's shape and dtype.
+        num_m_tiles (tensor): ``int32`` ``[1, 1]`` count of 128-row tiles per program.
+
     Returns:
-        output: [m_static, hidden] bf16 on HBM
+        tensor: Elementwise sum with the first operand shape and dtype in HBM.
+
+    Note:
+        Only rows covered by ``num_m_tiles`` across the programs are written;
+        remaining rows in the static result are uninitialized.
     """
     m_static, hidden = input_a.shape
 
@@ -52,6 +56,11 @@ def add_kernel(input_a, input_b, num_m_tiles):
     nisa.memset(m_tile_start, 0.0)
 
     def body(_i):
+        """Process one dynamic row-tile iteration.
+
+        Args:
+            _i (int): Loop iteration placeholder, which is not read directly.
+        """
         for seg in range(len(h_starts)):
             h_start = h_starts[seg]
             h_width = h_widths[seg]

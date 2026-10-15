@@ -92,10 +92,11 @@ def _backward_hierarchy_from_op(op_name: str) -> str:
 
 
 def reset_backward_counters() -> None:
-    """Reset backward counters for the current thread.
+    """Reset backward-operation counters for the current thread.
 
-    Call between backward passes to prevent unbounded counter growth
-    during long training runs.
+    Note:
+        Call this between backward passes to prevent unbounded counter growth
+        during long training runs.
     """
     _backward_local.counters = {}
 
@@ -142,22 +143,20 @@ def _compute_stack_fingerprint(start_frame):
 
 
 def get_hierarchy_from_stack(op_name: str = "") -> str:
-    """Walk the live call stack and return a hierarchy string.
-
-    Forward pass: builds hierarchy from live nn.Module frames.
-    Backward pass: uses op_name directly as a flat label (stack investigation
-                   confirmed grad_fn objects are not accessible on the C++
-                   autograd engine thread).
-
-    Uses stack fingerprint caching: if the frame chain + module instances
-    match a previous call, returns the cached result without the expensive
-    f_locals walk + isinstance checks.
+    """Build a hierarchy label from the live call stack.
 
     Args:
-        op_name: The aten op name (e.g. 'aten::linear_backward'). Required for
-                 backward ops to produce a meaningful label.
+        op_name (str, optional): ATen op name used for backward fallback. Defaults
+            to ``""``.
 
-    Returns a '/'-delimited string or empty string if nothing found.
+    Returns:
+        str: Slash-delimited forward hierarchy, counted backward label, or an
+        empty string when neither is available.
+
+    Note:
+        Forward labels use live ``nn.Module`` frames and cached stack fingerprints.
+        Without module frames, ``op_name`` produces a flat backward label because
+        the C++ autograd engine thread does not expose ``grad_fn`` objects.
     """
     global _current_top_level_id
 

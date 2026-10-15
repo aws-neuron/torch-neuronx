@@ -33,15 +33,17 @@ logger = logging.getLogger(__name__)
 
 
 class AliasingAnalysis(NeuronFXPass):
-    """Aliasing and Mutation Analysis Pass for PyTorch FX Graphs.
+    """Analyze FX graph input mutations and output aliases.
 
-    This pass analyzes a PyTorch FX GraphModule to identify:
-    1. Output tensors that alias input tensors (via view operations)
-    2. Input tensors that are mutated in-place (via setitem or in-place methods)
+    Args:
+        state (NeuronFXPassState | None, optional): Shared state used for pass artifact
+            dumping. Defaults to ``None``.
 
-    The output aliasing information is transformed to match AOTAutograd's
-    output convention where mutated inputs appear first (sorted by input index),
-    followed by non-aliased explicit outputs.
+    Note:
+        Recognizes view and slice aliases plus setitem, in-place method or operator,
+        mutable custom-op, and NKI mutations. Results follow AOTAutograd order:
+        mutated inputs sorted by input index, then explicit outputs except aliases of
+        mutated inputs, which are deduplicated.
     """
 
     def __init__(self, state: NeuronFXPassState | None = None):
@@ -51,6 +53,11 @@ class AliasingAnalysis(NeuronFXPass):
 
     @property
     def name(self) -> str:
+        """Return the pass name.
+
+        Returns:
+            str: The ``aliasing_analysis`` identifier.
+        """
         return "aliasing_analysis"
 
     # =========================================================================
@@ -205,7 +212,14 @@ class AliasingAnalysis(NeuronFXPass):
         return node.target in self.ALIASING_METHODS
 
     def is_aliasing_op(self, node: Node) -> bool:
-        """Determine if a node creates a view/alias."""
+        """Determine whether an FX node creates a tensor alias.
+
+        Args:
+            node: FX node to classify.
+
+        Returns:
+            bool: ``True`` for recognized slice, method, or ATen aliasing operations.
+        """
         return (
             self._is_slice_operation(node)
             or self._is_method_aliasing_op(node)
@@ -213,7 +227,14 @@ class AliasingAnalysis(NeuronFXPass):
         )
 
     def is_mutating_op(self, node: Node) -> bool:
-        """Determine if a node mutates a tensor in-place."""
+        """Determine whether an FX node mutates a tensor in place.
+
+        Args:
+            node: FX node to classify.
+
+        Returns:
+            bool: ``True`` for recognized setitem, method, or operator mutations.
+        """
         return (
             self._is_setitem_operation(node)
             or self._is_inplace_method(node)
@@ -583,19 +604,19 @@ class AliasingAnalysis(NeuronFXPass):
     # =========================================================================
 
     def call(self, gm: torch.fx.GraphModule) -> PassResult:
-        """Execute the aliasing analysis pass.
-
-        Analyzes the graph and produces aliasing information that matches
-        AOTAutograd's output convention.
+        """Analyze graph aliases and mutations without modifying the graph.
 
         Args:
-            gm: The GraphModule to analyze (not modified).
+            gm: Graph module to analyze.
 
         Returns:
-            PassResult with modified=False. Results stored in self.result.
+            PassResult: The unchanged graph module with ``modified`` set to ``False``.
 
         Raises:
-            RuntimeError: If analysis fails.
+            RuntimeError: If the graph is malformed or alias analysis fails.
+
+        Note:
+            Detailed output-to-input relationships are stored in ``self.result``.
         """
         try:
             alias_chain: dict[Node, Node] = {}

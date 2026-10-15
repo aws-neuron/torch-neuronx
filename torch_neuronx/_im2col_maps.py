@@ -39,7 +39,21 @@ def _block_flat_indices(kh, kw, ho, wo, dh, dw, sh, sw, w_pad, device):
 
 
 def im2col_forward(x, kernel_size, dilation, padding, stride):
-    """aten::im2col: extract sliding blocks into columns."""
+    """Extract sliding image blocks into columns for ``aten::im2col``.
+
+    Args:
+        x (torch.Tensor): Batched or unbatched image tensor.
+        kernel_size (Sequence[int]): Two-dimensional kernel size.
+        dilation (Sequence[int]): Two-dimensional kernel dilation.
+        padding (Sequence[int]): Two-dimensional input padding.
+        stride (Sequence[int]): Two-dimensional block stride.
+
+    Returns:
+        torch.Tensor: Extracted columns, preserving batchedness.
+
+    Note:
+        Non-overlapping unit-dilation tiles use a reshape-and-permute fast path.
+    """
     kh, kw = _pair(kernel_size)
     dh, dw = _pair(dilation)
     ph, pw = _pair(padding)
@@ -70,7 +84,23 @@ def im2col_forward(x, kernel_size, dilation, padding, stride):
 
 
 def col2im_forward(cols, output_size, kernel_size, dilation, padding, stride):
-    """aten::col2im: scatter columns back to an image, summing overlaps."""
+    """Scatter columns into an image and sum overlaps for ``aten::col2im``.
+
+    Args:
+        cols (torch.Tensor): Batched or unbatched columns tensor.
+        output_size (Sequence[int]): Two-dimensional output image size.
+        kernel_size (Sequence[int]): Two-dimensional kernel size.
+        dilation (Sequence[int]): Two-dimensional kernel dilation.
+        padding (Sequence[int]): Two-dimensional output padding.
+        stride (Sequence[int]): Two-dimensional block stride.
+
+    Returns:
+        torch.Tensor: Reconstructed image tensor, preserving batchedness.
+
+    Note:
+        Accumulation uses axis zero to avoid slow minor-axis index addition on a
+        Neuron device.
+    """
     h, w = _pair(output_size)
     kh, kw = _pair(kernel_size)
     dh, dw = _pair(dilation)

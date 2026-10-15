@@ -9,6 +9,7 @@ torch.profiler.profile(), offering profiling coverage for Neuron workloads.
 
 import logging
 import os
+from dataclasses import dataclass
 from enum import Enum, IntFlag
 from typing import ClassVar
 
@@ -21,10 +22,11 @@ logger = logging.getLogger(__name__)
 
 
 class ProfileMode(Enum):
-    """Neuron profiling modes for use with NeuronConfig.
+    """Select Neuron-specific profiling granularity.
 
-    Similar to torch.profiler.ProfilerActivity but for Neuron-specific
-    profiling granularity.
+    Note:
+        This enum parallels ``torch.profiler.ProfilerActivity`` and selects
+        the NRT profiling modes configured by ``NeuronConfig``.
     """
 
     DEVICE = "device"
@@ -34,24 +36,29 @@ class ProfileMode(Enum):
 
 
 class InspectExportMask(IntFlag):
-    """Selects what nrt_inspect_export exports.
+    """Select data for ``nrt_inspect_export`` to write.
 
-    Keep members and values in lock-step with at::neuron::InspectExportMask
-    (csrc/profiler/ContinuousExporter.h).
+    Note:
+        ``SYSTEM_PROFILE`` writes per-core part files, ``DEVICE_PROFILE`` stages HBM
+        notifications in host memory, and session stop writes the NTFF. ``ALL`` selects
+        both. Keep values synchronized with ``at::neuron::InspectExportMask``.
     """
 
     SYSTEM_PROFILE = 1
+    DEVICE_PROFILE = 2
+    ALL = SYSTEM_PROFILE | DEVICE_PROFILE
 
 
 class ExportStatus(Enum):
-    """Frontend gating status for the asynchronous request_export() path.
+    """Report frontend gating outcomes for asynchronous export requests.
 
-    This domain is deliberately disjoint from NRT's status codes: the async
-    drain runs later on a background thread, so the only outcomes reportable
-    synchronously are frontend configuration checks. The synchronous
-    export_now() path instead surfaces NRT's own status verbatim (via
-    NRTProfilerError.status). Keep members and values in lock-step with
-    at::neuron::ExportStatus (csrc/profiler/ContinuousExporter.h).
+    Note:
+        These values report immediate frontend submission checks rather than later
+        NRT drain statuses; their numeric values may overlap NRT status codes.
+        ``request_export`` uses them for immediate submission results, while
+        ``export_now`` exposes NRT status through ``NRTProfilerError.status``.
+        Keep values synchronized with ``at::neuron::ExportStatus`` in
+        ``ContinuousExporter.h``.
     """
 
     # Successfully submitted and will be executed later. Async API.
@@ -69,17 +76,84 @@ class ExportStatus(Enum):
     UNSUPPORTED_MASK = 4
 
 
-class ContinuousExportConfig:
-    """Config that expresses the user-intent that the profile data export
-    might be requested by the user code. The default is NO-EXPORT outside
-    of session end.
+_MAX_TIME_TRIGGER_INTERVAL_MS = (2**63 - 1) // 1_000_000
 
-    Enables the background exporter thread used by request_export(); it
-    configures no automatic export policy.
+
+@dataclass(frozen=True)
+class TimeTrigger:
+    """Immutable interval and mask for automatic exports.
+
+    Each active session owns its timer. This value stores configuration only.
+
+    Args:
+        interval_ms: Positive integer in milliseconds, at most (2**63 - 1) // 1_000_000.
+            This limit keeps the nanosecond interval within a signed 64-bit integer.
+        mask: Explicit, nonzero combination of supported InspectExportMask bits.
+
+    Raises:
+        TypeError: If ``interval_ms`` is not an integer or is a ``bool``, or ``mask``
+            is not an ``InspectExportMask``.
+        ValueError: If ``interval_ms`` is outside the supported range or ``mask`` is
+            empty or contains unsupported bits.
     """
 
+    interval_ms: int
+    mask: InspectExportMask
+
+    def __post_init__(self) -> None:
+        """Validate the interval and the supported mask bits."""
+        if isinstance(self.interval_ms, bool) or not isinstance(self.interval_ms, int):
+            raise TypeError("interval_ms has an invalid type. Pass an int other than bool.")
+        if not 0 < self.interval_ms <= _MAX_TIME_TRIGGER_INTERVAL_MS:
+            raise ValueError(
+                "interval_ms is outside the supported range. "
+                f"Pass a value from 1 to {_MAX_TIME_TRIGGER_INTERVAL_MS}."
+            )
+        mask_bits = _export_mask_to_int(self.mask)
+        supported_bits = 0
+        for member in InspectExportMask:
+            supported_bits |= int(member)
+        if mask_bits == 0 or mask_bits & ~supported_bits:
+            raise ValueError(
+                "mask is empty or has unsupported bits. Select supported InspectExportMask bits."
+            )
+
+
+class ContinuousExportConfig:
+    """Configure asynchronous and optional timed profile export.
+
+    Args:
+        policy (TimeTrigger | None, optional): Automatic export interval and mask.
+            Defaults to ``None`` (explicit requests only).
+
+    Raises:
+        TypeError: If ``policy`` is neither a ``TimeTrigger`` nor ``None``.
+
+    Note:
+        Passing this configuration to ``NeuronConfig`` enables the worker used by
+        ``request_export`` when the profiler session starts. Without this
+        configuration, buffered data is exported only at session end or by
+        ``export_now``.
+    """
+
+    def __init__(self, policy: TimeTrigger | None = None) -> None:
+        """Store an optional policy without runtime state."""
+        if policy is not None and not isinstance(policy, TimeTrigger):
+            raise TypeError("policy has an invalid type. Pass a TimeTrigger or None.")
+        self.policy = policy
+
     def _to_config_parts(self) -> list[str]:
-        return ["continuous_export:true"]
+        """Return export settings for a new profiler session."""
+        parts = ["continuous_export:true"]
+        if self.policy is not None:
+            parts.extend(
+                [
+                    "export_policy:time",
+                    f"export_interval_ms:{self.policy.interval_ms}",
+                    f"export_mask:{int(self.policy.mask)}",
+                ]
+            )
+        return parts
 
 
 def _export_mask_to_int(mask: InspectExportMask) -> int:
@@ -92,20 +166,23 @@ _NRT_SUCCESS = 0
 
 
 def export_now(mask: InspectExportMask) -> None:
-    """Synchronously export the currently captured profiled events to disk.
+    """Export currently buffered profile events synchronously.
 
-    This can be used to empty the profile event buffers so that they can be reused.
-    This lets you capture more events in the same session with the same buffer sizes.
-    This is a synchronous, blocking API; consider the async `request_export`.
-
-    A pure passthrough to nrt_inspect_export: with no active session NRT no-ops
-    successfully, and any NRT failure is surfaced verbatim.
+    Args:
+        mask (InspectExportMask): Profile data categories to export.
 
     Raises:
-        NRTProfilerError: nrt_inspect_export returned non-success; the `status`
-            attribute carries NRT's status code verbatim.
-    """
+        TypeError: If ``mask`` is not an ``InspectExportMask``.
+        NRTProfilerError: If NRT returns a non-success status; ``status`` contains
+            the original NRT status code.
 
+    Note:
+        This blocking call drains reusable buffers. System export writes part files;
+        device export stages HBM notifications for the session-end NTFF. Device export
+        requires ``NEURON_RT_INSPECT_ENABLE_PERIODIC_HBM_COLLECTOR=1`` before runtime
+        initialization and is otherwise skipped successfully. No active capture is also
+        a successful no-op. Use ``request_export`` for asynchronous submission.
+    """
     status = _C._nrt_inspect_export_now(_export_mask_to_int(mask))
     if status != _NRT_SUCCESS:
         error = NRTProfilerError(f"nrt_inspect_export failed. StatusCode: {status}")
@@ -114,21 +191,21 @@ def export_now(mask: InspectExportMask) -> None:
 
 
 def request_export(mask: InspectExportMask) -> None:
-    """Request an asynchronous export of the currently captured profile data to disk.
+    """Request asynchronous export of currently buffered profile events.
 
-    This can be used to empty the profile event buffers so that they can be reused.
-    This lets you capture more events in the same session with the same buffer sizes.
-
-    Configuration and gating errors are raised immediately so there is no
-    expectation mismatch. The export itself runs later on a background thread;
-    its outcome is not reported back -- failures appear in the Neuron logs.
+    Args:
+        mask (InspectExportMask): Profile data categories to export.
 
     Raises:
-        NRTProfilerError: the request was not accepted (no active session,
-            continuous export not enabled, or unsupported mask); the `status`
-            attribute carries the corresponding ExportStatus member.
-    """
+        TypeError: If ``mask`` is not an ``InspectExportMask``.
+        NRTProfilerError: If no session is active, continuous export is disabled,
+            the mask is unsupported, or the frontend returns an unknown status.
 
+    Note:
+        Accepted requests drain reusable buffers on a background thread, and overlapping
+        requests can coalesce. Later failures are written to Neuron logs and not returned;
+        ``status`` records the immediate ``ExportStatus`` or unknown integer.
+    """
     submit_status = _C._nrt_inspect_request_export(_export_mask_to_int(mask))
     try:
         status = ExportStatus(submit_status)
@@ -146,31 +223,30 @@ def request_export(mask: InspectExportMask) -> None:
 
 
 class NeuronConfig(_ExperimentalConfig):
-    """Neuron profiler configuration for use with torch.profiler.profile().
-
-    Subclasses _ExperimentalConfig so it can be passed directly to
-    experimental_config=. The neuron_profile key in custom_profiler_config
-    controls which NRT profiling modes are enabled.
+    """Configure Neuron profiling for ``torch.profiler.profile``.
 
     Args:
-        modes: List of ProfileMode values to enable.
-            Defaults to [DEVICE, RUNTIME].
-        max_events_per_nc: Maximum number of trace events per NeuronCore.
-        capture_enabled_for_nc: Comma-separated NeuronCore indices/ranges to capture
-            (e.g., "0,1,2-5").
-        profile_output_dir: Directory for NRT trace output files.
-        precache_node_info: When True, pre-cache expensive per-NEFF metadata
-            during wait iterations so the actively profiled iteration has reduced
-            overhead. Useful with torch.profiler.schedule(wait=N, warmup=M, active=K).
-        neff_cache_dir: Path to the NEFF cache directory. When set, the cached
-            NEFFs will be copied into the profile artifact directory when stopping
-            the profile instead of creating an additional copy on load.
-        correlate_device_time: When True, NeuronProfiler.export_trace()
-            automatically correlates device execution times into FunctionEvents
-            so key_averages() shows NEURON device time columns. Default: False.
-        continuous_export: Optional ContinuousExportConfig. Enables the
-            background export worker used by request_export(); configures no
-            automatic export policy but forthcoming..
+        modes (list[ProfileMode], optional): Modes to enable. Defaults to device
+            and runtime profiling.
+        max_events_per_nc (int, optional): Maximum events per NeuronCore. Defaults to ``None``.
+        capture_enabled_for_nc (str, optional): NeuronCore indices or ranges. Defaults to ``None``.
+        profile_output_dir (str, optional): Directory for NRT trace files. Defaults to ``None``.
+        precache_node_info (bool, optional): Pre-cache per-NEFF metadata during profiler wait
+            iterations. Defaults to ``True``.
+        neff_cache_dir (str, optional): NEFF cache copied into profile artifacts at
+            session stop. Defaults to ``TORCH_NEURONX_NEFF_CACHE_DIR``, then ``None``.
+        correlate_device_time (bool, optional): Correlate device times during trace export.
+            Defaults to ``False``.
+        continuous_export (ContinuousExportConfig, optional): Enable the background
+            export worker and its optional timed policy. Defaults to ``None``.
+
+    Raises:
+        ValueError: If ``modes`` is empty.
+        TypeError: If a mode or ``continuous_export`` has an invalid type.
+
+    Note:
+        This subclasses ``_ExperimentalConfig`` for use as ``experimental_config``;
+        ``neuron_profile`` controls the NRT modes.
     """
 
     _DEFAULT_MODES: ClassVar[list[ProfileMode]] = [ProfileMode.DEVICE, ProfileMode.RUNTIME]
@@ -238,13 +314,18 @@ class NeuronConfig(_ExperimentalConfig):
             _C._nrt_inspect_precache_enable()
 
     def get_session_dir(self) -> str:
-        """Get the NRT instance output directory for the current profiling session.
-
-        Must be called after profiling has started (i.e. after the profile context
-        manager has entered), as the directory is created by nrt_inspect_begin.
+        """Return the NRT output directory for the current profiling session.
 
         Returns:
-            Path to the instance-specific output directory.
+            str: Instance-specific profile output directory.
+
+        Raises:
+            ValueError: If ``profile_output_dir`` was not configured.
+            RuntimeError: If NRT cannot resolve the instance output directory.
+
+        Note:
+            Call this after entering the profiler context because
+            ``nrt_inspect_begin`` creates the directory.
         """
         if self.profile_output_dir is None:
             raise ValueError("profile_output_dir was not set on this NeuronConfig")
@@ -252,33 +333,18 @@ class NeuronConfig(_ExperimentalConfig):
 
 
 class NeuronProfiler:
-    """Exports PyTorch chrome traces into the NRT session output directory.
-
-    Wraps the time-dependent session directory lookup so callers never need
-    to reason about when to query it.
+    """Export PyTorch Chrome traces into an NRT session directory.
 
     Args:
-        config: A NeuronConfig whose profile_output_dir is set.
+        config (NeuronConfig): Configuration with ``profile_output_dir`` set.
 
-    Example:
-        config = NeuronConfig(profile_output_dir="./output")
-        profiler = NeuronProfiler(config)
+    Raises:
+        ValueError: If ``config.profile_output_dir`` is not set.
 
-        # As on_trace_ready callback
-        with profile(..., on_trace_ready=lambda p: profiler.export_trace(p)):
-            ...
-
-        # Inside a custom hook
-        def my_hook(prof):
-            # custom logic
-            profiler.export_trace(prof)
-        with profile(..., on_trace_ready=my_hook):
-            ...
-
-        # Or called directly after profiling
-        with profile(...) as prof:
-            ...
-        profiler.export_trace(prof)
+    Note:
+        Session-directory lookup is deferred until each export, so ``export_trace``
+        can be used as an ``on_trace_ready`` callback, called from a custom hook,
+        or called directly after profiling.
     """
 
     def __init__(self, config: NeuronConfig):
@@ -287,30 +353,62 @@ class NeuronProfiler:
         self._config = config
 
     def export_trace(self, prof, filename: str = "trace.json"):
-        """Export a PyTorch chrome trace into the current NRT session directory.
-
-        Automatically calls correlate_device_time() before export if enabled
-        on the NeuronConfig (correlate_device_time=True), so key_averages()
-        will show NEURON device time columns without any additional user action.
+        """Export a PyTorch Chrome trace into the current NRT session directory.
 
         Args:
-            prof: The torch.profiler.profile instance.
-            filename: Trace file name within the session directory.
+            prof: ``torch.profiler.profile`` instance to export.
+            filename (str, optional): File name within the session directory. Defaults to
+                ``"trace.json"``.
+
+        Raises:
+            ValueError: If ``profile_output_dir`` was not configured.
+            RuntimeError: If NRT cannot resolve the instance output directory.
+
+        Note:
+            When configured, device-time correlation runs before export so
+            ``key_averages`` includes Neuron device time columns.
         """
         if self._config.correlate_device_time:
             correlate_device_time(prof)
         session_dir = self._config.get_session_dir()
         prof.export_chrome_trace(os.path.join(session_dir, filename))
 
+    def export_snapshot(self, filename: str = "memory_snapshot.pickle") -> str:
+        """Dump a PyTorch memory snapshot into the current NRT session directory.
+
+        Args:
+            filename (str, optional): Snapshot file name within the session directory.
+                Defaults to ``"memory_snapshot.pickle"``.
+
+        Returns:
+            str: Full path written by the memory snapshot exporter.
+
+        Note:
+            This co-locates framework memory data with the system profile for tooling.
+            Enable ``torch_neuronx.memory._record_memory_history`` first, then call this
+            after the profiled region in the same process and rank that recorded it.
+        """
+        from torch_neuronx import memory as _memory
+
+        session_dir = self._config.get_session_dir()
+        path = os.path.join(session_dir, filename)
+        _memory._dump_snapshot(path)
+        return path
+
 
 _NON_COMPUTE_PREFIXES = ("neuron::alloc", "neuron::dealloc", "neuron::copy")
 
 
 def correlate_device_time(prof) -> None:
-    """Inject device execution time into profiler FunctionEvents.
+    """Inject Neuron device execution time into profiler function events.
 
-    Call after profiling to enable NEURON time columns in key_averages().
-    When using a schedule, call this inside on_trace_ready instead.
+    Args:
+        prof: Completed ``torch.profiler.profile`` instance to update.
+
+    Note:
+        Call this after profiling, or from ``on_trace_ready`` with a schedule.
+        Repeated calls are no-ops; allocation, deallocation, copy, host,
+        asynchronous, duplicate, and nonpositive-duration events are ignored.
     """
     if getattr(prof, "_neuron_correlated", False):
         return
@@ -369,6 +467,12 @@ def correlate_device_time(prof) -> None:
 
 
 class NRTProfilerError(Exception):
-    """Exception raised for NRT profiling errors."""
+    """Represent an NRT profiling failure.
+
+    Note:
+        Export APIs attach an NRT status integer, a known frontend
+        ``ExportStatus``, or an unknown frontend status integer to the ``status``
+        attribute.
+    """
 
     pass

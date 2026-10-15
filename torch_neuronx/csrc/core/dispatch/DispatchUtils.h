@@ -169,7 +169,7 @@ bool HasEmptyOutputTensor(const std::vector<c10::IValue>& args, const c10::Funct
  */
 bool HasComplexInput(const std::vector<c10::IValue>& args);
 
-/** Read TORCH_NEURONX_COMPLEX_DECOMPOSE on each call (default: false). */
+/** Read TORCH_NEURONX_COMPLEX_DECOMPOSE on each call (default: true). */
 bool ComplexDecompositionEnabled();
 
 /**
@@ -197,7 +197,7 @@ bool HasComplexNonOutputInput(const std::vector<c10::IValue>& args,
 
 bool HasNativeComplexLowering(const std::string& lookup_name);
 
-bool ShouldUseComplexDecomposition(bool has_lower_func);
+bool ShouldUseComplexDecomposition(const std::string& lookup_name, bool has_lower_func);
 
 // ═══════════════════════════════════════════════════════════════
 //  64-bit Dtype Detection and Downcasting
@@ -220,6 +220,15 @@ bool IsSupportedDtype(c10::ScalarType dt);
  * @param schema Op schema (to iterate args correctly)
  */
 void DowncastArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& schema);
+
+/**
+ * Copy IValue arguments while giving TensorList and GenericList values
+ * independent container storage. Tensor objects themselves remain shared.
+ *
+ * Dispatch preprocessing mutates list containers in place, so a plain vector
+ * copy is not a stable snapshot for CPU fallback or original-dtype inference.
+ */
+std::vector<c10::IValue> CloneIValueListContainers(const std::vector<c10::IValue>& args);
 
 /**
  * Promote the two leading tensor operands to c10::promoteTypes(a, b) for
@@ -309,6 +318,23 @@ std::string ExtractBaseOpName(const std::string& op_name);
 bool RawNrtCopyOverlaps(const at::Tensor& src, const at::Tensor& dst);
 
 /**
+ * If `tensors` are adjacent, non-overlapping 1-D views that tile one storage,
+ * return a single 1-D view spanning all of them; otherwise return an undefined
+ * tensor.
+ *
+ * Tiling means: one storage, one dtype, every element a plain 1-D contiguous
+ * memory view — no neg or conj flag, since those live outside memory and the
+ * span could only carry one of them — and each view starting exactly where the
+ * previous one ended. Zero-numel entries advance the offset by nothing, so they
+ * neither contribute to the span nor break adjacency.
+ *
+ * An elementwise operation applied to such a list touches exactly the bytes of
+ * the returned view, in the same order, so N of them can be issued as one. That
+ * is a property of the list's storage geometry rather than of any one operator.
+ */
+at::Tensor CoalesceAdjacentViews(const c10::List<at::Tensor>& tensors);
+
+/**
  * Reduction op configuration for empty tensor handling.
  * Mirrors Python ReductionOps in config.py.
  */
@@ -371,6 +397,30 @@ struct MatmulAccumulateConfig {
  */
 const MatmulAccumulateConfig* GetMatmulAccumulateConfig(const std::string& op_name);
 
+/**
+ * Config for ops that produce non-empty output from empty input using a fill
+ * value or bias term (e.g. constant_pad_nd uses a scalar pad value, linear
+ * uses the bias tensor).  When the contraction/input dim is empty but the
+ * output is non-empty, the result is the fill value broadcast to the output
+ * shape.
+ *
+ * fill_arg: schema argument name whose value fills the output.
+ *           For scalar fill (constant_pad_nd "value"): make_full(fill_scalar).
+ *           For tensor fill (linear "bias"): broadcast bias to output shape.
+ * fill_default: default when the argument is absent / None.
+ */
+struct FillValueConfig {
+  std::string fill_arg;  // Schema arg name ("value" or "bias")
+  double fill_default;   // Default fill (0.0 for pad, N/A for bias)
+  bool is_tensor_fill;   // true = tensor arg (bias), false = scalar arg (value)
+};
+
+/**
+ * Check if an op has a fill-value config for empty-input handling.
+ * Returns nullptr if the op is not one.
+ */
+const FillValueConfig* GetFillValueConfig(const std::string& op_name);
+
 /** True if any dimension of `shape` is zero (i.e. the tensor is empty). */
 bool HasZeroDim(const std::vector<int64_t>& shape);
 
@@ -387,6 +437,13 @@ bool HasZeroDim(const std::vector<int64_t>& shape);
 c10::Scalar ExtractScalarArg(const std::vector<c10::IValue>& args,
                              const c10::FunctionSchema& schema, const std::string& name,
                              const c10::Scalar& default_value);
+
+/**
+ * Extract a tensor argument by schema name.
+ * Returns an undefined Tensor when absent or not a tensor.
+ */
+torch::Tensor ExtractTensorArg(const std::vector<c10::IValue>& args,
+                               const c10::FunctionSchema& schema, const std::string& name);
 
 // ═══════════════════════════════════════════════════════════════
 //  Meta dispatch utilities — used by HandleEmptyTensors.
@@ -442,6 +499,8 @@ struct MetaOutputSpec {
   std::vector<int64_t> shape;
   c10::ScalarType dtype;
   bool is_undefined;  // True for None/undefined tensor outputs
+  // The layout that ATen gives the output. Empty for an undefined output.
+  std::vector<int64_t> strides;
 };
 
 /**
@@ -460,6 +519,61 @@ std::vector<MetaOutputSpec> ExtractMetaOutputSpecs(torch::jit::Stack& stack);
  */
 std::vector<MetaOutputSpec> InferOutputsViaMeta(const c10::OperatorHandle& op,
                                                 const std::vector<c10::IValue>& args);
+
+/**
+ * Report the output layout that ATen gives this op for these arguments.
+ *
+ * ATen propagates the layout of the inputs to the output. A Neuron output is
+ * contiguous instead, because DispatchCacheEntry::OutputSpec holds a shape and
+ * a dtype only. Call this function on a cache miss to recover the layout.
+ *
+ * The result is empty when there is no layout to propagate. The reasons are:
+ * the epilogue is off, the op writes an argument, every input is contiguous,
+ * or the Meta kernel rejects the arguments.
+ *
+ * Each entry keeps the Meta shape and dtype. The strides field is non-empty
+ * only for a dense permutation that the epilogue can fuse into the NEFF. An
+ * empty strides field means keep the contiguous output.
+ *
+ * @param op             The operator handle
+ * @param schema         Op schema
+ * @param original_args  Arguments before DowncastArgs and PreprocessArgs. The
+ *                       tensors still carry the strides of the caller.
+ * @return               One entry for each Meta tensor return, or empty
+ */
+std::vector<MetaOutputSpec> AtenOutputLayouts(const c10::OperatorHandle& op,
+                                              const c10::FunctionSchema& schema,
+                                              const std::vector<c10::IValue>& original_args);
+
+/**
+ * Resolve the narrow functional weak-integer-scalar route before Neuron
+ * downcasting/lowering.
+ *
+ * PyTorch represents a Python integer passed to a Tensor overload as a
+ * zero-dimensional CPU tensor with TensorImpl::is_wrapped_number().  Neuron's
+ * preprocessing materializes a new device tensor and therefore cannot carry
+ * that runtime-only bit into StableHLO.  Meta conversion intentionally keeps
+ * this adapter on CPU: Python-registered Meta kernels convert it back to the
+ * original Python number, and PyTorch forbids a wrapped number on Meta.
+ * For a functional binary route with
+ * exactly one wrapped integral tensor and one ordinary integral tensor (any rank),
+ * ask the exact ATen Meta kernel for the result dtype.  The wrapped operand is
+ * normalized only when that dtype equals the ordinary tensor's dtype.
+ *
+ * Writable schemas, multi-output schemas, comparisons, true division, and
+ * other policies whose output dtype does not prove the operand dtype do not
+ * satisfy these guards and are left unchanged.
+ *
+ * @param memo_key  Raw-args dispatch cache key. When non-empty, the Meta
+ *                  verdict is memoized under it so the Meta kernel runs once
+ *                  per key instead of on every eager call.
+ * @return true when a wrapped operand was replaced by an ordinary tensor cast
+ *         to the Meta-derived dtype.
+ */
+bool NormalizeWrappedIntegerScalarViaMeta(const c10::OperatorHandle& op,
+                                          std::vector<c10::IValue>& args,
+                                          const c10::FunctionSchema& schema,
+                                          const std::string& memo_key = "");
 
 // ═══════════════════════════════════════════════════════════════
 //  Static vs runtime argument classification

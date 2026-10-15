@@ -10,6 +10,15 @@ logger = logging.getLogger(__name__)
 
 
 def setup_distributed() -> tuple[int, int]:
+    """Initialize a Gloo process group from environment variables.
+
+    Returns:
+        tuple[int, int]: Current process rank and world size.
+
+    Raises:
+        KeyError: If ``RANK`` or ``WORLD_SIZE`` is absent from the environment.
+        ValueError: If either environment value cannot be converted to an integer.
+    """
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     dist.init_process_group("gloo")
@@ -17,6 +26,16 @@ def setup_distributed() -> tuple[int, int]:
 
 
 def log_model_info(rank: int, model: torch.nn.Module, model_name: str):
+    """Log parameter statistics for a model.
+
+    Args:
+        rank (int): Process rank included in log messages.
+        model (torch.nn.Module): Model whose parameters to count.
+        model_name (str): Model name included in log messages.
+
+    Returns:
+        None: This function only emits log messages.
+    """
     param_count = sum(p.numel() for p in model.parameters())
     param_nonzero = sum((p != 0).sum().item() for p in model.parameters())
     logger.info(f"Rank {rank}: Model: {model_name}")
@@ -24,7 +43,19 @@ def log_model_info(rank: int, model: torch.nn.Module, model_name: str):
 
 
 def run_eager_forward(rank: int, model: torch.nn.Module, *inputs) -> tuple[torch.Tensor, float]:
-    """Run eager forward pass on neuron device for comparison with compiled."""
+    """Run an eager forward pass on a Neuron device.
+
+    Args:
+        rank (int): Index of the target Neuron device.
+        model (torch.nn.Module): Model to move to the device and execute.
+        *inputs (Any): Inputs to localize when needed and move to the device.
+
+    Returns:
+        tuple[torch.Tensor, float]: Model output and wall-clock model-call time in seconds.
+
+    Note:
+        ``model.to(device)`` moves the model parameters and buffers in place.
+    """
     device = torch.device(f"neuron:{rank}")
 
     # Move model to neuron if not already
@@ -62,6 +93,16 @@ def run_eager_forward(rank: int, model: torch.nn.Module, *inputs) -> tuple[torch
 def compile_model(rank: int, model: torch.nn.Module, model_name: str):
     # Runs torch.compile with the neuron backend.
     # Assumes model is already on neuron device
+    """Wrap a model with the Dynamo backend.
+
+    Args:
+        rank (int): Process rank appended to the registered model name.
+        model (torch.nn.Module): Model to compile; it must already be on a Neuron device.
+        model_name (str): Base name registered for the compilation.
+
+    Returns:
+        torch.nn.Module: Full-graph compiled model wrapper.
+    """
     from torch_neuronx.neuron_dynamo_backend import set_model_name
 
     set_model_name(f"{model_name}_rank{rank}")
@@ -81,6 +122,17 @@ def run_neuron_forward(
     rank: int, compiled_model: torch.nn.Module, *inputs, run_number: int = 1
 ) -> tuple[torch.Tensor, float]:
     # Neuron forward pass
+    """Run a compiled forward pass on a Neuron device.
+
+    Args:
+        rank (int): Index of the target Neuron device.
+        compiled_model (torch.nn.Module): Compiled model to execute.
+        *inputs (Any): Inputs to localize when needed and move to the device.
+        run_number (int, optional): Run number used in log messages. Defaults to ``1``.
+
+    Returns:
+        tuple[torch.Tensor, float]: Model output and wall-clock model-call time in seconds.
+    """
     if run_number == 1:
         logger.info(f"Rank {rank}: Running first Neuron forward pass (compiles NEFF)...")
     else:
@@ -122,6 +174,15 @@ def run_neuron_forward(
 
 def log_comparison_summary(rank: int, model_name: str):
     # Prints that were in the previous tests
+    """Log the comparison completion summary on rank zero.
+
+    Args:
+        rank (int): Process rank; nonzero ranks do not log the summary.
+        model_name (str): Model name displayed in the summary.
+
+    Returns:
+        None: This function only emits log messages.
+    """
     if rank == 0:
         logger.info("\n" + "=" * 80)
         logger.info(f"{model_name.upper()} ACCURACY TEST COMPLETE")
@@ -136,6 +197,18 @@ def check_neuron_consistency(
     rank: int, output1: torch.Tensor, output2: torch.Tensor, atol: float = 1e-6, rtol: float = 1e-6
 ) -> bool:
     # Check if neuron tests were the same across runs
+    """Check whether two Neuron outputs are numerically close.
+
+    Args:
+        rank (int): Process rank included in the log message.
+        output1 (torch.Tensor): First output to compare.
+        output2 (torch.Tensor): Second output to compare.
+        atol (float, optional): Absolute tolerance. Defaults to ``1e-6``.
+        rtol (float, optional): Relative tolerance. Defaults to ``1e-6``.
+
+    Returns:
+        bool: ``True`` when ``torch.allclose`` accepts the outputs.
+    """
     consistent = torch.allclose(output1, output2, atol=atol, rtol=rtol)
     logger.info(f"Rank {rank}: Neuron outputs consistent across runs: {consistent}")
     return consistent

@@ -26,6 +26,13 @@ import torch_neuronx
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from internal import NeuronOpInfo
 from internal.common import (
+    COMPILE_TIMEOUT_S,
+    CompileTimeoutError,
+    compile_time_limit,
+    get_neuron_op_db,
+    kill_compile_subprocesses,
+)
+from internal.common import (
     STATUS_RANK as _STATUS_RANK,
 )
 from internal.common import (
@@ -38,10 +45,13 @@ from internal.common import (
     classify_op as _classify_op,
 )
 from internal.common import (
+    compile_supported_ops as _compile_supported_ops,
+)
+from internal.common import (
     count_input_elems as _count_input_elems,
 )
 from internal.common import (
-    get_neuron_op_db,
+    gate_enabled as _gate_enabled,
 )
 from internal.common import (
     probe_output_meta as _probe_output_meta,
@@ -49,8 +59,12 @@ from internal.common import (
 from internal.common import (
     reset_cache_dirs as _reset_cache_dirs,
 )
+from internal.common import (
+    sample_inputs_have_nan as _sample_inputs_have_nan,
+)
 from internal.neuron_op_info import _resolve_op
 from internal.roofline import compute_roofline
+from known_coverage_gaps import COMPILE_GAPS
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +84,16 @@ ERROR_MAXLEN = int(os.environ.get("NEURON_COVERAGE_ERROR_MAXLEN", "1000"))
 
 # Ops for which the CPU correctness reference is too expensive or fails to
 # run on CPU.
-_OPS_SKIP_CPU_CORRECTNESS: tuple[str, ...] = ("convolution_backward",)
+#   - _weight_norm_interface_backward: the harness fills saved_norms with
+#     independent randn, violating the saved_norms==‖saved_v‖ precondition; the
+#     1/norm**3 term then diverges and the compare is meaningless. Correctness is
+#     covered by upstream gradcheck + unit/e2e tests; the lowering is verified
+#     exact vs CPU with consistent inputs. (Substring match also covers the .out
+#     overload; it does NOT match the forward "aten::_weight_norm_interface".)
+_OPS_SKIP_CPU_CORRECTNESS: tuple[str, ...] = (
+    "convolution_backward",
+    "aten::_weight_norm_interface_backward",
+)
 
 # Ops that return multiple outputs where only a subset is mathematically unique;
 # the rest are valid-but-implementation-defined intermediates (e.g. an LU
@@ -83,17 +106,28 @@ _OPS_CORRECTNESS_OUTPUT_INDICES: dict[str, tuple[int, ...]] = {
     # mode returns (values, indices); the value is unique but index may not
     # match CPU unstable sort
     "aten::mode": (0,),
+    # topk returns (values, indices); with sorted=False the k values come back in an
+    # unspecified order and the indices are tie-unstable -- compare values only, made
+    # order-invariant by _normalize_unordered below.
+    "aten::topk": (0,),
 }
 
 # Skip reasons for _OPS_SKIP_COMPILE_HANG.
 _REASON_0D_HANG = "hangs with 0d tensor inputs"
 _REASON_REGRESSION_TIMEOUT = "regression causing tests to timeout"
+_REASON_COMPILATION_TIME_OVER_100_MINUTES = "compilation takes over 100 minutes with current shapes"
 
 # Ops that hang torch.compile; skip entirely.
 _OPS_SKIP_COMPILE_HANG: dict[str, str] = {
     "linspace": _REASON_0D_HANG,
     "logspace": _REASON_0D_HANG,
     "aten::_softmax_backward_data": _REASON_0D_HANG,
+    "_linalg_det": _REASON_REGRESSION_TIMEOUT,
+    "linalg_slogdet": _REASON_REGRESSION_TIMEOUT,
+    "ormqr.out": _REASON_REGRESSION_TIMEOUT,
+    "aten::put": _REASON_REGRESSION_TIMEOUT,
+    "special_log_ndtr": _REASON_COMPILATION_TIME_OVER_100_MINUTES,
+    "special_laguerre_polynomial_l.x_scalar": _REASON_COMPILATION_TIME_OVER_100_MINUTES,
 }
 
 # Ops that hang or segfault under dynamic shapes; skip when --dynamic is active.
@@ -133,6 +167,9 @@ _OPS_STATUS_OVERRIDE: dict[str, tuple[str, str]] = {
     # Upstream torch bug (functionalization assert on in-place fused optimizer).
     "aten::_fused_adam_": ("graph_break", "torch functionalization bug"),
     "aten::_fused_adamw_": ("graph_break", "torch functionalization bug"),
+    # Upstream torch bug. The .out meta kernel forwards out0/out1 to the
+    # functional op, which rejects them (TypeError before the Neuron backend).
+    "aten::grid_sampler_3d_backward.out": ("graph_break", "upstream .out meta rejects out0 kwarg"),
     # Unsupported tracing constructs.
     "aten::random_.from": ("graph_break", "unsupported"),
     "aten::sym_storage_offset": ("graph_break", "unsupported"),
@@ -211,6 +248,39 @@ def _correctness_output_indices(op_name: str) -> tuple[int, ...] | None:
     return None
 
 
+def _trim_grouped_mm_undefined_rows(op_name, neuron_cpu, cpu_out, sample):
+    """aten::_grouped_mm leaves output rows >= offs[-1] undefined (uninitialized) on
+    CPU and Neuron alike, so a value comparison there is meaningless. For the 2Dx3D
+    form (2D output) compare only the defined rows [0, offs[-1])."""
+    if "_grouped_mm" not in op_name:
+        return neuron_cpu, cpu_out
+    if not (torch.is_tensor(neuron_cpu) and neuron_cpu.dim() == 2):
+        return neuron_cpu, cpu_out
+    args = (sample.input, *sample.args)
+    if len(args) < 3 or not torch.is_tensor(args[2]) or args[2].dim() != 1:
+        return neuron_cpu, cpu_out
+    n = int(args[2][-1])
+    if 0 <= n < neuron_cpu.shape[0]:
+        return neuron_cpu[:n], cpu_out[:n]
+    return neuron_cpu, cpu_out
+
+
+# Ops whose output ordering is unspecified -- e.g. topk with sorted=False returns the k values
+# in arbitrary order.
+_OPS_ORDER_INSENSITIVE: tuple[str, ...] = ("aten::topk",)
+
+
+def _normalize_unordered(op_name: str, out):
+    """Sort compared value tensors along the last dim for order-unspecified ops."""
+    if not any(pat in op_name for pat in _OPS_ORDER_INSENSITIVE):
+        return out
+
+    def _srt(x):
+        return torch.sort(x, dim=-1).values if torch.is_tensor(x) and x.dim() else x
+
+    return _srt(out) if torch.is_tensor(out) else type(out)(_srt(x) for x in out)
+
+
 def _is_rng_op(op) -> bool:
     """Return True if the op reads the global RNG state.
 
@@ -225,7 +295,7 @@ def _is_rng_op(op) -> bool:
 
 
 def _matches_float64_oracle(
-    op, cpu_args, cpu_kwargs, neuron_cpu, *, rtol, atol, output_indices=None
+    op, cpu_args, cpu_kwargs, neuron_cpu, *, rtol, atol, output_indices=None, op_name=""
 ) -> bool:
     """Re-check a failed correctness comparison against a float64 CPU oracle."""
 
@@ -252,9 +322,9 @@ def _matches_float64_oracle(
             cpu_f32 = op(*cpu_args, **cpu_kwargs)
             cpu_f64 = op(*f64_args, **f64_kwargs)
 
-        cpu_f32 = _filter_outputs(cpu_f32, output_indices)
-        cpu_f64 = _filter_outputs(cpu_f64, output_indices)
-        neuron_cpu = _filter_outputs(neuron_cpu, output_indices)
+        cpu_f32 = _normalize_unordered(op_name, _filter_outputs(cpu_f32, output_indices))
+        cpu_f64 = _normalize_unordered(op_name, _filter_outputs(cpu_f64, output_indices))
+        neuron_cpu = _normalize_unordered(op_name, _filter_outputs(neuron_cpu, output_indices))
 
         flat32 = list(cpu_f32) if isinstance(cpu_f32, tuple | list) else [cpu_f32]
         flat64 = list(cpu_f64) if isinstance(cpu_f64, tuple | list) else [cpu_f64]
@@ -289,7 +359,12 @@ neuron_op_db = get_neuron_op_db()
 
 
 def _build_params():
-    return _build_params_for(neuron_op_db)
+    db = neuron_op_db
+    ops_filter = os.environ.get("NEURON_OPS_FILTER", "").strip()
+    if ops_filter:
+        wanted = {op.strip() for op in ops_filter.split(",") if op.strip()}
+        db = [info for info in db if info.op_name in wanted]
+    return _build_params_for(db)
 
 
 def _save_compile_result(result: dict):
@@ -301,6 +376,30 @@ def _save_compile_result(result: dict):
     )
     with open(filepath, "w") as f:
         json.dump(result, f)
+
+
+# Compile statuses that mean an expected-supported op did not lower. A compile
+# timeout is watchdog/load dependent, so it does not gate.
+_COMPILE_BLOCKING = frozenset({"failed_lowering", "graph_break"})
+
+
+def _gate_check_compile(op_name: str, status: str, error: str) -> None:
+    """Merge-queue gate: fail on a compile-supported op that regressed.
+
+    "Supported" is static: a registered or composite op, or an op the backend
+    lowers through a decomposition. A known gap is on the allowlist, so it
+    reports xfail, not a failure.
+    """
+    if status not in _COMPILE_BLOCKING:
+        return
+    expected = _classify_op(op_name) in ("registered", "composite") or (
+        op_name in _compile_supported_ops()
+    )
+    if not expected:
+        return
+    if op_name in COMPILE_GAPS:
+        pytest.xfail(f"known compile gap: {COMPILE_GAPS[op_name]}")
+    pytest.fail(f"{op_name}: compile regression ({status}). {error}", pytrace=False)
 
 
 def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> dict:
@@ -394,19 +493,36 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
     # from accumulating across the ~1360 target ops in a worker.
     try:
         try:
-            # Ensure a cold compile for time_to_first_ms — clear the worker's
-            # HLO+NEFF cache so no previously-compiled primitive from a sibling
-            # op in this worker leaks into this op's first compile.
-            _reset_cache_dirs(
-                os.environ.get("TORCH_NEURONX_HLO_CACHE_DIR", "/tmp/hlo_cache"),
-                os.environ.get("TORCH_NEURONX_NEFF_CACHE_DIR", "/tmp/neff_cache"),
-            )
+            # Ensure a cold compile for time_to_first_ms. Clear the worker's
+            # HLO cache so no previously-compiled primitive from a sibling op
+            # in this worker leaks into this op's first compile. When the
+            # persistent NEFF cache is active (PERSISTENT_STORAGE_BUCKET set),
+            # keep the shared NEFF dir: a seeding coverage run accumulates
+            # NEFFs and a gate run reads them warm. The NEFF key comes from the
+            # HLO content, so wiping the HLO dir does not stop the reuse. Perf
+            # never sets the bucket, so it still wipes the NEFF dir and keeps
+            # time_to_first_ms cold.
+            _reset_dirs = [os.environ.get("TORCH_NEURONX_HLO_CACHE_DIR", "/tmp/hlo_cache")]
+            if not os.environ.get("PERSISTENT_STORAGE_BUCKET"):
+                _reset_dirs.append(
+                    os.environ.get("TORCH_NEURONX_NEFF_CACHE_DIR", "/tmp/neff_cache")
+                )
+            _reset_cache_dirs(*_reset_dirs)
             start = time.perf_counter()
-            with torch.no_grad():
+            with torch.no_grad(), compile_time_limit():
                 _ = compiled_fn(*neuron_args, **neuron_kwargs)
-            torch_neuronx.synchronize()
+                # torch.compile(backend="neuron") runs lazily: the neuronx-cc
+                # compile fires at synchronize, so the time limit must cover it
+                # too, not just the trace call.
+                torch_neuronx.synchronize()
             out["ttf_ms"] = (time.perf_counter() - start) * 1000
             err_class = None
+        except CompileTimeoutError as e:
+            # A single shape ran past the compile limit. Kill the leftover
+            # neuronx-cc subprocess so the worker frees its core, then move on.
+            kill_compile_subprocesses()
+            out["error"] = str(e)
+            err_class = "compile_timeout"
         except Exception as e:
             exc_str = str(e)
             out["error"] = exc_str.replace("\n", " ").replace("\r", "")[:ERROR_MAXLEN]
@@ -417,6 +533,8 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
         # Single status decision.
         if err_class == "graph_break":
             out["status"] = "graph_break"
+        elif err_class == "compile_timeout":
+            out["status"] = "compile_timeout"
         elif err_class == "failed_lowering":
             out["status"] = "failed_lowering"
         else:
@@ -433,14 +551,28 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
 
         # NUM_EXEC_ITERATIONS + 1 calls; first is an untimed warmup.
         # compiled_fn is reused so dynamo's cache stays warm (no recompile).
-        for i in range(NUM_EXEC_ITERATIONS + 1):
-            torch_neuronx.synchronize()
-            start = time.perf_counter()
-            with torch.no_grad():
-                _ = compiled_fn(*neuron_args, **neuron_kwargs)
-            torch_neuronx.synchronize()
-            if i > 0:  # skip warmup
-                out["exec_times"].append((time.perf_counter() - start) * 1000)
+        #
+        # Guard the loop with compile_time_limit. backend="neuron" runs the
+        # neuronx-cc compile on a background thread, and synchronize() waits on
+        # the device kernels, not on that compile. So the cold compile can land
+        # here in the warmup call, not in the ttf block above. Without the guard
+        # a runaway compile hangs the worker for the rest of the run. The
+        # watchdog kills the neuronx-cc subprocess, so the wrapped call raises.
+        try:
+            for i in range(NUM_EXEC_ITERATIONS + 1):
+                torch_neuronx.synchronize()
+                start = time.perf_counter()
+                with torch.no_grad(), compile_time_limit():
+                    _ = compiled_fn(*neuron_args, **neuron_kwargs)
+                    torch_neuronx.synchronize()
+                if i > 0:  # skip warmup
+                    out["exec_times"].append((time.perf_counter() - start) * 1000)
+        except CompileTimeoutError as e:
+            kill_compile_subprocesses()
+            out["error"] = str(e)
+            out["status"] = "compile_timeout"
+            out["exec_times"] = []
+            return out
 
         # Correctness check — allocate FRESH neuron args so in-place ops
         # (aten::add_, aten::sub_, aten::_foreach_add_, etc.) compare against an
@@ -450,6 +582,8 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
             out["correctness"] = "skip_slow_cpu"
         elif _is_rng_op(op):
             out["correctness"] = "skip_accuracy_check_rng"
+        elif _sample_inputs_have_nan(sample):
+            out["correctness"] = "skip_nan"
         else:
             try:
                 cpu_args = tuple(
@@ -467,8 +601,11 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
                     neuron_out = compiled_fn(*fresh_neuron_args, **fresh_neuron_kwargs)
                 neuron_cpu = _allocate_to_device(neuron_out, "cpu")
                 output_indices = _correctness_output_indices(op_name)
-                cpu_cmp = _filter_outputs(neuron_cpu, output_indices)
-                ref_cmp = _filter_outputs(cpu_out, output_indices)
+                cpu_cmp = _normalize_unordered(op_name, _filter_outputs(neuron_cpu, output_indices))
+                ref_cmp = _normalize_unordered(op_name, _filter_outputs(cpu_out, output_indices))
+                cpu_cmp, ref_cmp = _trim_grouped_mm_undefined_rows(
+                    op_name, cpu_cmp, ref_cmp, sample
+                )
                 try:
                     torch.testing.assert_close(
                         cpu_cmp, ref_cmp, rtol=1e-2, atol=1e-3, equal_nan=True
@@ -487,6 +624,7 @@ def _run_one_sample_compile(op, op_name: str, classification: str, sample) -> di
                         rtol=1e-2,
                         atol=1e-3,
                         output_indices=output_indices,
+                        op_name=op_name,
                     ):
                         out["correctness"] = "pass"
                     else:
@@ -576,6 +714,8 @@ def _aggregate_compile_results(result: dict, per_shape: list[dict], classificati
             result["correctness_test"] = "skip_no_cpu"
         elif "skip_accuracy_check_rng" in correctness:
             result["correctness_test"] = "skip_accuracy_check_rng"
+        elif "skip_nan" in correctness:
+            result["correctness_test"] = "skip_nan"
 
 
 class TestTargetOpsCompileCoverage:
@@ -665,6 +805,16 @@ class TestTargetOpsCompileCoverage:
         result["input_count"] = str(len(samples))
         op = _resolve_op(op_name)
 
+        # Persist a provisional compile_timeout row before the compile. A hard
+        # abort (see compile_time_limit) ends the process without running Python
+        # again, so this row records the timeout. The success path overwrites it.
+        result["status"] = "compile_timeout"
+        result["error"] = f"compile exceeded {COMPILE_TIMEOUT_S}s (hard abort)"
+        _save_compile_result(result)
+
         per_shape = [_run_one_sample_compile(op, op_name, classification, s) for s in samples]
         _aggregate_compile_results(result, per_shape, classification)
         _save_compile_result(result)
+
+        if _gate_enabled():
+            _gate_check_compile(op_name, result["status"], result["error"])

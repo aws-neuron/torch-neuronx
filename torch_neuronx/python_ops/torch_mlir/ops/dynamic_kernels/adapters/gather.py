@@ -106,6 +106,16 @@ def _row_gather_entry(row_index_of) -> DynamicNkiEntry:
     """
 
     def can_handle(self, *args, **kwargs) -> bool:
+        """Determine whether arguments describe a supported row gather.
+
+        Args:
+            self (torch.Tensor): Source tensor containing rows to gather.
+            *args (Any): Positional arguments for the gather operation.
+            **kwargs (Any): Keyword arguments for the gather operation.
+
+        Returns:
+            bool: ``True`` when the row-gather kernel can serve the operation.
+        """
         if not isinstance(self, torch.Tensor) or self.device.type != "neuron":
             return False
         if self.dtype not in _SUPPORTED_DTYPES or self.dim() != 2:
@@ -121,10 +131,29 @@ def _row_gather_entry(row_index_of) -> DynamicNkiEntry:
         return n > 0 and _ceil_to_tile(n) <= self.shape[0]
 
     def prepare_io(self, *args, dest=None, **kwargs) -> tuple[tuple, tuple, int]:
+        """Marshal a supported row gather for kernel execution.
+
+        Args:
+            self (torch.Tensor): Source tensor containing rows to gather.
+            *args (Any): Positional arguments used to locate the row index.
+            dest (torch.Tensor, optional): Unused destination buffer. Defaults to ``None``.
+            **kwargs (Any): Keyword arguments used to locate the row index.
+
+        Returns:
+            tuple: Kernel inputs, output buffers, and gathered row count.
+        """
         return _row_gather_io(self, row_index_of(self, *args, **kwargs))
 
     def reshape_output(outputs, original_args):
-        """The kernel writes [T, H]; the op's result is the n gathered rows."""
+        """Slice the kernel output to the gathered row count.
+
+        Args:
+            outputs (tuple): Kernel output buffers with source-row capacity.
+            original_args (tuple): Original operation arguments.
+
+        Returns:
+            torch.Tensor: The gathered rows with padded capacity removed.
+        """
         return outputs[0][: row_index_of(*original_args).numel()]
 
     return DynamicNkiEntry(
@@ -137,5 +166,6 @@ def _row_gather_entry(row_index_of) -> DynamicNkiEntry:
 
 
 def register():
+    """Register index and gather row-gather adapters."""
     register_dynamic_nki("index", _row_gather_entry(_index_row_index))
     register_dynamic_nki("gather", _row_gather_entry(_gather_row_index))

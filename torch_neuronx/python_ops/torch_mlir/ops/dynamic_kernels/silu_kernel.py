@@ -12,14 +12,16 @@ import nki.language as nl
 
 @nki.jit()
 def silu_kernel(input_tensor, num_m_tiles):
-    """
-    SiLU activation: output = input * sigmoid(input)
+    """Apply SiLU over dynamic row tiles.
 
     Args:
-        input_tensor: [m_static, hidden] bf16 on HBM
-        num_m_tiles: [1, 1] int32 — number of 128-row tiles to process
+        input_tensor (nki.language.ndarray): HBM input shaped ``[m_static, hidden]``.
+        num_m_tiles (nki.language.ndarray): ``[1, 1]`` int32 tile count, with 128 rows
+            per tile.
+
     Returns:
-        output: [m_static, hidden] bf16 on HBM
+        nki.language.ndarray: Same-shape and same-dtype shared-HBM output whose processed
+        rows contain ``input_tensor * sigmoid(input_tensor)``; later rows are unwritten.
     """
     m_static, hidden = input_tensor.shape
 
@@ -52,6 +54,11 @@ def silu_kernel(input_tensor, num_m_tiles):
     nisa.memset(m_tile_start, 0.0)
 
     def body(_i):
+        """Apply SiLU to one 128-row tile.
+
+        Args:
+            _i (int): Dynamic loop iteration index, accepted but unused.
+        """
         for seg in range(len(h_starts)):
             h_start = h_starts[seg]
             h_width = h_widths[seg]

@@ -362,7 +362,9 @@ def register_all_defaults(r, smoke_subsets=()):
         "aten::_index_put_impl",
         {
             "self": (2374, 4096),
-            "indices": [{"shape": (64,), "dtype": "long", "low": 0, "high": 2374}],
+            "indices": [
+                {"shape": (64,), "dtype": "long", "low": 0, "high": 2374, "distinct": True}
+            ],
             "values": (64, 4096),
             "accumulate": False,
             "unsafe": False,
@@ -373,7 +375,9 @@ def register_all_defaults(r, smoke_subsets=()):
         "aten::index_put_",
         {
             "self": (2374, 4096),
-            "indices": [{"shape": (64,), "dtype": "long", "low": 0, "high": 2374}],
+            "indices": [
+                {"shape": (64,), "dtype": "long", "low": 0, "high": 2374, "distinct": True}
+            ],
             "values": (64, 4096),
         },
         source="builtin",
@@ -382,7 +386,9 @@ def register_all_defaults(r, smoke_subsets=()):
         "aten::index_put_",
         {
             "self": (100, 64),
-            "indices": [{"shape": (8,), "dtype": "long", "low": -100, "high": -1}],
+            "indices": [
+                {"shape": (8,), "dtype": "long", "low": -100, "high": -1, "distinct": True}
+            ],
             "values": (8, 64),
         },
         source="builtin",
@@ -399,7 +405,9 @@ def register_all_defaults(r, smoke_subsets=()):
         "aten::_unsafe_index_put",
         {
             "self": (2374, 4096),
-            "indices": [{"shape": (64,), "dtype": "long", "low": 0, "high": 2374}],
+            "indices": [
+                {"shape": (64,), "dtype": "long", "low": 0, "high": 2374, "distinct": True}
+            ],
             "values": (64, 4096),
         },
         source="builtin",
@@ -409,7 +417,7 @@ def register_all_defaults(r, smoke_subsets=()):
         {
             "self": (2374, 4096),
             "dim": 0,
-            "index": {"shape": (64,), "dtype": "long", "low": 0, "high": 2374},
+            "index": {"shape": (64,), "dtype": "long", "low": 0, "high": 2374, "distinct": True},
             "source": (64, 4096),
         },
         source="builtin",
@@ -470,6 +478,81 @@ def register_all_defaults(r, smoke_subsets=()):
     r(
         "aten::upsample_nearest2d.vec",
         {"input": (1, 64, 32, 32), "output_size": None, "scale_factors": [2.0, 2.0]},
+        source="builtin",
+    )
+    r(
+        "aten::upsample_trilinear3d",
+        {"self": (1, 16, 8, 16, 16), "output_size": [16, 32, 32], "align_corners": False},
+        source="builtin",
+    )
+    r(
+        "aten::upsample_trilinear3d.vec",
+        {
+            "input": (1, 16, 8, 16, 16),
+            "output_size": None,
+            "align_corners": False,
+            "scale_factors": [2.0, 2.0, 2.0],
+        },
+        source="builtin",
+    )
+    r(
+        "aten::upsample_trilinear3d_backward",
+        {
+            "grad_output": (1, 16, 16, 32, 32),
+            "output_size": [16, 32, 32],
+            "input_size": [1, 16, 8, 16, 16],
+            "align_corners": False,
+        },
+        source="builtin",
+    )
+
+    # Grid sampler
+    r(
+        "aten::grid_sampler_2d",
+        {
+            "input": (2, 3, 16, 16),
+            "grid": (2, 20, 20, 2),
+            "interpolation_mode": 0,
+            "padding_mode": 0,
+            "align_corners": False,
+        },
+        source="builtin",
+    )
+    r(
+        "aten::grid_sampler_2d_backward",
+        {
+            "grad_output": (2, 3, 20, 20),
+            "input": (2, 3, 16, 16),
+            "grid": (2, 20, 20, 2),
+            "interpolation_mode": 0,
+            "padding_mode": 0,
+            "align_corners": False,
+            "output_mask": [True, True],
+        },
+        source="builtin",
+    )
+    r(
+        "aten::grid_sampler_3d",
+        {
+            "input": (2, 3, 8, 16, 16),
+            "grid": (2, 10, 20, 20, 3),
+            "interpolation_mode": 0,
+            "padding_mode": 0,
+            "align_corners": False,
+        },
+        source="builtin",
+    )
+    r(
+        "aten::grid_sampler_3d_backward",
+        {
+            "grad_output": (2, 3, 10, 20, 20),
+            "input": (2, 3, 8, 16, 16),
+            "grid": (2, 10, 20, 20, 3),
+            "interpolation_mode": 0,
+            "padding_mode": 0,
+            "align_corners": False,
+            "output_mask": [True, True],
+        },
         source="builtin",
     )
 
@@ -608,6 +691,27 @@ def register_all_defaults(r, smoke_subsets=()):
         source="builtin",
     )
     r("aten::batch_norm_stats", {"input": (32, 64, 4096), "eps": 1e-5}, source="builtin")
+    r(
+        "aten::_weight_norm_interface",
+        {"v": (8192, 8192), "g": (8192, 1), "dim": 0},
+        source="manual",
+    )
+    # CPU correctness is skipped for this op (see _OPS_SKIP_CPU_CORRECTNESS): the
+    # harness fills saved_norms with independent randn, violating
+    # saved_norms==‖saved_v‖; the 1/norm**3 term then diverges. Correctness is
+    # covered by upstream gradcheck + unit/e2e tests; lowering verified exact vs
+    # CPU with consistent inputs.
+    r(
+        "aten::_weight_norm_interface_backward",
+        {
+            "grad_w": (8192, 8192),
+            "saved_v": (8192, 8192),
+            "saved_g": (8192, 1),
+            "saved_norms": (8192, 1),
+            "dim": 0,
+        },
+        source="manual",
+    )
 
     # Bitwise shift with scalar LHS
     r(
@@ -894,6 +998,28 @@ def register_all_defaults(r, smoke_subsets=()):
             "self": (256, 4096),
             "mask": {"shape": (256, 4096), "dtype": "bool"},
             "value": {"shape": (), "dtype": "float"},
+        },
+        source="builtin",
+    )
+
+    # masked_scatter_ and its backward have no OpInfo. Give the in-place variant a
+    # source that is large enough for any mask, and give the backward a source
+    # buffer size (sizes) that holds every True position.
+    r(
+        "aten::masked_scatter_",
+        {
+            "self": (128, 256),
+            "mask": {"shape": (128, 256), "dtype": "bool"},
+            "source": (32768,),
+        },
+        source="builtin",
+    )
+    r(
+        "aten::masked_scatter_backward",
+        {
+            "grad_output": (128, 256),
+            "mask": {"shape": (128, 256), "dtype": "bool"},
+            "sizes": [128, 256],
         },
         source="builtin",
     )
@@ -2053,7 +2179,7 @@ def register_all_defaults(r, smoke_subsets=()):
         {
             "self": (256, 4096),
             "dim": 0,
-            "index": {"shape": (64,), "dtype": "long", "low": 0, "high": 256},
+            "index": {"shape": (64,), "dtype": "long", "low": 0, "high": 256, "distinct": True},
             "source": (64, 4096),
         },
         source="builtin",
@@ -2560,7 +2686,7 @@ def register_all_defaults(r, smoke_subsets=()):
         "aten::put_",
         {
             "self": (256, 4096),
-            "index": {"shape": (64,), "dtype": "long", "low": 0, "high": 256},
+            "index": {"shape": (64,), "dtype": "long", "low": 0, "high": 256, "distinct": True},
             "source": (64,),
             "accumulate": False,
         },
@@ -2585,8 +2711,60 @@ def register_all_defaults(r, smoke_subsets=()):
         {"self": (1, 32, 16, 16, 16), "padding": [1, 1, 1, 1, 1, 1]},
         source="builtin",
     )
+    # reflection_pad*_backward (grad_output has the padded spatial shape; self is
+    # the original input; the op returns the input-shaped gradient).
+    r(
+        "aten::reflection_pad1d_backward",
+        {"grad_output": (1, 64, 4098), "self": (1, 64, 4096), "padding": [1, 1]},
+        source="builtin",
+    )
+    r(
+        "aten::reflection_pad1d_backward.grad_input",
+        {
+            "grad_output": (1, 64, 4098),
+            "self": (1, 64, 4096),
+            "padding": [1, 1],
+            "grad_input": (1, 64, 4096),
+        },
+        source="builtin",
+    )
+    r(
+        "aten::reflection_pad2d_backward",
+        {"grad_output": (1, 64, 34, 34), "self": (1, 64, 32, 32), "padding": [1, 1, 1, 1]},
+        source="builtin",
+    )
+    r(
+        "aten::reflection_pad2d_backward.grad_input",
+        {
+            "grad_output": (1, 64, 34, 34),
+            "self": (1, 64, 32, 32),
+            "padding": [1, 1, 1, 1],
+            "grad_input": (1, 64, 32, 32),
+        },
+        source="builtin",
+    )
+    r(
+        "aten::reflection_pad3d_backward",
+        {
+            "grad_output": (1, 32, 18, 18, 18),
+            "self": (1, 32, 16, 16, 16),
+            "padding": [1, 1, 1, 1, 1, 1],
+        },
+        source="builtin",
+    )
+    r(
+        "aten::reflection_pad3d_backward.grad_input",
+        {
+            "grad_output": (1, 32, 18, 18, 18),
+            "self": (1, 32, 16, 16, 16),
+            "padding": [1, 1, 1, 1, 1, 1],
+            "grad_input": (1, 32, 16, 16, 16),
+        },
+        source="builtin",
+    )
     r("aten::relu.out", {"self": (256, 4096)}, source="builtin")
     r("aten::relu6", {"self": (256, 4096)}, source="builtin")
+    r("aten::relu6_.default", {"self": (256, 4096)}, source="builtin")
     r("aten::relu_", {"self": (256, 4096)}, source="builtin")
     r("aten::remainder.Scalar", {"self": (256, 4096), "other": 1.0}, source="builtin")
     r("aten::remainder.Scalar_Tensor", {"self": 1.0, "other": (256, 4096)}, source="builtin")
@@ -2974,7 +3152,7 @@ def register_all_defaults(r, smoke_subsets=()):
     r("aten::tril_", {"self": (256, 4096), "diagonal": 1}, source="builtin")
     r("aten::trunc", {"self": (256, 4096)}, source="builtin")
     r("aten::trunc.out", {"self": (256, 4096)}, source="builtin")
-    r("aten::uniform_", {"self": (256, 4096), "from": 1.0, "to": 1.0}, source="builtin")
+    r("aten::uniform_", {"self": (256, 4096), "from": 0.0, "to": 1.0}, source="builtin")
     r(
         "aten::xlogy.OutScalar_Other",
         {"self": (256, 4096), "other": 1.0},
@@ -3035,7 +3213,7 @@ def register_all_defaults(r, smoke_subsets=()):
         {
             "self": (256, 4096),
             "dim": 0,
-            "index": {"shape": (64,), "dtype": "long", "low": 0, "high": 256},
+            "index": {"shape": (64,), "dtype": "long", "low": 0, "high": 256, "distinct": True},
             "source": (64, 4096),
             "out": (256, 4096),
         },
@@ -4367,6 +4545,29 @@ def register_all_defaults(r, smoke_subsets=()):
         "aten::batch_norm_stats.out",
         {"input": _bn_in, "eps": 1e-5, "out0": _bn_c, "out1": _bn_c},
         source="builtin",
+    )
+    r(
+        "aten::_weight_norm_interface.out",
+        {"v": (8192, 8192), "g": (8192, 1), "dim": 0, "out0": (8192, 8192), "out1": (8192, 1)},
+        source="manual",
+    )
+    # CPU correctness is skipped for this op (see _OPS_SKIP_CPU_CORRECTNESS): the
+    # harness fills saved_norms with independent randn, violating
+    # saved_norms==‖saved_v‖; the 1/norm**3 term then diverges. Correctness is
+    # covered by upstream gradcheck + unit/e2e tests; lowering verified exact vs
+    # CPU with consistent inputs.
+    r(
+        "aten::_weight_norm_interface_backward.out",
+        {
+            "grad_w": (8192, 8192),
+            "saved_v": (8192, 8192),
+            "saved_g": (8192, 1),
+            "saved_norms": (8192, 1),
+            "dim": 0,
+            "out0": (8192, 8192),
+            "out1": (8192, 1),
+        },
+        source="manual",
     )
     r(
         "aten::native_batch_norm_backward.out",
@@ -7136,7 +7337,7 @@ SMOKE_SUBSET_OP_MODE = {
 
 
 # BEGIN GENERATED CACHE-KEY SHAPES
-# Do not edit by hand. Regenerate with tests/vertical/tools/refresh_cache_key_shapes.py.
+# Do not edit. Regenerate with tests/vertical/internal/refresh_cache_key_shapes.py.
 CACHE_KEY_SOURCE = "cache_keys"
 
 
@@ -7175,7 +7376,7 @@ def register_cache_key_shapes(r):
             ],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_foreach_add_.List",
@@ -7199,7 +7400,7 @@ def register_cache_key_shapes(r):
             ],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_foreach_add_.List",
@@ -7223,7 +7424,7 @@ def register_cache_key_shapes(r):
             ],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_foreach_add_.List",
@@ -7247,7 +7448,7 @@ def register_cache_key_shapes(r):
             ],
         },
         count=9,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_foreach_add_.List",
@@ -7271,7 +7472,7 @@ def register_cache_key_shapes(r):
             ],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_foreach_add_.List",
@@ -7295,7 +7496,7 @@ def register_cache_key_shapes(r):
             ],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_foreach_add_.Scalar",
@@ -7312,7 +7513,7 @@ def register_cache_key_shapes(r):
         },
         count=78,
         paths=(
-            "test_kaizen_hf_onboarding_reduced_eager",
+            "hf_onboarding_reduced_eager",
             "text-generation-torch-titan-multi-core-async",
             "text-generation-torch-titan-multi-core-async-compile",
             "text-generation-torch-titan-multi-core-async-compile-dev",
@@ -7348,7 +7549,7 @@ def register_cache_key_shapes(r):
             ],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_foreach_copy_",
@@ -8339,7 +8540,7 @@ def register_cache_key_shapes(r):
             "values": {"dtype": "bfloat16", "shape": [64, 4096, 4088]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_index_put_impl_",
@@ -8351,7 +8552,7 @@ def register_cache_key_shapes(r):
             "values": {"dtype": "bfloat16", "shape": [64, 2880, 5760]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_index_put_impl_",
@@ -8363,7 +8564,7 @@ def register_cache_key_shapes(r):
             "values": {"dtype": "bfloat16", "shape": [64, 4096, 4032]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_index_put_impl_",
@@ -8390,7 +8591,7 @@ def register_cache_key_shapes(r):
             "values": {"dtype": "bfloat16", "shape": [64, 3072, 3072]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_index_put_impl_",
@@ -8402,7 +8603,7 @@ def register_cache_key_shapes(r):
             "values": {"dtype": "bfloat16", "shape": [64, 4088, 2048]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_scaled_dot_product_fused_attention_overrideable",
@@ -8417,7 +8618,7 @@ def register_cache_key_shapes(r):
             "value": {"dtype": "float32", "shape": [1, 20, 1500, 64]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_scaled_dot_product_fused_attention_overrideable",
@@ -8432,7 +8633,7 @@ def register_cache_key_shapes(r):
             "value": {"dtype": "float32", "shape": [1, 20, 1500, 64]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_scaled_dot_product_fused_attention_overrideable",
@@ -8447,7 +8648,7 @@ def register_cache_key_shapes(r):
             "value": {"dtype": "float32", "shape": [1, 20, 448, 64]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_scaled_dot_product_fused_attention_overrideable",
@@ -8462,7 +8663,7 @@ def register_cache_key_shapes(r):
             "value": {"dtype": "bfloat16", "shape": [1, 1, 96, 128]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_scaled_dot_product_fused_attention_overrideable",
@@ -8477,7 +8678,7 @@ def register_cache_key_shapes(r):
             "value": {"dtype": "bfloat16", "shape": [1, 1, 96, 256]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_scaled_dot_product_fused_attention_overrideable",
@@ -8492,7 +8693,7 @@ def register_cache_key_shapes(r):
             "value": {"dtype": "bfloat16", "shape": [1, 1, 96, 256]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_softmax",
@@ -8530,7 +8731,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 128, 32, 33]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_softmax",
@@ -8540,13 +8741,13 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [3, 1, 8, 16, 212]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_softmax",
         {"dim": -1, "half_to_float": False, "self": {"dtype": "float32", "shape": [1, 73, 32, 32]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_softmax_backward_data",
@@ -8597,7 +8798,7 @@ def register_cache_key_shapes(r):
             "output": {"dtype": "float32", "shape": [1, 128, 32, 33]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_softmax_backward_data",
@@ -8608,7 +8809,7 @@ def register_cache_key_shapes(r):
             "output": {"dtype": "float32", "shape": [3, 1, 8, 16, 212]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_softmax_backward_data",
@@ -8619,7 +8820,7 @@ def register_cache_key_shapes(r):
             "output": {"dtype": "float32", "shape": [1, 73, 32, 32]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::_to_copy",
@@ -8743,37 +8944,37 @@ def register_cache_key_shapes(r):
         "aten::abs",
         {"self": {"dtype": "float32", "shape": [1, 1024, 640]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::abs",
         {"self": {"dtype": "bfloat16", "shape": [1000, 48]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::abs",
         {"self": {"dtype": "bfloat16", "shape": [1000, 5]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::abs",
         {"self": {"dtype": "int64", "shape": [32, 32]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::abs",
         {"self": {"dtype": "float32", "shape": [1, 448]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::abs",
         {"self": {"dtype": "float32", "shape": [1, 96]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::add.Tensor",
@@ -8953,7 +9154,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [3072]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::addmm",
@@ -8965,7 +9166,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [768]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::addmm",
@@ -8977,7 +9178,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [2304]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::addmm",
@@ -8989,43 +9190,43 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [768]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::all",
         {"self": {"dtype": "bool", "shape": [1, 96]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::all",
         {"self": {"dtype": "bool", "shape": [1, 65]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::all",
         {"self": {"dtype": "bool", "shape": [1, 36]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::all",
         {"self": {"dtype": "bool", "shape": [1, 32]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::all",
         {"self": {"dtype": "bool", "shape": [1]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::all",
         {"self": {"dtype": "bool", "shape": []}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::all.out",
@@ -9036,7 +9237,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bool", "shape": [1, 36, 4]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::all.out",
@@ -9047,7 +9248,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bool", "shape": [1, 36, 2]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::amax",
@@ -9271,7 +9472,7 @@ def register_cache_key_shapes(r):
         {"end": 128, "out": {"dtype": "int64", "shape": [0]}, "start": 0, "step": 2},
         count=22,
         paths=(
-            "test_kaizen_hf_onboarding_reduced_eager",
+            "hf_onboarding_reduced_eager",
             "text-generation-torch-titan-multi-core-async",
             "text-generation-torch-titan-multi-core-async-compile",
             "text-generation-torch-titan-multi-core-async-compile-dev",
@@ -9311,25 +9512,25 @@ def register_cache_key_shapes(r):
         "aten::arange.start_out",
         {"end": 1024, "out": {"dtype": "int64", "shape": [0]}, "start": 0, "step": 16},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::arange.start_out",
         {"end": 12, "out": {"dtype": "float32", "shape": [0]}, "start": 0, "step": 2},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::arange.start_out",
         {"end": 32, "out": {"dtype": "int64", "shape": [0]}, "start": 0, "step": 1},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::arange.start_out",
         {"end": 64, "out": {"dtype": "int64", "shape": [0]}, "start": 0, "step": 1},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::avg_pool2d",
@@ -9343,7 +9544,7 @@ def register_cache_key_shapes(r):
             "stride": [1, 1],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bitwise_and.Tensor_out",
@@ -9353,7 +9554,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bool", "shape": [1, 16, 96, 96]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bitwise_and.Tensor_out",
@@ -9378,7 +9579,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bool", "shape": [1, 1, 96, 96]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bitwise_and.Tensor_out",
@@ -9388,7 +9589,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bool", "shape": [1, 1, 96, 96]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bitwise_and.Tensor_out",
@@ -9398,7 +9599,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bool", "shape": [1, 1, 96, 96]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bitwise_and.Tensor_out",
@@ -9408,43 +9609,43 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bool", "shape": [1, 96, 96]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bitwise_not",
         {"self": {"dtype": "bool", "shape": [1, 16, 96, 96]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bitwise_not",
         {"self": {"dtype": "bool", "shape": [256, 256]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bitwise_not",
         {"self": {"dtype": "bool", "shape": [96, 384]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bitwise_not",
         {"self": {"dtype": "bool", "shape": [128, 128]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bitwise_not",
         {"self": {"dtype": "bool", "shape": [1, 1, 96, 96]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bitwise_not",
         {"self": {"dtype": "bool", "shape": [32, 8]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bitwise_or.Tensor_out",
@@ -9547,13 +9748,13 @@ def register_cache_key_shapes(r):
         "aten::bitwise_right_shift.Tensor_Scalar",
         {"other": 0.0, "self": {"dtype": "int32", "shape": [1, 32, 32]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bitwise_right_shift.Tensor_Scalar",
         {"other": 0.0, "self": {"dtype": "int32", "shape": [32, 32]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bitwise_right_shift.Tensor_Scalar",
@@ -9571,7 +9772,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [64, 4096, 4088]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bmm",
@@ -9580,7 +9781,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [64, 1, 2880]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bmm",
@@ -9589,7 +9790,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [64, 4096, 4032]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bmm",
@@ -9598,7 +9799,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [64, 3072, 3072]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bmm",
@@ -9607,7 +9808,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [64, 4088, 2048]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::bmm",
@@ -9616,7 +9817,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [64, 1, 2880]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::cat",
@@ -9812,7 +10013,7 @@ def register_cache_key_shapes(r):
         "aten::clamp",
         {"max": 1.0, "min": None, "self": {"dtype": "bfloat16", "shape": [1, 32, 1024]}},
         count=2,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::clamp",
@@ -9840,13 +10041,13 @@ def register_cache_key_shapes(r):
         "aten::clamp",
         {"max": 1.0, "min": None, "self": {"dtype": "bfloat16", "shape": [1, 32, 128]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::clamp",
         {"max": 1.0, "min": None, "self": {"dtype": "int64", "shape": [2048]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::clamp",
@@ -9862,7 +10063,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 36, 192]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::clamp.Tensor",
@@ -9872,19 +10073,19 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 36, 48]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::clamp_min",
         {"min": 0.0, "self": {"dtype": "bfloat16", "shape": [1, 32, 8, 1]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::clamp_min",
         {"min": 0.0, "self": {"dtype": "bfloat16", "shape": [1, 32, 2, 1]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::clamp_min.Tensor_out",
@@ -9894,7 +10095,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 1]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::constant_pad_nd",
@@ -9904,7 +10105,7 @@ def register_cache_key_shapes(r):
             "value": 0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::constant_pad_nd",
@@ -9914,7 +10115,7 @@ def register_cache_key_shapes(r):
             "value": 0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::constant_pad_nd",
@@ -9924,7 +10125,7 @@ def register_cache_key_shapes(r):
             "value": 0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::constant_pad_nd",
@@ -9934,7 +10135,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::constant_pad_nd",
@@ -9944,7 +10145,7 @@ def register_cache_key_shapes(r):
             "value": 0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::constant_pad_nd",
@@ -9954,7 +10155,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::convolution",
@@ -9970,7 +10171,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [1280, 1280, 3]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::convolution",
@@ -9986,7 +10187,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [480, 480, 3, 3]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::convolution",
@@ -10002,7 +10203,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [480, 480, 3, 3]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::convolution",
@@ -10018,7 +10219,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "bfloat16", "shape": [1024, 3, 2, 16, 16]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::convolution",
@@ -10034,7 +10235,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "bfloat16", "shape": [1152, 3, 14, 14]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::convolution",
@@ -10050,7 +10251,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "bfloat16", "shape": [1152, 3, 14, 14]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::convolution_backward",
@@ -10068,7 +10269,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [1280, 1280, 3]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::convolution_backward",
@@ -10086,7 +10287,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [1280, 80, 3]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::convolution_backward",
@@ -10104,7 +10305,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [480, 480, 3, 3]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::convolution_backward",
@@ -10122,7 +10323,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [480, 480, 3, 3]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::convolution_backward",
@@ -10140,7 +10341,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "bfloat16", "shape": [1024, 3, 2, 16, 16]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::convolution_backward",
@@ -10158,7 +10359,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [480, 1, 3, 3]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::copy_",
@@ -10305,13 +10506,13 @@ def register_cache_key_shapes(r):
         "aten::cos",
         {"self": {"dtype": "float32", "shape": [1, 256, 512]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::cos",
         {"self": {"dtype": "float32", "shape": [1, 256, 256]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::cross_entropy_loss",
@@ -10378,7 +10579,7 @@ def register_cache_key_shapes(r):
             "weight": None,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::cross_entropy_loss",
@@ -10391,7 +10592,7 @@ def register_cache_key_shapes(r):
             "weight": None,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::cross_entropy_loss",
@@ -10404,43 +10605,43 @@ def register_cache_key_shapes(r):
             "weight": None,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::cumsum",
         {"dim": -2, "dtype": None, "self": {"dtype": "float32", "shape": [1, 128, 1, 256, 256]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::cumsum",
         {"dim": -2, "dtype": None, "self": {"dtype": "float32", "shape": [1, 16, 1, 128, 128]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::cumsum",
         {"dim": -2, "dtype": None, "self": {"dtype": "float32", "shape": [1, 8, 1, 128, 128]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::cumsum",
         {"dim": -1, "dtype": None, "self": {"dtype": "float32", "shape": [1, 128, 1, 256]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::cumsum",
         {"dim": -1, "dtype": None, "self": {"dtype": "float32", "shape": [1, 64, 2, 64]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::cumsum",
         {"dim": -1, "dtype": 6, "self": {"dtype": "float32", "shape": [1, 64, 2, 64]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::div.out",
@@ -10501,7 +10702,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 256, 3000]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::div.out",
@@ -10511,7 +10712,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 96, 3000]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::div.out_mode",
@@ -10522,7 +10723,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [1, 36, 2]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::div.out_mode",
@@ -10533,7 +10734,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [64]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::div_.Tensor",
@@ -10555,7 +10756,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [256, 8]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::div_.Tensor",
@@ -10564,7 +10765,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [96, 10]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::div_.Tensor",
@@ -10573,7 +10774,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [96, 8]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::div_.Tensor",
@@ -10582,7 +10783,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [96, 8]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::div_.Tensor",
@@ -10591,7 +10792,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [96, 4]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::embedding",
@@ -10840,7 +11041,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [768]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::eq.Scalar_out",
@@ -10850,7 +11051,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 448]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::eq.Scalar_out",
@@ -10860,7 +11061,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 4, 96, 1]},
         },
         count=2,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::eq.Scalar_out",
@@ -10870,7 +11071,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [1, 264]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::eq.Tensor_out",
@@ -10880,7 +11081,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [1, 1, 96, 1]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::eq.Tensor_out",
@@ -10890,7 +11091,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [1, 96, 1]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::exp",
@@ -10957,7 +11158,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 448, 30000]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::exp.out",
@@ -10966,7 +11167,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 32, 30000]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::exp.out",
@@ -10975,7 +11176,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 16, 30000]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::exp.out",
@@ -10984,7 +11185,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 96, 3000]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::exp.out",
@@ -10993,25 +11194,25 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 32, 3000]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::eye",
         {"device": None, "dtype": 6, "layout": None, "n": 64, "pin_memory": None},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::fill_.Scalar",
         {"self": {"dtype": "bfloat16", "shape": [1, 8, 8, 512]}, "value": float("-inf")},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::fill_.Scalar",
         {"self": {"dtype": "bfloat16", "shape": [1, 8, 8, 128]}, "value": float("-inf")},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::fill_.Scalar",
@@ -11026,61 +11227,61 @@ def register_cache_key_shapes(r):
         "aten::fill_.Scalar",
         {"self": {"dtype": "bool", "shape": [1, 32, 32]}, "value": 1.0},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::fill_.Scalar",
         {"self": {"dtype": "int64", "shape": [32, 32]}, "value": 15},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::fill_.Scalar",
         {"self": {"dtype": "bfloat16", "shape": [1, 4, 96, 2]}, "value": float("-inf")},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::flip",
         {"dims": [-2], "self": {"dtype": "float32", "shape": [1, 128, 1, 256, 256]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::flip",
         {"dims": [-2], "self": {"dtype": "float32", "shape": [1, 16, 1, 128, 128]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::flip",
         {"dims": [-2], "self": {"dtype": "float32", "shape": [1, 8, 1, 128, 128]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::flip",
         {"dims": [-1], "self": {"dtype": "float32", "shape": [1, 128, 1, 256]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::flip",
         {"dims": [-1], "self": {"dtype": "float32", "shape": [1, 64, 2, 64]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::flip",
         {"dims": [-1], "self": {"dtype": "float32", "shape": [1, 32, 2, 64]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::floor_divide",
         {"other": {"dtype": "int64", "shape": []}, "self": {"dtype": "float32", "shape": [262144]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::floor_divide",
@@ -11120,7 +11321,7 @@ def register_cache_key_shapes(r):
         "aten::floor_divide",
         {"other": {"dtype": "int64", "shape": []}, "self": {"dtype": "int64", "shape": [1, 96]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::full",
@@ -11133,7 +11334,7 @@ def register_cache_key_shapes(r):
             "size": [1, 96],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gather",
@@ -11231,7 +11432,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 96, 12288]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ge.Scalar_out",
@@ -11241,7 +11442,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [96, 3072]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ge.Scalar_out",
@@ -11251,7 +11452,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [64, 2880]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ge.Scalar_out",
@@ -11261,7 +11462,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [64, 1024]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ge.Scalar_out",
@@ -11271,7 +11472,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 32, 1024]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ge.Scalar_out",
@@ -11281,7 +11482,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [384, 48]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ge.Tensor_out",
@@ -11291,7 +11492,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 36, 192]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ge.Tensor_out",
@@ -11301,7 +11502,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 36, 48]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ge.Tensor_out",
@@ -11311,7 +11512,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [1, 1, 8]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ge.Tensor_out",
@@ -11321,7 +11522,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [1, 32, 8]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ge.Tensor_out",
@@ -11331,43 +11532,43 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [16, 1]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gelu",
         {"approximate": "none", "self": {"dtype": "float32", "shape": [1, 1500, 5120]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gelu",
         {"approximate": "none", "self": {"dtype": "float32", "shape": [1, 1280, 3000]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gelu",
         {"approximate": "none", "self": {"dtype": "float32", "shape": [1, 448, 5120]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gelu",
         {"approximate": "tanh", "self": {"dtype": "bfloat16", "shape": [1, 264, 8192]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gelu",
         {"approximate": "none", "self": {"dtype": "bfloat16", "shape": [1, 1025, 2048]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gelu",
         {"approximate": "none", "self": {"dtype": "float32", "shape": [1, 1280, 1500]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gelu_backward",
@@ -11377,7 +11578,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 1500, 5120]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gelu_backward",
@@ -11387,7 +11588,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 1280, 3000]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gelu_backward",
@@ -11397,7 +11598,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 448, 5120]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gelu_backward",
@@ -11407,7 +11608,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 264, 8192]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gelu_backward",
@@ -11417,7 +11618,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 1025, 2048]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gelu_backward",
@@ -11427,7 +11628,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 480, 64, 50]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gt.Scalar_out",
@@ -11534,7 +11735,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [1, 1, 1, 96]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gt.Tensor_out",
@@ -11544,7 +11745,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [96]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gt.Tensor_out",
@@ -11554,7 +11755,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [1, 1, 1, 32]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::gt.Tensor_out",
@@ -11594,7 +11795,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": []},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::histc",
@@ -11627,7 +11828,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [32, 3072, 1536]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index.Tensor",
@@ -11636,7 +11837,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [8, 4096, 4088]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index.Tensor",
@@ -11645,7 +11846,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [8, 2880, 5760]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index.Tensor",
@@ -11654,7 +11855,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [8, 4096, 4032]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index.Tensor",
@@ -11663,7 +11864,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [32, 1536, 1536]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index.Tensor",
@@ -11672,7 +11873,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [8, 3072, 3072]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index_add_",
@@ -11684,7 +11885,7 @@ def register_cache_key_shapes(r):
             "source": {"dtype": "float32", "shape": [10, 4032]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index_add_",
@@ -11696,7 +11897,7 @@ def register_cache_key_shapes(r):
             "source": {"dtype": "float32", "shape": [11, 4032]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index_add_",
@@ -11708,7 +11909,7 @@ def register_cache_key_shapes(r):
             "source": {"dtype": "float32", "shape": [12, 4032]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index_add_",
@@ -11720,7 +11921,7 @@ def register_cache_key_shapes(r):
             "source": {"dtype": "float32", "shape": [13, 4032]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index_add_",
@@ -11732,7 +11933,7 @@ def register_cache_key_shapes(r):
             "source": {"dtype": "float32", "shape": [14, 4032]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index_add_",
@@ -11744,7 +11945,7 @@ def register_cache_key_shapes(r):
             "source": {"dtype": "float32", "shape": [15, 4032]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index_select",
@@ -11754,7 +11955,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 10, 256, 256]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index_select",
@@ -11764,7 +11965,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [32, 4032]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index_select",
@@ -11774,7 +11975,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [32, 4032]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index_select",
@@ -11784,7 +11985,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [32, 4032]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index_select",
@@ -11794,7 +11995,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [32, 4032]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index_select",
@@ -11804,7 +12005,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [32, 4032]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::index_select_backward",
@@ -11815,7 +12016,7 @@ def register_cache_key_shapes(r):
             "self_sizes": [13, 1024],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::le.Scalar_out",
@@ -11825,7 +12026,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 96, 12288]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::le.Scalar_out",
@@ -11835,7 +12036,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [96, 3072]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::le.Scalar_out",
@@ -11845,7 +12046,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [64, 2880]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::le.Scalar_out",
@@ -11855,7 +12056,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [64, 1024]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::le.Scalar_out",
@@ -11865,7 +12066,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 32, 1024]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::le.Scalar_out",
@@ -11875,7 +12076,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [384, 48]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::le.Tensor_out",
@@ -11885,7 +12086,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [1, 1, 1, 96]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::le.Tensor_out",
@@ -11895,7 +12096,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [96]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::le.Tensor_out",
@@ -11905,7 +12106,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 36, 192]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::le.Tensor_out",
@@ -11915,7 +12116,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 36, 48]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::le.Tensor_out",
@@ -11925,7 +12126,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [1, 1, 1, 32]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::linalg_vector_norm",
@@ -11937,7 +12138,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 32, 8, 128]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::linalg_vector_norm",
@@ -11949,7 +12150,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 32, 2, 128]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::linalg_vector_norm",
@@ -11961,7 +12162,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 1024]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::linalg_vector_norm",
@@ -12237,7 +12438,7 @@ def register_cache_key_shapes(r):
         "aten::log",
         {"self": {"dtype": "float32", "shape": [32, 32]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::log",
@@ -12255,7 +12456,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 448]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::log.out",
@@ -12264,7 +12465,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 96]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::log.out",
@@ -12273,7 +12474,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 32]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::log.out",
@@ -12282,7 +12483,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 16]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::logical_and.out",
@@ -12292,7 +12493,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bool", "shape": [1, 96, 12288]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::logical_and.out",
@@ -12302,7 +12503,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bool", "shape": [96, 3072]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::logical_and.out",
@@ -12312,7 +12513,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bool", "shape": [64, 2880]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::logical_and.out",
@@ -12322,7 +12523,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bool", "shape": [64, 1024]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::logical_and.out",
@@ -12332,7 +12533,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bool", "shape": [1, 32, 1024]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::logical_and.out",
@@ -12342,13 +12543,13 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bool", "shape": [384, 48]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::logical_not",
         {"self": {"dtype": "bool", "shape": [1, 4]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::lt.Scalar_out",
@@ -12491,7 +12692,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [13]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_fill.Scalar",
@@ -12501,7 +12702,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=2,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_fill.Scalar",
@@ -12511,7 +12712,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_fill.Scalar",
@@ -12521,7 +12722,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=2,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_fill.Scalar",
@@ -12531,7 +12732,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_fill.Scalar",
@@ -12541,7 +12742,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_fill.Scalar",
@@ -12551,7 +12752,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_fill_.Scalar",
@@ -12561,7 +12762,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_fill_.Scalar",
@@ -12571,7 +12772,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_fill_.Scalar",
@@ -12581,7 +12782,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_fill_.Scalar",
@@ -12591,7 +12792,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_fill_.Scalar",
@@ -12601,7 +12802,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_fill_.Scalar",
@@ -12611,7 +12812,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_select",
@@ -12620,7 +12821,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 264, 2048]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_select",
@@ -12629,7 +12830,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 96, 2048]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_select",
@@ -12638,7 +12839,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 96, 640]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_select",
@@ -12647,7 +12848,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 96, 512]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_select",
@@ -12656,7 +12857,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 96, 448]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::masked_select",
@@ -12665,7 +12866,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 96, 336]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::max",
@@ -12689,67 +12890,67 @@ def register_cache_key_shapes(r):
         "aten::max",
         {"self": {"dtype": "int64", "shape": [3, 96]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::max",
         {"self": {"dtype": "int64", "shape": [64, 2]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::max",
         {"self": {"dtype": "int64", "shape": [1]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::max.dim",
         {"dim": -1, "keepdim": True, "self": {"dtype": "bfloat16", "shape": [1, 128, 32, 33]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::max.dim",
         {"dim": -1, "keepdim": True, "self": {"dtype": "bfloat16", "shape": [1, 64, 32, 33]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::max.dim",
         {"dim": -1, "keepdim": True, "self": {"dtype": "bfloat16", "shape": [1, 21, 32, 32]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::max.dim",
         {"dim": -1, "keepdim": True, "self": {"dtype": "bfloat16", "shape": [1, 4, 32, 41]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::max.dim",
         {"dim": -1, "keepdim": True, "self": {"dtype": "bfloat16", "shape": [1, 4, 32, 33]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::max.dim",
         {"dim": -1, "keepdim": True, "self": {"dtype": "int64", "shape": [1, 36]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mean",
         {"dtype": None, "self": {"dtype": "float32", "shape": [1, 448]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mean",
         {"dtype": None, "self": {"dtype": "float32", "shape": [1, 96]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mean",
@@ -12775,13 +12976,13 @@ def register_cache_key_shapes(r):
         "aten::mean",
         {"dtype": None, "self": {"dtype": "float32", "shape": [1, 32]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mean",
         {"dtype": None, "self": {"dtype": "float32", "shape": [1, 16]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mean.dim",
@@ -12792,7 +12993,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [6144, 128]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mean.dim",
@@ -12803,7 +13004,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 1024, 640]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mean.dim",
@@ -12814,7 +13015,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 264, 16, 128]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mean.dim",
@@ -12825,7 +13026,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 264, 2048]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mean.dim",
@@ -12836,7 +13037,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 256, 4, 512]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mean.dim",
@@ -12847,7 +13048,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 96, 8, 512]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::min",
@@ -12874,7 +13075,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [32, 32]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::minimum",
@@ -12883,7 +13084,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [16, 16]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mm",
@@ -12892,7 +13093,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [2048, 32]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mm",
@@ -12901,7 +13102,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [64, 72]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mse_loss",
@@ -12911,7 +13112,7 @@ def register_cache_key_shapes(r):
             "target": {"dtype": "float32", "shape": [1, 40, 132]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mse_loss",
@@ -12921,7 +13122,7 @@ def register_cache_key_shapes(r):
             "target": {"dtype": "float32", "shape": [1, 16, 32]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mse_loss",
@@ -12931,7 +13132,7 @@ def register_cache_key_shapes(r):
             "target": {"dtype": "float32", "shape": [1, 3, 7, 7]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mse_loss_backward",
@@ -12942,7 +13143,7 @@ def register_cache_key_shapes(r):
             "target": {"dtype": "float32", "shape": [1, 40, 132]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mse_loss_backward",
@@ -12953,7 +13154,7 @@ def register_cache_key_shapes(r):
             "target": {"dtype": "float32", "shape": [1, 16, 32]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mse_loss_backward",
@@ -12964,43 +13165,43 @@ def register_cache_key_shapes(r):
             "target": {"dtype": "float32", "shape": [1, 3, 7, 7]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mul.Scalar",
         {"other": 0.0, "self": {"dtype": "float32", "shape": [6144, 128]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mul.Scalar",
         {"other": 0.0, "self": {"dtype": "float32", "shape": [1, 264, 16, 128]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mul.Scalar",
         {"other": 0.0, "self": {"dtype": "float32", "shape": [1, 264, 2048]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mul.Scalar",
         {"other": 0.0, "self": {"dtype": "float32", "shape": [1, 256, 4, 512]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mul.Scalar",
         {"other": 0.0, "self": {"dtype": "float32", "shape": [1, 96, 8, 512]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mul.Scalar",
         {"other": 0.0, "self": {"dtype": "float32", "shape": [3072, 128]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mul.Tensor",
@@ -13085,7 +13286,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 4096, 16]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mul_.Tensor",
@@ -13094,7 +13295,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 256, 176]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mul_.Tensor",
@@ -13103,7 +13304,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 96, 336]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mul_.Tensor",
@@ -13112,7 +13313,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 96, 176]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mul_.Tensor",
@@ -13121,49 +13322,49 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "bfloat16", "shape": [1, 96, 96]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::mul_.Tensor",
         {"other": {"dtype": "int64", "shape": []}, "self": {"dtype": "int64", "shape": []}},
         count=2,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_dropout",
         {"input": {"dtype": "bfloat16", "shape": [1, 96, 160]}, "p": 0.1, "train": True},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_dropout",
         {"input": {"dtype": "bfloat16", "shape": [96, 160]}, "p": 0.1, "train": True},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_dropout",
         {"input": {"dtype": "bfloat16", "shape": [1, 96, 48]}, "p": 0.1, "train": True},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_dropout",
         {"input": {"dtype": "float32", "shape": [1, 96, 48]}, "p": 0.1, "train": True},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_dropout",
         {"input": {"dtype": "bfloat16", "shape": [1, 64, 48]}, "p": 0.1, "train": True},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_dropout",
         {"input": {"dtype": "bfloat16", "shape": [1, 32, 48]}, "p": 0.1, "train": True},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_dropout_backward",
@@ -13173,7 +13374,7 @@ def register_cache_key_shapes(r):
             "scale": 1.11111,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_dropout_backward",
@@ -13183,7 +13384,7 @@ def register_cache_key_shapes(r):
             "scale": 1.11111,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_dropout_backward",
@@ -13193,7 +13394,7 @@ def register_cache_key_shapes(r):
             "scale": 1.11111,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_dropout_backward",
@@ -13203,7 +13404,7 @@ def register_cache_key_shapes(r):
             "scale": 1.11111,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_dropout_backward",
@@ -13213,7 +13414,7 @@ def register_cache_key_shapes(r):
             "scale": 1.11111,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_dropout_backward",
@@ -13223,7 +13424,7 @@ def register_cache_key_shapes(r):
             "scale": 1.11111,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_layer_norm",
@@ -13235,7 +13436,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [1280]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_layer_norm",
@@ -13247,7 +13448,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [1280]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_layer_norm",
@@ -13259,7 +13460,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [2048]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_layer_norm",
@@ -13271,7 +13472,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "bfloat16", "shape": [512]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_layer_norm",
@@ -13283,7 +13484,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [768]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_layer_norm",
@@ -13295,7 +13496,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [768]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_layer_norm_backward",
@@ -13310,7 +13511,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [1280]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_layer_norm_backward",
@@ -13325,7 +13526,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [1280]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_layer_norm_backward",
@@ -13340,7 +13541,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [2048]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_layer_norm_backward",
@@ -13355,7 +13556,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "bfloat16", "shape": [512]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_layer_norm_backward",
@@ -13370,7 +13571,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "float32", "shape": [1152]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::native_layer_norm_backward",
@@ -13385,7 +13586,7 @@ def register_cache_key_shapes(r):
             "weight": {"dtype": "bfloat16", "shape": [1024]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ne.Scalar_out",
@@ -13491,115 +13692,115 @@ def register_cache_key_shapes(r):
         "aten::neg",
         {"self": {"dtype": "float32", "shape": [1, 1024, 640]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::neg",
         {"self": {"dtype": "float32", "shape": [1, 64, 2, 64, 64]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::neg",
         {"self": {"dtype": "bfloat16", "shape": [1, 64, 64, 128]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::neg",
         {"self": {"dtype": "float32", "shape": [1, 32, 2, 64, 64]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::neg",
         {"self": {"dtype": "bfloat16", "shape": [1, 32, 64, 128]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::nonzero",
         {"self": {"dtype": "bool", "shape": [768]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::nonzero",
         {"self": {"dtype": "bool", "shape": [1, 96]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::nonzero",
         {"self": {"dtype": "bool", "shape": [96]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::nonzero",
         {"self": {"dtype": "int64", "shape": [32, 2]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::nonzero",
         {"self": {"dtype": "bool", "shape": [13]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::nonzero",
         {"self": {"dtype": "bool", "shape": [1, 4]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::one_hot",
         {"num_classes": 8, "self": {"dtype": "int64", "shape": [32, 2]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::one_hot",
         {"num_classes": 4, "self": {"dtype": "int64", "shape": [1, 36]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ones",
         {"device": None, "dtype": 4, "layout": None, "pin_memory": None, "size": [1, 32]},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ones",
         {"device": None, "dtype": 4, "layout": None, "pin_memory": None, "size": [1, 65]},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ones",
         {"device": None, "dtype": 11, "layout": None, "pin_memory": None, "size": [128, 128]},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ones",
         {"device": None, "dtype": 11, "layout": None, "pin_memory": None, "size": [2, 2]},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ones",
         {"device": None, "dtype": 11, "layout": None, "pin_memory": None, "size": [256, 256]},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ones",
         {"device": None, "dtype": 4, "layout": None, "pin_memory": None, "size": [3, 1, 96]},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ones_like",
@@ -13612,7 +13813,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [262144, 32]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::ones_like",
@@ -13676,7 +13877,7 @@ def register_cache_key_shapes(r):
         },
         count=22,
         paths=(
-            "test_kaizen_hf_onboarding_reduced_eager",
+            "hf_onboarding_reduced_eager",
             "text-generation-torch-titan-multi-core-async",
             "text-generation-torch-titan-multi-core-async-compile",
             "text-generation-torch-titan-multi-core-async-compile-dev",
@@ -13705,7 +13906,7 @@ def register_cache_key_shapes(r):
         {"exponent": {"dtype": "float32", "shape": [64]}, "self": 0.0},
         count=24,
         paths=(
-            "test_kaizen_hf_onboarding_reduced_eager",
+            "hf_onboarding_reduced_eager",
             "text-generation-torch-titan-multi-core-async-compile-dev",
             "text-generation-torch-titan-multi-core-async-compile-hostcc",
             "text-generation-torch-titan-multi-core-async-compile-moe",
@@ -13732,7 +13933,7 @@ def register_cache_key_shapes(r):
         {"exponent": {"dtype": "float32", "shape": [32]}, "self": 0.0},
         count=5,
         paths=(
-            "test_kaizen_hf_onboarding_reduced_eager",
+            "hf_onboarding_reduced_eager",
             "text-generation-torch-titan-multi-core-async-compile-moe",
             "text-generation-torch-titan-multi-core-async-hostcc",
             "text-generation-torch-titan-multi-core-trn3",
@@ -13743,13 +13944,13 @@ def register_cache_key_shapes(r):
         "aten::pow.Scalar",
         {"exponent": {"dtype": "float32", "shape": [10]}, "self": 0.0},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::pow.Scalar",
         {"exponent": {"dtype": "float32", "shape": [6]}, "self": 0.0},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::pow.Tensor_Scalar_out",
@@ -13759,7 +13960,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [6144, 128]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::pow.Tensor_Scalar_out",
@@ -13769,7 +13970,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [6144, 128]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::pow.Tensor_Scalar_out",
@@ -13779,7 +13980,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 264, 16, 128]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::pow.Tensor_Scalar_out",
@@ -13789,7 +13990,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 264, 16, 128]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::pow.Tensor_Scalar_out",
@@ -13799,7 +14000,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 264, 2048]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::pow.Tensor_Scalar_out",
@@ -13809,20 +14010,20 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 264, 2048]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::reciprocal",
         {"self": {"dtype": "bfloat16", "shape": [1, 32, 8, 1]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::reciprocal",
         {"self": {"dtype": "float32", "shape": [64]}},
         count=22,
         paths=(
-            "test_kaizen_hf_onboarding_reduced_eager",
+            "hf_onboarding_reduced_eager",
             "text-generation-torch-titan-multi-core-async",
             "text-generation-torch-titan-multi-core-async-compile",
             "text-generation-torch-titan-multi-core-async-compile-dev",
@@ -13850,14 +14051,14 @@ def register_cache_key_shapes(r):
         "aten::reciprocal",
         {"self": {"dtype": "bfloat16", "shape": [1, 32, 2, 1]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::reciprocal",
         {"self": {"dtype": "float32", "shape": [32]}},
         count=6,
         paths=(
-            "test_kaizen_hf_onboarding_reduced_eager",
+            "hf_onboarding_reduced_eager",
             "text-generation-torch-titan-multi-core-async",
             "text-generation-torch-titan-multi-core-async-compile-moe",
             "text-generation-torch-titan-multi-core-async-hostcc",
@@ -13869,55 +14070,55 @@ def register_cache_key_shapes(r):
         "aten::reciprocal",
         {"self": {"dtype": "float32", "shape": [10]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::reciprocal",
         {"self": {"dtype": "float32", "shape": [6]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::relu",
         {"self": {"dtype": "bfloat16", "shape": [1, 32, 4096]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::relu",
         {"self": {"dtype": "bfloat16", "shape": [1, 32, 3712]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::relu",
         {"self": {"dtype": "bfloat16", "shape": [64, 1856]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::relu",
         {"self": {"dtype": "float32", "shape": [1, 32, 64, 32]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::relu",
         {"self": {"dtype": "bfloat16", "shape": [1, 49, 1024]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::relu",
         {"self": {"dtype": "bfloat16", "shape": [1, 41, 1024]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::remainder.Scalar",
         {"other": 0.0, "self": {"dtype": "float32", "shape": [262144]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::remainder.Scalar",
@@ -13947,13 +14148,13 @@ def register_cache_key_shapes(r):
         "aten::remainder.Scalar",
         {"other": 0.0, "self": {"dtype": "int64", "shape": [1]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::remainder.Scalar",
         {"other": 0.0, "self": {"dtype": "int64", "shape": []}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::remainder.Tensor_out",
@@ -13963,43 +14164,43 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "int64", "shape": [64]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::repeat",
         {"repeats": [1, 2], "self": {"dtype": "float32", "shape": [96, 64]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::repeat",
         {"repeats": [1, 1], "self": {"dtype": "float32", "shape": [64, 80]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::repeat",
         {"repeats": [1, 1, 1], "self": {"dtype": "float32", "shape": [1, 1, 1408]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::repeat",
         {"repeats": [1, 1, 1], "self": {"dtype": "bfloat16", "shape": [1, 1, 1152]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::repeat",
         {"repeats": [1, 2], "self": {"dtype": "float32", "shape": [64, 10]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::repeat",
         {"repeats": [1, 1], "self": {"dtype": "int64", "shape": [1, 448]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::repeat_interleave.Tensor",
@@ -14015,37 +14216,37 @@ def register_cache_key_shapes(r):
         "aten::rsqrt",
         {"self": {"dtype": "float32", "shape": [1, 96, 64, 1]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::rsqrt",
         {"self": {"dtype": "float32", "shape": [6144, 1]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::rsqrt",
         {"self": {"dtype": "float32", "shape": [1, 264, 16, 1]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::rsqrt",
         {"self": {"dtype": "float32", "shape": [1, 96, 32, 1]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::rsqrt",
         {"self": {"dtype": "float32", "shape": [3072, 1]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::rsqrt",
         {"self": {"dtype": "float32", "shape": [1, 264, 8, 1]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::scatter.value_out",
@@ -14073,7 +14274,7 @@ def register_cache_key_shapes(r):
             "value": False,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::scatter.value_out",
@@ -14085,7 +14286,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::scatter.value_out",
@@ -14097,7 +14298,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::scatter.value_out",
@@ -14109,7 +14310,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::scatter.value_out",
@@ -14121,7 +14322,7 @@ def register_cache_key_shapes(r):
             "value": 0.0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::scatter_add_",
@@ -14132,7 +14333,7 @@ def register_cache_key_shapes(r):
             "src": {"dtype": "bfloat16", "shape": [1, 256, 1024]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::scatter_add_",
@@ -14179,7 +14380,7 @@ def register_cache_key_shapes(r):
             "src": {"dtype": "bfloat16", "shape": [96, 8]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::scatter_add_",
@@ -14190,7 +14391,7 @@ def register_cache_key_shapes(r):
             "src": {"dtype": "float32", "shape": [96, 4]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::select_backward",
@@ -14201,7 +14402,7 @@ def register_cache_key_shapes(r):
             "input_sizes": [2, 10240, 72],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::select_backward",
@@ -14212,7 +14413,7 @@ def register_cache_key_shapes(r):
             "input_sizes": [2, 10240, 72],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::select_backward",
@@ -14223,7 +14424,7 @@ def register_cache_key_shapes(r):
             "input_sizes": [1, 64, 2, 64, 128],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::select_backward",
@@ -14234,7 +14435,7 @@ def register_cache_key_shapes(r):
             "input_sizes": [1, 64, 2, 64, 128],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::select_backward",
@@ -14245,7 +14446,7 @@ def register_cache_key_shapes(r):
             "input_sizes": [1, 64, 2, 64, 128],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::select_backward",
@@ -14256,49 +14457,49 @@ def register_cache_key_shapes(r):
             "input_sizes": [1, 64, 2, 64, 128],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sgn",
         {"self": {"dtype": "float32", "shape": [1, 1024, 640]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sigmoid",
         {"self": {"dtype": "bfloat16", "shape": [1, 96, 12288]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sigmoid",
         {"self": {"dtype": "bfloat16", "shape": [96, 3072]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sigmoid",
         {"self": {"dtype": "bfloat16", "shape": [1, 96, 2048]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sigmoid",
         {"self": {"dtype": "bfloat16", "shape": [64, 2880]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sigmoid",
         {"self": {"dtype": "bfloat16", "shape": [1, 32, 4096]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sigmoid",
         {"self": {"dtype": "bfloat16", "shape": [1, 96, 1024]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sigmoid_backward",
@@ -14307,7 +14508,7 @@ def register_cache_key_shapes(r):
             "output": {"dtype": "bfloat16", "shape": [1, 96, 12288]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sigmoid_backward",
@@ -14316,7 +14517,7 @@ def register_cache_key_shapes(r):
             "output": {"dtype": "bfloat16", "shape": [96, 3072]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sigmoid_backward",
@@ -14325,7 +14526,7 @@ def register_cache_key_shapes(r):
             "output": {"dtype": "bfloat16", "shape": [1, 96, 2048]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sigmoid_backward",
@@ -14334,7 +14535,7 @@ def register_cache_key_shapes(r):
             "output": {"dtype": "bfloat16", "shape": [64, 2880]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sigmoid_backward",
@@ -14343,7 +14544,7 @@ def register_cache_key_shapes(r):
             "output": {"dtype": "bfloat16", "shape": [1, 32, 4096]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sigmoid_backward",
@@ -14352,7 +14553,7 @@ def register_cache_key_shapes(r):
             "output": {"dtype": "bfloat16", "shape": [1, 96, 1024]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sign",
@@ -14574,13 +14775,13 @@ def register_cache_key_shapes(r):
         "aten::sin",
         {"self": {"dtype": "float32", "shape": [1, 256, 512]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sin",
         {"self": {"dtype": "float32", "shape": [1, 256, 256]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::slice_backward",
@@ -14688,37 +14889,37 @@ def register_cache_key_shapes(r):
         "aten::softplus",
         {"beta": 1, "self": {"dtype": "bfloat16", "shape": [1, 4096, 32]}, "threshold": 20},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::softplus",
         {"beta": 1, "self": {"dtype": "bfloat16", "shape": [1, 2048, 32]}, "threshold": 20},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::softplus",
         {"beta": 1, "self": {"dtype": "float32", "shape": [1, 96, 64]}, "threshold": 20},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::softplus",
         {"beta": 1, "self": {"dtype": "bfloat16", "shape": [1, 32, 128]}, "threshold": 20},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::softplus",
         {"beta": 1, "self": {"dtype": "float32", "shape": [1, 96, 32]}, "threshold": 20},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::softplus",
         {"beta": 1, "self": {"dtype": "float32", "shape": [1, 32, 32]}, "threshold": 20},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::softplus_backward",
@@ -14729,7 +14930,7 @@ def register_cache_key_shapes(r):
             "threshold": 20,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::softplus_backward",
@@ -14740,7 +14941,7 @@ def register_cache_key_shapes(r):
             "threshold": 20,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::softplus_backward",
@@ -14751,7 +14952,7 @@ def register_cache_key_shapes(r):
             "threshold": 20,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::softplus_backward",
@@ -14762,7 +14963,7 @@ def register_cache_key_shapes(r):
             "threshold": 20,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::softplus_backward",
@@ -14773,7 +14974,7 @@ def register_cache_key_shapes(r):
             "threshold": 20,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::softplus_backward",
@@ -14784,7 +14985,7 @@ def register_cache_key_shapes(r):
             "threshold": 20,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::split_with_sizes_copy.out",
@@ -14887,7 +15088,7 @@ def register_cache_key_shapes(r):
         "aten::sqrt",
         {"self": {"dtype": "bfloat16", "shape": [32, 4]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::stack",
@@ -14900,19 +15101,19 @@ def register_cache_key_shapes(r):
             ],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::stack",
         {"dim": 0, "tensors": [{"dtype": "bfloat16", "shape": [64, 256]}]},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::stack",
         {"dim": 0, "tensors": [{"dtype": "float32", "shape": [96, 128]}]},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::stack",
@@ -14928,7 +15129,7 @@ def register_cache_key_shapes(r):
             ],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::stack",
@@ -14940,7 +15141,7 @@ def register_cache_key_shapes(r):
             ],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::stack",
@@ -14952,7 +15153,7 @@ def register_cache_key_shapes(r):
             ],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sub.Tensor",
@@ -15082,13 +15283,13 @@ def register_cache_key_shapes(r):
         "aten::sum",
         {"dtype": 6, "self": {"dtype": "bfloat16", "shape": [1, 40, 132]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sum",
         {"dtype": 6, "self": {"dtype": "float32", "shape": [1, 40, 132]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sum.IntList_out",
@@ -15100,7 +15301,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 448, 30000]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sum.IntList_out",
@@ -15112,7 +15313,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 32, 30000]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sum.IntList_out",
@@ -15124,7 +15325,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 16, 30000]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sum.IntList_out",
@@ -15136,7 +15337,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 96, 3000]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sum.IntList_out",
@@ -15148,7 +15349,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 32, 3000]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::sum.dim_IntList",
@@ -15242,31 +15443,31 @@ def register_cache_key_shapes(r):
         "aten::tanh",
         {"self": {"dtype": "float32", "shape": [1, 256, 3000]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::tanh",
         {"self": {"dtype": "bfloat16", "shape": [1, 96, 3000]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::tanh",
         {"self": {"dtype": "float32", "shape": [1, 32, 5120]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::tanh",
         {"self": {"dtype": "bfloat16", "shape": [1, 32, 3072]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::tanh",
         {"self": {"dtype": "float32", "shape": [1, 16, 5120]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::tanh_backward",
@@ -15275,7 +15476,7 @@ def register_cache_key_shapes(r):
             "output": {"dtype": "float32", "shape": [1, 256, 3000]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::tanh_backward",
@@ -15284,7 +15485,7 @@ def register_cache_key_shapes(r):
             "output": {"dtype": "bfloat16", "shape": [1, 96, 3000]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::tanh_backward",
@@ -15293,7 +15494,7 @@ def register_cache_key_shapes(r):
             "output": {"dtype": "float32", "shape": [1, 32, 5120]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::tanh_backward",
@@ -15302,7 +15503,7 @@ def register_cache_key_shapes(r):
             "output": {"dtype": "bfloat16", "shape": [1, 32, 3072]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::tanh_backward",
@@ -15311,7 +15512,7 @@ def register_cache_key_shapes(r):
             "output": {"dtype": "float32", "shape": [1, 16, 5120]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::threshold_backward",
@@ -15321,7 +15522,7 @@ def register_cache_key_shapes(r):
             "threshold": 0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::threshold_backward",
@@ -15331,7 +15532,7 @@ def register_cache_key_shapes(r):
             "threshold": 0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::threshold_backward",
@@ -15341,7 +15542,7 @@ def register_cache_key_shapes(r):
             "threshold": 0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::threshold_backward",
@@ -15351,7 +15552,7 @@ def register_cache_key_shapes(r):
             "threshold": 0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::threshold_backward",
@@ -15361,7 +15562,7 @@ def register_cache_key_shapes(r):
             "threshold": 0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::threshold_backward",
@@ -15371,7 +15572,7 @@ def register_cache_key_shapes(r):
             "threshold": 0,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::topk",
@@ -15441,7 +15642,7 @@ def register_cache_key_shapes(r):
             "sorted": True,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::topk",
@@ -15453,55 +15654,55 @@ def register_cache_key_shapes(r):
             "sorted": True,
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::tril",
         {"diagonal": 0, "self": {"dtype": "float32", "shape": [1, 64, 2, 64, 64]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::tril",
         {"diagonal": 0, "self": {"dtype": "float32", "shape": [1, 32, 2, 64, 64]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::tril",
         {"diagonal": 0, "self": {"dtype": "float32", "shape": [1, 32, 1, 64, 64]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::tril",
         {"diagonal": -1, "self": {"dtype": "bool", "shape": [256, 256]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::tril",
         {"diagonal": 0, "self": {"dtype": "bool", "shape": [256, 256]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::tril",
         {"diagonal": -1, "self": {"dtype": "bool", "shape": [128, 128]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::triu",
         {"diagonal": 0, "self": {"dtype": "bool", "shape": [64, 64]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::triu",
         {"diagonal": 1, "self": {"dtype": "bool", "shape": [64, 64]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::upsample_bilinear2d",
@@ -15513,7 +15714,7 @@ def register_cache_key_shapes(r):
             "self": {"dtype": "float32", "shape": [1, 3, 256, 256]},
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::value_selecting_reduction_backward",
@@ -15525,7 +15726,7 @@ def register_cache_key_shapes(r):
             "sizes": [1, 128, 32, 33],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::value_selecting_reduction_backward",
@@ -15537,7 +15738,7 @@ def register_cache_key_shapes(r):
             "sizes": [1, 64, 32, 33],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::value_selecting_reduction_backward",
@@ -15549,7 +15750,7 @@ def register_cache_key_shapes(r):
             "sizes": [256, 128],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::value_selecting_reduction_backward",
@@ -15561,7 +15762,7 @@ def register_cache_key_shapes(r):
             "sizes": [96, 512],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::value_selecting_reduction_backward",
@@ -15573,7 +15774,7 @@ def register_cache_key_shapes(r):
             "sizes": [96, 128],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::value_selecting_reduction_backward",
@@ -15585,7 +15786,7 @@ def register_cache_key_shapes(r):
             "sizes": [96, 8],
         },
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::where.self",
@@ -15717,7 +15918,7 @@ def register_cache_key_shapes(r):
         "aten::zero_",
         {"self": {"dtype": "bfloat16", "shape": [262144, 1024]}},
         count=1,
-        paths=("test_kaizen_hf_onboarding_reduced_eager",),
+        paths=("hf_onboarding_reduced_eager",),
     )
     t(
         "aten::zero_",
@@ -15748,7 +15949,7 @@ def register_cache_key_shapes(r):
         {"device": None, "dtype": 6, "layout": None, "pin_memory": None, "size": []},
         count=22,
         paths=(
-            "test_kaizen_hf_onboarding_reduced_eager",
+            "hf_onboarding_reduced_eager",
             "text-generation-torch-titan-multi-core-async",
             "text-generation-torch-titan-multi-core-async-compile",
             "text-generation-torch-titan-multi-core-async-compile-dev",

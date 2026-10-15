@@ -20,6 +20,13 @@ logger = logging.getLogger(__name__)
 
 
 class RemoveNoneOutputs(NeuronFXPass):
+    """Remove ``None`` graph outputs and record how to restore them.
+
+    Args:
+        state (NeuronFXPassState, optional): Shared pass state used to record output
+            mutations. Defaults to ``None``.
+    """
+
     def __init__(self, state: NeuronFXPassState | None = None):
         super().__init__(state)
 
@@ -35,10 +42,17 @@ class RemoveNoneOutputs(NeuronFXPass):
         return list(outputs)
 
     def call(self, gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
-        """Execute the pass to remove None outputs from the graph.
+        """Remove ``None`` values from an FX graph's outputs.
 
-        Filters out None values from the graph's output tuple and records
-        an IOMutation so the executor can restore them at runtime.
+        Args:
+            gm (torch.fx.GraphModule): FX graph module to update.
+
+        Returns:
+            PassResult: Graph module and whether any ``None`` output was removed.
+
+        Note:
+            Records an output mutation when state is available so runtime execution can
+            restore removed ``None`` values at their original positions.
         """
         logger.debug("Starting remove_none_outputs_pass")
         output_node = gm.graph.output_node()

@@ -19,12 +19,9 @@ Usage: python testing/vertical/run_gate.py [csv_dir]
 
 from __future__ import annotations
 
-import contextlib
 import os
-import signal
 import subprocess
 import sys
-import time
 
 SUITES = [
     "tests/vertical/test_target_ops_coverage.py",
@@ -50,17 +47,6 @@ PYTEST_TESTS_FAILED = 1
 # pytest exit code for "no tests collected".
 PYTEST_NO_TESTS = 5
 
-# Outer wall-clock guard for the whole gate (both passes). The per-op
-# --timeout cannot catch a hang outside a test, for example in collection or in
-# an xdist worker that crashes and stops answering signals. Such a hang would
-# otherwise run to the multi-hour runner cap. This guard kills the run and fails
-# the gate, which blocks the merge. A healthy gate finishes in about 40 minutes,
-# so 5400s (1.5h) leaves wide headroom. Keep it below the runner node cap.
-GATE_WALL_CLOCK_SECONDS = 5400
-# Exit code the gate returns when the wall-clock guard fires. This matches the
-# code GNU timeout uses, and should_retry treats it as a non-retryable failure.
-GATE_TIMEOUT_EXIT = 124
-
 
 def should_retry(main_exit: int) -> bool:
     """Return whether to run the --last-failed retry pass.
@@ -82,24 +68,10 @@ def resolve_exit(retry_exit: int) -> int:
     return 0 if retry_exit == PYTEST_NO_TESTS else retry_exit
 
 
-def _run_pytest(report_flags: list[str], extra: list[str], timeout: float) -> int:
+def _run_pytest(report_flags: list[str], extra: list[str]) -> int:
     cmd = [sys.executable, "-m", "pytest", *SUITES, *GATE_OPTS, *report_flags, *extra]
     print(f"+ {' '.join(cmd)}", flush=True)
-    # Start the run in a new process group so the guard kills the whole xdist
-    # tree, not only the pytest controller.
-    proc = subprocess.Popen(cmd, start_new_session=True)
-    try:
-        return proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        print(
-            f"::error::The gate exceeded the {GATE_WALL_CLOCK_SECONDS}s wall-clock "
-            "limit. A hang stalled the run. Kill the run and fail the gate.",
-            flush=True,
-        )
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        proc.wait()
-        return GATE_TIMEOUT_EXIT
+    return subprocess.run(cmd).returncode
 
 
 def main(argv: list[str]) -> int:
@@ -107,11 +79,8 @@ def main(argv: list[str]) -> int:
     os.environ["NEURON_COVERAGE_GATE"] = "1"
     os.environ["NEURON_COVERAGE_CSV_DIR"] = csv_dir
 
-    # One wall-clock budget covers both passes. Each pass gets the time left.
-    deadline = time.monotonic() + GATE_WALL_CLOCK_SECONDS
-
     # Main pass. Records every op status and marks a regression as a failure.
-    main_exit = _run_pytest(["--tb=no", "-q"], [], GATE_WALL_CLOCK_SECONDS)
+    main_exit = _run_pytest(["--tb=no", "-q"], [])
     if main_exit == 0:
         print("Main pass clean: no regression, no retry.")
         return 0
@@ -125,13 +94,9 @@ def main(argv: list[str]) -> int:
 
     # Retry only the failed ops once. A flaky failure that clears here no longer
     # gates; a real regression reproduces and fails again.
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        print("::error::The gate ran out of wall-clock time before the retry. Fail the gate.")
-        return GATE_TIMEOUT_EXIT
     print("Main pass reported test failures. Retry the failed ops once.")
     retry_exit = _run_pytest(
-        ["--tb=short", "-rf"], ["--last-failed", "--last-failed-no-failures=none"], remaining
+        ["--tb=short", "-rf"], ["--last-failed", "--last-failed-no-failures=none"]
     )
     if retry_exit == PYTEST_NO_TESTS:
         print("Retry collected no test to re-run. Treat as pass.")

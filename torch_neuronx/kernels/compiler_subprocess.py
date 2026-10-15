@@ -19,11 +19,19 @@ from .compiler_config import CompilerConfig
 
 
 class NEFFCacheKey:
-    """Efficient cache key for NEFF compilation.
+    """Create a deterministic key for a NEFF compilation.
 
-    Uses lazy hash computation to avoid re-hashing on repeated access.
-    The hash combines HLO content hash with compiler configuration to
-    produce a deterministic cache key.
+    Args:
+        hlo_protobuf (bytes): HLO protobuf or MLIR bytes to hash.
+        config (CompilerConfig): Compiler configuration to hash.
+        lnc_override (str | None): Logical NeuronCore override to hash; a falsey value
+            uses ``config.lnc``.
+        compiler_version (str | None): Compiler version to hash; ``None`` hashes
+            an empty version string.
+
+    Note:
+        Precompute separate HLO and configuration hashes, then combine them so
+        repeated key access does not rehash the inputs.
     """
 
     __slots__ = ("_config_hash", "_hash", "_hlo_hash")
@@ -57,7 +65,11 @@ class NEFFCacheKey:
 
     @property
     def hash(self) -> str:
-        """Return the pre-computed hash."""
+        """Return the precomputed hexadecimal cache-key hash.
+
+        Returns:
+            str: SHA-256 cache-key digest.
+        """
         return self._hash
 
     def __hash__(self) -> int:
@@ -72,19 +84,30 @@ class NEFFCacheKey:
 
 
 class CompilationError(Exception):
-    """Base exception for compilation errors."""
+    """Represent a compilation pipeline failure."""
 
     pass
 
 
 class NEFFCompilationError(CompilationError):
-    """Exception raised when NEFF compilation fails."""
+    """Represent a failed NEFF compilation."""
 
     pass
 
 
 class CompilerSubprocess:
-    """Handles subprocess operations for compilation pipeline."""
+    """Handle cached NEFF compilation through a subprocess.
+
+    Args:
+        nfs_cache_dir (str, optional): Shared cache directory override. A falsey value
+            uses ``get_nfs_cache_dir()``. Defaults to ``None``.
+        local_cache_dir (str, optional): Local lock directory override. A falsey value
+            uses ``get_local_cache_dir()``. Defaults to ``None``.
+
+    Note:
+        Create both cache directories during initialization unless caching is
+        disabled.
+    """
 
     def __init__(self, nfs_cache_dir: str | None = None, local_cache_dir: str | None = None):
         # Use environment variables or defaults
@@ -125,20 +148,26 @@ class CompilerSubprocess:
         output_file: str | None = None,
         neff_cache_key: str | None = None,
     ) -> bytes:
-        """Two-tier cache lookup and compilation.
+        """Return a cached NEFF or compile and cache MLIR bytes.
 
         Args:
-            hlo_protobuf: HLO protobuf bytes or MLIR bytes
-            config: Compiler configuration
-            lnc_override: Optional override for logical neuron cores
-            ir_type: Type of IR ("StableHLO" for MLIR)
-            output_file: Path to write output NEFF file (optional, for callers
-                that need the result at a specific path, e.g. neuronx_cc_wrapper)
-            neff_cache_key: Optional override for NFS cache key. If provided,
-                uses this instead of generating from HLO bytes.
+            hlo_protobuf (bytes): MLIR bytes to compile; the parameter name is retained for
+                compatibility.
+            config (CompilerConfig): Compiler configuration.
+            lnc_override (str, optional): Logical NeuronCore override. A falsey value uses
+                ``config.lnc``. Defaults to ``None``.
+            ir_type (str, optional): Accepted for compatibility but ignored. Defaults to
+                ``"StableHLO"``.
+            output_file (str, optional): Additional NEFF destination. Defaults to ``None``.
+            neff_cache_key (str, optional): External cache-key text. Defaults to ``None``.
 
         Returns:
-            Compiled NEFF bytes
+            bytes: Cached or newly compiled NEFF bytes.
+
+        Raises:
+            NEFFCompilationError: If NEFF compilation fails.
+            RuntimeError: If ``neuronx-cc`` is not found.
+            filelock.Timeout: If the cache lock cannot be acquired before its timeout.
         """
         # Skip caching if disabled
         if is_caching_disabled():
@@ -208,13 +237,13 @@ class CompilerSubprocess:
 
     @staticmethod
     def find_neuronx_cc() -> str:
-        """Find neuronx-cc compiler in PATH.
+        """Find the ``neuronx-cc`` executable on ``PATH``.
 
         Returns:
-            Path to neuronx-cc executable
+            str: Path to the compiler executable.
 
         Raises:
-            RuntimeError: If neuronx-cc is not found
+            RuntimeError: If ``neuronx-cc`` is not found.
         """
         neuronx_cc = shutil.which("neuronx-cc")
         if not neuronx_cc:
@@ -229,17 +258,19 @@ class CompilerSubprocess:
         lnc_override: str | None = None,
         workdir: str | None = None,
     ) -> None:
-        """Compile HLO protobuf to NEFF.
+        """Run ``neuronx-cc`` for an input IR file.
 
         Args:
-            config: Compiler configuration
-            input_file: Path to input HLO/MLIR file
-            output_file: Path to output NEFF file
-            lnc_override: Optional override for logical neuron cores
-            workdir: Compilation working directory
+            config (CompilerConfig): Compiler configuration.
+            input_file (str): Input HLO or MLIR filename.
+            output_file (str): Output NEFF filename.
+            lnc_override (str, optional): Logical NeuronCore override. A falsey value
+                uses ``config.lnc``. Defaults to ``None``.
+            workdir (str, optional): Compiler working directory. Defaults to ``None``.
 
         Raises:
-            NEFFCompilationError: If compilation fails
+            NEFFCompilationError: If the compiler exits with a nonzero status.
+            RuntimeError: If ``neuronx-cc`` is not found.
         """
         neuronx_cc = CompilerSubprocess.find_neuronx_cc()
         cmd = [
@@ -262,19 +293,23 @@ class CompilerSubprocess:
         lnc_override: str | None = None,
         ir_type: str = "StableHLO",
     ) -> bytes:
-        """Compile HLO protobuf or MLIR directly to NEFF.
+        """Compile MLIR bytes into a NEFF.
 
         Args:
-            hlo_protobuf: HLO protobuf bytes or MLIR bytes
-            config: Compiler configuration
-            lnc_override: Optional override for logical neuron cores
-            ir_type: Type of IR ("StableHLO" for MLIR)
+            hlo_protobuf (bytes): MLIR bytes to compile; the parameter name is retained for
+                compatibility.
+            config (CompilerConfig): Compiler configuration.
+            lnc_override (str, optional): Logical NeuronCore override. A falsey value uses
+                ``config.lnc``. Defaults to ``None``.
+            ir_type (str, optional): Accepted for compatibility but ignored. Defaults to
+                ``"StableHLO"``.
 
         Returns:
-            Compiled NEFF bytes
+            bytes: Compiled NEFF bytes.
 
         Raises:
-            NEFFCompilationError: If NEFF compilation fails
+            NEFFCompilationError: If NEFF compilation fails.
+            RuntimeError: If ``neuronx-cc`` is not found.
         """
         with compilation_job("eager") as job:
             workdir = job.get_neuronx_cc_workdir()

@@ -10,8 +10,8 @@ Run with ``-n 1``. This is a host-side measurement at microsecond scale, so xdis
 workers would add scheduler noise, and ``met.clear_all()`` would wipe
 process-global metrics for anything sharing the interpreter.
 
-Export ``TORCH_NEURONX_DISPATCH_TIMING=1`` and ``NEURON_LAUNCH_BLOCKING=0`` before
-starting python. The fixture below checks both.
+Export ``NEURON_LAUNCH_BLOCKING=0`` before starting python; the fixture below
+checks it.
 """
 
 import json

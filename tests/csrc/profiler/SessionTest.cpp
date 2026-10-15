@@ -2,10 +2,13 @@
 #include <gtest/gtest.h>
 #include <libkineto.h>
 #include <output_base.h>
+#include <torch/headeronly/version.h>
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <future>
+#include <mutex>
 #include <set>
 #include <thread>
 #include <vector>
@@ -24,6 +27,8 @@ namespace at::neuron {
 namespace {
 
 constexpr uint32_t kSystemProfile = static_cast<uint32_t>(InspectExportMask::SystemProfile);
+constexpr uint32_t kDeviceProfile = static_cast<uint32_t>(InspectExportMask::DeviceProfile);
+constexpr uint32_t kAllProfiles = static_cast<uint32_t>(InspectExportMask::All);
 
 // Fake nrt_inspect_config for testing
 struct FakeNrtInspectConfig {
@@ -99,6 +104,12 @@ class SessionTest : public ::testing::Test {
   FakeNrtInspectConfig fake_config_;
 };
 
+// Verify session ownership and capture independence for each public export mask.
+class SessionExportMaskTest : public SessionTest, public ::testing::WithParamInterface<uint32_t> {};
+
+INSTANTIATE_TEST_SUITE_P(ProfileMasks, SessionExportMaskTest,
+                         ::testing::Values(kSystemProfile, kDeviceProfile, kAllProfiles));
+
 TEST_F(SessionTest, StartStopSuccess) {
   std::set<libkineto::ActivityType> activityTypes;
   libkineto::Config config;
@@ -114,7 +125,7 @@ TEST_F(SessionTest, StartStopSuccess) {
   EXPECT_TRUE(session.errors().empty());
 }
 
-TEST_F(SessionTest, RequestExportWithoutContinuousExportReturnsExportNotEnabled) {
+TEST_P(SessionExportMaskTest, RequestExportWithoutContinuousExportReturnsExportNotEnabled) {
   // Opt-in boundary: a session without continuous_export publishes a null exporter,
   // so async requests are rejected (and nrt_inspect_export is never called).
   std::set<libkineto::ActivityType> activityTypes;
@@ -129,13 +140,13 @@ TEST_F(SessionTest, RequestExportWithoutContinuousExportReturnsExportNotEnabled)
   NeuronActivityProfilerSession session(activityTypes, config);
   session.start();
 
-  EXPECT_EQ(requestActiveExport(kSystemProfile), ExportStatus::ExportNotEnabled);
+  EXPECT_EQ(requestActiveExport(GetParam()), ExportStatus::ExportNotEnabled);
 
   session.stop();
   EXPECT_TRUE(session.errors().empty());
 }
 
-TEST_F(SessionTest, ContinuousExportConfigDoesNotRequireRuntimeMode) {
+TEST_P(SessionExportMaskTest, ContinuousExportConfigDoesNotRequireRuntimeMode) {
   // Capture modes and export opt-in are independent: a device-only session with
   // continuous_export:true still runs the async worker, and the requested mask is
   // forwarded to nrt_inspect_export verbatim (Runtime decides what it yields).
@@ -157,7 +168,7 @@ TEST_F(SessionTest, ContinuousExportConfigDoesNotRequireRuntimeMode) {
 
   std::promise<void> exportCalled;
   auto exportFuture = exportCalled.get_future();
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(kSystemProfile)).WillOnce([&exportCalled](uint32_t) {
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(GetParam())).WillOnce([&exportCalled](uint32_t) {
     exportCalled.set_value();
     return NRT_SUCCESS;
   });
@@ -167,14 +178,14 @@ TEST_F(SessionTest, ContinuousExportConfigDoesNotRequireRuntimeMode) {
   NeuronActivityProfilerSession session(activityTypes, config);
   session.start();
 
-  EXPECT_EQ(requestActiveExport(kSystemProfile), ExportStatus::Submitted);
+  EXPECT_EQ(requestActiveExport(GetParam()), ExportStatus::Submitted);
   EXPECT_EQ(exportFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
 
   session.stop();
   EXPECT_TRUE(session.errors().empty());
 }
 
-TEST_F(SessionTest, ContinuousExportBeginFailureLeavesNoActiveSession) {
+TEST_P(SessionExportMaskTest, ContinuousExportBeginFailureLeavesNoActiveSession) {
   // If nrt_inspect_begin fails, the session never publishes the bridge: no exporter
   // exists and async requests report NoActiveSession (not ExportNotEnabled).
   std::set<libkineto::ActivityType> activityTypes;
@@ -187,11 +198,11 @@ TEST_F(SessionTest, ContinuousExportBeginFailureLeavesNoActiveSession) {
   NeuronActivityProfilerSession session(activityTypes, config);
   session.start();
 
-  EXPECT_EQ(requestActiveExport(kSystemProfile), ExportStatus::NoActiveSession);
+  EXPECT_EQ(requestActiveExport(GetParam()), ExportStatus::NoActiveSession);
   EXPECT_FALSE(session.errors().empty());
 }
 
-TEST_F(SessionTest, ContinuousExportDuplicateStartDoesNotCreateSecondExporter) {
+TEST_P(SessionExportMaskTest, ContinuousExportDuplicateStartDoesNotCreateSecondExporter) {
   // Session::start() is idempotent (isActive_ guard): the second start must not
   // construct a second exporter/thread; the single worker keeps servicing requests.
   std::set<libkineto::ActivityType> activityTypes;
@@ -202,7 +213,7 @@ TEST_F(SessionTest, ContinuousExportDuplicateStartDoesNotCreateSecondExporter) {
 
   std::promise<void> exportCalled;
   auto exportFuture = exportCalled.get_future();
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(kSystemProfile)).WillOnce([&exportCalled](uint32_t) {
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(GetParam())).WillOnce([&exportCalled](uint32_t) {
     exportCalled.set_value();
     return NRT_SUCCESS;
   });
@@ -213,7 +224,7 @@ TEST_F(SessionTest, ContinuousExportDuplicateStartDoesNotCreateSecondExporter) {
   session.start();
   session.start();
 
-  EXPECT_EQ(requestActiveExport(kSystemProfile), ExportStatus::Submitted);
+  EXPECT_EQ(requestActiveExport(GetParam()), ExportStatus::Submitted);
   EXPECT_EQ(exportFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
 
   session.stop();
@@ -261,7 +272,7 @@ TEST_F(SessionTest, ContinuousExportSecondActiveSessionDoesNotCreateExporter) {
   firstSession.stop();
 }
 
-TEST_F(SessionTest, ContinuousExportDestructorJoinsExporterBeforeStop) {
+TEST_P(SessionExportMaskTest, ContinuousExportDestructorJoinsExporterBeforeStop) {
   // Teardown ordering on the dtor path (session destroyed without stop()): the
   // exporter is joined BEFORE nrt_inspect_stop(), so the final flush never races an
   // in-flight async drain. The gated mock holds the drain while the dtor runs.
@@ -276,10 +287,11 @@ TEST_F(SessionTest, ContinuousExportDestructorJoinsExporterBeforeStop) {
   std::promise<void> allowExport;
   auto allowExportFuture = allowExport.get_future().share();
   std::atomic<bool> exportCompleted{false};
+  std::atomic<bool> teardownStarted{false};
   std::atomic<bool> stopCalled{false};
   std::atomic<bool> stopBeforeExportCompleted{false};
 
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(kSystemProfile)).WillOnce([&](uint32_t) {
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(GetParam())).WillOnce([&](uint32_t) {
     exportStarted.set_value();
     allowExportFuture.wait();
     exportCompleted.store(true, std::memory_order_release);
@@ -297,21 +309,31 @@ TEST_F(SessionTest, ContinuousExportDestructorJoinsExporterBeforeStop) {
   {
     NeuronActivityProfilerSession session(activityTypes, config);
     session.start();
-    EXPECT_EQ(requestActiveExport(kSystemProfile), ExportStatus::Submitted);
+    EXPECT_EQ(requestActiveExport(GetParam()), ExportStatus::Submitted);
     EXPECT_EQ(exportStartedFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
     releaser = std::thread([&] {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      // A zero mask cannot queue work. NoActiveSession proves that the destructor
+      // unpublished the bridge while the export was still blocked.
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (requestActiveExport(0) != ExportStatus::NoActiveSession &&
+             std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      teardownStarted.store(requestActiveExport(0) == ExportStatus::NoActiveSession,
+                            std::memory_order_release);
+      // Release even after a timeout so a failed assertion cannot strand the worker.
       allowExport.set_value();
     });
   }
   releaser.join();
 
   EXPECT_TRUE(exportCompleted.load(std::memory_order_acquire));
+  EXPECT_TRUE(teardownStarted.load(std::memory_order_acquire));
   EXPECT_TRUE(stopCalled.load(std::memory_order_acquire));
   EXPECT_FALSE(stopBeforeExportCompleted.load(std::memory_order_acquire));
 }
 
-TEST_F(SessionTest, NeuronProfileDeviceOnlyAllowsSynchronousExport) {
+TEST_P(SessionExportMaskTest, NeuronProfileDeviceOnlyAllowsSynchronousExport) {
   // Two claims: (a) device-only config enables exactly device_profile (no
   // system_profile); (b) export_now needs no opt-in or runtime mode — it is a
   // passthrough available in any session, forwarding the mask to NRT verbatim.
@@ -333,17 +355,51 @@ TEST_F(SessionTest, NeuronProfileDeviceOnlyAllowsSynchronousExport) {
       .Times(0);
 
   EXPECT_CALL(*mock_nrt_, nrt_inspect_begin_with_options(_)).WillOnce(Return(NRT_SUCCESS));
-  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(kSystemProfile)).WillOnce(Return(NRT_SUCCESS));
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(GetParam())).WillOnce(Return(NRT_SUCCESS));
   expectStop();
   expectCleanup();
 
   NeuronActivityProfilerSession session(activityTypes, config);
   session.start();
 
-  EXPECT_EQ(exportNow(kSystemProfile), NRT_SUCCESS);
+  EXPECT_EQ(exportNow(GetParam()), NRT_SUCCESS);
 
   session.stop();
   EXPECT_TRUE(session.errors().empty());
+}
+
+TEST_F(SessionTest, SuccessiveSessionsCreateFreshExporters) {
+  // Stop must clear the bridge. A later session must service its own device or combined request.
+  // Mock verification at each boundary detects a stale worker or an export after session stop.
+  for (const uint32_t mask : {kDeviceProfile, kAllProfiles}) {
+    SCOPED_TRACE(mask);
+    std::set<libkineto::ActivityType> activityTypes;
+    libkineto::Config config;
+    setCustomConfig(config, "neuron_profile:runtime;continuous_export:true");
+    expectRuntimeStart();
+    expectCleanup();
+
+    std::promise<void> exported;
+    auto exportedFuture = exported.get_future();
+    {
+      ::testing::InSequence sequence;
+      EXPECT_CALL(*mock_nrt_, nrt_inspect_export(mask)).WillOnce([&](uint32_t) {
+        exported.set_value();
+        return NRT_SUCCESS;
+      });
+      expectStop();
+    }
+    {
+      NeuronActivityProfilerSession session(activityTypes, config);
+      session.start();
+      EXPECT_EQ(requestActiveExport(mask), ExportStatus::Submitted);
+      EXPECT_EQ(exportedFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+      session.stop();
+      EXPECT_EQ(requestActiveExport(mask), ExportStatus::NoActiveSession);
+      EXPECT_TRUE(session.errors().empty());
+    }
+    EXPECT_TRUE(::testing::Mock::VerifyAndClearExpectations(mock_nrt_));
+  }
 }
 
 TEST_F(SessionTest, NeuronProfileRuntimeOnlyEnablesSystemProfile) {
@@ -766,8 +822,13 @@ class NoOpLogger : public libkineto::ActivityLogger {
   void handleTraceStart(const std::unordered_map<std::string, std::string>&,
                         const std::string&) override {}
   void finalizeMemoryTrace(const std::string&, const libkineto::Config&) override {}
-  void finalizeTrace(const libkineto::Config&, std::unique_ptr<libkineto::ActivityBuffers>, int64_t,
-                     std::unordered_map<std::string, std::vector<std::string>>&) override {}
+  void finalizeTrace(const libkineto::Config&, std::unique_ptr<libkineto::ActivityBuffers>, int64_t
+#if TORCH_VERSION_MINOR < 14
+                     ,
+                     std::unordered_map<std::string, std::vector<std::string>>&
+#endif
+                     ) override {
+  }
 
   int activityCount() const { return activityCount_; }
 
@@ -1917,6 +1978,238 @@ TEST_F(SessionTest, NeffCacheDirNotSetWhenOmittedFromConfig) {
   session.start();
   session.stop();
 
+  EXPECT_TRUE(session.errors().empty());
+}
+
+// Exercise raw option order through repeated starts of the same Session.
+class SessionTimePolicyTest : public SessionTest,
+                              public ::testing::WithParamInterface<std::string> {};
+
+TEST_P(SessionTimePolicyTest, ExportsAutomaticallyOnEachStart) {
+  // Each start must create a fresh schedule and export before the final stop without a request.
+  const std::set<libkineto::ActivityType> activityTypes;
+  libkineto::Config config;
+  setCustomConfig(config, GetParam());
+
+  expectConfigAllocation();
+  expectActivityTypeSetup();
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("system_profile"), true))
+      .WillOnce(Return(NRT_SUCCESS));
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_begin_with_options(_))
+      .Times(2)
+      .WillRepeatedly(Return(NRT_SUCCESS));
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_stop()).Times(2).WillRepeatedly(Return(NRT_SUCCESS));
+  expectCleanup();
+
+  std::mutex exportMutex;
+  std::condition_variable exportCv;
+  size_t completedExports = 0;
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(kSystemProfile))
+      .Times(::testing::AtLeast(2))
+      .WillRepeatedly([&](uint32_t) {
+        std::lock_guard<std::mutex> lock(exportMutex);
+        ++completedExports;
+        exportCv.notify_one();
+        return NRT_SUCCESS;
+      });
+
+  NeuronActivityProfilerSession session(activityTypes, config);
+  for (int iteration = 0; iteration < 2; ++iteration) {
+    SCOPED_TRACE(iteration);
+    size_t previousExports;
+    {
+      std::lock_guard<std::mutex> lock(exportMutex);
+      previousExports = completedExports;
+    }
+    session.start();
+    {
+      std::unique_lock<std::mutex> lock(exportMutex);
+      EXPECT_TRUE(exportCv.wait_for(lock, std::chrono::seconds(2),
+                                    [&] { return completedExports > previousExports; }));
+    }
+    session.stop();
+    EXPECT_TRUE(session.errors().empty());
+    EXPECT_EQ(requestActiveExport(kSystemProfile), ExportStatus::NoActiveSession);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    OptionOrders, SessionTimePolicyTest,
+    ::testing::Values(
+        "neuron_profile:runtime;export_policy:time;export_interval_ms:5;export_mask:1;"
+        "continuous_export:true",
+        "continuous_export:true;export_mask:01;neuron_profile:runtime;"
+        "export_interval_ms:005;export_policy:time"));
+
+TEST_F(SessionTest, TimePolicyRequiresExplicitContinuousExportEnable) {
+  // Valid timer fields must leave the worker disabled when opt-in is missing or false.
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(_)).Times(0);
+  for (const auto& enableSetting : {std::string{}, std::string{";continuous_export:false"}}) {
+    SCOPED_TRACE(enableSetting);
+    const std::set<libkineto::ActivityType> activityTypes;
+    libkineto::Config config;
+    setCustomConfig(config,
+                    "neuron_profile:runtime;export_policy:time;export_interval_ms:5;export_mask:1" +
+                        enableSetting);
+
+    expectRuntimeStart();
+    expectStop();
+    expectCleanup();
+
+    NeuronActivityProfilerSession session(activityTypes, config);
+    session.start();
+    EXPECT_NE(getActiveProfilerBuffer(), nullptr);
+    EXPECT_EQ(requestActiveExport(kSystemProfile), ExportStatus::ExportNotEnabled);
+    session.stop();
+    EXPECT_TRUE(session.errors().empty());
+  }
+}
+
+// Apply invalid raw policies with and without an explicit manual worker.
+class SessionInvalidTimePolicyTest : public SessionTest,
+                                     public ::testing::WithParamInterface<std::string> {};
+
+TEST_P(SessionInvalidTimePolicyTest, DoesNotArmWorkerOrDisableProfiling) {
+  // An incomplete or invalid policy must leave profiling active without creating a worker.
+  const std::set<libkineto::ActivityType> activityTypes;
+  libkineto::Config config;
+  setCustomConfig(config, "neuron_profile:runtime;" + GetParam());
+
+  expectRuntimeStart();
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(_)).Times(0);
+  expectStop();
+  expectCleanup();
+
+  ::testing::internal::CaptureStderr();
+  NeuronActivityProfilerSession session(activityTypes, config);
+  const auto diagnostics = ::testing::internal::GetCapturedStderr();
+  EXPECT_THAT(diagnostics, ::testing::HasSubstr("Time export policy disabled."));
+  session.start();
+  EXPECT_NE(getActiveProfilerBuffer(), nullptr);
+  EXPECT_EQ(requestActiveExport(kSystemProfile), ExportStatus::ExportNotEnabled);
+  session.stop();
+  EXPECT_TRUE(session.errors().empty());
+}
+
+TEST_P(SessionInvalidTimePolicyTest, KeepsExplicitManualWorker) {
+  // The rejection diagnostic proves invalid fields were rejected before a manual request is
+  // serviced.
+  const std::set<libkineto::ActivityType> activityTypes;
+  libkineto::Config config;
+  setCustomConfig(config, "neuron_profile:runtime;continuous_export:true;" + GetParam());
+
+  expectRuntimeStart();
+  std::promise<void> exportCalled;
+  auto exportFuture = exportCalled.get_future();
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(kSystemProfile)).WillOnce([&](uint32_t) {
+    exportCalled.set_value();
+    return NRT_SUCCESS;
+  });
+  expectStop();
+  expectCleanup();
+
+  ::testing::internal::CaptureStderr();
+  NeuronActivityProfilerSession session(activityTypes, config);
+  const auto diagnostics = ::testing::internal::GetCapturedStderr();
+  EXPECT_THAT(diagnostics, ::testing::HasSubstr("Time export policy disabled."));
+  session.start();
+  EXPECT_EQ(requestActiveExport(kSystemProfile), ExportStatus::Submitted);
+  EXPECT_EQ(exportFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  session.stop();
+  EXPECT_TRUE(session.errors().empty());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    InvalidRawSettings, SessionInvalidTimePolicyTest,
+    ::testing::Values(
+        "export_policy:time", "export_interval_ms:5;export_mask:1",
+        "export_policy:time;export_mask:1", "export_policy:time;export_interval_ms:5",
+        "export_policy:unknown;export_interval_ms:5;export_mask:1",
+        "export_policy:;export_interval_ms:5;export_mask:1",
+        "export_policy:time;export_interval_ms:;export_mask:1",
+        "export_policy:time;export_interval_ms:5;export_mask:",
+        "export_policy:time;export_interval_ms:0;export_mask:1",
+        "export_policy:time;export_interval_ms:-1;export_mask:1",
+        "export_policy:time;export_interval_ms:+1;export_mask:1",
+        "export_policy:time;export_interval_ms:1.5;export_mask:1",
+        "export_policy:time;export_interval_ms:5ms;export_mask:1",
+        "export_policy:time;export_interval_ms:9223372036855;export_mask:1",
+        "export_policy:time;export_interval_ms:18446744073709551616;export_mask:1",
+        "export_policy:time;export_interval_ms:5;export_mask:0",
+        "export_policy:time;export_interval_ms:5;export_mask:-1",
+        "export_policy:time;export_interval_ms:5;export_mask:+1",
+        "export_policy:time;export_interval_ms:5;export_mask:1tail",
+        "export_policy:time;export_interval_ms:5;export_mask:2147483648",
+        "export_policy:time;export_interval_ms:5;export_mask:2147483649",
+        "export_policy:time;export_interval_ms:5;export_mask:4294967297",
+        "export_policy:time;export_interval_ms:5;export_mask:18446744073709551616",
+        "export_policy:time;export_interval_ms:5;export_mask:1;export_interval_ms:0",
+        "export_policy:time;export_interval_ms:5;export_mask:1;export_mask:2147483648",
+        "export_policy:time;export_interval_ms:5;export_mask:1;export_policy:unknown"));
+
+TEST_F(SessionTest, TimePolicyDoesNotRequireRuntimeCapture) {
+  // A device-only session must forward the system export mask without enabling runtime capture.
+  const std::set<libkineto::ActivityType> activityTypes;
+  libkineto::Config config;
+  setCustomConfig(config,
+                  "neuron_profile:device;continuous_export:true;export_policy:time;"
+                  "export_interval_ms:5;export_mask:1");
+
+  expectConfigAllocation();
+  expectActivityTypeSetup();
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("device_profile"), true))
+      .WillOnce(Return(NRT_SUCCESS));
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_inspect_device_profile_mode(
+                              _, NRT_INSPECT_DEVICE_PROFILE_MODE_SESSION))
+      .WillOnce(Return(NRT_SUCCESS));
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_config_set_activity(_, StrEq("system_profile"), true))
+      .Times(0);
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_begin_with_options(_)).WillOnce(Return(NRT_SUCCESS));
+  expectStop();
+  expectCleanup();
+
+  std::atomic<bool> notified{false};
+  std::promise<void> exportCalled;
+  auto exportFuture = exportCalled.get_future();
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(kSystemProfile))
+      .Times(::testing::AtLeast(1))
+      .WillRepeatedly([&](uint32_t) {
+        if (!notified.exchange(true)) {
+          exportCalled.set_value();
+        }
+        return NRT_SUCCESS;
+      });
+
+  NeuronActivityProfilerSession session(activityTypes, config);
+  session.start();
+  EXPECT_EQ(exportFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  session.stop();
+  EXPECT_TRUE(session.errors().empty());
+}
+
+TEST_F(SessionTest, TimePolicyAcceptsMaximumInterval) {
+  // An enabled worker must still service a manual request with the maximum policy interval.
+  const std::set<libkineto::ActivityType> activityTypes;
+  libkineto::Config config;
+  setCustomConfig(config,
+                  "neuron_profile:runtime;continuous_export:true;export_policy:time;"
+                  "export_interval_ms:9223372036854;export_mask:1");
+
+  expectRuntimeStart();
+  std::promise<void> exportCalled;
+  auto exportFuture = exportCalled.get_future();
+  EXPECT_CALL(*mock_nrt_, nrt_inspect_export(kSystemProfile)).WillOnce([&](uint32_t) {
+    exportCalled.set_value();
+    return NRT_SUCCESS;
+  });
+  expectStop();
+  expectCleanup();
+
+  NeuronActivityProfilerSession session(activityTypes, config);
+  session.start();
+  EXPECT_EQ(requestActiveExport(kSystemProfile), ExportStatus::Submitted);
+  EXPECT_EQ(exportFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  session.stop();
   EXPECT_TRUE(session.errors().empty());
 }
 

@@ -6,7 +6,7 @@ from contextlib import contextmanager
 import pytest
 import torch
 
-from tests.utils.neuron_test_utils import assert_raises, get_core_start_index
+from tests.utils.neuron_test_utils import assert_raises, get_rank_core
 
 from ..utils import DistributedTester
 
@@ -47,7 +47,7 @@ class DistributedTesterForMultiDevice(DistributedTester):
 
 def _test_multi_process_single_device(rank, world_size, args):
     """Test each process uses single device"""
-    os.environ["NEURON_RT_VISIBLE_CORES"] = str(get_core_start_index() + rank)
+    os.environ["NEURON_RT_VISIBLE_CORES"] = str(get_rank_core(rank))
 
     import torch.distributed as dist
 
@@ -76,8 +76,9 @@ def _test_multi_process_single_device(rank, world_size, args):
 def _test_multi_process_multi_device(rank, world_size, args):
     """Test each process uses multiple devices"""
     devices_per_process = args.get("devices_per_process", 2)
-    start_core = get_core_start_index() + rank * devices_per_process
-    visible_cores = ",".join(str(start_core + i) for i in range(devices_per_process))
+    visible_cores = ",".join(
+        str(get_rank_core(rank * devices_per_process + i)) for i in range(devices_per_process)
+    )
     os.environ["NEURON_RT_VISIBLE_CORES"] = visible_cores
 
     import torch.distributed as dist
@@ -89,7 +90,7 @@ def _test_multi_process_multi_device(rank, world_size, args):
 
 def _test_cross_device_access_failure(rank, world_size, args):
     """Test that tries to access device from other process"""
-    os.environ["NEURON_RT_VISIBLE_CORES"] = str(get_core_start_index() + rank)
+    os.environ["NEURON_RT_VISIBLE_CORES"] = str(get_rank_core(rank))
 
     import torch.distributed as dist
 
@@ -103,10 +104,12 @@ def _test_cross_device_access_failure(rank, world_size, args):
 def _test_vnc_id_mapping(rank, world_size, args):
     """Test local_rank to vnc_id mapping"""
     devices_per_process = args.get("devices_per_process", 1)
-    start_core = get_core_start_index() + rank * devices_per_process
+    start_core = get_rank_core(rank * devices_per_process)
 
     if devices_per_process > 1:
-        visible_cores = ",".join(str(start_core + i) for i in range(devices_per_process))
+        visible_cores = ",".join(
+            str(get_rank_core(rank * devices_per_process + i)) for i in range(devices_per_process)
+        )
         os.environ["NEURON_RT_VISIBLE_CORES"] = visible_cores
     else:
         os.environ["NEURON_RT_VISIBLE_CORES"] = str(start_core)
@@ -130,7 +133,7 @@ def _test_vnc_id_mapping(rank, world_size, args):
 
 
 def _test_device_properties(rank, world_size, args):
-    os.environ["NEURON_RT_VISIBLE_CORES"] = str(get_core_start_index() + rank)
+    os.environ["NEURON_RT_VISIBLE_CORES"] = str(get_rank_core(rank))
 
     import torch.distributed as dist
 

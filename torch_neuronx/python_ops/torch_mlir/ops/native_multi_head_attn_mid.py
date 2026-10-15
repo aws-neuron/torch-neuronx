@@ -7,7 +7,11 @@ from .scaled_dot_product_attention import ScaledDotProductAttnMLIRImpl
 
 
 class NativeMultiHeadAttnMidMLIRImpl(ScaledDotProductAttnMLIRImpl):
-    """MLIR implementation for Mid operation with transposed inputs"""
+    """Implement the middle attention stage with Torch-MLIR.
+
+    Args:
+        op_name (str): Operation name passed to the attention kernel.
+    """
 
     def __init__(self, op_name: str):
         super().__init__(op_name)
@@ -23,7 +27,26 @@ class NativeMultiHeadAttnMidMLIRImpl(ScaledDotProductAttnMLIRImpl):
         training: bool = False,
         out: torch.Tensor | None = None,
     ) -> bool:
-        """Check if MLIR implementation can handle Mid operation parameters"""
+        """Check whether the middle attention stage can handle the inputs.
+
+        Args:
+            query (torch.Tensor): Query in transposed middle-stage format.
+            key (torch.Tensor): Key in transposed middle-stage format.
+            value (torch.Tensor): Value in transposed middle-stage format.
+            use_causal_mask (bool, optional): Apply causal masking. Defaults to ``False``.
+            dropout_p (float, optional): Dropout probability. Defaults to ``0.0``.
+            training (bool, optional): Training mode flag. Defaults to ``False``.
+            out (torch.Tensor | None, optional): Output tensor. Defaults to ``None``.
+
+        Returns:
+            bool: ``True`` when the base attention implementation accepts the inputs.
+
+        Raises:
+            RuntimeError: If key/value heads do not divide query heads.
+
+        Note:
+            ``training`` and ``out`` do not affect capability checks.
+        """
         return super().can_handle(
             query,
             key,
@@ -43,7 +66,25 @@ class NativeMultiHeadAttnMidMLIRImpl(ScaledDotProductAttnMLIRImpl):
         training: bool = False,
         out: torch.Tensor | None = None,
     ) -> ExecutionResult:
-        """Execute with input transposition for Mid format"""
+        """Execute middle-stage attention after transposing its inputs.
+
+        Args:
+            query (torch.Tensor): Query in ``[B, H_q, D_q, S_q]`` middle-stage layout.
+            key (torch.Tensor): Key in ``[B, H_kv, D_q, S_k]`` middle-stage layout.
+            value (torch.Tensor): Value in ``[B, H_kv, D_v, S_k]`` middle-stage layout.
+            use_causal_mask (bool, optional): Apply causal masking. Defaults to ``False``.
+            dropout_p (float, optional): Dropout probability. Defaults to ``0.0``.
+            training (bool, optional): Training mode flag. Defaults to ``False``.
+            out (torch.Tensor | None, optional): ``[B, H_q, S_q, D_v]`` destination
+                copied in place and returned. Defaults to ``None``.
+
+        Returns:
+            ExecutionResult: Success with a ``[B, H_q, S_q, D_v]`` attention output,
+                or captured execution failure.
+
+        Note:
+            ``training`` is accepted but does not alter execution.
+        """
         # Transpose inputs from Mid format (batch, heads, embed_dim, seq_len)
         # to standard format (batch, heads, seq_len, embed_dim)
         q_transposed = query.transpose(-2, -1)

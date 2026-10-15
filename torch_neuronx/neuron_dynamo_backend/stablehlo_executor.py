@@ -77,7 +77,18 @@ def _parse_bf16_dense_attr(attr_str: str) -> torch.Tensor:
 
 
 def dense_attr_to_torch_tensor(attr) -> torch.Tensor:
-    """Convert an MLIR DenseElementsAttr to a PyTorch tensor."""
+    """Convert an MLIR ``DenseElementsAttr`` into a PyTorch tensor.
+
+    Args:
+        attr (mlir_ir.DenseElementsAttr): Dense MLIR attribute to convert.
+
+    Returns:
+        torch.Tensor: Tensor with the attribute's values and element dtype. Rank-zero
+            attributes are represented as one-element tensors.
+
+    Raises:
+        ValueError: If the MLIR element type is unsupported.
+    """
     ranked_type = mlir_ir.RankedTensorType(attr.type)
     shape = list(ranked_type.shape)
     element_type_str = str(ranked_type.element_type)
@@ -110,7 +121,18 @@ def dense_attr_to_torch_tensor(attr) -> torch.Tensor:
 
 
 def torch_tensor_to_dense_attr(val, expected_type, context):
-    """Convert a torch.Tensor or scalar to an MLIR DenseElementsAttr."""
+    """Convert a PyTorch tensor or scalar into an MLIR ``DenseElementsAttr``.
+
+    Args:
+        val (torch.Tensor | Scalar): Value whose shape and contents to convert; tensors
+            are copied to CPU first.
+        expected_type (mlir_ir.RankedTensorType): MLIR type whose element type to use.
+        context (mlir_ir.Context): MLIR context used to construct the attribute.
+
+    Returns:
+        mlir_ir.DenseElementsAttr: Dense attribute with the value's shape and the
+            expected element type.
+    """
     if isinstance(val, torch.Tensor):
         t = val.detach().cpu().contiguous()
         # Handle bf16 tensors separately by casting
@@ -171,9 +193,15 @@ def _tensorize_scalar_args(module):
 
 
 class StableHLOInterpreterExecutor:
-    """Executor that runs stablehlo via the reference interpreter (eval_module).
+    """Run StableHLO through the CPU reference interpreter.
 
-    Drop-in replacement for the NEFF-based Executor. Inputs stay on CPU.
+    Args:
+        stablehlo_mlir (mlir_ir.Module): StableHLO module to execute and mutate in place.
+        io_spec (Any): Input and output specification stored but otherwise unused.
+        cast_spec (Sequence): Output dtype specification stored but otherwise unused.
+
+    Note:
+        This is a drop-in replacement for the NEFF executor, and all inputs remain on CPU.
     """
 
     def __init__(self, stablehlo_mlir, io_spec, cast_spec):

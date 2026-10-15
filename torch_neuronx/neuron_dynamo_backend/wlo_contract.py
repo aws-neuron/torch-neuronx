@@ -26,15 +26,25 @@ TRANSFORM_KEYS = ("input_index", "reshape", "transpose")
 
 
 class WLOContractError(RuntimeError):
-    """A WLO transform violates the compile<->execute relayout contract."""
+    """Report a violation of the compile-to-execute WLO relayout contract."""
 
 
 def validate_transform(t: object) -> None:
-    """Raise WLOContractError unless ``t`` is a structurally valid WLO transform.
+    """Validate the static structure of a WLO weight transform.
 
-    Checks only the static shape: keys present, non-negative input_index, non-empty
-    positive-dim reshape, and transpose a permutation of range(len(reshape)). Callers
-    holding the input tensor also check element count and input-index range.
+    Args:
+        t (object): Transform with ``input_index``, ``reshape``, and ``transpose`` keys.
+
+    Raises:
+        WLOContractError: If ``t`` is not a dictionary, required keys are missing,
+            ``input_index`` is not a non-negative integer, ``reshape`` is not a non-empty
+            ``list`` or ``tuple`` of positive integers, or ``transpose`` is not a same-rank
+            ``list`` or ``tuple`` whose sorted values equal the reshape axes.
+        TypeError: If the ``transpose`` values cannot be sorted together.
+
+    Note:
+        This check does not validate tensor element counts or input-index bounds; callers
+        holding the input tensor perform those runtime checks.
     """
     if not isinstance(t, dict):
         raise WLOContractError(f"WLO transform must be a dict, got {type(t).__name__}: {t!r}")

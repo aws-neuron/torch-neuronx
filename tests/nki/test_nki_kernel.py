@@ -329,10 +329,16 @@ def scale_kernel(x):
     def _load_kernel(self, tmp_path, operand):
         """Write kernel source to file, import it, return the @nki.jit kernel."""
         import importlib.util
+        import pathlib
 
         source = self._KERNEL_SOURCE.format(operand=operand)
         module_file = tmp_path / "scale_kernel_mod.py"
         module_file.write_text(source)
+
+        # CPython reuses a .pyc when the source size and the whole-second mtime match.
+        # Both sources are the same length and get written inside the same second.
+        pyc = pathlib.Path(importlib.util.cache_from_source(str(module_file)))
+        pyc.unlink(missing_ok=True)
 
         spec = importlib.util.spec_from_file_location("scale_kernel_mod", str(module_file))
         mod = importlib.util.module_from_spec(spec)
@@ -347,10 +353,18 @@ def scale_kernel(x):
 
         # Write kernel with operand0=2.0, import, get cache key
         kernel_jit = self._load_kernel(tmp_path, "2.0")
+        assert (
+            2.0 in kernel_jit.func.__code__.co_consts
+        ), "stale import: the module does not hold operand0=2.0"
         key_v1 = TorchNativeKernel(kernel_jit.func).get_cache_key(x=inp)
 
         # Overwrite same file with operand0=3.0, reimport, get cache key
         kernel_jit = self._load_kernel(tmp_path, "3.0")
+        # A stale import keeps operand0=2.0, which would make the keys match and
+        # blame the cache key below.
+        assert (
+            3.0 in kernel_jit.func.__code__.co_consts
+        ), "stale import: the reloaded module still holds the old operand"
         key_v2 = TorchNativeKernel(kernel_jit.func).get_cache_key(x=inp)
 
         assert key_v1 != key_v2, (

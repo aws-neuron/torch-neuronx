@@ -1107,3 +1107,246 @@ class TestAntiAliasedBilinearBackward:
             else {"atol": 1e-2, "rtol": 1e-2}
         )
         torch.testing.assert_close(got.cpu().float(), oracle, **tol)
+
+
+# --- trilinear 3d ---
+# 5-D volumetric interpolation. The forward decomposes into three separable
+# matmuls (one per spatial axis); the backward is the transpose of the same
+# matmuls. CPU is the reference for both, including the per-dimension
+# short-circuit (an unchanged size drops that axis' scale, quirk 2).
+
+# ((in_d, in_h, in_w), (out_d, out_h, out_w), (scales_d, scales_h, scales_w))
+TRILINEAR_3D_CFGS = [
+    ((4, 4, 4), (8, 8, 8), (None, None, None)),  # 2x upsample
+    ((4, 4, 4), (4, 4, 4), (2.0, 2.0, 2.0)),  # identity, per-dim scale ignored (quirk 2)
+    ((4, 5, 6), (2, 3, 3), (None, None, None)),  # downsample, non-cube
+    ((3, 5, 4), (7, 4, 9), (None, None, None)),  # mixed up/down, non-integer ratios
+    ((1, 4, 4), (3, 8, 8), (None, None, None)),  # size-1 depth
+    ((4, 4, 4), (4, 7, 4), (2.0, None, 2.0)),  # only H resampled (per-dim short-circuit)
+    ((2, 2, 2), (5, 5, 5), (None, None, None)),  # small source
+]
+
+
+def _reduced_precision_tol(dtype):
+    if dtype == torch.float32:
+        return {}
+    slack = 32 * torch.finfo(dtype).eps
+    return {"atol": slack, "rtol": slack}
+
+
+class TestTrilinearForward:
+    @pytest.mark.parametrize("align_corners", [False, True])
+    @pytest.mark.parametrize("in_dhw,out_dhw,scales", TRILINEAR_3D_CFGS)
+    def test_values(self, align_corners, in_dhw, out_dhw, scales):
+        x = torch.randn(2, 3, *in_dhw)
+        expected = aten.upsample_trilinear3d(x, list(out_dhw), align_corners, *scales)
+        with track_neuron_ops():
+            got = aten.upsample_trilinear3d(x.to("neuron"), list(out_dhw), align_corners, *scales)
+            assert_op_runs_on_neuron("aten::upsample_trilinear3d")
+        torch.testing.assert_close(got.cpu(), expected)
+
+    @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+    def test_dtypes(self, dtype):
+        x = torch.randn(2, 3, 4, 4, 4, dtype=dtype)
+        expected = aten.upsample_trilinear3d(x, [8, 8, 8], False)
+        with track_neuron_ops():
+            got = aten.upsample_trilinear3d(x.to("neuron"), [8, 8, 8], False)
+            _assert_ran_on_device(aten.upsample_trilinear3d)
+        assert got.dtype == dtype
+        torch.testing.assert_close(got.cpu(), expected, **_reduced_precision_tol(dtype))
+
+
+class TestTrilinearBackward:
+    @pytest.mark.parametrize("align_corners", [False, True])
+    @pytest.mark.parametrize("in_dhw,out_dhw,scales", TRILINEAR_3D_CFGS)
+    def test_values(self, align_corners, in_dhw, out_dhw, scales):
+        grad = torch.randn(2, 3, *out_dhw)
+        input_size = [2, 3, *in_dhw]
+        expected = aten.upsample_trilinear3d_backward(
+            grad, list(out_dhw), input_size, align_corners, *scales
+        )
+        with track_neuron_ops():
+            got = aten.upsample_trilinear3d_backward(
+                grad.to("neuron"), list(out_dhw), input_size, align_corners, *scales
+            )
+            assert_op_runs_on_neuron("aten::upsample_trilinear3d_backward")
+        torch.testing.assert_close(got.cpu(), expected)
+
+    @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+    def test_dtypes(self, dtype):
+        grad = torch.randn(2, 3, 8, 8, 8, dtype=dtype)
+        input_size = [2, 3, 4, 4, 4]
+        expected = aten.upsample_trilinear3d_backward(grad, [8, 8, 8], input_size, False)
+        with track_neuron_ops():
+            got = aten.upsample_trilinear3d_backward(
+                grad.to("neuron"), [8, 8, 8], input_size, False
+            )
+            _assert_ran_on_device(aten.upsample_trilinear3d_backward)
+        assert got.dtype == dtype
+        torch.testing.assert_close(got.cpu(), expected, **_reduced_precision_tol(dtype))
+
+    def test_grad_input_overload(self):
+        """The ``.grad_input`` variant writes the same values and leaves grad untouched."""
+        grad = torch.randn(2, 3, 8, 8, 8)
+        input_size = [2, 3, 4, 4, 4]
+        expected = aten.upsample_trilinear3d_backward(grad, [8, 8, 8], input_size, False)
+        grad_n = grad.to("neuron")
+        out_n = torch.empty_like(expected).to("neuron")
+        with track_neuron_ops():
+            result = aten.upsample_trilinear3d_backward.grad_input(
+                grad_n, [8, 8, 8], input_size, False, grad_input=out_n
+            )
+            _assert_ran_on_device(aten.upsample_trilinear3d_backward)
+        torch.testing.assert_close(result.cpu(), expected)
+        torch.testing.assert_close(out_n.cpu(), expected)
+        torch.testing.assert_close(grad_n.cpu(), grad)
+
+
+class TestTrilinearOverloadsAndEdges:
+    def test_out_overload(self):
+        x = torch.randn(2, 3, 4, 4, 4)
+        expected = aten.upsample_trilinear3d(x, [8, 8, 8], False)
+        x_n = x.to("neuron")
+        out_n = torch.empty_like(expected).to("neuron")
+        with track_neuron_ops():
+            result = aten.upsample_trilinear3d.out(x_n, [8, 8, 8], False, out=out_n)
+            _assert_ran_on_device(aten.upsample_trilinear3d)
+        torch.testing.assert_close(result.cpu(), expected)
+        torch.testing.assert_close(out_n.cpu(), expected)
+        # out= must not disturb self (the fallback path aliases them).
+        torch.testing.assert_close(x_n.cpu(), x)
+
+    @pytest.mark.parametrize(
+        "vec_args",
+        [
+            ([8, 8, 8], False, None),  # output_size path
+            (None, False, [2.0, 2.0, 2.0]),  # scale_factors path
+        ],
+    )
+    def test_vec_overload(self, vec_args):
+        x = torch.randn(2, 3, 4, 4, 4)
+        expected = aten.upsample_trilinear3d.vec(x, *vec_args)
+        with track_neuron_ops():
+            got = aten.upsample_trilinear3d.vec(x.to("neuron"), *vec_args)
+            _assert_ran_on_device(aten.upsample_trilinear3d)
+        torch.testing.assert_close(got.cpu(), expected)
+
+    def test_zero_batch(self):
+        x = torch.randn(0, 3, 4, 4, 4)
+        expected = aten.upsample_trilinear3d(x, [8, 8, 8], False)
+        with track_neuron_ops():
+            got = aten.upsample_trilinear3d(x.to("neuron"), [8, 8, 8], False)
+        assert got.shape == expected.shape
+        assert got.numel() == 0
+
+    def test_single_element(self):
+        x = torch.randn(1, 1, 1, 1, 1)
+        expected = aten.upsample_trilinear3d(x, [5, 5, 5], False)
+        with track_neuron_ops():
+            got = aten.upsample_trilinear3d(x.to("neuron"), [5, 5, 5], False)
+        torch.testing.assert_close(got.cpu(), expected)
+
+    @pytest.mark.parametrize("dtype", [torch.uint8, torch.int32, torch.int64, torch.bool])
+    def test_forward_rejects_non_float_dtypes(self, dtype):
+        """``upsample_trilinear3d`` is floating-only, like ``upsample_linear1d``."""
+        x = torch.ones(1, 1, 4, 4, 4, dtype=dtype, device="neuron")
+        with pytest.raises((RuntimeError, NotImplementedError), match="not implemented for"):
+            aten.upsample_trilinear3d(x, [8, 8, 8], False)
+        # ... and the CPU reference agrees, so this is not an invented rule.
+        with pytest.raises((RuntimeError, NotImplementedError), match="not implemented for"):
+            aten.upsample_trilinear3d(torch.ones(1, 1, 4, 4, 4, dtype=dtype), [8, 8, 8], False)
+
+    @pytest.mark.parametrize("dtype", [torch.uint8, torch.int32, torch.int64])
+    def test_backward_rejects_integral_dtypes(self, dtype):
+        g = torch.ones(1, 1, 8, 8, 8, dtype=dtype, device="neuron")
+        with pytest.raises((RuntimeError, NotImplementedError), match="not implemented for"):
+            aten.upsample_trilinear3d_backward(g, [8, 8, 8], [1, 1, 4, 4, 4], False)
+
+
+class TestTrilinearAutograd:
+    """``.backward()`` through the volumetric path picks the dedicated backward op.
+
+    Assert the backward op runs on Neuron, not just the forward: a correct
+    forward can still pair with a CPU-fallback backward.
+    """
+
+    @pytest.mark.parametrize("align_corners", [False, True])
+    def test_size_backward(self, align_corners):
+        x_cpu = torch.randn(2, 3, 4, 4, 4, requires_grad=True)
+        x_n = x_cpu.detach().clone().to("neuron").requires_grad_(True)
+        out_cpu = torch.nn.functional.interpolate(
+            x_cpu, size=(7, 8, 9), mode="trilinear", align_corners=align_corners
+        )
+        grad = torch.randn_like(out_cpu)
+        out_cpu.backward(grad)
+        with track_neuron_ops():
+            out_n = torch.nn.functional.interpolate(
+                x_n, size=(7, 8, 9), mode="trilinear", align_corners=align_corners
+            )
+            out_n.backward(grad.to("neuron"))
+            assert_op_runs_on_neuron("aten::upsample_trilinear3d_backward")
+        torch.testing.assert_close(out_n.detach().cpu(), out_cpu.detach())
+        torch.testing.assert_close(x_n.grad.cpu(), x_cpu.grad)
+
+    def test_scale_factor_backward(self):
+        """``scale_factor`` routes the forward and backward through ``.vec``."""
+        x_cpu = torch.randn(2, 3, 4, 4, 4, requires_grad=True)
+        x_n = x_cpu.detach().clone().to("neuron").requires_grad_(True)
+        out_cpu = torch.nn.functional.interpolate(
+            x_cpu, scale_factor=2.0, mode="trilinear", align_corners=False
+        )
+        grad = torch.randn_like(out_cpu)
+        out_cpu.backward(grad)
+        with track_neuron_ops():
+            out_n = torch.nn.functional.interpolate(
+                x_n, scale_factor=2.0, mode="trilinear", align_corners=False
+            )
+            out_n.backward(grad.to("neuron"))
+            assert_op_runs_on_neuron("aten::upsample_trilinear3d_backward")
+        torch.testing.assert_close(x_n.grad.cpu(), x_cpu.grad)
+
+
+class TestTrilinearFunctionalInterface:
+    @pytest.mark.parametrize("align_corners", [False, True])
+    def test_interpolate_size(self, align_corners):
+        x = torch.randn(2, 3, 4, 4, 4)
+        expected = torch.nn.functional.interpolate(
+            x, size=(7, 8, 9), mode="trilinear", align_corners=align_corners
+        )
+        with track_neuron_ops():
+            got = torch.nn.functional.interpolate(
+                x.to("neuron"), size=(7, 8, 9), mode="trilinear", align_corners=align_corners
+            )
+        torch.testing.assert_close(got.cpu(), expected)
+
+    def test_interpolate_scale_factor(self):
+        x = torch.randn(2, 3, 4, 4, 4)
+        expected = torch.nn.functional.interpolate(
+            x, scale_factor=2.0, mode="trilinear", align_corners=False
+        )
+        with track_neuron_ops():
+            got = torch.nn.functional.interpolate(
+                x.to("neuron"), scale_factor=2.0, mode="trilinear", align_corners=False
+            )
+        torch.testing.assert_close(got.cpu(), expected)
+
+
+class TestTrilinearMemoryFormat:
+    """A channels_last_3d input must produce a channels_last_3d output."""
+
+    CL3D = torch.channels_last_3d
+
+    @pytest.mark.parametrize("align_corners", [False, True])
+    def test_channels_last_3d_preserved(self, align_corners):
+        x = torch.randn(2, 3, 4, 4, 4).contiguous(memory_format=self.CL3D)
+        expected = aten.upsample_trilinear3d(x, [7, 8, 9], align_corners)
+        with track_neuron_ops():
+            got = aten.upsample_trilinear3d(x.to("neuron"), [7, 8, 9], align_corners)
+            _assert_ran_on_device(aten.upsample_trilinear3d)
+        assert (
+            got.stride() == expected.stride()
+        ), f"stride {got.stride()} != aten's {expected.stride()}"
+        assert got.is_contiguous(memory_format=self.CL3D) == expected.is_contiguous(
+            memory_format=self.CL3D
+        )
+        torch.testing.assert_close(got.cpu(), expected)

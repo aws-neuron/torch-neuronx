@@ -114,8 +114,7 @@ class ConcatenationState {
   // Get the number of cascading operations
   size_t GetCascadingOperationsCount() const { return cascading_operations_.size(); }
 
-  // Increment the count of compiled cascading operations and check if all are done
-  // Returns true if this was the last operation to compile
+  // Count each compilation result, including failures. Return true for the last result.
   bool IncrementAndCheckCompiledCascadingOpsCount() {
     size_t new_count = compiled_cascading_ops_count_.fetch_add(1, std::memory_order_acq_rel) + 1;
     EXECUTION_RUNTIME_CHECK(new_count <= cascading_operations_.size(),
@@ -155,10 +154,10 @@ struct KernelTypeTraits;
 DEFINE_KERNEL_TYPE_TRAITS(kHLO, XLACompilableKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kCollective, CollectiveDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kCopy, CopyDirectKernelExecution)
+DEFINE_KERNEL_TYPE_TRAITS(kCast, CastDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kWrite, WriteDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kRead, ReadDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kEvent, EventDirectKernelExecution)
-DEFINE_KERNEL_TYPE_TRAITS(kHint, HintDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kAlloc, AllocDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kDealloc, DeallocDirectKernelExecution)
 DEFINE_KERNEL_TYPE_TRAITS(kHost, HostKernelExecution)
@@ -223,10 +222,10 @@ struct OperationContext {
   // Stream context - pointer to the stream this operation belongs to
   StreamImpl* stream = nullptr;
 
-  // Logical (user-facing) Stream ID
+  // Logical (user-facing) stream ID.
   c10::StreamId stream_id{0};
 
-  // Priority from PyTorch stream (decoded from stream_id at submission)
+  // Priority of the caller's PyTorch stream.
   int stream_priority = 0;
 
   // Completion handling

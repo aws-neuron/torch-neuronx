@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class NonzeroMLIRImpl(OperationImplementation):
-    """nonzero implementation using MLIR"""
+    """Implement ``aten::nonzero`` with Torch-MLIR."""
 
     def __init__(self):
         """Initialize the nonzero kernel"""
@@ -23,21 +23,40 @@ class NonzeroMLIRImpl(OperationImplementation):
         )
 
     def can_handle(self, tensor, out=None):
+        """Check whether the input tensor is on a Neuron device.
+
+        Args:
+            tensor (torch.Tensor): Input tensor.
+            out (torch.Tensor | None, optional): Output tensor accepted but not inspected by this
+                predicate. Defaults to ``None``.
+
+        Returns:
+            bool: ``True`` when the input uses a Neuron device.
+        """
         return tensor.device.type == "neuron"
 
     def get_lower_func(self):
-        """Return a lower function for C++ dispatch of nonzero.
+        """Return the C++ dispatch lowering function for nonzero.
 
-        The kernel traces nonzero_with_count which returns (indices, count)
-        as 2 tensors. The C++ DispatchNonzeroImpl handles post-processing
-        (slicing and int64 cast).
+        Returns:
+            Callable: Function that injects the input size and count-output flag.
 
-        Injects size=tensor.numel() and with_count=True since the ATen
-        schema only provides (Tensor self) but the kernel needs these.
+        Note:
+            The kernel returns index and count tensors. C++ dispatch slices the indices and
+            casts them to int64 after execution.
         """
         kernel = self.kernel
 
         def lower_func(*args, **kwargs):
+            """Lower a raw ``aten::nonzero`` invocation.
+
+            Args:
+                *args (Any): Positional arguments with the input tensor first.
+                **kwargs (Any): Raw dispatch keyword arguments.
+
+            Returns:
+                LoweringResult: Lowered kernel metadata with static size and count arguments.
+            """
             kwargs.pop("original_args", None)
             kwargs.pop("original_kwargs", None)
             kwargs.pop("out", None)  # out= handled by C++ post-processing

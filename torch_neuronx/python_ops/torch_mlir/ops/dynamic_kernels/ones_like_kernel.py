@@ -19,14 +19,19 @@ import nki.language as nl
 
 @nki.jit()
 def ones_like_kernel(input_tensor, num_m_tiles):
-    """
-    ones_like: output = ones([m_static, hidden]) with input_tensor's dtype.
+    """Create a tensor of ones over a runtime-dynamic row dimension.
 
     Args:
-        input_tensor: [m_static, hidden] on HBM — provides shape/dtype only
-        num_m_tiles: [1, 1] int32 — number of 128-row tiles per program
+        input_tensor (tensor): ``[m_static, hidden]`` shape and dtype prototype in HBM.
+        num_m_tiles (tensor): Int32 ``[1, 1]`` count of 128-row tiles per program.
+
     Returns:
-        output: [m_static, hidden] filled with 1, input_tensor.dtype, on HBM
+        tensor: HBM tensor with the prototype shape and dtype whose first
+            ``128 * num_programs * num_m_tiles[0]`` rows contain ones.
+
+    Note:
+        ``num_programs`` is the launch-grid width. Later rows are left unwritten, and the
+        input values are not read, so the adapter may pass the output buffer as arg0.
     """
     m_static, hidden = input_tensor.shape
 
@@ -61,6 +66,11 @@ def ones_like_kernel(input_tensor, num_m_tiles):
     nisa.memset(m_tile_start, 0.0)
 
     def body(_i):
+        """Fill one dynamic row-tile iteration with ones.
+
+        Args:
+            _i (int): Unused loop iteration index.
+        """
         for seg in range(len(h_starts)):
             h_start = h_starts[seg]
             h_width = h_widths[seg]

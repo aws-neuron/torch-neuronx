@@ -3,6 +3,7 @@
 
 #include <list>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -299,6 +300,7 @@ class ConcatenationCore {
   /// Manager for creating and caching IR nodes
   std::unique_ptr<IrNodeManager> ir_node_manager;
 
+  std::mutex invalidated_cache_mutex_;
   std::unordered_set<std::string> invalidated_cache_keys_;
 
   /// Factory has access to private constructor

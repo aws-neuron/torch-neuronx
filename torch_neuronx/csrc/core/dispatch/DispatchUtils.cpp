@@ -6,10 +6,16 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
+#include "torch_neuronx/csrc/core/NeuronOpsApi.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"
+#include "torch_neuronx/csrc/core/dispatch/Int64Policy.h"
 #include "torch_neuronx/csrc/utils/TypeConversion.h"
 
 namespace torch_neuronx {
@@ -59,17 +65,49 @@ bool RawNrtCopyOverlaps(const at::Tensor& src, const at::Tensor& dst) {
   return std::max(a_lo, b_lo) < std::min(a_hi, b_hi);
 }
 
+at::Tensor CoalesceAdjacentViews(const c10::List<at::Tensor>& tensors) {
+  at::Tensor first;  // first non-empty entry: supplies storage, dtype and base offset
+  int64_t total = 0;
+  int64_t next_offset = 0;  // in elements, where the next view must start
+
+  for (size_t i = 0; i < tensors.size(); ++i) {
+    at::Tensor t = tensors[i];
+    if (!t.defined() || !t.has_storage()) return {};
+    if (t.dim() != 1 || !t.is_contiguous()) return {};
+    // A neg or conj view holds its transform in a flag, not in memory, so the
+    // span would carry only whichever flag the first entry happened to have.
+    if (t.is_neg() || t.is_conj()) return {};
+    if (t.numel() == 0) continue;  // contributes nothing, so cannot break adjacency
+
+    if (!first.defined()) {
+      first = t;
+      next_offset = t.storage_offset();
+    } else if (t.storage().data() != first.storage().data() ||
+               // Dtype, not element size: bf16 and fp16 are both two bytes, and a
+               // span typed as `first` would cast every element to first's dtype
+               // where the pairwise copies cast each to its own.
+               t.scalar_type() != first.scalar_type() || t.storage_offset() != next_offset) {
+      return {};
+    }
+    next_offset += t.numel();
+    total += t.numel();
+  }
+
+  if (!first.defined() || total == 0) return {};
+  return first.as_strided({total}, {1}, first.storage_offset());
+}
+
 bool IsIndexOp(const std::string& op_name) {
   // Index-family ops where PyTorch's Meta dispatch does NOT validate
   // shapes/bounds.  CPU dispatch errors on these when shapes are invalid,
   // but Meta silently produces wrong output shapes.
   //
-  // Ops in GetIndexOpConfig (scatter, scatter_add, _index_put_impl_) are
-  // NOT listed here — they have their own empty-index handling branch
+  // Ops in GetIndexOpConfig (scatter, scatter_add, _index_put_impl_, index_fill)
+  // are NOT listed here — they have their own empty-index handling branch
   // inside TryHandleEmptyTensors.
   static const std::unordered_set<std::string> kIndexOps = {
-      "index_copy",   "index_copy_", "index_add",  "index_add_", "index_fill", "index_fill_",
-      "index_select", "index_put",   "index_put_", "gather",     "put",        "put_",
+      "index_copy", "index_copy_", "index_add", "index_add_", "index_select",
+      "index_put",  "index_put_",  "gather",    "put",        "put_",
   };
   auto base = ExtractBaseOpName(op_name);
   return kIndexOps.count(base) > 0;
@@ -91,7 +129,7 @@ bool HasComplexInput(const std::vector<c10::IValue>& args) {
 
 bool ComplexDecompositionEnabled() {
   const char* value = std::getenv("TORCH_NEURONX_COMPLEX_DECOMPOSE");
-  if (value == nullptr) return false;
+  if (value == nullptr) return true;
   std::string normalized(value);
   std::transform(normalized.begin(), normalized.end(), normalized.begin(), ::tolower);
   return normalized == "1" || normalized == "true" || normalized == "yes";
@@ -113,8 +151,9 @@ bool HasComplexNonOutputInput(const std::vector<c10::IValue>& args,
 
 static const std::unordered_set<std::string>& NativeComplexOpsAllowlist() {
   static const std::unordered_set<std::string> kOps = {
-      "mul.Tensor", "mul.Scalar", "mul.out",      "mul.Scalar_out", "mul_.Tensor",
-      "div.Tensor", "div.out",    "div.out_mode", "div_.Tensor",
+      "mul.Tensor",  "mul.Scalar", "mul.out", "mul.Scalar_out",
+      "mul_.Tensor", "div.Tensor", "div.out", "div.out_mode",
+      "div_.Tensor", "abs",        "abs.out",
   };
   return kOps;
 }
@@ -123,8 +162,8 @@ bool HasNativeComplexLowering(const std::string& lookup_name) {
   return NativeComplexOpsAllowlist().count(lookup_name) > 0;
 }
 
-bool ShouldUseComplexDecomposition(bool has_lower_func) {
-  return ComplexDecompositionEnabled() && has_lower_func;
+bool ShouldUseComplexDecomposition(const std::string& lookup_name, bool has_lower_func) {
+  return ComplexDecompositionEnabled() && has_lower_func && !HasNativeComplexLowering(lookup_name);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -143,8 +182,11 @@ bool IsSupportedDtype(c10::ScalarType dt) {
 }
 
 static c10::ScalarType CastTarget(c10::ScalarType dt) {
-  // float64 → float32; all unsupported int types → int32
   if (dt == c10::ScalarType::Double) return c10::ScalarType::Float;
+  // A complex dtype must stay complex. An int target keeps only the truncated
+  // real part, so a complex64 tensor times 1j gave 0 instead of a rotation.
+  if (dt == c10::ScalarType::ComplexDouble || dt == c10::ScalarType::ComplexHalf)
+    return c10::ScalarType::ComplexFloat;
   return c10::ScalarType::Int;
 }
 
@@ -160,6 +202,12 @@ static bool IsScalarTypeArg(const c10::Argument& arg) {
 
 void DowncastArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& schema) {
   const auto& schema_args = schema.arguments();
+  // Per-op cpu_bounce (HostCC workaround): these ops route their int64
+  // tensor args through a CPU int32 roundtrip instead of the on-device
+  // packed int64 view, which races cross-stream under HostCC.
+  // TODO: replace with the proper long-term fix for the cross-stream int64 hazard.
+  static const std::unordered_set<std::string> kCpuBounceInt64Ops = {"aten::embedding"};
+  const bool cpu_bounce_op = kCpuBounceInt64Ops.count(schema.name()) > 0;
   for (size_t i = 0; i < args.size() && i < schema_args.size(); ++i) {
     auto& arg = args[i];
 
@@ -178,6 +226,10 @@ void DowncastArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& sch
     if (arg.isTensor()) {
       auto t = arg.toTensor();
       if (!t.defined()) continue;
+      if (cpu_bounce_op && t.scalar_type() == c10::ScalarType::Long) {
+        args[i] = c10::IValue(t.to(c10::kCPU).to(c10::ScalarType::Int).to(t.device()));
+        continue;
+      }
       auto dt = t.scalar_type();
       if (!IsSupportedDtype(dt)) {
         auto target = CastTarget(dt);
@@ -215,6 +267,18 @@ void DowncastArgs(std::vector<c10::IValue>& args, const c10::FunctionSchema& sch
       if (changed) args[i] = c10::IValue(list);
     }
   }
+}
+
+std::vector<c10::IValue> CloneIValueListContainers(const std::vector<c10::IValue>& args) {
+  auto cloned = args;
+  for (size_t i = 0; i < cloned.size(); ++i) {
+    if (cloned[i].isTensorList()) {
+      cloned[i] = c10::IValue(cloned[i].toTensorList().copy());
+    } else if (cloned[i].isList()) {
+      cloned[i] = c10::IValue(cloned[i].toList().copy());
+    }
+  }
+  return cloned;
 }
 
 bool DowncastTensorList(std::vector<at::Tensor>& tensors) {
@@ -276,6 +340,12 @@ void PromoteBinaryCompareOperands(std::vector<c10::IValue>& args,
   if (dt_a == dt_b) return;
 
   auto common = c10::promoteTypes(dt_a, dt_b);
+
+  // In packed int64 mode, comparisons operate on the low int32 word.
+  // Promoting to int64 builds a high word that's immediately discarded.
+  if (common == c10::ScalarType::Long && UsePackedInt64ViewForOp(schema.operator_name().name)) {
+    common = c10::ScalarType::Int;
+  }
 
   // The whitelist contains only ops whose result dtype is bool, so the
   // inputs are always non-bool/non-complex value tensors. Cast each operand
@@ -562,6 +632,27 @@ const MatmulAccumulateConfig* GetMatmulAccumulateConfig(const std::string& op_na
   return (it != kConfigs.end()) ? &it->second : nullptr;
 }
 
+const FillValueConfig* GetFillValueConfig(const std::string& op_name) {
+  static const std::unordered_map<std::string, FillValueConfig> kConfigs = {
+      // constant_pad_nd(input, pad, value=0) — pad value is a scalar
+      {"constant_pad_nd", {"value", 0.0, false}},
+      // isin(elements, test_elements, *, invert=False) — with an empty test set every
+      // element is a non-member, so the eager result is all-`invert` (shaped like
+      // `elements`; a 0-element operand can't be compiled, so it's filled here). `invert`
+      // is a bool kwarg read as a scalar fill (True->1.0, False->0.0). The torch.compile
+      // path handles empty in the aten.isin decomposition instead (this branch is eager-only).
+      {"isin", {"invert", 0.0, false}},
+      // linear(input, weight, bias=None) — bias is a tensor
+      {"linear", {"bias", 0.0, true}},
+      // nonzero_static(input, size, fill_value=-1): an empty input has no
+      // nonzero element, so every row of the (size, ndim) output is padding
+      {"nonzero_static", {"fill_value", -1.0, false}},
+  };
+  auto base = ExtractBaseOpName(op_name);
+  auto it = kConfigs.find(base);
+  return (it != kConfigs.end()) ? &it->second : nullptr;
+}
+
 bool HasZeroDim(const std::vector<int64_t>& shape) {
   return std::any_of(shape.begin(), shape.end(), [](int64_t d) { return d == 0; });
 }
@@ -577,6 +668,16 @@ c10::Scalar ExtractScalarArg(const std::vector<c10::IValue>& args,
   return default_value;
 }
 
+torch::Tensor ExtractTensorArg(const std::vector<c10::IValue>& args,
+                               const c10::FunctionSchema& schema, const std::string& name) {
+  const auto& schema_args = schema.arguments();
+  for (size_t i = 0; i < args.size() && i < schema_args.size(); ++i) {
+    if (schema_args[i].name() != name) continue;
+    return args[i].isTensor() ? args[i].toTensor() : torch::Tensor();
+  }
+  return torch::Tensor();
+}
+
 const IndexOpConfig* GetIndexOpConfig(const std::string& op_name) {
   // Mirrors Python config.py: IndexOps.INDEX_OPS
   // index_argnum = position of the index tensor, input_argnum = position of self/input
@@ -584,9 +685,8 @@ const IndexOpConfig* GetIndexOpConfig(const std::string& op_name) {
   // source_argnum = position of the argument written from; scatter's `.value`
   // overloads pass a Scalar there rather than a tensor
   static const std::unordered_map<std::string, IndexOpConfig> kConfigs = {
-      {"scatter", {2, 0, 3}},
-      {"scatter_add", {2, 0, 3}},
-      {"_index_put_impl_", {1, 0, 2}},
+      {"scatter", {2, 0, 3}},     {"scatter_add", {2, 0, 3}},  {"_index_put_impl_", {1, 0, 2}},
+      {"index_fill", {2, 0, -1}}, {"index_fill_", {2, 0, -1}},
   };
   auto base = ExtractBaseOpName(op_name);
   auto it = kConfigs.find(base);
@@ -599,7 +699,15 @@ const IndexOpConfig* GetIndexOpConfig(const std::string& op_name) {
 
 at::Tensor TensorToMeta(const at::Tensor& t) {
   if (!t.defined()) return t;
-  return at::detail::empty_strided_meta(t.sizes(), t.strides(), t.scalar_type());
+  // Wrapped numbers are CPU scalar adapters, not ordinary tensors.  Keep
+  // them on CPU so Python-registered Meta kernels can convert them back to
+  // the original Python number.  Moving one to Meta and retaining the bit
+  // violates pybind_utils' wrapped-number invariant.
+  if (t.unsafeGetTensorImpl()->is_wrapped_number()) {
+    return t;
+  }
+  auto meta = at::detail::empty_strided_meta(t.sizes(), t.strides(), t.scalar_type());
+  return meta;
 }
 
 c10::IValue IValueToMeta(const c10::IValue& val) {
@@ -670,7 +778,7 @@ std::vector<MetaOutputSpec> ExtractMetaOutputSpecs(torch::jit::Stack& stack) {
     if (out.isTensor()) {
       auto t = out.toTensor();
       if (t.defined()) {
-        specs.push_back({t.sizes().vec(), t.scalar_type(), false});
+        specs.push_back({t.sizes().vec(), t.scalar_type(), false, t.strides().vec()});
       } else {
         specs.push_back({{}, c10::ScalarType::Undefined, true});
       }
@@ -680,7 +788,7 @@ std::vector<MetaOutputSpec> ExtractMetaOutputSpecs(torch::jit::Stack& stack) {
       for (const auto& t_ref : out.toTensorList()) {
         at::Tensor t = t_ref;
         if (t.defined()) {
-          specs.push_back({t.sizes().vec(), t.scalar_type(), false});
+          specs.push_back({t.sizes().vec(), t.scalar_type(), false, t.strides().vec()});
         } else {
           specs.push_back({{}, c10::ScalarType::Undefined, true});
         }
@@ -697,6 +805,194 @@ std::vector<MetaOutputSpec> InferOutputsViaMeta(const c10::OperatorHandle& op,
                                                 const std::vector<c10::IValue>& args) {
   auto stack = RunMetaDispatch(op, args);
   return ExtractMetaOutputSpecs(stack);
+}
+
+// True for strides that are a plain permutation of a dense buffer, and that
+// are not the contiguous layout.
+//
+// AnalyzeEpilogueLayout (Transformations.cpp) accepts exactly this class of
+// layout for a buffer that starts at element 0. It ignores each dim of size 1,
+// it needs the innermost active stride to be 1, and it refuses a gap between
+// two active dims. The walk below proves all three: it visits the active dims
+// from the innermost outward and it needs each stride to equal the product of
+// the sizes inside it.
+//
+// A layout outside this class must keep the contiguous output. The epilogue
+// reports such a layout as unsupported and then copies through the host, which
+// costs more than the stride difference.
+static bool IsFusableDensePermutation(const std::vector<int64_t>& shape,
+                                      const std::vector<int64_t>& strides) {
+  if (shape.size() != strides.size()) return false;
+
+  std::vector<size_t> active;
+  for (size_t d = 0; d < shape.size(); ++d) {
+    // An empty output has no layout to keep.
+    if (shape[d] == 0) return false;
+    if (shape[d] > 1) active.push_back(d);
+  }
+  if (active.empty()) return false;
+
+  std::vector<size_t> physical = active;
+  std::stable_sort(physical.begin(), physical.end(),
+                   [&](size_t a, size_t b) { return strides[a] > strides[b]; });
+
+  int64_t expected = 1;
+  for (size_t pi = physical.size(); pi-- > 0;) {
+    const size_t d = physical[pi];
+    if (strides[d] != expected) return false;
+    expected *= shape[d];
+  }
+
+  // Equal orders mean the layout is already contiguous, so there is no work.
+  return physical != active;
+}
+
+std::vector<MetaOutputSpec> AtenOutputLayouts(const c10::OperatorHandle& op,
+                                              const c10::FunctionSchema& schema,
+                                              const std::vector<c10::IValue>& original_args) {
+  // The epilogue is the only mechanism that writes a permuted output, so there
+  // is nothing to propagate when it is off.
+  if (!torch_neuronx::IsEpilogueEnabled()) return {};
+
+  // An out or inplace op takes the layout of the caller buffer instead.
+  if (schema.is_mutable()) return {};
+
+  // ATen derives the output layout from the inputs. Contiguous inputs give a
+  // contiguous output, which is what the default allocation already does.
+  bool has_permuted_input = false;
+  ForEachTensor(original_args, [&](const at::Tensor& t) {
+    if (t.defined() && t.numel() > 0 && !t.is_contiguous()) has_permuted_input = true;
+  });
+  if (!has_permuted_input) return {};
+
+  std::vector<MetaOutputSpec> specs;
+  try {
+    specs = InferOutputsViaMeta(op, original_args);
+  } catch (const std::exception& e) {
+    // No Meta kernel, or the Meta kernel rejects the arguments. The op still
+    // runs and returns correct values with the contiguous layout.
+    TORCH_NEURONX_DISPATCH_DEBUG("[AtenOutputLayouts] meta dispatch failed",
+                                 " op=", schema.operator_name().name, " error=", e.what());
+    return {};
+  }
+
+  for (auto& spec : specs) {
+    // Clear the layout of every output that must stay contiguous. This keeps
+    // the index alignment with the Meta returns.
+    if (spec.is_undefined || !IsFusableDensePermutation(spec.shape, spec.strides)) {
+      spec.strides.clear();
+    }
+  }
+
+  return specs;
+}
+
+bool NormalizeWrappedIntegerScalarViaMeta(const c10::OperatorHandle& op,
+                                          std::vector<c10::IValue>& args,
+                                          const c10::FunctionSchema& schema,
+                                          const std::string& memo_key) {
+  // The output dtype of a writable overload is constrained by its destination
+  // and cannot prove the arithmetic operand dtype. Keep out=/in-place behavior
+  // on its existing path.
+  for (const auto& schema_arg : schema.arguments()) {
+    const auto& alias_info = schema_arg.alias_info();
+    if (alias_info != nullptr && alias_info->isWrite()) return false;
+  }
+
+  if (schema.returns().size() != 1 ||
+      schema.returns()[0].type()->kind() != c10::TypeKind::TensorType) {
+    return false;
+  }
+
+  c10::optional<size_t> wrapped_index;
+  c10::optional<c10::ScalarType> ordinary_dtype;
+  size_t defined_tensor_count = 0;
+
+  for (size_t i = 0; i < args.size(); ++i) {
+    if (!args[i].isTensor()) continue;
+    const auto& tensor = args[i].toTensor();
+    if (!tensor.defined()) continue;
+    ++defined_tensor_count;
+
+    const bool is_integral = c10::isIntegralType(tensor.scalar_type(), /*includeBool=*/false);
+    const bool is_wrapped = tensor.unsafeGetTensorImpl()->is_wrapped_number();
+    if (is_wrapped) {
+      if (wrapped_index.has_value() || tensor.dim() != 0 || !is_integral) return false;
+      wrapped_index = i;
+      continue;
+    }
+
+    // One ordinary integer tensor of any rank plus one wrapped Python integer.
+    // For a dim>0 operand the result dtype is already inferred correctly, but
+    // an unnormalized wrapped scalar still reaches the compiler as S64 and
+    // produces a mixed i32/i64 TensorTensor op that fails ISA validation.
+    if (ordinary_dtype.has_value() || !is_integral) return false;
+    ordinary_dtype = tensor.scalar_type();
+  }
+
+  if (defined_tensor_count != 2 || !wrapped_index.has_value() || !ordinary_dtype.has_value()) {
+    return false;
+  }
+
+  // Nothing to narrow, e.g. an int64 tensor plus a Python int.
+  if (args[*wrapped_index].toTensor().scalar_type() == *ordinary_dtype) return false;
+
+  // Result dtype equality is meaningful only when these are the conventional
+  // binary promoting operands. Reject tensor roles such as index, mask, or
+  // destination even if their operator happens to return the other tensor's
+  // dtype.
+  const auto& schema_args = schema.arguments();
+  if (schema_args.size() < 2 || args.size() < 2 || schema_args[0].name() != "self" ||
+      schema_args[1].name() != "other" || (*wrapped_index != 0 && *wrapped_index != 1)) {
+    return false;
+  }
+
+  // The Meta verdict depends only on the op and operand dtypes, which the raw
+  // dispatch cache key encodes (including the wrapped tag). The Meta kernels
+  // for these ops are Python-registered, so memoize the verdict rather than
+  // re-entering Python on every eager call.
+  static std::mutex verdict_mutex;
+  static std::unordered_map<std::string, bool> verdicts;
+  c10::optional<bool> memoized;
+  if (!memo_key.empty()) {
+    std::lock_guard<std::mutex> lock(verdict_mutex);
+    auto it = verdicts.find(memo_key);
+    if (it != verdicts.end()) memoized = it->second;
+  }
+
+  bool normalizable = false;
+  if (memoized.has_value()) {
+    normalizable = *memoized;
+  } else {
+    try {
+      auto output_specs = InferOutputsViaMeta(op, args);
+      normalizable = output_specs.size() == 1 && !output_specs[0].is_undefined &&
+                     output_specs[0].dtype == *ordinary_dtype;
+    } catch (const c10::Error& e) {
+      TORCH_NEURONX_DISPATCH_DEBUG("[NormalizeWrappedIntegerScalarViaMeta] Meta dispatch failed",
+                                   " op=", c10::toString(schema.operator_name()),
+                                   " error=", e.what_without_backtrace());
+    } catch (const std::exception& e) {
+      TORCH_NEURONX_DISPATCH_DEBUG("[NormalizeWrappedIntegerScalarViaMeta] Meta dispatch failed",
+                                   " op=", c10::toString(schema.operator_name()),
+                                   " error=", e.what());
+    }
+    if (!memo_key.empty()) {
+      std::lock_guard<std::mutex> lock(verdict_mutex);
+      verdicts.emplace(memo_key, normalizable);
+    }
+  }
+  if (!normalizable) return false;
+
+  auto wrapped = args[*wrapped_index].toTensor();
+  auto normalized = wrapped.to(*ordinary_dtype, /*non_blocking=*/false, /*copy=*/true);
+  normalized.unsafeGetTensorImpl()->set_wrapped_number(false);
+  args[*wrapped_index] = c10::IValue(std::move(normalized));
+  TORCH_NEURONX_DISPATCH_DEBUG("[NormalizeWrappedIntegerScalarViaMeta] normalized",
+                               " op=", c10::toString(schema.operator_name()),
+                               " wrapped_dtype=", wrapped.scalar_type(),
+                               " meta_dtype=", *ordinary_dtype);
+  return true;
 }
 
 // ═══════════════════════════════════════════════════════════════

@@ -38,30 +38,30 @@ enum class KernelTypeEnum {
   kHLO,
   kCollective,
   kCopy,
+  kCast,
   kWrite,
   kRead,
   kEvent,
   kBarrier,
-  kHint,  // Merely a non-functional hint
   kAlloc,
   kDealloc,
   kHost,
 };
 
 // Check if a kernel type represents a device operation (vs host-side operation).
-// Device operations: kHLO, kCollective, kCopy, kWrite, kRead
-// Host-side operations: kEvent, kBarrier, kHint, kAlloc, kDealloc, kHost
+// Device operations: kHLO, kCollective, kCopy, kCast, kWrite, kRead
+// Host-side operations: kEvent, kBarrier, kAlloc, kDealloc, kHost
 inline bool IsDeviceKernelType(KernelTypeEnum kernel_type) {
   switch (kernel_type) {
     case KernelTypeEnum::kHLO:
     case KernelTypeEnum::kCollective:
     case KernelTypeEnum::kCopy:
+    case KernelTypeEnum::kCast:
     case KernelTypeEnum::kWrite:
     case KernelTypeEnum::kRead:
       return true;
     case KernelTypeEnum::kEvent:
     case KernelTypeEnum::kBarrier:
-    case KernelTypeEnum::kHint:
     case KernelTypeEnum::kAlloc:
     case KernelTypeEnum::kDealloc:
     case KernelTypeEnum::kHost:
@@ -70,17 +70,17 @@ inline bool IsDeviceKernelType(KernelTypeEnum kernel_type) {
   return false;
 }
 
-// kHint/kAlloc/kDealloc are bufferable because the merge path consumes their
+// kAlloc/kDealloc are bufferable because the merge path consumes their
 // lifetime info; only kHLO is fusible. Everything else flushes the buffer.
 inline bool IsConcatBufferableKernelType(KernelTypeEnum kernel_type) {
   switch (kernel_type) {
     case KernelTypeEnum::kHLO:
-    case KernelTypeEnum::kHint:
     case KernelTypeEnum::kAlloc:
     case KernelTypeEnum::kDealloc:
       return true;
     case KernelTypeEnum::kCollective:
     case KernelTypeEnum::kCopy:
+    case KernelTypeEnum::kCast:
     case KernelTypeEnum::kWrite:
     case KernelTypeEnum::kRead:
     case KernelTypeEnum::kEvent:
@@ -99,6 +99,7 @@ inline size_t GetXUIndex(KernelTypeEnum kernel_type) {
     case KernelTypeEnum::kCollective:
       return NRTA_XU_COLLECTIVES;
     case KernelTypeEnum::kCopy:
+    case KernelTypeEnum::kCast:
     case KernelTypeEnum::kWrite:
     case KernelTypeEnum::kRead:
       return NRTA_XU_TENSOR_OP;
@@ -284,18 +285,11 @@ class NeuronKernelExecutionTyped : public NeuronKernelExecution {
     StorageVec data_ptrs;
     data_ptrs.reserve(refs.size());
     if constexpr (std::is_same_v<StorageType, nrt_tensor_t*>) {
-      // TODO(rpsilva): Simplify once converged
-      if (c10_neuron::NeuronCachingAllocator::IsLazyAllocEnabled()) {
-        for (const auto& ref : refs) {
-          nrt_tensor_t* data_ptr = c10_neuron::NeuronCachingAllocator::findTensor(ref.ptr);
-          EXECUTION_RUNTIME_CHECK(data_ptr,
-                                  "Tensor not bound: lazy alloc kAlloc may not have executed");
-          data_ptrs.push_back(data_ptr);
-        }
-      } else {
-        for (const auto& ref : refs) {
-          data_ptrs.push_back(ref.tensor_ptr.get());
-        }
+      for (const auto& ref : refs) {
+        nrt_tensor_t* data_ptr = c10_neuron::NeuronCachingAllocator::findTensor(ref.ptr);
+        EXECUTION_RUNTIME_CHECK(data_ptr,
+                                "Tensor not bound: lazy alloc kAlloc may not have executed");
+        data_ptrs.push_back(data_ptr);
       }
     } else {
       for (const auto& ref : refs) {
@@ -628,11 +622,12 @@ class CollectiveDirectKernelExecution
   int GetMyRank() const { return my_rank_; }
   const nrt::NRTCollectiveComm& GetComm() const { return comm_; }
 
-  void Prepare() const override;
   bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
                 c10::StreamId stream_id) const override;
   KernelTypeEnum GetKernelType() const override { return KernelTypeEnum::kCollective; }
-  bool RequiresPrepare() const override { return true; }
+  // Device memory is bound on the runtime worker, so the NRT tensors are not
+  // resolvable on the caller thread; collective prepare happens in Schedule().
+  bool RequiresPrepare() const override { return false; }
 
  protected:
   bool ValidateImpl() const override;
@@ -660,38 +655,6 @@ class CollectiveDirectKernelExecution
   mutable nrt::NRTCollectiveComm comm_{};
 };
 
-// Hint primitive for fusion optimizations. It merely signals lifecycle events.
-class HintDirectKernelExecution : public NeuronKernelExecution {
- public:
-  enum class HintType {
-    kAllocation,    // Tensor was allocated
-    kDeallocation,  // Tensor was deallocated
-  };
-
-  HintDirectKernelExecution(const std::string& op_name, void* ptr, size_t size_bytes, int device_id,
-                            HintType hint_type);
-
-  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
-                c10::StreamId stream_id) const override {
-    // No-op for hints - nothing to execute or schedule
-    return false;
-  }
-  bool RequiresCompilation() const override { return false; }
-  KernelTypeEnum GetKernelType() const override { return KernelTypeEnum::kHint; }
-
-  HintType GetHintType() const { return hint_type_; }
-  size_t GetSizeBytes() const { return size_bytes_; }
-  void* GetPtr() const { return ptr_; }
-
- protected:
-  bool ValidateImpl() const override { return size_bytes_ > 0; }
-
- private:
-  void* ptr_;
-  size_t size_bytes_;
-  HintType hint_type_;
-};
-
 class EventDirectKernelExecution : public NeuronKernelExecution {
  public:
   enum class EventAction {
@@ -700,6 +663,8 @@ class EventDirectKernelExecution : public NeuronKernelExecution {
   };
 
   EventDirectKernelExecution(const std::string& op_name, const NeuronEvent& event,
+                             EventAction action, int device_id);
+  EventDirectKernelExecution(const std::string& op_name, std::shared_ptr<EventImpl> event,
                              EventAction action, int device_id);
 
   // Events are host-side operations - Schedule handles async execution
@@ -710,13 +675,15 @@ class EventDirectKernelExecution : public NeuronKernelExecution {
 
   void CompleteWithoutExecution() const override {
     if (action_ == EventAction::kSignal) {
-      event_.complete_event();
+      event_->complete_event();
     }
   }
 
   // Event-specific methods
   EventAction GetEventAction() const { return action_; }
-  const NeuronEvent& GetEvent() const { return event_; }
+  // A public snapshot can be recorded again without changing this kernel's record.
+  NeuronEvent GetEvent() const { return NeuronEvent(event_); }
+  const std::shared_ptr<EventImpl>& GetEventImpl() const { return event_; }
   virtual bool IsReady() const;
   // StreamImpl that recorded this event; used for same-stream-wait bypass.
   at::neuron::StreamImpl* GetSignalStreamImpl() const { return signal_stream_impl_; }
@@ -725,7 +692,7 @@ class EventDirectKernelExecution : public NeuronKernelExecution {
   bool ValidateImpl() const override;
 
  private:
-  NeuronEvent event_;
+  const std::shared_ptr<EventImpl> event_;
   EventAction action_;
   at::neuron::StreamImpl* signal_stream_impl_;
 };
@@ -746,7 +713,8 @@ class AllocDirectKernelExecution
   bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
                 c10::StreamId stream_id) const override;
   size_t GetSizeBytes() const { return size_bytes_; }
-  const NeuronEvent& GetEvent() const { return event_op_.GetEvent(); }
+  NeuronEvent GetEvent() const { return event_op_.GetEvent(); }
+  const std::shared_ptr<EventImpl>& GetEventImpl() const { return event_op_.GetEventImpl(); }
 
   AllocState GetAllocState() const { return alloc_state_.load(std::memory_order_acquire); }
   void SetAllocState(AllocState s) { alloc_state_.store(s, std::memory_order_release); }
@@ -769,7 +737,7 @@ class DeallocDirectKernelExecution
   bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
                 c10::StreamId stream_id) const override;
   size_t GetSizeBytes() const { return size_bytes_; }
-  const NeuronEvent& GetEvent() const { return event_op_.GetEvent(); }
+  NeuronEvent GetEvent() const { return event_op_.GetEvent(); }
 
  protected:
   bool ValidateImpl() const override { return HasInputs() && size_bytes_ > 0; }
@@ -797,6 +765,29 @@ class CopyDirectKernelExecution
   size_t src_offset_bytes_;
   size_t dst_offset_bytes_;
   size_t size_bytes_;
+};
+
+class CastDirectKernelExecution
+    : public NeuronKernelExecutionTyped<KernelTypeEnum::kCast, c10::DeviceType::PrivateUse1,
+                                        c10::DeviceType::PrivateUse1> {
+ public:
+  CastDirectKernelExecution(const std::string& op_name, TensorDataRef src_ref,
+                            TensorDataRef dst_ref, uint64_t src_offset_elements,
+                            uint64_t dst_offset_elements, c10::ScalarType src_dtype,
+                            c10::ScalarType dst_dtype, uint64_t num_elements, int device_id);
+
+  bool Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                c10::StreamId stream_id) const override;
+
+ protected:
+  bool ValidateImpl() const override;
+
+ private:
+  uint64_t src_offset_elements_;
+  uint64_t dst_offset_elements_;
+  c10::ScalarType src_dtype_;
+  c10::ScalarType dst_dtype_;
+  uint64_t num_elements_;
 };
 
 class WriteDirectKernelExecution

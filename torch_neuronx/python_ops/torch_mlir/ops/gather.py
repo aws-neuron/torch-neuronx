@@ -14,7 +14,12 @@ def _gather_mlir(input, dim, index, sparse_grad=False, out=None):
 
 @neuron_op("aten::gather", priority=40)
 class GatherMLIRImpl(TorchMlirOpImpl):
-    """Register gather and gather.out"""
+    """Implement MLIR gather operation variants.
+
+    Args:
+        op_variant (str, optional): Use ``"gather.out"`` for the output variant;
+            any other value selects ``"gather"``. Defaults to ``"gather"``.
+    """
 
     def __init__(self, op_variant="gather"):
         if op_variant == "gather.out":
@@ -34,6 +39,20 @@ class GatherMLIRImpl(TorchMlirOpImpl):
         self.op_variant = op_variant
 
     def can_handle(self, input, dim, index, sparse_grad=False, out=None) -> bool:
+        """Check whether MLIR can handle the gather arguments.
+
+        Args:
+            input (torch.Tensor): Tensor checked for Neuron device placement.
+            dim (int): Gather dimension, accepted but not inspected.
+            index (torch.Tensor): Index tensor checked for Neuron device placement.
+            sparse_grad (bool, optional): Sparse-gradient request, accepted but not inspected.
+                Defaults to ``False``.
+            out (torch.Tensor, optional): Output tensor, accepted but not inspected.
+                Defaults to ``None``.
+
+        Returns:
+            bool: ``True`` when MLIR ATen ops are enabled and inputs use a Neuron device.
+        """
         from torch_neuronx.utils import use_mlir_aten_ops
 
         return (
@@ -42,5 +61,7 @@ class GatherMLIRImpl(TorchMlirOpImpl):
 
 
 class GatherOutMLIRImpl(GatherMLIRImpl):
+    """Implement the output-tensor MLIR gather operation."""
+
     def __init__(self):
         super().__init__("gather.out")

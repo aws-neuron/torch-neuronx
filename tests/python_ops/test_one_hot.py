@@ -53,7 +53,7 @@ class TestOneHot:
         different max must not share a cached NEFF.
 
         Their raw dispatch args are identical (same-shape int64, num_classes=-1),
-        so the relower_every_call lowering must key on the preprocessed num_classes
+        so the VALUE_DEPENDENT lowering must key on the preprocessed num_classes
         (max(x)+1); otherwise the second call replays the first's shape.
         """
         with track_neuron_ops():

@@ -12,6 +12,7 @@ import math
 import operator
 import os
 import tempfile
+from typing import NamedTuple
 
 import nki
 import numpy as np
@@ -22,6 +23,7 @@ from torch.fx import Node
 from torch.fx.passes.infra.pass_base import PassResult
 from torch.fx.passes.shape_prop import TensorMetadata
 
+from torch_neuronx.neuron_dynamo_backend.flex_attention import kernel_rendering
 from torch_neuronx.neuron_dynamo_backend.flex_attention.kernel_rendering import (
     generate_body_template,
     generate_buffer_allocator,
@@ -29,6 +31,9 @@ from torch_neuronx.neuron_dynamo_backend.flex_attention.kernel_rendering import 
     generate_graph_lowering,
     jinja_env,
     save_and_import_kernel,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.flex_attention_legalization import (
+    decomposition_unsupported_reason,
 )
 from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import (
     NeuronFXPass,
@@ -46,8 +51,131 @@ _TILE_SKIP = 0
 _TILE_PARTIAL = 1
 _TILE_FULL = 2
 _Q_GRP_SZ = 128
+_D_TILE_SZ = 128
 _V_TILE_SZ = 128
+_MAX_HEAD_DIM = 512
+_FLASH_ATTENTION_THRESHOLD = 10 * 1024
 _SECTION_LEN = 8192
+
+_SCORE_MOD_COST_FACTOR = 4
+_COST_UNITS_PER_SECOND = 128
+
+_COMPILE_BUDGET_ENV = "TORCH_NEURONX_FLEX_NKI_COMPILE_BUDGET_S"
+_DEFAULT_COMPILE_BUDGET_S = 250.0
+
+# The kernel keeps the log-sum-exp as -(max + log(sum exp)), because the backward kernel adds
+# it straight to the scores as an exp bias. The HOP wants log2(sum exp), so the sign belongs
+# to this boundary and is written at each conversion.
+_LOG2_E = 1.0 / math.log(2.0)
+
+
+class _CompileCostEstimate(NamedTuple):
+    live_tiles: int
+    total_tiles: int
+    density: float
+    cost_units: int
+    est_seconds: float
+    has_score_mod: bool
+
+
+def _estimate_compile_cost(
+    qk_tile_types: list[list[int]], batch: int, q_heads: int, has_score_mod: bool
+) -> _CompileCostEstimate:
+    """Estimate the compile time of the flex attention NKI kernel.
+
+    A heuristic, linear in the count of tiles that the mask does not skip, in the batch
+    size and in the query head count, times _SCORE_MOD_COST_FACTOR when the operator has
+    a score modification. _COST_UNITS_PER_SECOND turns that count into seconds.
+    """
+    num_grps = len(qk_tile_types)
+    num_k_tiles = len(qk_tile_types[0]) if num_grps else 0
+    total_tiles = num_grps * num_k_tiles
+    live_tiles = sum(1 for row in qk_tile_types for tile in row if tile != _TILE_SKIP)
+    score_mod_factor = _SCORE_MOD_COST_FACTOR if has_score_mod else 1
+    cost_units = batch * q_heads * live_tiles * score_mod_factor
+    return _CompileCostEstimate(
+        live_tiles=live_tiles,
+        total_tiles=total_tiles,
+        density=live_tiles / total_tiles if total_tiles else 0.0,
+        cost_units=cost_units,
+        est_seconds=cost_units / _COST_UNITS_PER_SECOND,
+        has_score_mod=has_score_mod,
+    )
+
+
+def _compile_budget_seconds() -> float:
+    """Return the compile budget in seconds.
+
+    The budget is active by default. A value of 0 or less turns the budget off. A value
+    that is not a number keeps the default, so a typo does not remove the gate.
+    """
+    value = os.environ.get(_COMPILE_BUDGET_ENV)
+    if value is None:
+        return _DEFAULT_COMPILE_BUDGET_S
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning(
+            f"{_COMPILE_BUDGET_ENV}={value!r} is not a number. The compile budget stays at "
+            f"the default {_DEFAULT_COMPILE_BUDGET_S} s. Set a number of seconds, or 0 to "
+            "turn the budget off."
+        )
+        return _DEFAULT_COMPILE_BUDGET_S
+
+
+def _is_identity_score_mod(score_module: fx.GraphModule) -> bool:
+    """Return True when the score_mod graph returns its score input unchanged."""
+    nodes = list(score_module.graph.nodes)
+    placeholders = [n for n in nodes if n.op == "placeholder"]
+    output = next((n for n in nodes if n.op == "output"), None)
+    return (
+        output is not None
+        and len(placeholders) >= 1
+        and len(nodes) == len(placeholders) + 1
+        and output.args[0] is placeholders[0]
+    )
+
+
+def _nki_supports_head_dims(d_head_qk: int, d_head_v: int, backward: bool) -> bool:
+    """Return True when the NKI kernel of one direction supports the head dimensions."""
+
+    def supported(d: int) -> bool:
+        """Check whether one head dimension is supported.
+
+        Args:
+            d (int): Head dimension to check.
+
+        Returns:
+            bool: Whether the dimension fits the directional kernel constraints.
+        """
+        # The backward kernel splits the head dimension into equal tiles of at most 128.
+        return 0 < d <= _MAX_HEAD_DIM and (not backward or d % math.ceil(d / _D_TILE_SZ) == 0)
+
+    return supported(d_head_qk) and supported(d_head_v)
+
+
+def _unsupported_head_dims_message(d_head_qk: int, d_head_v: int, backward: bool) -> str:
+    limit = f"head dimensions up to {_MAX_HEAD_DIM}"
+    if backward:
+        limit += f" that split into equal tiles of at most {_D_TILE_SZ}"
+    return (
+        f"Unsupported head dimensions: q/k={d_head_qk}, v={d_head_v}. The NKI "
+        f"{'backward' if backward else 'forward'} kernel supports {limit}. "
+        "FlexAttentionLegalization decomposes the operator instead."
+    )
+
+
+def _get_fwd_section_len(seqlen_kv: int, d_head_qk: int, d_head_v: int) -> int:
+    """Return the K/V section length of the forward kernel.
+
+    Keep this in sync with _compute_tile_parameters in flex_attention.py.jinja, which
+    asserts that the two agree.
+    """
+    num_d_tiles = math.ceil(max(d_head_qk, d_head_v) / _D_TILE_SZ)
+    section_scale = 1 << (num_d_tiles - 1).bit_length()
+    if seqlen_kv > _FLASH_ATTENTION_THRESHOLD // section_scale:
+        return min(seqlen_kv, _SECTION_LEN // section_scale)
+    return seqlen_kv
 
 
 def _atomic_save_npy(path: str, array) -> None:
@@ -194,6 +322,8 @@ def _generate_tile_types(
     seqlen_q: int,
     seqlen_kv: int,
     k_tile_sz: int,
+    d_head_qk: int = _D_TILE_SZ,
+    d_head_v: int = _D_TILE_SZ,
     extra_buffers: tuple = (),
 ) -> dict:
     """Generate tile type arrays and precomputed mask data from the mask_mod FX submodule.
@@ -304,8 +434,9 @@ def _generate_tile_types(
         _atomic_save_npy(npy_int8_path, masks_int8_2d)
 
         # Compute per-group last section with compute
-        num_sections = max(1, math.ceil(seqlen_kv / _SECTION_LEN))
-        k_tiles_per_section = _SECTION_LEN // k_tile_sz
+        section_len = _get_fwd_section_len(seqlen_kv, d_head_qk, d_head_v)
+        num_sections = max(1, math.ceil(seqlen_kv / section_len))
+        k_tiles_per_section = math.ceil(section_len / k_tile_sz)
         last_compute_section = []
         for g in range(num_grps):
             last_sec = -1  # -1 means no section has compute for this group
@@ -338,6 +469,7 @@ def _generate_tile_types(
             "masks_npy_path": npy_path,
             "masks_int8_npy_path": npy_int8_path,
             "last_compute_section": last_compute_section,
+            "section_len": section_len,
             "max_large_tiles_needed": max_large_tiles_needed,
         }
     except Exception as e:
@@ -353,14 +485,24 @@ def _compute_lnc(k_shape):
     Falls back to lnc=1 if the batch dimension (product of all dims except
     the last two) is not divisible by 2.
     """
-    lnc = int(get_logical_neuron_cores())
     if math.prod(k_shape[:-2]) % 2 == 1:
-        lnc = 1
-    return lnc
+        return 0
+    return int(get_logical_neuron_cores())
 
 
 def add_metadata_to_node(node: fx.Node, example_tensor=None, shape=None, dtype=None) -> fx.Node:
-    """Helper to add metadata to a node for torch-mlir compatibility."""
+    """Add tensor metadata to an FX node for torch-mlir compatibility.
+
+    Args:
+        node (fx.Node): FX node whose metadata is updated in place.
+        example_tensor (torch.Tensor, optional): Tensor stored in ``meta["val"]``. Defaults to
+            ``None``.
+        shape (Sequence[int], optional): Shape used together with ``dtype``. Defaults to ``None``.
+        dtype (torch.dtype, optional): Data type used together with ``shape``. Defaults to ``None``.
+
+    Returns:
+        fx.Node: The same input node.
+    """
     if not hasattr(node, "meta"):
         node.meta = {}
 
@@ -373,7 +515,42 @@ def add_metadata_to_node(node: fx.Node, example_tensor=None, shape=None, dtype=N
     return node
 
 
+def _rescale_lse(graph: fx.Graph, lse: fx.Node, shape: list[int], scale: float) -> fx.Node:
+    """Scale a log-sum-exp tensor without letting the multiply overflow.
+
+    The forward kernel marks a Q row that attends to nothing with a value near the float32
+    limit, and it saves its log-sum-exp for the backward, so an overflow here crosses the
+    autograd boundary and becomes an infinite exp bias there, which makes every gradient nan.
+    """
+    limit = torch.finfo(torch.float32).max
+    bound = limit / abs(scale)
+    operand = lse
+    if bound < limit:
+        operand = graph.call_function(torch.ops.aten.clamp.default, args=(lse, -bound, bound))
+        add_metadata_to_node(operand, shape=shape, dtype=torch.float32)
+
+    scaled = graph.call_function(torch.ops.aten.mul.Scalar, args=(operand, scale))
+    add_metadata_to_node(scaled, shape=shape, dtype=torch.float32)
+    return scaled
+
+
 def get_fwd_dumped_config(fwd_kernel, q, k, v, scale, other_buffers=None):
+    """Build the dumped configuration for a forward NKI attention kernel.
+
+    Args:
+        fwd_kernel (NKIHOPCaller): Registered forward kernel wrapper.
+        q (fx.Node): Query FX node with tensor metadata.
+        k (fx.Node): Key FX node with tensor metadata.
+        v (fx.Node): Value FX node with tensor metadata.
+        scale (float): Attention scale passed to the kernel configuration.
+        other_buffers (Sequence[fx.Node | torch.Tensor], optional): Captured buffers appended to
+            kernel arguments. Defaults to ``None``.
+
+    Returns:
+        tuple: Four elements containing backend configuration text, operand-output aliases,
+            ``(dtype, shape)`` output specifications, and the logical Neuron core count
+            (``0`` when the key batch size is odd).
+    """
     if other_buffers is None:
         other_buffers = []
     kernel_idx = fwd_kernel.kernel_idx
@@ -395,7 +572,7 @@ def get_fwd_dumped_config(fwd_kernel, q, k, v, scale, other_buffers=None):
         positional_values.append(torch.empty(buf_val.shape, dtype=buf_val.dtype, device="meta"))
     meta_args = dict(zip(arg_names, positional_values))  # noqa: B905
 
-    dconfig = get_config(kernel[lnc], **meta_args)
+    dconfig = get_config(kernel[lnc] if lnc else kernel, **meta_args)
     logger.debug(f"FWD Kernel return types: {return_types_of(dconfig)}")
     return (
         backend_config_str(dconfig),
@@ -405,7 +582,28 @@ def get_fwd_dumped_config(fwd_kernel, q, k, v, scale, other_buffers=None):
     )
 
 
-def get_bwd_dumped_config(bwd_kernel, q, k, v, o, dy, lse, scale, other_buffers=None):
+def get_bwd_dumped_config(bwd_kernel, q, k, v, o, dy, lse, scale, other_buffers=None, dlse=None):
+    """Build the dumped configuration for a backward NKI attention kernel.
+
+    Args:
+        bwd_kernel (NKIHOPCaller): Registered backward kernel wrapper.
+        q (fx.Node): Query FX node with tensor metadata.
+        k (fx.Node): Key FX node with tensor metadata.
+        v (fx.Node): Value FX node with tensor metadata.
+        o (fx.Node): Forward output FX node with tensor metadata.
+        dy (fx.Node): Output-gradient FX node with tensor metadata.
+        lse (fx.Node): Log-sum-exp FX node with tensor metadata.
+        scale (float): Softmax scale supplied when the kernel accepts it.
+        other_buffers (Sequence[fx.Node | torch.Tensor], optional): Captured buffers appended to
+            kernel arguments. Defaults to ``None``.
+        dlse (fx.Node, optional): Log-sum-exp gradient appended before captured buffers.
+            Defaults to ``None``.
+
+    Returns:
+        tuple: Four elements containing backend configuration text, operand-output aliases,
+            ``(dtype, shape)`` output specifications, and the logical Neuron core count
+            (``0`` when the key batch size is odd).
+    """
     if other_buffers is None:
         other_buffers = []
     kernel_idx = bwd_kernel.kernel_idx
@@ -424,6 +622,10 @@ def get_bwd_dumped_config(bwd_kernel, q, k, v, o, dy, lse, scale, other_buffers=
     arg_names = list(sig.parameters.keys())
     # Build args dict: positional args first, then softmax_scale as keyword
     positional_values = [q_meta, k_meta, v_meta, o_meta, dy_meta, lse_meta]
+    if dlse is not None:
+        positional_values.append(
+            torch.empty(dlse.meta["val"].shape, dtype=dlse.meta["val"].dtype, device="meta")
+        )
     for buf in other_buffers:
         buf_val = buf.meta["val"] if hasattr(buf, "meta") else buf
         positional_values.append(torch.empty(buf_val.shape, dtype=buf_val.dtype, device="meta"))
@@ -432,7 +634,7 @@ def get_bwd_dumped_config(bwd_kernel, q, k, v, o, dy, lse, scale, other_buffers=
     if "softmax_scale" in arg_names:
         meta_args["softmax_scale"] = scale
 
-    dconfig = get_config(kernel[lnc], **meta_args)
+    dconfig = get_config(kernel[lnc] if lnc else kernel, **meta_args)
     logger.debug(f"BWD Kernel return types: {return_types_of(dconfig)}")
     return (
         backend_config_str(dconfig),
@@ -443,18 +645,30 @@ def get_bwd_dumped_config(bwd_kernel, q, k, v, o, dy, lse, scale, other_buffers=
 
 
 class FlexAttentionNKILowering(NeuronFXPass):
-    """Flex Attention Lowering Pass to a NKI kernel.
+    """Lower flex-attention higher-order operators to NKI kernels.
 
-    This pass lowers the flex attention HOP to a NKI kernel.
+    Args:
+        state (NeuronFXPassState, optional): Shared FX-pass state used for artifact dumping.
+            Defaults to ``None``.
+        static_tile_elimination (bool, optional): Whether to classify and eliminate static mask
+            tiles. Defaults to ``True``.
     """
 
     def __init__(self, state: NeuronFXPassState | None = None, static_tile_elimination=True):
         super().__init__(state)
         self.tile_shape = [128, 128]
         self.static_tile_elimination = static_tile_elimination
+        # Tile info built by the cost estimate, keyed by node name. Host replay of the
+        # mask_mod is expensive, so the rewrite reuses it.
+        self._tile_info = {}
 
     @property
     def name(self) -> str:
+        """Return the pass name.
+
+        Returns:
+            str: The ``flex_attention_nki_lowering`` identifier.
+        """
         return "flex_attention_nki_lowering"
 
     @staticmethod
@@ -498,9 +712,85 @@ class FlexAttentionNKILowering(NeuronFXPass):
                 specs.append((f"other_buf_{i}", v.dtype, tuple(v.shape)))
         return specs
 
-    def _maybe_build_tile_info(
-        self, gm, fwd_mask_module, mask_mod_other_buffers, seqlen_q, seqlen_kv, label=""
-    ):
+    def _apply_compile_budget(self, gm: fx.GraphModule, node: fx.Node, backward: bool):
+        """Estimate the compile cost of one flex_attention node and apply the compile budget.
+
+        Returns (tile_info_entry, bail). tile_info_entry is the
+        (use_static_tile_elimination, tile_info) pair that the rewrite reuses, or None
+        when this method could not build it. bail is True when the budget stops the NKI
+        lowering of the whole graph.
+
+        Both directions share the same estimate.
+        """
+        direction = "backward" if backward else "forward"
+        # The backward HOP inserts out, logsumexp, grad_out and grad_logsumexp before the
+        # score_mod and a joint_graph after it, so every later argument shifts.
+        score_mod_idx, block_mask_idx, mask_buffers_idx, min_args = (
+            (7, 9, 13, 11) if backward else (3, 4, 8, 9)
+        )
+        if len(node.args) < min_args:
+            # The rewrite reports the unexpected argument count and skips the node.
+            return None, False
+        q_shape, v_shape = (arg.meta["val"].shape for arg in node.args[:3:2])
+        if not _nki_supports_head_dims(q_shape[-1], v_shape[-1], backward):
+            # The rewrite reports the unsupported head dimensions and skips the node.
+            return None, False
+
+        score_module = getattr(gm, node.args[score_mod_idx].target, None)
+        has_score_mod = score_module is not None and not _is_identity_score_mod(score_module)
+
+        block_mask_node = node.args[block_mask_idx]
+        q_block_size, kv_block_size = block_mask_node[-3], block_mask_node[-2]
+        if q_block_size != 128 or kv_block_size not in [128, 256, 512]:
+            # The rewrite reports the unsupported block size and skips the node.
+            return None, False
+        self.tile_shape = [q_block_size, kv_block_size]
+
+        mask_mod_other_buffers = ()
+        if _getenv_bool("TORCH_NEURONX_ENABLE_NKI_FREE_VAR", False) and (
+            len(node.args) > mask_buffers_idx
+        ):
+            mask_mod_other_buffers = node.args[mask_buffers_idx]
+
+        batch, q_heads = q_shape[:2]
+        use_static_tile_elimination, tile_info = self._maybe_build_tile_info(
+            gm, node, getattr(gm, block_mask_node[-1].target, None), mask_mod_other_buffers
+        )
+        if tile_info is None:
+            logger.info(
+                f"Flex attention NKI {direction} compile cost for {node.name} is unknown, "
+                f"because the pass has no tile types. {_COMPILE_BUDGET_ENV} does not apply."
+            )
+            return (use_static_tile_elimination, tile_info), False
+
+        estimate = _estimate_compile_cost(tile_info["qk_tile_types"], batch, q_heads, has_score_mod)
+        logger.info(
+            f"Flex attention NKI {direction} compile cost estimate for {node.name}: "
+            f"live_tiles={estimate.live_tiles}, total_tiles={estimate.total_tiles}, "
+            f"density={estimate.density:.4f}, cost_units={estimate.cost_units}, "
+            f"est_seconds={estimate.est_seconds:.1f}, score_mod={estimate.has_score_mod}"
+        )
+        budget_s = _compile_budget_seconds()
+        if budget_s > 0 and estimate.est_seconds > budget_s:
+            unsupported = decomposition_unsupported_reason(node, backward, has_score_mod)
+            if unsupported is not None:
+                logger.info(
+                    f"The estimated {direction} compile time {estimate.est_seconds:.1f} s is "
+                    f"more than {_COMPILE_BUDGET_ENV}={budget_s} s, but "
+                    f"FlexAttentionLegalization cannot decompose {node.name}, because "
+                    f"{unsupported}. The pass keeps the NKI lowering and accepts the slow "
+                    "compilation."
+                )
+                return (use_static_tile_elimination, tile_info), False
+            logger.info(
+                f"The estimated {direction} compile time {estimate.est_seconds:.1f} s is more "
+                f"than {_COMPILE_BUDGET_ENV}={budget_s} s. The pass leaves the flex_attention "
+                "operators for FlexAttentionLegalization to decompose."
+            )
+            return None, True
+        return (use_static_tile_elimination, tile_info), False
+
+    def _maybe_build_tile_info(self, gm, node, fwd_mask_module, mask_mod_other_buffers, label=""):
         """Return (use_static_tile_elimination, tile_info).
 
         Returns (True, tile_info) when static-tile-elimination is enabled and the
@@ -510,13 +800,16 @@ class FlexAttentionNKILowering(NeuronFXPass):
         """
         if not self.static_tile_elimination:
             return False, None
+        q_shape, k_shape, v_shape = (arg.meta["val"].shape for arg in node.args[:3])
         try:
             extra_mask_buffers = _resolve_other_buffers(gm, mask_mod_other_buffers)
             tile_info = _generate_tile_types(
                 fwd_mask_module,
-                seqlen_q,
-                seqlen_kv,
+                q_shape[-2],
+                k_shape[-2],
                 self.tile_shape[1],
+                q_shape[-1],
+                v_shape[-1],
                 extra_buffers=extra_mask_buffers,
             )
             logger.debug(
@@ -546,7 +839,7 @@ class FlexAttentionNKILowering(NeuronFXPass):
         if static_tile_elimination is None:
             static_tile_elimination = self.static_tile_elimination
         input_score = [
-            ("score", query_dtype),
+            ("score", kernel_rendering.SCORE_TILE_DTYPE),
             ("b", torch.int32),
             ("h", torch.int32),
             ("q_idx", torch.int32),
@@ -566,17 +859,7 @@ class FlexAttentionNKILowering(NeuronFXPass):
         score_graph_lowering = generate_graph_lowering(fwd_score_module, input_score, tile_shape)
         mask_graph_lowering = generate_graph_lowering(fwd_mask_module, input_mask, tile_shape)
 
-        # Identity score_mod: graph is just placeholders + an output returning
-        # score unchanged.
-        _score_graph_nodes = list(fwd_score_module.graph.nodes)
-        _score_placeholders = [n for n in _score_graph_nodes if n.op == "placeholder"]
-        _score_output = next((n for n in _score_graph_nodes if n.op == "output"), None)
-        is_identity_score_mod = (
-            _score_output is not None
-            and len(_score_placeholders) >= 1
-            and len(_score_graph_nodes) == len(_score_placeholders) + 1
-            and _score_output.args[0] is _score_placeholders[0]
-        )
+        is_identity_score_mod = _is_identity_score_mod(fwd_score_module)
 
         # Build extra buffer arg names for template rendering
         score_extra_names = [s[0] for s in score_buf_specs]
@@ -589,6 +872,19 @@ class FlexAttentionNKILowering(NeuronFXPass):
                 seen.add(name)
 
         def render_score_function(score, b, h, q_idx, kv_idx, prefix):
+            """Render the lowered forward score function.
+
+            Args:
+                score (str): Template expression for the attention score.
+                b (str): Template expression for the batch index.
+                h (str): Template expression for the head index.
+                q_idx (str): Template expression for the query index.
+                kv_idx (str): Template expression for the key/value index.
+                prefix (str): Prefix applied to generated symbols.
+
+            Returns:
+                str: Rendered score-function source.
+            """
             body_template = generate_body_template(score_graph_lowering)
             render_kwargs = {
                 "score": score,
@@ -608,6 +904,18 @@ class FlexAttentionNKILowering(NeuronFXPass):
         score_buffer_allocator = functools.partial(generate_buffer_allocator, score_graph_lowering)
 
         def render_mask_function(b, h, q_idx, kv_idx, prefix):
+            """Render the lowered forward mask function.
+
+            Args:
+                b (str): Template expression for the batch index.
+                h (str): Template expression for the head index.
+                q_idx (str): Template expression for the query index.
+                kv_idx (str): Template expression for the key/value index.
+                prefix (str): Prefix applied to generated symbols.
+
+            Returns:
+                str: Rendered mask-function source.
+            """
             body_template = generate_body_template(mask_graph_lowering)
             render_kwargs = {
                 "b": b,
@@ -636,6 +944,7 @@ class FlexAttentionNKILowering(NeuronFXPass):
         return template.render(
             k_tile_size=self.tile_shape[1],
             static_tile_elimination=static_tile_elimination,
+            score_tile_dtype=kernel_rendering.nl_dtype_name(kernel_rendering.SCORE_TILE_DTYPE),
             qk_tile_types=ti.get("qk_tile_types"),
             pv_tile_types=ti.get("pv_tile_types"),
             qk_mask_index=ti.get("qk_mask_index"),
@@ -643,6 +952,7 @@ class FlexAttentionNKILowering(NeuronFXPass):
             masks_npy_path=ti.get("masks_npy_path", ""),
             masks_int8_npy_path=ti.get("masks_int8_npy_path", ""),
             last_compute_section=ti.get("last_compute_section"),
+            section_len=ti.get("section_len"),
             max_large_tiles_needed=ti.get("max_large_tiles_needed", 0),
             render_score_function=render_score_function,
             render_mask_function=render_mask_function,
@@ -667,11 +977,15 @@ class FlexAttentionNKILowering(NeuronFXPass):
         mask_mod_other_buffers=(),
         tile_info=None,
         static_tile_elimination=None,
+        has_grad_lse=False,
     ):
         if static_tile_elimination is None:
             static_tile_elimination = self.static_tile_elimination
+        # score is the bwd kernel's pre_mod_scores tile for both score_mod and joint_mod.
+        # grad_score_mod is softmax_dx_local, which is allocated in the kernel dtype
+        # (kernel_dtype = q_ref.dtype), so it does follow the query dtype.
         input_score = [
-            ("score", query_dtype),
+            ("score", kernel_rendering.SCORE_TILE_DTYPE),
             ("b", torch.int32),
             ("h", torch.int32),
             ("q_idx", torch.int32),
@@ -684,7 +998,7 @@ class FlexAttentionNKILowering(NeuronFXPass):
             ("kv_idx", torch.int32),
         ]
         input_joint = [
-            ("score", query_dtype),
+            ("score", kernel_rendering.SCORE_TILE_DTYPE),
             ("b", torch.int32),
             ("h", torch.int32),
             ("q_idx", torch.int32),
@@ -716,6 +1030,19 @@ class FlexAttentionNKILowering(NeuronFXPass):
                 seen.add(name)
 
         def render_score_function(score, b, h, q_idx, kv_idx, prefix):
+            """Render the lowered backward score function.
+
+            Args:
+                score (str): Template expression for the attention score.
+                b (str): Template expression for the batch index.
+                h (str): Template expression for the head index.
+                q_idx (str): Template expression for the query index.
+                kv_idx (str): Template expression for the key/value index.
+                prefix (str): Prefix applied to generated symbols.
+
+            Returns:
+                str: Rendered score-function source.
+            """
             body_template = generate_body_template(score_graph_lowering)
             render_kwargs = {
                 "score": score,
@@ -730,6 +1057,18 @@ class FlexAttentionNKILowering(NeuronFXPass):
             return jinja_env.from_string(body_template).render(**render_kwargs)
 
         def render_mask_function(b, h, q_idx, kv_idx, prefix):
+            """Render the lowered backward mask function.
+
+            Args:
+                b (str): Template expression for the batch index.
+                h (str): Template expression for the head index.
+                q_idx (str): Template expression for the query index.
+                kv_idx (str): Template expression for the key/value index.
+                prefix (str): Prefix applied to generated symbols.
+
+            Returns:
+                str: Rendered mask-function source.
+            """
             body_template = generate_body_template(mask_graph_lowering)
             render_kwargs = {
                 "b": b,
@@ -743,6 +1082,20 @@ class FlexAttentionNKILowering(NeuronFXPass):
             return jinja_env.from_string(body_template).render(**render_kwargs)
 
         def render_joint_function(score, b, h, q_idx, kv_idx, grad_score_mod, prefix):
+            """Render the lowered joint score-gradient function.
+
+            Args:
+                score (str): Template expression for the attention score.
+                b (str): Template expression for the batch index.
+                h (str): Template expression for the head index.
+                q_idx (str): Template expression for the query index.
+                kv_idx (str): Template expression for the key/value index.
+                grad_score_mod (str): Template expression for the score-modifier gradient.
+                prefix (str): Prefix applied to generated symbols.
+
+            Returns:
+                str: Rendered joint-function source.
+            """
             body_template = generate_body_template(joint_graph_lowering)
             render_kwargs = {
                 "score": score,
@@ -772,6 +1125,7 @@ class FlexAttentionNKILowering(NeuronFXPass):
         return template.render(
             k_tile_size=self.tile_shape[1],
             static_tile_elimination=static_tile_elimination,
+            score_tile_dtype=kernel_rendering.nl_dtype_name(kernel_rendering.SCORE_TILE_DTYPE),
             qk_tile_types=ti.get("qk_tile_types"),
             pv_tile_types=ti.get("pv_tile_types"),
             qk_mask_index=ti.get("qk_mask_index"),
@@ -789,6 +1143,7 @@ class FlexAttentionNKILowering(NeuronFXPass):
             score_extra_names=score_extra_names,
             mask_extra_names=mask_extra_names,
             all_extra_names=all_extra_names,
+            has_grad_lse=has_grad_lse,
         )
 
     @staticmethod
@@ -866,6 +1221,12 @@ class FlexAttentionNKILowering(NeuronFXPass):
             return False
         self.tile_shape = [q_block_size, kv_block_size]
 
+        d_head_qk = query.meta["val"].shape[-1]
+        d_head_v = value.meta["val"].shape[-1]
+        if not _nki_supports_head_dims(d_head_qk, d_head_v, backward=False):
+            logger.warning(_unsupported_head_dims_message(d_head_qk, d_head_v, backward=False))
+            return False
+
         logger.debug(f"Found mask_mod in block_mask: {mask_fn_node}")
         fwd_mask_module = getattr(gm, mask_fn_node.target, None)
         logger.debug(f"{fwd_mask_module.code}")
@@ -878,17 +1239,16 @@ class FlexAttentionNKILowering(NeuronFXPass):
         logger.debug(f"{fwd_score_module.code}")
 
         try:
-            q_shape = query.meta["val"].shape
-            k_shape = key.meta["val"].shape
-            seqlen_q = q_shape[-2]
-            seqlen_kv = k_shape[-2]
-            # q_shape is [b, nheads_q, seqlen_q, d_head]; nheads_q used to split
-            # the combined batch*heads dim into (b_idx, h_idx) for score_mod/mask_mod.
-            nheads_q = q_shape[1]
+            # The query shape is [b, nheads_q, seqlen_q, d_head]. nheads_q splits the
+            # combined batch*heads dim into (b_idx, h_idx) for score_mod/mask_mod.
+            nheads_q = query.meta["val"].shape[1]
 
-            use_static_tile_elimination, tile_info = self._maybe_build_tile_info(
-                gm, fwd_mask_module, mask_mod_other_buffers, seqlen_q, seqlen_kv
-            )
+            if node.name in self._tile_info:
+                use_static_tile_elimination, tile_info = self._tile_info[node.name]
+            else:
+                use_static_tile_elimination, tile_info = self._maybe_build_tile_info(
+                    gm, node, fwd_mask_module, mask_mod_other_buffers
+                )
             rendered_kernel = self._render_fwd_kernel_template(
                 query_dtype,
                 self.tile_shape,
@@ -908,9 +1268,9 @@ class FlexAttentionNKILowering(NeuronFXPass):
             IO Shapes:
             - q: (batch_size, seqlen_q, d) when tp_q is True
             - k: (batch_size_kv, d, seqlen_kv) when tp_k is False
-            - v: (batch_size_kv, seqlen_kv, d)
+            - v: (batch_size_kv, seqlen_kv, d_v)
             - returns output with shape:
-                (batch_size, seqlen_q, d) if tp_out is False
+                (batch_size, seqlen_q, d_v) if tp_out is False
             """
             q_shape = query.meta["val"].shape
             q_dtype = query.meta["val"].dtype
@@ -960,7 +1320,7 @@ class FlexAttentionNKILowering(NeuronFXPass):
 
                 nki_kernel_args = {
                     "kernel_idx": fwd_kernel.kernel_idx,
-                    "grid": [lnc],
+                    "grid": [lnc] if lnc else [],
                     "backend_config": backend_config,
                     "operand_output_aliases": operand_output_aliases,
                     "args": [q, k, v, *extra_buf_nodes],
@@ -1022,6 +1382,7 @@ class FlexAttentionNKILowering(NeuronFXPass):
                     shape=lse_shape,
                     dtype=torch.float32,
                 )
+                lse = _rescale_lse(graph, lse, lse_shape, -_LOG2_E)
             # Store for backward pass is done in _render_fwd_kernel_template
 
             self._replace_flex_forward_users(graph, node, attn_output, lse)
@@ -1036,6 +1397,46 @@ class FlexAttentionNKILowering(NeuronFXPass):
             )
             return False
         return True
+
+    @staticmethod
+    def _build_lse_kernel_arg(
+        graph: fx.Graph,
+        lse: fx.Node,
+        scale: float,
+        bs: int,
+        nheads: int,
+        seqlen_q: int,
+        tile_size: int,
+        bound: bool = False,
+    ) -> fx.Node:
+        """Put a log-sum-exp tensor in the layout and the scale the kernel needs.
+
+        Set `bound` for the forward log-sum-exp, whose masked rows carry a value that
+        overflows the multiply. Its gradient carries no such value.
+        """
+        if bound:
+            scaled = _rescale_lse(graph, lse, [bs, nheads, seqlen_q], scale)
+        else:
+            scaled = graph.call_function(torch.ops.aten.mul.Scalar, args=(lse, scale))
+            add_metadata_to_node(scaled, shape=[bs, nheads, seqlen_q], dtype=torch.float32)
+
+        reshaped = graph.call_function(
+            torch.ops.aten.view.default,
+            args=(scaled, [bs, nheads, seqlen_q // tile_size, tile_size]),
+        )
+        add_metadata_to_node(
+            reshaped,
+            shape=[bs, nheads, seqlen_q // tile_size, tile_size],
+            dtype=torch.float32,
+        )
+
+        transposed = graph.call_function(torch.ops.aten.transpose.int, args=(reshaped, -2, -1))
+        add_metadata_to_node(
+            transposed,
+            shape=[bs, nheads, tile_size, seqlen_q // tile_size],
+            dtype=torch.float32,
+        )
+        return transposed
 
     def _legalize_flex_backward(self, graph: fx.Graph, gm: fx.GraphModule, node: fx.Node) -> bool:
         """Legalize a flex_attention backward node."""
@@ -1052,6 +1453,7 @@ class FlexAttentionNKILowering(NeuronFXPass):
         out = node.args[3]
         lse = node.args[4]
         grad_out = node.args[5]
+        grad_logsumexp = node.args[6]
         score_mod_node = node.args[7]
         joint_mod_node = node.args[8]
         block_mask_node = node.args[9]
@@ -1064,17 +1466,18 @@ class FlexAttentionNKILowering(NeuronFXPass):
             score_mod_other_buffers = ()
             mask_mod_other_buffers = ()
 
-        q_shape = query.meta["val"].shape  # [bs, nheads, seqlen_q, d_head]
-        k_shape = key.meta["val"].shape  # [bs, nheads_kv, seqlen_k, d_head]
-        v_shape = value.meta["val"].shape  # [bs, nheads_kv, seqlen_k, d_head]
+        q_shape = query.meta["val"].shape  # [bs, nheads, seqlen_q, d_head_qk]
+        k_shape = key.meta["val"].shape  # [bs, nheads_kv, seqlen_k, d_head_qk]
+        v_shape = value.meta["val"].shape  # [bs, nheads_kv, seqlen_k, d_head_v]
         query_dtype = query.meta["val"].dtype
         key_dtype = key.meta["val"].dtype
         value_dtype = value.meta["val"].dtype
         out_dtype = out.meta["val"].dtype
         grad_out_dtype = grad_out.meta["val"].dtype
 
-        bs, nheads, seqlen_q, d_head = q_shape
+        bs, nheads, seqlen_q, d_head_qk = q_shape
         _, nheads_kv, seqlen_k, _ = k_shape
+        d_head_v = v_shape[-1]
 
         (
             _,  # q_length
@@ -1101,6 +1504,9 @@ class FlexAttentionNKILowering(NeuronFXPass):
                 + " Only supported block sizes are [128, 128], [128, 256], [128, 512]."
             )
             return False
+        if not _nki_supports_head_dims(d_head_qk, d_head_v, backward=True):
+            logger.warning(_unsupported_head_dims_message(d_head_qk, d_head_v, backward=True))
+            return False
         fwd_mask_module = getattr(gm, mask_fn_node.target, None)
         fwd_score_module = getattr(gm, score_mod_node.target, None)
         joint_mod_module = getattr(gm, joint_mod_node.target, None)
@@ -1111,9 +1517,13 @@ class FlexAttentionNKILowering(NeuronFXPass):
         )
 
         try:
-            use_static_tile_elimination, tile_info = self._maybe_build_tile_info(
-                gm, fwd_mask_module, mask_mod_other_buffers, seqlen_q, seqlen_k, label="BWD: "
-            )
+            if node.name in self._tile_info:
+                use_static_tile_elimination, tile_info = self._tile_info[node.name]
+            else:
+                use_static_tile_elimination, tile_info = self._maybe_build_tile_info(
+                    gm, node, fwd_mask_module, mask_mod_other_buffers, label="BWD: "
+                )
+            has_grad_lse = isinstance(grad_logsumexp, fx.Node)
             rendered_kernel = self._render_bwd_kernel_template(
                 query_dtype,
                 fwd_score_module,
@@ -1123,6 +1533,7 @@ class FlexAttentionNKILowering(NeuronFXPass):
                 mask_mod_other_buffers=mask_mod_other_buffers,
                 tile_info=tile_info,
                 static_tile_elimination=use_static_tile_elimination,
+                has_grad_lse=has_grad_lse,
             )
             temp_module = save_and_import_kernel(
                 rendered_kernel, "temp_bwd_kernel", dir_name="flex_attention"
@@ -1130,54 +1541,43 @@ class FlexAttentionNKILowering(NeuronFXPass):
             bwd_kernel = wrap_nki(nki.jit(temp_module.attention_bwd))
 
             with graph.inserting_before(node):
-                # Transpose to [bs, nheads, d_head, seqlen]
+                # Transpose to [bs, nheads, head_dim, seqlen]
                 q = graph.call_function(torch.ops.aten.transpose.int, args=(query, -2, -1))
-                add_metadata_to_node(q, shape=[bs, nheads, d_head, seqlen_q], dtype=query_dtype)
+                add_metadata_to_node(q, shape=[bs, nheads, d_head_qk, seqlen_q], dtype=query_dtype)
 
                 k = graph.call_function(torch.ops.aten.transpose.int, args=(key, -2, -1))
-                add_metadata_to_node(k, shape=[bs, nheads_kv, d_head, seqlen_k], dtype=key_dtype)
+                add_metadata_to_node(k, shape=[bs, nheads_kv, d_head_qk, seqlen_k], dtype=key_dtype)
 
                 v = graph.call_function(torch.ops.aten.transpose.int, args=(value, -2, -1))
-                add_metadata_to_node(v, shape=[bs, nheads_kv, d_head, seqlen_k], dtype=value_dtype)
+                add_metadata_to_node(
+                    v, shape=[bs, nheads_kv, d_head_v, seqlen_k], dtype=value_dtype
+                )
 
                 o = graph.call_function(torch.ops.aten.transpose.int, args=(out, -2, -1))
-                add_metadata_to_node(o, shape=[bs, nheads, d_head, seqlen_q], dtype=out_dtype)
+                add_metadata_to_node(o, shape=[bs, nheads, d_head_v, seqlen_q], dtype=out_dtype)
 
                 dy = graph.call_function(torch.ops.aten.transpose.int, args=(grad_out, -2, -1))
-                add_metadata_to_node(dy, shape=[bs, nheads, d_head, seqlen_q], dtype=grad_out_dtype)
+                add_metadata_to_node(
+                    dy, shape=[bs, nheads, d_head_v, seqlen_q], dtype=grad_out_dtype
+                )
 
-                # Reshape lse to match lse_ref: [bs, nheads, tile_size, seqlen_q // tile_size]
                 tile_size = self.tile_shape[0]
+                lse_transposed = self._build_lse_kernel_arg(
+                    graph,
+                    lse,
+                    -1.0 / _LOG2_E,
+                    bs,
+                    nheads,
+                    seqlen_q,
+                    tile_size,
+                    bound=True,
+                )
 
-                lse_reshaped = graph.call_function(
-                    torch.ops.aten.view.default,
-                    args=(lse, [bs, nheads, seqlen_q // tile_size, tile_size]),
-                )
-                add_metadata_to_node(
-                    lse_reshaped,
-                    shape=[bs, nheads, seqlen_q // tile_size, tile_size],
-                    dtype=torch.float32,
-                )
-
-                lse_transposed = graph.call_function(
-                    torch.ops.aten.transpose.int, args=(lse_reshaped, -2, -1)
-                )
-                add_metadata_to_node(
-                    lse_transposed,
-                    shape=[bs, nheads, tile_size, seqlen_q // tile_size],
-                    dtype=torch.float32,
-                )
-                """
-                lse_transposed = graph.call_function(
-                    torch.ops.aten.view.default,
-                    args=(lse, [bs, nheads, tile_size, seqlen_q // tile_size]),
-                )
-                add_metadata_to_node(
-                    lse_transposed,
-                    shape=[bs, nheads, tile_size, seqlen_q // tile_size],
-                    dtype=torch.float32,
-                )
-                """
+                grad_lse_transposed = None
+                if has_grad_lse:
+                    grad_lse_transposed = self._build_lse_kernel_arg(
+                        graph, grad_logsumexp, _LOG2_E, bs, nheads, seqlen_q, tile_size
+                    )
 
                 (backend_config, operand_output_aliases, return_types, lnc) = get_bwd_dumped_config(
                     bwd_kernel,
@@ -1189,18 +1589,30 @@ class FlexAttentionNKILowering(NeuronFXPass):
                     lse_transposed,
                     scale,
                     other_buffers=list(score_mod_other_buffers) + list(mask_mod_other_buffers),
+                    dlse=grad_lse_transposed,
                 )
                 extra_buf_nodes, extra_buf_names = self._build_extra_buffer_args(
                     score_mod_other_buffers, mask_mod_other_buffers
                 )
+                grad_lse_args = [grad_lse_transposed] if has_grad_lse else []
+                grad_lse_names = ("dlse",) if has_grad_lse else ()
 
                 nki_kernel_args = {
                     "kernel_idx": bwd_kernel.kernel_idx,
-                    "grid": [lnc],
+                    "grid": [lnc] if lnc else [],
                     "backend_config": backend_config,
                     "operand_output_aliases": operand_output_aliases,
-                    "args": [q, k, v, o, dy, lse_transposed, *extra_buf_nodes],
-                    "arg_names": ("q", "k", "v", "o", "dy", "lse", *extra_buf_names),
+                    "args": [q, k, v, o, dy, lse_transposed, *grad_lse_args, *extra_buf_nodes],
+                    "arg_names": (
+                        "q",
+                        "k",
+                        "v",
+                        "o",
+                        "dy",
+                        "lse",
+                        *grad_lse_names,
+                        *extra_buf_names,
+                    ),
                     "constant_args_key": -1,
                 }
                 nki_node = graph.call_function(nki_kernel_wrapper, args=(), kwargs=nki_kernel_args)
@@ -1301,18 +1713,35 @@ class FlexAttentionNKILowering(NeuronFXPass):
             ShapeProp(gm).propagate(*example_inputs)
 
     def call(self, gm: fx.GraphModule) -> PassResult:
-        """Execute the flex attention legalization pass.
+        """Lower flex-attention nodes in an FX graph to NKI kernel calls.
 
         Args:
-            gm: The GraphModule to transform.
+            gm (fx.GraphModule): Graph module to transform in place.
 
         Returns:
-            PassResult with modified=True if any transformations were made.
+            PassResult: The graph module and whether any node was lowered.
         """
         graph = gm.graph
         modified = False
 
         logger.debug("Scanning graph for flex_attention nodes...")
+
+        # Estimate the compile cost of every flex_attention node before the first rewrite.
+        # The budget stops the whole pass, so it must not run after a partial rewrite.
+        self._tile_info = {}
+        for node in graph.nodes:
+            backward = self._is_flex_attention_backward(node)
+            if not backward and not self._is_flex_attention_forward(node):
+                continue
+            try:
+                tile_info_entry, bail = self._apply_compile_budget(gm, node, backward)
+            except Exception as e:
+                logger.debug(f"Failed to estimate the compile cost of {node.name}: {e}")
+                continue
+            if bail:
+                return PassResult(gm, modified=False)
+            if tile_info_entry is not None:
+                self._tile_info[node.name] = tile_info_entry
 
         for node in graph.nodes:
             if self._is_flex_attention_forward(node):

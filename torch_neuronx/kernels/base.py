@@ -2,35 +2,26 @@
 
 
 class BaseNeuronKernel:
-    """Base class for all Neuron kernels (NKI and XLA).
+    """Provide shared behavior for NKI and XLA kernel implementations.
 
-    This provides the static-argnum normalization shared between NKI and XLA
-    kernel implementations.
-
-    Subclasses that support lowering (torch-mlir, NKI, HLO scribe) must
-    override the ``lower()`` method to produce a ``LoweringResult``.
-    The C++ NeuronDispatcher calls ``kernel.lower()`` on cache miss.
+    Note:
+        Normalize static argument indices for all kernels. Subclasses that support
+        lowering through Torch-MLIR, NKI, or HLO scribe must override ``lower`` to
+        produce a ``LoweringResult`` for the C++ Neuron dispatcher on a cache miss.
     """
 
     def __init__(self):
         self.static_argnums = ()
 
     def lower(self, *args, **kwargs):
-        """Lower the operation to StableHLO without executing.
-
-        Called by the C++ NeuronDispatcher on cache miss. Subclasses that
-        support compilation-based execution (TorchMlirKernel, NkiKernel,
-        XLABuilderKernel) must override this method.
+        """Require subclasses to implement StableHLO lowering.
 
         Args:
-            *args: Same positional arguments as __call__
-            **kwargs: Same keyword arguments as __call__
-
-        Returns:
-            LoweringResult with StableHLO bytes, cache key, and metadata
+            *args: Positional arguments accepted by the kernel call.
+            **kwargs: Keyword arguments accepted by the kernel call.
 
         Raises:
-            NotImplementedError: If the kernel subclass does not support lowering
+            NotImplementedError: If the subclass does not implement lowering.
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not implement lower(). "

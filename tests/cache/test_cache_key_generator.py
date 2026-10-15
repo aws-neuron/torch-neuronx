@@ -94,6 +94,23 @@ class TestStaticNonStatic:
         k2 = _gen("op", [torch.zeros(2), 2.5], static_argnums=[1])
         assert k1 != k2
 
+    def test_static_float_keeps_precision_beyond_6_digits(self):
+        """A float that differs past the 6th significant digit needs its own key.
+
+        The key used the default ostream format, which keeps 6 significant digits,
+        so arange(0.0, -8.000001, -4.0) and arange(0.0, -8.0, -4.0) shared one
+        entry. Their output lengths differ (3 vs 2), so the first to compile
+        returned its length for both.
+        """
+        k1 = _gen("op", [torch.zeros(2), -8.000001], static_argnums=[1])
+        k2 = _gen("op", [torch.zeros(2), -8.0], static_argnums=[1])
+        assert k1 != k2
+
+    def test_static_float_distinguishes_signed_zero(self):
+        k1 = _gen("op", [torch.zeros(2), 0.0], static_argnums=[1])
+        k2 = _gen("op", [torch.zeros(2), -0.0], static_argnums=[1])
+        assert k1 != k2
+
 
 class TestListInference:
     def test_int_list_tag(self):

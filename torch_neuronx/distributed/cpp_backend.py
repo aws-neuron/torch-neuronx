@@ -92,8 +92,18 @@ def _lower_all_to_all_torch_mlir(inputs, replica_groups, reduce_op, kwargs):
 
 
 def is_dynamic_collective_inputs(inputs) -> bool:
-    """True when the C++ NeuronBackend injected the runtime numel scalar for a dynamic
-    collective (all-gather / all-reduce): inputs == [data_tensor, int32 [1,1] numel scalar].
+    """Return whether inputs include an injected runtime element-count scalar.
+
+    Args:
+        inputs (Sequence[Any]): Candidate collective inputs.
+
+    Returns:
+        bool: ``True`` when there are exactly two inputs and the second is a
+        one-element ``torch.int32`` tensor.
+
+    Note:
+        This identifies the runtime scalar injected by the C++ NeuronBackend
+        for dynamic all-gather and all-reduce lowering.
     """
     return (
         len(inputs) == 2
@@ -138,20 +148,24 @@ _OP_TYPE_TO_TORCH_MLIR = {
 
 
 def lower_collective_hlo(op_type, inputs, replica_groups, reduce_op, kwargs):
-    """Python lowering callback for C++ NeuronBackend on cache miss.
-
-    Lowers a collective operation to StableHLO via torch-mlir.
-    Called from C++ with GIL held.
+    """Lower a collective with torch-MLIR after a C++ backend cache miss.
 
     Args:
-        op_type: c10d.OpType enum value
-        inputs: list[Tensor] — input tensors
-        replica_groups: list[list[int]] — replica group configuration
-        reduce_op: int — c10d::ReduceOp enum value
-        kwargs: dict — additional kwargs from C++
+        op_type (OpType): Collective operation to lower.
+        inputs (Sequence[torch.Tensor]): Input tensors for the collective.
+        replica_groups (list[list[int]]): Participating rank groups.
+        reduce_op (int): ``c10d::ReduceOp`` enumeration value.
+        kwargs (dict): Additional arguments supplied by C++.
 
     Returns:
-        LoweringResult with stablehlo_bytes, cache_key, has_collectives=True
+        LoweringResult: Result containing ``stablehlo_bytes``, ``cache_key``,
+        and ``has_collectives=True``.
+
+    Raises:
+        ValueError: If ``op_type`` has no registered lowering.
+
+    Note:
+        The C++ NeuronBackend invokes this callback with the GIL held.
     """
     lower_fn = _OP_TYPE_TO_TORCH_MLIR.get(op_type)
     if lower_fn is None:
@@ -163,12 +177,14 @@ def create_neuron_cpp_backend(store, options, rank, size, global_world_size):
     """Create a C++ NeuronBackend process group.
 
     Args:
-        store: c10d.Store handed to the PG (typically a PrefixStore wrapping the
-            world TCPStore). Carried into NeuronBackend so RDMA P2P can publish
-            descriptors via Store.set/get keyed by global rank.
-        options: c10d.Backend.Options.
-        rank: group-local rank.
-        size: group size.
-        global_world_size: world size (across all PGs).
+        store (dist.Store): Process-group store, typically a prefix store,
+            used to publish and resolve RDMA descriptors by global rank.
+        options (Backend.Options): C++ backend options.
+        rank (int): Rank within the process group.
+        size (int): Number of ranks in the process group.
+        global_world_size (int): Number of ranks across all process groups.
+
+    Returns:
+        NeuronBackend: Process group configured with the Python lowering callback.
     """
     return NeuronBackend(store, options, rank, size, global_world_size, lower_collective_hlo)

@@ -66,7 +66,7 @@ Tensor manipulation (shape, stacking, etc.):
 
 ### creation.py
 Tensor creation operations:
-- arange, zeros, ones, ones_like
+- arange, linspace, zeros, ones, ones_like
 - eye
 - fill_, zero_
 

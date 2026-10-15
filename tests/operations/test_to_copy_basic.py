@@ -1,5 +1,3 @@
-import os
-
 import pytest
 import torch
 
@@ -131,20 +129,15 @@ def test_to_copy_scalar_tensor():
     assert result.item() == pytest.approx(3.14)
 
 
-@pytest.mark.parametrize("cpp_dispatch", [False, True], ids=["python_dispatch", "cpp_dispatch"])
-def test_to_copy_preserves_strides_transpose(cpp_dispatch):
+def test_to_copy_preserves_strides_transpose():
     """Test that .to('neuron') preserves strides from transpose, matching CUDA semantics."""
-    os.environ["TORCH_NEURONX_CPP_DISPATCH"] = "1" if cpp_dispatch else "0"
-    try:
-        t = torch.randn(2, 4, 512, 512).transpose(1, 2)
-        assert not t.is_contiguous()
-        t_neu = t.to("neuron")
-        assert (
-            t_neu.stride() == t.stride()
-        ), f"stride mismatch: neuron={t_neu.stride()} cpu={t.stride()}"
-        torch.testing.assert_close(t_neu.cpu(), t)
-    finally:
-        os.environ.pop("TORCH_NEURONX_CPP_DISPATCH", None)
+    t = torch.randn(2, 4, 512, 512).transpose(1, 2)
+    assert not t.is_contiguous()
+    t_neu = t.to("neuron")
+    assert (
+        t_neu.stride() == t.stride()
+    ), f"stride mismatch: neuron={t_neu.stride()} cpu={t.stride()}"
+    torch.testing.assert_close(t_neu.cpu(), t)
 
 
 def _make_tensor_with_stride(shape, dtype, pattern):

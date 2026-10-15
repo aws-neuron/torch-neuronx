@@ -19,6 +19,36 @@ logger = logging.getLogger(__name__)
 # in practice, but keeps security scanners happy.
 jinja_env = jinja2.Environment(autoescape=True)
 
+# dtype of the score tile the flex kernels hand to score_mod / joint_mod. The kernel templates
+# allocate their score tiles with it ({{ score_tile_dtype }} in flex_attention.py.jinja and
+# flex_attention_bwd.py.jinja) and the lowering declares the score_mod "score" placeholder with
+# it, so the kernel and the lowering cannot drift apart. It is not the query dtype: torch traces
+# score_mod with a placeholder of the query dtype (query.new_empty(())), which does not describe
+# what the kernels pass.
+SCORE_TILE_DTYPE = torch.float32
+
+# The kernels also hand score_mod the raw matmul result straight from PSUM (fwd, scale == 1.0),
+# and PSUM accumulates in fp32, so the score tile cannot be narrower than that.
+_PSUM_ACCUM_DTYPE = torch.float32
+if SCORE_TILE_DTYPE != _PSUM_ACCUM_DTYPE:
+    raise ImportError(
+        f"SCORE_TILE_DTYPE must be {_PSUM_ACCUM_DTYPE} (PSUM accumulation dtype), "
+        f"got {SCORE_TILE_DTYPE}"
+    )
+
+
+def nl_dtype_name(dtype: torch.dtype) -> str:
+    """Convert a PyTorch dtype to its generated NKI source spelling.
+
+    Args:
+        dtype (torch.dtype): PyTorch dtype to format.
+
+    Returns:
+        str: Corresponding ``nl.<dtype>`` spelling.
+    """
+    return str(dtype).replace("torch.", "nl.")
+
+
 """
 input_spec: list of (name, dtype)
   e.g.: input_spec = [
@@ -51,6 +81,20 @@ def _scalar_needs_materialization(node: torch.fx.Node) -> bool:
 
 
 def generate_graph_lowering(gm: torch.fx.GraphModule, input_spec, shape: tuple):
+    """Lower an FX graph to NKI pointwise statements.
+
+    Args:
+        gm (torch.fx.GraphModule): FX graph module to lower.
+        input_spec (Sequence[tuple]): Placeholder names, dtypes, and optional capture shapes.
+        shape (tuple): Default tile shape for placeholder arrays.
+
+    Returns:
+        NISAPointwiseSubgraphLowering: Completed lowering for the graph.
+
+    Note:
+        Scalar ``b`` and ``h`` placeholders are materialized only when an operation reads
+        their values; three-item input specifications use their captured shapes.
+    """
     graph_lowering = NISAPointwiseSubgraphLowering(gm, shape)
 
     # input_spec entries are (name, dtype), or (name, dtype, capture_shape) for
@@ -77,6 +121,16 @@ def generate_graph_lowering(gm: torch.fx.GraphModule, input_spec, shape: tuple):
 
 
 def generate_mod_template(gm: torch.fx.GraphModule, input_spec, shape: tuple):
+    """Generate an NKI modifier body template from an FX graph.
+
+    Args:
+        gm (torch.fx.GraphModule): FX graph module to lower.
+        input_spec (Sequence[tuple]): Placeholder names, dtypes, and optional capture shapes.
+        shape (tuple): Default tile shape for placeholder arrays.
+
+    Returns:
+        str: Jinja-renderable source code ending with the graph output.
+    """
     graph_lowering = generate_graph_lowering(gm, input_spec, shape)
     ctx = graph_lowering.ctx
     parts = []
@@ -89,14 +143,29 @@ def generate_mod_template(gm: torch.fx.GraphModule, input_spec, shape: tuple):
 
 
 def generate_buffer_allocator(graph_lowering: NISAPointwiseSubgraphLowering, prefix, manual=True):
+    """Generate source code that allocates lowering buffers.
+
+    Args:
+        graph_lowering (NISAPointwiseSubgraphLowering): Lowering whose buffers to allocate.
+        prefix (str): Prefix value supplied while rendering buffer expressions.
+        manual (bool, optional): Use the manual SBUF allocator instead of ``nl.ndarray``.
+            Defaults to ``True``.
+
+    Returns:
+        str: Rendered Python source that allocates each lowering buffer.
+
+    Note:
+        Boolean buffers use ``nl.uint8`` because bit-vector operations need one-byte
+        operands and ``nl.bool_`` has no SBUF allocator size.
+    """
     ctx = graph_lowering.ctx
     parts = ["#GENERATED: Buffer Allocator#"]
     for bufname in ctx.buffers:
         buffer = ctx.buffers[bufname]
         nl_dtype = str(buffer.dtype).replace("torch.", "nl.")
-        # TODO: nl.bool_ is not correctly handled yet in flexattention kernel
+        # The nisa bitvec ops need 1-byte operands. nl.bool_ has no sbuf allocator size.
         if buffer.dtype == torch.bool:
-            nl_dtype = "nl.int32"
+            nl_dtype = "nl.uint8"
         if manual:
             parts.append(
                 bufname
@@ -111,6 +180,15 @@ def generate_buffer_allocator(graph_lowering: NISAPointwiseSubgraphLowering, pre
 
 
 def generate_buffer_initializer(graph_lowering: NISAPointwiseSubgraphLowering, prefix):
+    """Generate source code that initializes lowering buffers.
+
+    Args:
+        graph_lowering (NISAPointwiseSubgraphLowering): Lowering whose buffers to initialize.
+        prefix (str): Prefix value supplied while rendering buffer expressions.
+
+    Returns:
+        str: Rendered Python source that assigns ``None`` to each buffer.
+    """
     ctx = graph_lowering.ctx
     parts = ["#GENERATED: Initialize Buffers#"]
     for bufname in ctx.buffers:
@@ -119,6 +197,14 @@ def generate_buffer_initializer(graph_lowering: NISAPointwiseSubgraphLowering, p
 
 
 def generate_body_template(graph_lowering: NISAPointwiseSubgraphLowering):
+    """Generate an NKI function body template from a completed lowering.
+
+    Args:
+        graph_lowering (NISAPointwiseSubgraphLowering): Lowering whose statements to emit.
+
+    Returns:
+        str: Jinja-renderable statements ending with the graph output.
+    """
     ctx = graph_lowering.ctx
     parts = ["#GENERATED: Function Body#"]
     for stmt in ctx.code_body:
@@ -130,17 +216,21 @@ def generate_body_template(graph_lowering: NISAPointwiseSubgraphLowering):
 def save_and_import_kernel(
     rendered_kernel: str, module_name: str = "temp_mask_mod", dir_name: str = "nki"
 ):
-    """Save a rendered kernel to disk and import it as a Python module.
-
-    Uses a file lock to prevent races when multiple ranks write concurrently.
+    """Save rendered kernel source and import it as a Python module.
 
     Args:
-        rendered_kernel: The rendered kernel source code.
-        module_name: The module name to use when importing.
-        dir_name: Subdirectory name under the artifacts directory.
+        rendered_kernel (str): Rendered kernel source code.
+        module_name (str, optional): Name for the imported module. Defaults to
+            ``"temp_mask_mod"``.
+        dir_name (str, optional): Artifacts subdirectory for generated files. Defaults to
+            ``"nki"``.
 
     Returns:
-        The imported module.
+        ModuleType: Imported module containing the rendered kernel.
+
+    Note:
+        Uses a file lock to serialize concurrent writers, names the source from its SHA-256
+        hash, and registers the imported module in ``sys.modules`` under ``module_name``.
     """
     import fcntl
 

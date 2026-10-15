@@ -20,9 +20,11 @@ neuron_dynamo_backend environment variables:
         timeout in seconds when invoking neuronx-cc
     TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS: bool (default=False)
         whether to preserve directory with compilation artifacts after execution is complete
-    TORCH_NEURONX_DEBUG_DIR: str (default="/tmp/neuron_backend_<random string>")
-        directory in which to save compilation artifacts
-    TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION: bool (default=False)
+    TORCH_NEURONX_DEBUG_DIR: str (default="/tmp/neuron_backend")
+        base directory for compilation artifacts. Artifacts are saved under:
+            {TORCH_NEURONX_DEBUG_DIR}/torch_neuronx/rank{rank}/{job_id}/
+        with subdirectories for fx_graphs/, stablehlo/, transformed_fx/, etc.
+    TORCH_NEURONX_DISABLE_FALLBACK_EXECUTION: bool (default=True)
         disables fallback execution on failure for neuron backend.
     TORCH_NEURONX_ENABLE_NKI_SDPA: bool (default=True)
         enables decomposing scaled_dot_product_attention to the NKI kernel if possible.
@@ -32,6 +34,19 @@ neuron_dynamo_backend environment variables:
         plumbing through the NKI flex_attention lowering and kernel templates.
     NEURON_CC_FLAGS: str (default="")
         flags passed to neuronx-cc call
+    TORCH_NEURONX_DYNAMO_TENSOR_DUMPS: str (default="")
+        configures input/output tensor dumping during execution.
+        format: semicolon-delimited key=value pairs.
+        keys: "inputs", "outputs"
+        values: "all" (dump for all ranks) or comma-separated rank ints (e.g. "0,1,2")
+        examples:
+            "inputs=all"              - dump inputs for all ranks
+            "outputs=0,1"             - dump outputs for ranks 0 and 1 only
+            "inputs=all;outputs=all"  - dump both inputs and outputs for all ranks
+        dump files are written as pickled dicts of numpy arrays under:
+            {TORCH_NEURONX_DEBUG_DIR}/torch_neuronx/rank{rank}/{job_id}/inputs/
+            {TORCH_NEURONX_DEBUG_DIR}/torch_neuronx/rank{rank}/{job_id}/outputs/
+        filenames: inp-{rank_3digit}-{count}.p, out-{rank_3digit}-{count}.p
 """
 
 import contextlib
@@ -51,7 +66,6 @@ with contextlib.suppress(ImportError):
 from torch_neuronx.neuron_dynamo_backend import cache_artifact as _cache_artifact
 from torch_neuronx.neuron_dynamo_backend.config import (
     get_model_name,
-    get_rank,
     set_model_name,
 )
 from torch_neuronx.neuron_dynamo_backend.exceptions import (
@@ -69,7 +83,6 @@ __all__ = [
     "fx_to_mlir_string",
     "get_dynamo_metrics",
     "get_model_name",
-    "get_rank",
     "load_mlir",
     "neuron_backend",
     "reset_dynamo_metrics",

@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
+import signal
+import threading
 from functools import cache
 
 import pytest
@@ -38,7 +41,127 @@ STATUS_RANK = {
     "invalid_sample": 1,
     "unresolved": 2,
     "failed_lowering": 3,
+    # Cold compile ran past the time limit (see compile_time_limit). Ranks as a
+    # hard gap so one timed-out shape marks the whole op.
+    "compile_timeout": 3,
 }
+
+
+# Per-shape cold-compile time limit in seconds. A single large op (for example a
+# vocab-projection aten::gather) can take 30+ minutes to compile and stall an
+# xdist worker for the rest of the run. The limit bounds one compile so the run
+# continues. Set NEURON_COMPILE_TIMEOUT_S=0 to disable the limit.
+COMPILE_TIMEOUT_S = int(os.environ.get("NEURON_COMPILE_TIMEOUT_S", "600"))
+
+
+class CompileTimeoutError(Exception):
+    """A single cold compile ran past COMPILE_TIMEOUT_S."""
+
+
+@contextlib.contextmanager
+def compile_time_limit(seconds: int = COMPILE_TIMEOUT_S):
+    """Bound one cold compile to ``seconds``. Raise CompileTimeoutError on overrun.
+
+    Two mechanisms run together, because the compile can run on different
+    threads:
+
+      - SIGALRM interrupts a compile that runs inline on the main thread, for
+        example the eager coverage path.
+      - A watchdog thread kills the neuronx-cc subprocess. The torch.compile
+        backend submits the NEFF compile to a runtime background thread, so
+        SIGALRM never reaches the Python handler on the main thread. A
+        process-directed SIGALRM can also go to that background thread, where
+        Python runs no handler, so the signal is lost. The watchdog does not
+        depend on the compile thread. It kills the neuronx-cc subprocess, the
+        wrapped call then raises, and this manager reports a CompileTimeoutError.
+      - A hard abort (NEURON_COMPILE_HARD_ABORT=1) ends the whole process when
+        the two mechanisms above do not release the block. It bounds a hang in
+        an in-process native call that ignores SIGALRM and has no subprocess.
+        Use it only in the --forked compile suite, where each test owns its
+        process. The test pre-writes a compile_timeout row so the status
+        survives the abort.
+
+    A value of 0 or less disables the limit.
+    """
+    if seconds <= 0:
+        yield
+        return
+
+    timed_out = threading.Event()
+    done = threading.Event()
+
+    def _watch():
+        # Wait for the block to finish. On overrun, kill the compile subprocess.
+        if not done.wait(seconds):
+            timed_out.set()
+            kill_compile_subprocesses()
+            # A hang in an in-process native call ignores SIGALRM and has no
+            # subprocess to kill. In the --forked compile suite each test owns
+            # its process, so end it. The test pre-writes a compile_timeout row,
+            # so the status survives. Enable with NEURON_COMPILE_HARD_ABORT=1.
+            if os.environ.get("NEURON_COMPILE_HARD_ABORT") == "1" and not done.wait(
+                min(seconds, 15)
+            ):
+                os.kill(os.getpid(), signal.SIGKILL)
+
+    watcher = threading.Thread(target=_watch, name="neuron-compile-timeout", daemon=True)
+
+    on_main = threading.current_thread() is threading.main_thread()
+    previous = None
+    if on_main:
+
+        def _raise_timeout(signum, frame):
+            raise CompileTimeoutError(f"compile exceeded {seconds}s")
+
+        previous = signal.signal(signal.SIGALRM, _raise_timeout)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+
+    watcher.start()
+    try:
+        yield
+    except CompileTimeoutError:
+        raise
+    except Exception as exc:
+        # The watchdog killed the compile subprocess, so the call raised.
+        if timed_out.is_set():
+            raise CompileTimeoutError(f"compile exceeded {seconds}s") from exc
+        raise
+    finally:
+        done.set()
+        if on_main:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+        watcher.join(timeout=5)
+    # The compile finished as the watchdog killed it. Report the overrun.
+    if timed_out.is_set():
+        raise CompileTimeoutError(f"compile exceeded {seconds}s")
+
+
+def kill_compile_subprocesses():
+    """Kill leftover neuronx-cc compile subprocesses of this worker.
+
+    A timed-out compile leaves the neuronx-cc subprocess running, which keeps a
+    NeuronCore busy. Walk the /proc process tree and kill every descendant so
+    the worker frees the core. Dependency-free (no psutil).
+    """
+    my_pid = os.getpid()
+    children: dict[int, list[int]] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        children.setdefault(ppid, []).append(int(entry))
+
+    stack = list(children.get(my_pid, []))
+    while stack:
+        pid = stack.pop()
+        stack.extend(children.get(pid, []))
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
 
 
 # ── Data movement ────────────────────────────────────────────────────────────
@@ -130,6 +253,50 @@ def classify_op(op_name: str) -> str:
     if is_composite(op_name):
         return "composite"
     return "unknown"
+
+
+# ── torch.compile static support surface (merge-queue gate) ──────────────────
+
+_COMPILE_SUPPORTED_OPS: frozenset[str] | None = None
+
+
+def _decomp_key_op_name(op) -> str | None:
+    """Map a decomposition-table key to the ``aten::name[.overload]`` form.
+
+    The key is an ``OpOverload`` (has ``_schema``) or an ``OpOverloadPacket``.
+    """
+    schema = getattr(op, "_schema", None)
+    if schema is not None:
+        return f"{schema.name}.{schema.overload_name}" if schema.overload_name else schema.name
+    text = str(op)  # OpOverloadPacket, e.g. "aten.take"
+    return "aten::" + text[len("aten.") :] if text.startswith("aten.") else None
+
+
+def compile_supported_ops() -> frozenset[str]:
+    """Op names the torch.compile backend lowers through a decomposition.
+
+    Static: read the Neuron decomposition table at import time, not a run
+    result. The merge-queue gate uses this so a decomposition-only op that stops
+    compiling still counts as "expected supported" and gates.
+    """
+    global _COMPILE_SUPPORTED_OPS
+    if _COMPILE_SUPPORTED_OPS is None:
+        from torch_neuronx.neuron_dynamo_backend.decompositions import (
+            get_compile_decomposition_table,
+        )
+
+        names = {
+            name
+            for op in get_compile_decomposition_table()
+            if (name := _decomp_key_op_name(op)) is not None
+        }
+        _COMPILE_SUPPORTED_OPS = frozenset(names)
+    return _COMPILE_SUPPORTED_OPS
+
+
+def gate_enabled() -> bool:
+    """True when the suite runs as the merge-queue gate (asserts on regressions)."""
+    return os.environ.get("NEURON_COVERAGE_GATE", "") == "1"
 
 
 # ── Exception classification ────────────────────────────────────────────────
@@ -251,6 +418,25 @@ def count_input_elems(sample) -> int:
     except Exception as e:
         logger.debug("count_input_elems failed: %s", e)
         return 0
+
+
+def sample_inputs_have_nan(sample) -> bool:
+    """Return True if a positional float input tensor holds a NaN.
+
+    Scan ``sample.input`` and each positional arg. This is the same scope as
+    ``count_input_elems``. Do not scan kwargs. The write-alias ``out=`` slot is
+    an uninitialized buffer, and its bytes can read as NaN. A NaN input makes
+    the correctness compare not meaningful, so the caller skips that check.
+    """
+    try:
+        for t in (sample.input, *sample.args):
+            items = t if isinstance(t, list | tuple) else (t,)
+            for x in items:
+                if isinstance(x, torch.Tensor) and x.is_floating_point() and torch.isnan(x).any():
+                    return True
+    except Exception as e:
+        logger.debug("sample_inputs_have_nan failed: %s", e)
+    return False
 
 
 def probe_output_meta(op, sample):

@@ -29,15 +29,44 @@ def _one_hot_error_handler(ctx):
 @register_aten(
     ["aten::one_hot"],
     static_argnums=(1,),
+    # num_classes = max(x) + 1 (when -1) is value-derived, so it cannot be cached.
     preprocessing=Preprocessing.VALUE_DEPENDENT,
     validate_static_inputs=_validate_one_hot,
-    # num_classes = max(x) + 1 (when -1) is value-derived, so re-lower every call.
-    relower_every_call=True,
     error_handler=_one_hot_error_handler,
 )
 def torch_one_hot(x, num_classes=-1):
+    """Prepare one-hot lowering and infer the class count when requested.
+
+    Args:
+        x (torch.Tensor): ``torch.int64`` class-index tensor.
+        num_classes (int, optional): Number of classes, or a negative value to infer it.
+            Defaults to ``-1``.
+
+    Returns:
+        tuple: Compute function, positional arguments, and keyword arguments.
+
+    Raises:
+        RuntimeError: If ``x`` is not ``torch.int64`` or inference receives an empty tensor.
+
+    Note:
+        A negative ``num_classes`` reads the maximum index on the host to derive the output shape.
+    """
+
     def torch_one_hot_fn(x, num_classes):
         # Create output tensor with zeros
+        """Construct one-hot encodings by scattering integer indices.
+
+        Args:
+            x (torch.Tensor): Integer class-index tensor.
+            num_classes (int): Number of classes in the output.
+
+        Returns:
+            torch.Tensor: ``torch.int64`` one-hot encodings with a trailing class dimension.
+
+        Raises:
+            RuntimeError: If a class index is negative or not less than
+                ``num_classes``.
+        """
         output_shape = [*list(x.shape), num_classes]
         result = torch.zeros(output_shape, dtype=torch.int64, device=x.device)
 

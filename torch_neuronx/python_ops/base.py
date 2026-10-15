@@ -33,13 +33,21 @@ def _needs_python_side_logging(impl, *args):
 
 @dataclass
 class ExecutionResult:
+    """Represent the outcome of an operation implementation.
+
+    Args:
+        success (bool): Whether execution completed successfully.
+        output (Any | None, optional): Produced value. Defaults to ``None``.
+        error_msg (str | None, optional): Failure detail. Defaults to ``None``.
+    """
+
     success: bool
     output: Any | None = None
     error_msg: str | None = None
 
 
 class OperationImplementation(ABC):
-    """Base class for all operation implementations"""
+    """Define the base interface for operation implementations."""
 
     # Execution policy toggles (default: current behavior)
     # - When DISABLE_DTYPE_AUTOCAST is True, skip float64->float32 input pre-cast and
@@ -49,31 +57,38 @@ class OperationImplementation(ABC):
     DISABLE_EMPTY_SHORTCIRCUIT: bool = False
 
     def translate_args(self, *args, **kwargs):
-        """Translate raw ATen dispatcher arguments to what this implementation expects.
+        """Translate raw ATen dispatcher arguments for this implementation.
 
-        Override this when the PyTorch ATen schema passes more arguments than
-        the implementation consumes (e.g. _grouped_mm passes bias and
-        use_fast_accum that the NKI kernel ignores).
+        Args:
+            *args (Any): Positional ATen dispatcher arguments.
+            **kwargs (Any): Keyword ATen dispatcher arguments.
 
         Returns:
-            Tuple of (args, kwargs) in the format expected by can_handle,
-            execute, and _execute_impl.
+            tuple: A pair containing the positional-argument tuple and
+            keyword-argument dictionary.
+
+        Note:
+            Override this when an ATen schema supplies arguments that an
+            implementation does not consume.
         """
         return args, kwargs
 
     def can_handle(self, *args, **kwargs) -> bool:
-        """Check if this implementation can handle the given arguments
+        """Check whether this implementation accepts the supplied arguments.
 
-        Default implementation requires all tensors to be in device, assuming single implementation
-        for the operation. Override this method when multiple implementations
-        exist and need to filter based on input arguments.
+        Args:
+            *args (Any): Positional operation arguments.
+            **kwargs (Any): Keyword operation arguments.
 
-        Complex dtypes are allowed through here; the allowlist in
-        composite_lower (auto_registration.py) controls which complex
-        ops actually run on Neuron vs fall back to CPU.
+        Returns:
+            bool: ``True`` when the implementation can handle the arguments.
 
         Raises:
-            RuntimeError: If non-scalar tensors are on wrong device
+            RuntimeError: If a non-scalar tensor passed directly, inside a positional
+                list or tuple, or as a direct keyword is not on a Neuron device.
+
+        Note:
+            This base check does not reject complex dtypes.
         """
         for i, arg in enumerate(args):
             if isinstance(arg, torch.Tensor):
@@ -108,15 +123,26 @@ class OperationImplementation(ABC):
 
     @torch._dynamo.disable
     def execute(self, *args, **kwargs) -> ExecutionResult:
-        """Execute the operation honoring policy flags.
+        """Execute the operation according to its policy flags.
 
-        By default, this:
-          - casts float64 inputs to float32,
-          - short-circuits empty tensors,
-          - calls implementation, then post-processes outputs for dtype fixes.
+        Args:
+            *args (Any): Positional operation arguments.
+            **kwargs (Any): Keyword operation arguments.
 
-        Ops can set class flags to disable autocast and/or empty short-circuiting
-        to avoid recursion or to own these behaviors explicitly.
+        Returns:
+            ExecutionResult: The implementation result.
+
+        Raises:
+            TypeError: If a float64 ``out`` tensor is supplied without a float64
+                positional input.
+            NotImplementedError: If an empty input reaches the default empty-tensor
+                handler.
+
+        Note:
+            By default, this casts non-scalar float64 tensor inputs to float32,
+            short-circuits empty tensors, and casts float64 tensors in tuple
+            outputs to float32. Class flags can disable autocasting or the
+            empty-tensor short circuit.
         """
         # pre-cast (skip when disabled)
         args2, kwargs2 = args, kwargs
@@ -252,16 +278,16 @@ class OperationImplementation(ABC):
 
     @property
     def priority(self) -> int:
-        """Priority for ordering implementations (higher = tried first)
+        """Return the implementation selection priority.
 
-        Default priority is 50. Override this method to change priority
-        when multiple implementations exist for the same operation.
+        Returns:
+            int: The priority, where higher values are tried first. Defaults to ``50``.
         """
         return 50
 
 
 class UnaryOpImplementation(OperationImplementation):
-    """Base class for element-wise unary operations (sqrt, neg, gelu, relu, etc.)"""
+    """Provide base behavior for element-wise unary operation implementations."""
 
     def _handle_empty_tensor(self, *args, **kwargs) -> ExecutionResult:
         """Unary ops preserve input shape for empty tensors"""
@@ -282,7 +308,7 @@ class UnaryOpImplementation(OperationImplementation):
 
 
 class BinaryOpImplementation(OperationImplementation):
-    """Base class for element-wise binary operations (add, mul, div, etc.)"""
+    """Provide base behavior for element-wise binary operation implementations."""
 
     def _handle_empty_tensor(self, input1, input2, *, out=None, **kwargs) -> ExecutionResult:
         """Binary ops follow broadcasting rules for empty tensors"""
@@ -325,7 +351,7 @@ class BinaryOpImplementation(OperationImplementation):
 
 
 class ReductionOpImplementation(OperationImplementation):
-    """Base class for reduction operations (sum, mean, max, min, etc.)"""
+    """Provide base behavior for reduction operation implementations."""
 
     @abstractmethod
     def _get_identity_value(self) -> Any:
@@ -387,7 +413,7 @@ class ReductionOpImplementation(OperationImplementation):
 
 
 class MatrixOpImplementation(OperationImplementation):
-    """Base class for matrix operations (mm, bmm, addmm, etc.)"""
+    """Provide base behavior for matrix operation implementations."""
 
     def _handle_empty_tensor(self, *args, **kwargs) -> ExecutionResult:
         """Matrix ops need careful dimension checking for empty tensors"""
@@ -419,7 +445,7 @@ class MatrixOpImplementation(OperationImplementation):
 
 
 class ComparisonOpImplementation(OperationImplementation):
-    """Base class for comparison operations (eq, lt, gt, le, ge, ne, etc.)"""
+    """Provide base behavior for comparison operation implementations."""
 
     def _handle_empty_tensor(self, input1, input2, *, out=None) -> ExecutionResult:
         """Comparison ops always return bool dtype for empty tensors"""
@@ -443,7 +469,7 @@ class ComparisonOpImplementation(OperationImplementation):
 
 
 class CompilableOpImpl(OperationImplementation):
-    """Base class for compilable operations that extends OperationImplementation."""
+    """Mark an operation implementation as compilable."""
 
     pass
 
@@ -545,7 +571,12 @@ def _create_and_raise_detailed_error(
 
 
 class Operation(ABC):
-    """Base class for operations that can have multiple implementations"""
+    """Coordinate implementations and CPU fallback for one ATen operation.
+
+    Note:
+        Implementations are tried in descending priority. Successful Neuron execution
+        and CPU fallback are logged once through native logging bindings.
+    """
 
     def __init__(self):
         self._implementations: list[OperationImplementation] = []
@@ -575,13 +606,22 @@ class Operation(ABC):
 
     @property
     def is_inplace(self) -> bool:
-        """Check if this is an in-place operation, per the op's ATen schema."""
+        """Check whether the operation is in-place from its schema or name.
+
+        Returns:
+            bool: ``True`` when the schema marks the first argument writable or the
+                fallback name heuristic identifies an in-place operation.
+        """
         return is_inplace_op(getattr(self, "_actual_aten_name", self.op_name))
 
     @property
     @abstractmethod
     def op_name(self) -> str:
-        """The ATen operation name (e.g., 'contiguous', 'add.Tensor')"""
+        """Return the ATen operation name.
+
+        Returns:
+            str: The operation name, such as ``contiguous`` or ``add.Tensor``.
+        """
         pass
 
     def _get_expected_output_shape(self, *args, **kwargs) -> torch.Size | None:
@@ -888,9 +928,10 @@ class Operation(ABC):
 
 
 class UnaryOperation(Operation):
-    """Base class for unary operations (sqrt, neg, relu, exp, etc.)
+    """Provide unary operations with default output-shape inference.
 
-    Provides default output shape computation for unary ops (output shape = input shape).
+    Note:
+        The inferred output shape equals the input shape.
     """
 
     def _get_expected_output_shape(self, input: torch.Tensor, **kwargs) -> torch.Size | None:
@@ -899,9 +940,10 @@ class UnaryOperation(Operation):
 
 
 class BinaryOperation(Operation):
-    """Base class for binary operations (add, mul, div, pow, etc.)
+    """Provide binary operations with default output-shape inference.
 
-    Provides default output shape computation using PyTorch broadcasting rules.
+    Note:
+        Output shapes follow PyTorch broadcasting rules.
     """
 
     def _get_expected_output_shape(self, input, other=None, **kwargs) -> torch.Size | None:
@@ -923,9 +965,10 @@ class BinaryOperation(Operation):
 
 
 class ReductionOperation(Operation):
-    """Base class for reduction operations (sum, mean, max, min, etc.)
+    """Provide reduction operations with default output-shape inference.
 
-    Provides default output shape computation based on reduction dimensions.
+    Note:
+        Output shapes are derived from the reduction dimensions and ``keepdim``.
     """
 
     def _get_expected_output_shape(
@@ -963,9 +1006,10 @@ class ReductionOperation(Operation):
 
 
 class ComparisonOperation(Operation):
-    """Base class for comparison operations (eq, lt, gt, le, ge, ne, etc.)
+    """Provide comparison operations with default output-shape inference.
 
-    Provides default output shape computation using broadcasting rules (same as binary ops).
+    Note:
+        Output shapes follow the same broadcasting rules as binary operations.
     """
 
     def _get_expected_output_shape(self, input, other=None, **kwargs) -> torch.Size | None:
@@ -987,7 +1031,7 @@ class ComparisonOperation(Operation):
 
 
 class AttentionOpImpl(OperationImplementation):
-    """Base class for attention operation implementations with common validation"""
+    """Provide common validation for attention operation implementations."""
 
     def can_handle(
         self,
@@ -1000,8 +1044,27 @@ class AttentionOpImpl(OperationImplementation):
         return_debug_mask: bool = False,
         scale: "float | None" = None,
     ) -> bool:
-        """Common validation for attention operations"""
+        """Check whether common attention inputs satisfy Neuron constraints.
 
+        Args:
+            query (torch.Tensor): Query tensor in batch-head-sequence-feature layout.
+            key (torch.Tensor): Key tensor in batch-head-sequence-feature layout.
+            value (torch.Tensor): Value tensor in batch-head-sequence-feature layout.
+            attn_bias (torch.Tensor | None, optional): Attention bias. Defaults to ``None``.
+            dropout_p (float, optional): Dropout probability. Defaults to ``0.0``.
+            is_causal (bool, optional): Whether attention is causal. Defaults to ``False``.
+            return_debug_mask (bool, optional): Debug-mask request. Defaults to ``False``.
+            scale (float | None, optional): Attention scale. Defaults to ``None``.
+
+        Returns:
+            bool: ``True`` when the tensor inputs and debug-mask request are supported.
+
+        Raises:
+            RuntimeError: If query heads are not divisible by key/value heads.
+
+        Note:
+            Validation ignores ``attn_bias``, ``dropout_p``, ``is_causal``, and ``scale``.
+        """
         # Must be on Neuron device
         if (
             query.device.type != "neuron"

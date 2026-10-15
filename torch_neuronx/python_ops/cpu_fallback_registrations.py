@@ -40,6 +40,18 @@ def _create_cpu_fallback(op, op_name):
     """Create a fallback that runs on CPU and preserves stride info on Neuron."""
 
     def fallback(*args, **kwargs):
+        """Run the wrapped operation through CPU fallback.
+
+        Args:
+            *args (Any): Positional values, with tensors copied to CPU.
+            **kwargs (Any): Keyword values, with tensors copied to CPU.
+
+        Returns:
+            Any: The result, copied back to the first tensor's Neuron device when applicable.
+
+        Note:
+            Tensor outputs preserve CPU shape, stride, and storage-offset metadata.
+        """
         from torch_neuronx._C import _log_offloaded_op
 
         _log_offloaded_op(f"aten::{op_name}")
@@ -60,7 +72,11 @@ def _register_op(aten_lib, op_name, fallback):
 
 
 def register_cpu_fallback_ops(aten_lib):
-    """Register all CPU fallback ops."""
+    """Register stride-preserving linalg CPU fallbacks.
+
+    Args:
+        aten_lib (torch.library.Library): ATen implementation library to update.
+    """
     # Linalg ops that return non-contiguous (column-major) tensors
     linalg_ops = [
         ("linalg_qr", torch.ops.aten.linalg_qr.default),

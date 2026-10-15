@@ -11,6 +11,7 @@
 | noop_fp32                   | noop_mask               | None             | PASS    | PASS    |
 | head_bias_bf16              | noop_mask               | head_bias_score  | PASS    | PASS    |
 | rel_fp32                    | causal                  | rel_score        | PASS    | PASS    |
+| rel_bf16                    | causal                  | rel_score        | PASS    | n/a     |
 | alibi_bf16                  | causal                  | alibi_score      | PASS    | PASS    |
 | prefix_lm_fp32              | prefix_lm_mask_512      | None             | PASS    | PASS    |
 | softcap_fp32                | causal                  | soft_cap         | PASS    | PASS    |
@@ -26,7 +27,6 @@
 """
 
 import logging
-import math
 import os
 from unittest.mock import patch
 
@@ -391,6 +391,16 @@ class TestFlexAttentionE2E:
                 dtype=torch.float32,
                 id="rel_fp32",
             ),
+            # Large q_idx - kv_idx offsets: the score_mod must run on the fp32 score tile, not bf16.
+            case(
+                seq_len=2048,
+                s=2048,
+                k_tile_size=128,
+                score_mod=rel_score,
+                mask_mod=causal,
+                dtype=torch.bfloat16,
+                id="rel_bf16",
+            ),
             case(
                 seq_len=1024,
                 s=1024,
@@ -511,10 +521,8 @@ class TestFlexAttentionE2E:
             atol=1e-3,
         )
 
-        # CPU LSE uses base 2, while Neuron LSE uses base e and is negated.
-        neuron_lse_converted = neuron_lse.cpu() / (-math.log(2))
         assert max_all_close(
-            neuron_lse_converted.float().numpy(),
+            neuron_lse.cpu().float().numpy(),
             cpu_lse.float().numpy(),
             rtol=2e-2,
             atol=1e-3,
@@ -713,3 +721,101 @@ class TestFlexAttentionE2E:
                 rtol=2e-2,
                 atol=1e-2,
             )
+
+    @pytest.mark.parametrize(
+        "batch,q_heads,kv_heads,q_len,kv_len,qk_dim,v_dim,k_tile_size,mask_mod,scale,bwd_nki",
+        [
+            pytest.param(2, 4, 2, 512, 512, 192, 128, 128, causal, None, True, id="qk192-v128-gqa"),
+            pytest.param(2, 2, 2, 512, 512, 128, 192, 128, causal, None, True, id="wide-value"),
+            pytest.param(1, 2, 2, 512, 512, 256, 256, 128, causal, None, True, id="d256"),
+            pytest.param(1, 1, 1, 512, 512, 512, 512, 128, noop_mask, None, True, id="d512"),
+            pytest.param(1, 2, 2, 512, 512, 192, 128, 512, causal, None, True, id="k-tile-512"),
+            pytest.param(
+                1, 1, 1, 512, 3072, 384, 384, 128, noop_mask, None, True, id="partial-section"
+            ),
+            pytest.param(1, 2, 2, 512, 512, 64, 64, 128, causal, 0.0, True, id="zero-scale"),
+            pytest.param(
+                1, 2, 2, 512, 512, 320, 320, 128, causal, None, False, id="unequal-tiles-d320"
+            ),
+        ],
+    )
+    def test_flex_attention_head_dimensions(
+        self,
+        batch,
+        q_heads,
+        kv_heads,
+        q_len,
+        kv_len,
+        qk_dim,
+        v_dim,
+        k_tile_size,
+        mask_mod,
+        scale,
+        bwd_nki,
+    ):
+        """Compare the output and gradients with CPU, and check which directions lower to NKI."""
+        from tests.neuron_dynamo_backend.component.flex.test_nki_lowering_regressions import (
+            nki_lowering,
+        )
+
+        torch.manual_seed(42)
+        query_input = torch.randn(batch, q_heads, q_len, qk_dim, dtype=torch.bfloat16)
+        key_input = torch.randn(batch, kv_heads, kv_len, qk_dim, dtype=torch.bfloat16)
+        value_input = torch.randn(batch, kv_heads, kv_len, v_dim, dtype=torch.bfloat16)
+        query_cpu, key_cpu, value_cpu = (
+            t.float().requires_grad_(True) for t in (query_input, key_input, value_input)
+        )
+        enable_gqa = q_heads != kv_heads
+
+        def block_mask(device):
+            return create_block_mask(
+                mask_mod,
+                B=batch,
+                H=q_heads,
+                Q_LEN=q_len,
+                KV_LEN=kv_len,
+                BLOCK_SIZE=(128, k_tile_size),
+                device=device,
+            )
+
+        cpu_out = flex_attention(
+            query_cpu,
+            key_cpu,
+            value_cpu,
+            block_mask=block_mask("cpu"),
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
+        # A constant dY sums to the same value whichever d tile or head it came from, so
+        # it hides an offset mistake. Keep it random, and keep both sides on one value.
+        grad_out = torch.randn(cpu_out.shape, dtype=torch.bfloat16)
+        cpu_out.backward(grad_out.float())
+
+        query_neuron, key_neuron, value_neuron = (
+            t.to("neuron").requires_grad_(True) for t in (query_input, key_input, value_input)
+        )
+
+        @torch.compile(backend="neuron")
+        def flex_attn_neuron(q, k, v, mask):
+            return flex_attention(q, k, v, block_mask=mask, scale=scale, enable_gqa=enable_gqa)
+
+        with nki_lowering() as fwd, nki_lowering("_legalize_flex_backward") as bwd:
+            neuron_out = flex_attn_neuron(
+                query_neuron, key_neuron, value_neuron, block_mask("neuron")
+            )
+            neuron_out.backward(grad_out.to("neuron"))
+
+        assert fwd == [True]
+        assert bwd == [bwd_nki]
+        assert max_all_close(
+            neuron_out.detach().cpu().float().numpy(),
+            cpu_out.detach().numpy(),
+            rtol=2e-2,
+            atol=1e-2,
+        )
+        for neuron_grad, cpu_grad in (
+            (query_neuron.grad, query_cpu.grad),
+            (key_neuron.grad, key_cpu.grad),
+            (value_neuron.grad, value_cpu.grad),
+        ):
+            torch.testing.assert_close(neuron_grad.cpu().float(), cpu_grad, rtol=2e-2, atol=2e-2)

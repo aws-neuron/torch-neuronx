@@ -132,9 +132,11 @@ class IsHloContentKeyEnabledTest : public ::testing::Test {
   bool had_value_ = false;
 };
 
-TEST_F(IsHloContentKeyEnabledTest, FalseWhenUnset) {
+TEST_F(IsHloContentKeyEnabledTest, TrueWhenUnset) {
+  // Content addressing is the default. An unset variable must not fall back to the
+  // legacy key, which breaks on any source or version change.
   ::unsetenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO");
-  EXPECT_FALSE(IsHloContentKeyEnabled());
+  EXPECT_TRUE(IsHloContentKeyEnabled());
 }
 
 TEST_F(IsHloContentKeyEnabledTest, TrueWhenSetToOne) {
@@ -147,13 +149,15 @@ TEST_F(IsHloContentKeyEnabledTest, FalseWhenSetToZero) {
   EXPECT_FALSE(IsHloContentKeyEnabled());
 }
 
-TEST_F(IsHloContentKeyEnabledTest, FalseForOtherTruthyStrings) {
-  // Strict opt-in: only "1" enables. Avoids accidental enables from "true",
-  // "yes", etc. that other env vars in this codebase accept.
-  ::setenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "true", /*overwrite=*/1);
-  EXPECT_FALSE(IsHloContentKeyEnabled());
-  ::setenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "yes", /*overwrite=*/1);
-  EXPECT_FALSE(IsHloContentKeyEnabled());
+TEST_F(IsHloContentKeyEnabledTest, TrueForNonZeroStrings) {
+  // Strict opt-out: only "0" disables. This keeps the safe key for a typo such as
+  // "false", which would otherwise silently select the legacy key.
+  ::setenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "false", /*overwrite=*/1);
+  EXPECT_TRUE(IsHloContentKeyEnabled());
+  ::setenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "no", /*overwrite=*/1);
+  EXPECT_TRUE(IsHloContentKeyEnabled());
+  ::setenv("TORCH_NEURONX_NEFF_KEY_FROM_HLO", "", /*overwrite=*/1);
+  EXPECT_TRUE(IsHloContentKeyEnabled());
 }
 
 }  // namespace

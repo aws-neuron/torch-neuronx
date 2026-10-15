@@ -91,8 +91,15 @@ def _render_step_summary(
 
     Pure function — easy to unit-test without env vars or file I/O.
     """
+    suite = (
+        "Internal"
+        if "internal" in dist_config_name
+        else "PT Upstream"
+        if "upstream" in dist_config_name
+        else "Test"
+    )
     lines = [
-        "## PT Upstream — Matrix Selection",
+        f"## {suite} — Matrix Selection",
         "",
         _RULE_HEADLINES.get(decision.rule, decision.rule),
         "",
@@ -144,6 +151,20 @@ def main():
     nodes = expand_distribution_config(dist)
     matrix = {"include": []}
 
+    # The entries with a ``node`` id run in series on one matrix node. See
+    # run_upstream_tests.py --node.
+    for node_id in dict.fromkeys(node["node"] for node in nodes if "node" in node):
+        group = [node for node in nodes if node.get("node") == node_id]
+        matrix["include"].append(
+            {
+                "node": node_id,
+                "label": next((node["name"] for node in group if node.get("name")), node_id),
+                "neff_cache": any(node.get("neff_cache") for node in group),
+                "soft_fail": any(node["soft_fail"] for node in group),
+            }
+        )
+    nodes = [node for node in nodes if "node" not in node]
+
     for i, node in enumerate(nodes):
         items = " ".join(node["items"])
         label = node["items"][0].replace("/", "-").replace(".py", "")
@@ -173,11 +194,11 @@ def main():
         with open(output_file, "a") as f:
             f.write(f"matrix={json.dumps(matrix)}\n")
 
-    logger.info(f"Expanded {len(nodes)} nodes from distribution config")
+    logger.info(f"Expanded {len(matrix['include'])} nodes from distribution config")
 
     # Render a step-summary panel so reviewers can see at a glance which
     # rule fired, which labels participated, and how many nodes ran.
-    _write_step_summary(_render_step_summary(decision, dist_path.name, len(nodes)))
+    _write_step_summary(_render_step_summary(decision, dist_path.name, len(matrix["include"])))
 
 
 if __name__ == "__main__":

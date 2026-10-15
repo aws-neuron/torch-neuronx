@@ -27,6 +27,26 @@ try:
         eps: float,
         amsgrad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply a fused Adam optimizer update with coupled weight decay.
+
+        Args:
+            param (torch.Tensor): Parameter values to update.
+            grad (torch.Tensor): Gradient values.
+            exp_avg (torch.Tensor): First-moment state.
+            exp_avg_sq (torch.Tensor): Second-moment state.
+            max_exp_avg_sq (torch.Tensor): Maximum second-moment state or placeholder.
+            ss (torch.Tensor): Step-size values expanded for the NKI kernel.
+            ibc (torch.Tensor): Inverse square-root bias-correction values.
+            wd (torch.Tensor): Coupled weight-decay values.
+            beta1 (float): First-moment decay coefficient.
+            beta2 (float): Second-moment decay coefficient.
+            eps (float): Denominator stability term.
+            amsgrad (bool): Whether to update the maximum second moment.
+
+        Returns:
+            tuple[torch.Tensor, ...]: Updated parameter and optimizer states, including
+                maximum second moment only when ``amsgrad`` is enabled.
+        """
         return _wrapped_adam[(int(get_logical_neuron_cores()),)](
             param,
             grad,
@@ -58,6 +78,26 @@ try:
         eps: float,
         amsgrad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply a fused AdamW optimizer update with decoupled weight decay.
+
+        Args:
+            param (torch.Tensor): Parameter values to update.
+            grad (torch.Tensor): Gradient values.
+            exp_avg (torch.Tensor): First-moment state.
+            exp_avg_sq (torch.Tensor): Second-moment state.
+            max_exp_avg_sq (torch.Tensor): Maximum second-moment state or placeholder.
+            ss (torch.Tensor): Step-size values expanded for the NKI kernel.
+            ibc (torch.Tensor): Inverse square-root bias-correction values.
+            wd (torch.Tensor): Decoupled parameter-decay factors.
+            beta1 (float): First-moment decay coefficient.
+            beta2 (float): Second-moment decay coefficient.
+            eps (float): Denominator stability term.
+            amsgrad (bool): Whether to update the maximum second moment.
+
+        Returns:
+            tuple[torch.Tensor, ...]: Updated parameter and optimizer states, including
+                maximum second moment only when ``amsgrad`` is enabled.
+        """
         return _wrapped_adamw[(int(get_logical_neuron_cores()),)](
             param,
             grad,

@@ -7,6 +7,7 @@
 #include <sstream>
 #include <unordered_map>
 
+#include "LazyTransformationManager.h"
 #include "MlirGenerators.h"
 #include "TransformationRegistry.h"
 #include "TypeUtils.h"
@@ -222,30 +223,14 @@ std::string OperationPrologue::ComputePrologueCacheKey(
   // validateAndGetMainFunctions (OpConcatUtils.cpp) throws:
   //   "Module1 input address count (N) does not match function argument count (M)".
   //
-  // Dedup is computed from storage base pointers, matching the
-  // computation in LazyTransformationManager::ProcessOperationWithPrologue
-  // so the key we emit here agrees with the `deduped_input_count` /
-  // `input_dedup_map` passed to MergeTransformations.
+  // Use ComputeInputDedupMap so this key agrees with the
+  // `deduped_input_count` / `input_dedup_map` that MergeTransformations gets.
+  // One helper is the single source of the dedup rule.
   //
   // The suffix is only appended when dedup actually collapses inputs,
   // keeping the common no-dedup key exactly as before.
   {
-    std::unordered_map<uintptr_t, size_t> base_to_slot;
-    std::vector<size_t> dedup_map(input_ptrs.size());
-    size_t deduped_count = 0;
-    for (size_t i = 0; i < input_ptrs.size(); ++i) {
-      uintptr_t base =
-          reinterpret_cast<uintptr_t>(input_ptrs[i]) -
-          (input_contexts[i].get_storage_offset() * input_contexts[i].get_element_size());
-      auto it = base_to_slot.find(base);
-      if (it != base_to_slot.end()) {
-        dedup_map[i] = it->second;
-      } else {
-        base_to_slot[base] = deduped_count;
-        dedup_map[i] = deduped_count;
-        deduped_count++;
-      }
-    }
+    auto [dedup_map, deduped_count] = ComputeInputDedupMap(input_ptrs, input_contexts);
     if (deduped_count < input_ptrs.size()) {
       cache_key_ss << "dedup";
       for (size_t slot : dedup_map) {

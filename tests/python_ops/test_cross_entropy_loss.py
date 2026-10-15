@@ -1,6 +1,5 @@
 """Test that cross_entropy operation is properly registered with PyTorch dispatcher."""
 
-import os
 import re
 
 import pytest
@@ -12,8 +11,6 @@ from tests.utils.neuron_test_utils import (
     assert_op_runs_on_neuron,
     track_neuron_ops,
 )
-
-_CPP_DISPATCH = os.environ.get("TORCH_NEURONX_CPP_DISPATCH", "1") == "1"
 
 
 def _run_cross_entropy(logits_cpu, targets_cpu, backward=False, rtol=1e-4, atol=1e-4, **kwargs):
@@ -498,12 +495,8 @@ class TestCrossEntropy:
         onto input 0 for any single-output op whose name ends in "_". So `logits` came
         back holding the gradient. Silent, because grad_input is logits-shaped.
 
-        Two independent guards now stop that, which is why this passes in BOTH
-        dispatch modes:
-          * the alias-free schema (no `Tensor(a!) self`) keeps buffer donation off on
-            the C++ cached path, and
-          * the underscore-free name keeps kernel._call_impl's endswith("_") branch
-            from firing on the Python path (TORCH_NEURONX_CPP_DISPATCH=0).
+        The alias-free schema (no `Tensor(a!) self`) keeps buffer donation off on
+        the C++ cached path, which is why this passes.
         """
         logits = torch.randn(8, 10).to("neuron").requires_grad_(True)
         targets = torch.randint(0, 10, (8,)).to("neuron")

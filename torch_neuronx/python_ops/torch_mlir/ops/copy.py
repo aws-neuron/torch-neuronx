@@ -32,7 +32,7 @@ def _copy_fn(src, out_dtype=None, out=None):
 
 @neuron_op("aten::copy_", disable_dtype_autocast=True, priority=90)
 class CopyMLIRImpl(TorchMlirOpImpl):
-    """MLIR-based implementation for neuron-to-neuron copy operations."""
+    """Implement Neuron-to-Neuron copies with Torch-MLIR."""
 
     def __init__(self):
         super().__init__(
@@ -53,11 +53,19 @@ class CopyMLIRImpl(TorchMlirOpImpl):
         return []
 
     def can_handle(self, *args, **kwargs) -> bool:
-        """Only handle neuron-to-neuron tensor copies.
+        """Check whether MLIR supports the requested tensor copy.
 
         Args:
-            args[0]: destination tensor
-            args[1]: source tensor
+            *args (Any): Destination and source copy arguments.
+            **kwargs (Any): Additional dispatch arguments.
+
+        Returns:
+            bool: ``True`` for supported Neuron-to-Neuron copies.
+
+        Note:
+            Rejects non-tensor sources, non-Neuron tensors, float64 or uint64 tensors, copies
+                between int64 and floating dtypes, and nondefault streams when host collective
+                communication is enabled.
         """
         dest = args[0]
         src = args[1]
@@ -68,8 +76,16 @@ class CopyMLIRImpl(TorchMlirOpImpl):
 
         # Only handle neuron-to-neuron copies, excluding dtypes that need special handling:
         # - float64: Not natively supported on device, handled by NRT-based implementation
-        # - int64/uint64: Not natively supported on device, handled by NRT-based implementation
-        unsupported_dtypes = (torch.float64, torch.int64, torch.uint64)
+        # - uint64: Not natively supported on device, handled by NRT-based implementation
+        unsupported_dtypes = (torch.float64, torch.uint64)
+        # An int64 to float pair needs all 64 bits. The device convert keeps the
+        # low word only, so that pair goes to the NRT path. The C++ mirror of this
+        # rule is IsCopyMlirPairSupported() in NeuronDispatcher.cpp.
+        int64_float_pair = (src.dtype == torch.int64 and dest.dtype.is_floating_point) or (
+            dest.dtype == torch.int64 and src.dtype.is_floating_point
+        )
+        if int64_float_pair:
+            return False
         if not (
             dest.device.type == "neuron"
             and src.device.type == "neuron"
@@ -84,11 +100,18 @@ class CopyMLIRImpl(TorchMlirOpImpl):
         return not (is_host_cc_enabled() and current_stream() != default_stream())
 
     def execute(self, *args, **kwargs):
-        """Execute copy operation using MLIR backend.
+        """Copy source data into a destination tensor.
 
         Args:
-            args[0]: destination tensor
-            args[1]: source tensor
+            *args (Any): Destination tensor followed by the source tensor.
+            **kwargs (Any): Additional dispatch arguments.
+
+        Returns:
+            ExecutionResult: Mutated destination tensor or failure information.
+
+        Note:
+            Expands broadcast sources, makes sources contiguous, converts sources to the
+                destination dtype, and handles noncontiguous destinations separately.
         """
         dest = args[0]
         src = args[1]
@@ -124,14 +147,28 @@ class CopyMLIRImpl(TorchMlirOpImpl):
         return super().execute(src_prepared, **mlir_kwargs)
 
     def get_lower_func(self):
-        """Return a lower function for aten::copy_(dest, src, non_blocking).
+        """Return the C++ dispatch lowering callable for ``aten::copy_``.
 
-        C++ aten args: [dest(0), src(1), non_blocking(2)].
-        Graph input: src (aten index 1). Output written to: dest (aten index 0).
+        Returns:
+            Callable: Function that lowers the source and writes through the destination schema
+                alias.
+
+        Note:
+            The lowering keeps flattened source index 1, treats destination index 0 as output, and
+                signals CPU fallback by returning ``None`` on failure.
         """
         kernel = self.kernel
 
         def copy_lower(*args, **kwargs):
+            """Lower a source tensor for the in-place copy schema.
+
+            Args:
+                *args (Any): Destination and source copy arguments.
+                **kwargs (Any): Additional lowering arguments.
+
+            Returns:
+                LoweringResult or None: Lowered source copy, or ``None`` to request CPU fallback.
+            """
             dest = args[0]
             src = args[1]
 

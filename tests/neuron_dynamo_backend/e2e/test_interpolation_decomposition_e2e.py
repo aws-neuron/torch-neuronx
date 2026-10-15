@@ -28,6 +28,7 @@ FORWARD_PACKETS = [
     aten.upsample_linear1d,
     aten.upsample_bilinear2d,
     aten.upsample_bicubic2d,
+    aten.upsample_trilinear3d,
 ]
 
 MODES_1D = [("nearest", {}), ("nearest-exact", {}), ("linear", {"align_corners": False})]
@@ -51,7 +52,7 @@ def _compiled(fn):
     return torch.compile(fn, backend="neuron", fullgraph=True)
 
 
-# ═════════════════════════ routing ═════════════════════════
+# --- routing ---
 class TestDecompositionRouting:
     """PyTorch's python kernels must not shadow our decompositions."""
 
@@ -82,7 +83,7 @@ class TestDecompositionRouting:
         assert packet.default in table, f"{packet}.default missing from the table"
 
 
-# ═════════════════════════ forward numerics ═════════════════════════
+# --- forward numerics ---
 class TestForward:
     @pytest.mark.parametrize("mode,kwargs", MODES_1D)
     def test_1d(self, mode, kwargs):
@@ -130,7 +131,7 @@ class TestForward:
         torch.testing.assert_close(got.cpu(), expected)
 
 
-# ═════════════════════════ backward numerics ═════════════════════════
+# --- backward numerics ---
 class TestBackward:
     """AOTAutograd generates the backward from the traced forward."""
 
@@ -169,7 +170,7 @@ class TestBackward:
         torch.testing.assert_close(x_n.grad.cpu(), x_cpu.grad)
 
 
-# ═════════════════════════ the family in one graph ═════════════════════════
+# --- the family in one graph ---
 class TestFullGraph:
     def test_all_modes_in_one_capture(self):
         """Every mode inside a single ``fullgraph=True`` capture."""
@@ -211,6 +212,61 @@ class TestFullGraph:
         out_cpu.backward(grad)
 
         out_n = _compiled(model)(x_n)
+        out_n.backward(grad.to("neuron"))
+
+        torch.testing.assert_close(out_n.detach().cpu(), out_cpu.detach())
+        torch.testing.assert_close(x_n.grad.cpu(), x_cpu.grad)
+
+
+# --- trilinear 3d ---
+class TestTrilinear3d:
+    """The volumetric mode through the compile path, forward and backward.
+
+    The backward is auto-derived by AOTAutograd from the traced forward
+    decomposition (the three separable matmuls), so no dedicated backward
+    decomposition is exercised here.
+    """
+
+    @pytest.mark.parametrize("align_corners", [False, True])
+    def test_forward_size(self, align_corners):
+        def fn(t):
+            return torch.nn.functional.interpolate(
+                t, size=(7, 8, 9), mode="trilinear", align_corners=align_corners
+            )
+
+        x = torch.randn(2, 3, 4, 4, 4)
+        expected = fn(x)
+        got = _compiled(fn)(x.to("neuron"))
+        torch.testing.assert_close(got.cpu(), expected)
+
+    def test_forward_scale_factor(self):
+        """scale_factor routes through the ``.vec`` overload."""
+
+        def fn(t):
+            return torch.nn.functional.interpolate(
+                t, scale_factor=2.0, mode="trilinear", align_corners=False
+            )
+
+        x = torch.randn(2, 3, 4, 4, 4)
+        expected = fn(x)
+        got = _compiled(fn)(x.to("neuron"))
+        torch.testing.assert_close(got.cpu(), expected)
+
+    @pytest.mark.parametrize("align_corners", [False, True])
+    def test_backward(self, align_corners):
+        def fn(t):
+            return torch.nn.functional.interpolate(
+                t, size=(7, 8, 9), mode="trilinear", align_corners=align_corners
+            )
+
+        x_cpu = torch.randn(2, 3, 4, 4, 4, requires_grad=True)
+        x_n = x_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        out_cpu = fn(x_cpu)
+        grad = torch.randn_like(out_cpu)
+        out_cpu.backward(grad)
+
+        out_n = _compiled(fn)(x_n)
         out_n.backward(grad.to("neuron"))
 
         torch.testing.assert_close(out_n.detach().cpu(), out_cpu.detach())

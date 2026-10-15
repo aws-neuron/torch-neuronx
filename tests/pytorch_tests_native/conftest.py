@@ -252,7 +252,7 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         # Guard: only apply skip/xfail markers to pytorch_tests_native tests.
         # pytest_collection_modifyitems receives ALL collected items, and
-        # run-test-parallel collects the entire tests/ tree in one invocation.
+        # A run of the ATen node collects the entire tests/ tree in one invocation.
         # Without this guard, patterns like *complex* in the skip registry
         # would incorrectly skip tests in tests/operations/ and tests/views/.
         if "pytorch_tests_native" in str(item.fspath):

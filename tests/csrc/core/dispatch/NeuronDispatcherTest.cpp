@@ -43,8 +43,10 @@ class NeuronDispatcherTestAccess {
   static std::vector<torch::Tensor> FlattenAndFilterInputs(const std::vector<c10::IValue>& args,
                                                            const c10::FunctionSchema& schema,
                                                            const std::vector<int>& kept,
-                                                           const std::string& op_name) {
-    return NeuronDispatcher::FlattenAndFilterInputs(args, schema, kept, op_name);
+                                                           const std::string& op_name,
+                                                           int64_t ir_input_count = -1) {
+    return NeuronDispatcher::FlattenAndFilterInputs(args, schema, kept, op_name, {}, {},
+                                                    ir_input_count);
   }
   static const auto& GetOpRegistrations(NeuronDispatcher& d) { return d.op_registrations_; }
 };
@@ -419,6 +421,16 @@ TEST_F(FlattenFilterTest, EmptyKeptReturnsAll) {
   EXPECT_EQ(TA::FlattenAndFilterInputs(args, schema(), {}, "t").size(), 2u);
 }
 
+TEST_F(FlattenFilterTest, ZeroIrInputsReturnsNone) {
+  std::vector<c10::IValue> args = {torch::zeros({2}), torch::ones({2}), 1};
+  EXPECT_TRUE(TA::FlattenAndFilterInputs(args, schema(), {}, "t", 0).empty());
+}
+
+TEST_F(FlattenFilterTest, ZeroIrInputsRejectsKeptIndices) {
+  std::vector<c10::IValue> args = {torch::zeros({2}), torch::ones({2}), 1};
+  EXPECT_THROW(TA::FlattenAndFilterInputs(args, schema(), {0}, "t", 0), c10::Error);
+}
+
 TEST_F(FlattenFilterTest, UndefinedSkipped) {
   std::vector<c10::IValue> args = {torch::zeros({2}), c10::IValue(torch::Tensor()), 1};
   EXPECT_EQ(TA::FlattenAndFilterInputs(args, schema(), {}, "t").size(), 1u);
@@ -447,6 +459,46 @@ TEST_F(FlattenFilterTest, NoTensorsEmpty) {
 
 TEST_F(FlattenFilterTest, EmptyArgsEmpty) {
   EXPECT_TRUE(TA::FlattenAndFilterInputs({}, schema(), {}, "t").empty());
+}
+
+// A zero-input factory NEFF (arange with out=) keeps no inputs. The write-aliased
+// out= must not become a phantom input, which would trip an NRT arity check.
+TEST_F(FlattenFilterTest, FactoryOutIsDroppedFromEmptyKept) {
+  auto sch = c10::Dispatcher::singleton().findSchemaOrThrow("aten::arange", "start_out").schema();
+  std::vector<c10::IValue> args = {c10::IValue(0), c10::IValue(4), c10::IValue(1),
+                                   torch::empty({4})};
+  EXPECT_TRUE(TA::FlattenAndFilterInputs(args, sch, {}, "aten::arange.start_out").empty());
+}
+
+// A write-only in-place self (zero_) is an output binding, not an input.
+TEST_F(FlattenFilterTest, WriteOnlyInplaceSelfDroppedFromEmptyKept) {
+  auto sch = c10::Dispatcher::singleton().findSchemaOrThrow("aten::zero_", "").schema();
+  std::vector<c10::IValue> args = {torch::ones({4})};
+  EXPECT_TRUE(TA::FlattenAndFilterInputs(args, sch, {}, "aten::zero_").empty());
+}
+
+// A write-aliased self stays an input when the NEFF references it (non-empty
+// kept). The drop happens only in the empty-kept factory branch.
+TEST_F(FlattenFilterTest, ReadModifyWriteInplaceSelfKeptWhenReferenced) {
+  auto sch = c10::Dispatcher::singleton().findSchemaOrThrow("aten::add_", "Tensor").schema();
+  auto self = torch::ones({4});
+  std::vector<c10::IValue> args = {self, torch::ones({4}), 1};
+  auto r = TA::FlattenAndFilterInputs(args, sch, {0}, "aten::add_.Tensor");
+  EXPECT_EQ(r.size(), 1u);
+  EXPECT_TRUE(r[0].equal(self));
+}
+
+// A mix of read-only args and a write-aliased out= keeps only the read-only
+// inputs under empty kept.
+TEST_F(FlattenFilterTest, MixedReadOnlyAndWriteAliasedKeepsOnlyReadOnly) {
+  auto sch = c10::Dispatcher::singleton().findSchemaOrThrow("aten::add", "out").schema();
+  auto self = torch::zeros({4});
+  auto other = torch::ones({4});
+  std::vector<c10::IValue> args = {self, other, 1, torch::empty({4})};
+  auto r = TA::FlattenAndFilterInputs(args, sch, {}, "aten::add.out");
+  EXPECT_EQ(r.size(), 2u);
+  EXPECT_TRUE(r[0].equal(self));
+  EXPECT_TRUE(r[1].equal(other));
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -564,6 +616,7 @@ TEST(DispatchCacheEntryTest, DefaultValues) {
   EXPECT_TRUE(e.stablehlo_bytes.empty());
   EXPECT_TRUE(e.neff_cache_key.empty());
   EXPECT_TRUE(e.kept_input_indices.empty());
+  EXPECT_EQ(e.ir_input_count, -1);
   EXPECT_TRUE(e.kept_output_indices.empty());
   EXPECT_TRUE(e.output_specs.empty());
   EXPECT_TRUE(e.original_output_specs.empty());

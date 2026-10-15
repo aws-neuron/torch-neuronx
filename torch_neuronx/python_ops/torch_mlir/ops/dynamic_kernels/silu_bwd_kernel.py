@@ -19,15 +19,19 @@ import nki.language as nl
 
 @nki.jit()
 def silu_bwd_kernel(grad_output, input_tensor, num_m_tiles):
-    """
-    SiLU backward: output = grad_output * silu_dx(input_tensor)
+    """Compute SiLU input gradients over dynamic row tiles.
 
     Args:
-        grad_output: [m_static, hidden] bf16 on HBM — upstream gradient
-        input_tensor: [m_static, hidden] bf16 on HBM — original input to silu fwd
-        num_m_tiles: [1, 1] int32 — number of 128-row tiles to process
+        grad_output (nki.language.ndarray): Upstream gradient with shape ``[m_static, hidden]``.
+        input_tensor (nki.language.ndarray): Original SiLU input with the same shape.
+        num_m_tiles (nki.language.ndarray): Number of 128-row tiles to process.
+
     Returns:
-        output: [m_static, hidden] bf16 on HBM — gradient w.r.t. input
+        nki.language.ndarray: Static-shaped ``grad_output * silu_dx(input_tensor)``
+        in the ``grad_output`` dtype.
+
+    Note:
+        Rows after the requested tiles are not initialized.
     """
     m_static, hidden = grad_output.shape
 
@@ -55,6 +59,11 @@ def silu_bwd_kernel(grad_output, input_tensor, num_m_tiles):
     nisa.memset(m_tile_start, 0.0)
 
     def body(_i):
+        """Compute SiLU gradients for one 128-row tile.
+
+        Args:
+            _i (int): Dynamic loop iteration index, accepted but unused.
+        """
         for seg in range(len(h_starts)):
             h_start = h_starts[seg]
             h_width = h_widths[seg]

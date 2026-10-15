@@ -29,14 +29,19 @@ _INV_TWO_PI = 1.0 / (2.0 * math.pi)
 
 @nki.jit()
 def cos_kernel(input_tensor, num_m_tiles):
-    """
-    Cos activation via sin(x + pi/2) with range reduction: any input range.
+    """Compute cosine over a runtime-dynamic row dimension.
 
     Args:
-        input_tensor: [m_static, hidden] on HBM
-        num_m_tiles: [1, 1] int32 — number of 128-row tiles to process
+        input_tensor (tensor): ``[m_static, hidden]`` HBM input.
+        num_m_tiles (tensor): Int32 ``[1, 1]`` count of 128-row tiles to process.
+
     Returns:
-        output: [m_static, hidden] on HBM
+        tensor: Cosine values with the input shape and dtype in HBM.
+
+    Note:
+        The kernel performs float32 range reduction and evaluates
+        ``sin(x + pi / 2)`` because NKI has no cosine activation. Rows outside the
+        selected tiles remain unspecified in the static-capacity result.
     """
     m_static, hidden = input_tensor.shape
 
@@ -66,6 +71,11 @@ def cos_kernel(input_tensor, num_m_tiles):
     nisa.memset(m_tile_start, 0.0)
 
     def body(_i):
+        """Process one dynamic row-tile iteration.
+
+        Args:
+            _i (int): Loop iteration index.
+        """
         for seg in range(len(h_starts)):
             h_start = h_starts[seg]
             h_width = h_widths[seg]

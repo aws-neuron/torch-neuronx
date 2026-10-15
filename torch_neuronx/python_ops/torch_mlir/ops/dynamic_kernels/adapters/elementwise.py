@@ -75,8 +75,16 @@ def _can_handle_mul(x, y, out=None) -> bool:
 
 # ── factory: the shared compile_fn + prepare_io (the mechanical half) ──
 def make_elementwise_entry(name, can_handle, *, arity=1):
-    """Build a DynamicNkiEntry for an elementwise op. ``arity`` is the operand
-    count (1 unary, 2 binary); ``can_handle`` is supplied per op."""
+    """Build a dynamic NKI entry for an elementwise operation.
+
+    Args:
+        name (str): Operation name used to select the wrapper and graph name.
+        can_handle (Callable): Predicate that determines whether the entry applies.
+        arity (int, optional): Number of tensor operands. Defaults to ``1``.
+
+    Returns:
+        DynamicNkiEntry: Entry that compiles and marshals the elementwise operation.
+    """
     graph_name = f"dynamic_nki_{name}"
     # Unsharded, every LNC program redundantly runs the whole kernel; ones_like is
     # pure store, so that duplicated traffic is the entire cost of the op.
@@ -87,7 +95,17 @@ def make_elementwise_entry(name, can_handle, *, arity=1):
     reads_input = name not in {"ones_like"}
 
     def compile_fn(compile_key):
-        """Compile one row tile per LNC program; H + dtype are baked."""
+        """Compile one row tile per logical Neuron core program.
+
+        Args:
+            compile_key (tuple): Baked hidden width and input dtype.
+
+        Returns:
+            tuple: HLO bytes and the compiled NEFF cache key.
+
+        Note:
+            The hidden width and dtype are baked into the NEFF.
+        """
         from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
 
         from .. import wrappers
@@ -107,7 +125,22 @@ def make_elementwise_entry(name, can_handle, *, arity=1):
         return _compile_or_load_neff(kernel, graph_name, (*ins, nm), out)
 
     def prepare_io(*tensors, dest=None, **_):
-        """Pad M so every LNC program executes the same number of row tiles."""
+        """Pad rows so each logical Neuron core program runs equal tile counts.
+
+        Args:
+            *tensors (torch.Tensor): Input tensors to flatten and pad without mutation.
+            dest (torch.Tensor, optional): Candidate output destination. When no row
+                padding is needed and it is reusable, the returned output aliases it
+                and the kernel writes it in place. Defaults to ``None``.
+            **_ (Any): Additional keyword arguments, which are ignored.
+
+        Returns:
+            tuple: Kernel inputs, a one-element output-buffer tuple, and the original
+            row count. The output is fresh when rows are padded or ``dest`` is unusable.
+
+        Note:
+            For ``ones_like``, the output buffer is also the unread kernel input.
+        """
         x = tensors[0]
         H = x.shape[-1]  # noqa: N806
         M = x.numel() // H  # noqa: N806
@@ -118,6 +151,15 @@ def make_elementwise_entry(name, can_handle, *, arity=1):
             # _pad_or_contig avoids a redundant .contiguous() on the pad path (the
             # pad-assign reads a strided view directly), killing the per-shape
             # aten::contiguous recompiles on strided (e.g. .chunk()) inputs.
+            """Flatten and pad a tensor to the kernel's two-dimensional shape.
+
+            Args:
+                t (torch.Tensor): Tensor to reshape and pad.
+
+            Returns:
+                torch.Tensor: Tensor with shape ``[M_ceil, H]``. A padded result is
+                fresh; an unpadded contiguous result may alias ``t``.
+            """
             return _pad_or_contig(t.reshape(-1, H), M_ceil)
 
         nm = _num_tiles_tensor(M_ceil // row_group, device)
@@ -132,7 +174,15 @@ def make_elementwise_entry(name, can_handle, *, arity=1):
         return (*ins, nm), outputs, M
 
     def reshape_output(outputs, original_args):
-        """Slice off the padded rows, restore the input shape."""
+        """Slice padded rows and restore the input shape.
+
+        Args:
+            outputs (tuple): Kernel output buffers.
+            original_args (tuple): Original operation arguments.
+
+        Returns:
+            torch.Tensor: View of the first output buffer with the first input's shape.
+        """
         x = original_args[0]
         H = x.shape[-1]  # noqa: N806
         M = x.numel() // H  # noqa: N806
@@ -165,5 +215,6 @@ _ELEMENTWISE_OPS = [
 
 
 def register():
+    """Register all supported elementwise dynamic NKI adapters."""
     for name, can_handle, arity in _ELEMENTWISE_OPS:
         register_dynamic_nki(name, make_elementwise_entry(name, can_handle, arity=arity))

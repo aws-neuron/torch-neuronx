@@ -753,6 +753,44 @@ TEST_F(TransformationsTest, TryCreateCompound_PureBroadcast) {
   EXPECT_EQ(result->transformations[0].output_shape[3], D);
 }
 
+// An unaligned interior offset defeats the offset-0 decomposition, so the base is anchored at the
+// view offset and needs one TRANSPOSE.
+TEST_F(TransformationsTest, TryCreateCompound_InteriorOffsetTransposedView) {
+  constexpr int64_t R = 40, C = 36, N = 5000;
+  constexpr int64_t offset = 100;  // not a multiple of C
+  auto flat = at::zeros({N}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  auto w_t = flat.slice(0, offset, offset + R * C).view({R, C}).t();
+  ASSERT_FALSE(w_t.is_contiguous());
+
+  auto result = Creators::TryCreateCompound(w_t, "test_op", 0);
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->pattern_name, "COMPOUND");
+  EXPECT_TRUE(result->processed_input.is_contiguous());
+  EXPECT_EQ(result->processed_input.sizes(), at::IntArrayRef({R, C}));
+  EXPECT_EQ(result->processed_input.storage_offset(), offset);
+  ASSERT_EQ(result->transformations.size(), 1u);
+  EXPECT_EQ(result->transformations[0].type, TransformationType::TRANSPOSE);
+}
+
+// An aligned interior offset keeps the offset-0 base that input dedup needs.
+TEST_F(TransformationsTest, TryCreateCompound_AlignedInteriorOffsetKeepsBaseFromZero) {
+  constexpr int64_t R = 40, C = 36, N = 5000;
+  constexpr int64_t offset = 144;  // a multiple of C
+  auto flat = at::zeros({N}, at::TensorOptions().dtype(c10::ScalarType::Float));
+  auto w_t = flat.slice(0, offset, offset + R * C).view({R, C}).t();
+  ASSERT_FALSE(w_t.is_contiguous());
+
+  auto result = Creators::TryCreateCompound(w_t, "test_op", 0);
+
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->pattern_name, "COMPOUND");
+  EXPECT_TRUE(result->processed_input.is_contiguous());
+  EXPECT_EQ(result->processed_input.storage_offset(), 0);
+  EXPECT_GT(result->processed_input.numel(), R * C);
+  EXPECT_EQ(result->transformations.back().type, TransformationType::TRANSPOSE);
+}
+
 TEST_F(TransformationsTest, TryCreateCompound_TransposeSlice_RoPE) {
   // The RoPE pattern: [B,S,H,D].transpose(1,2)[..., D//2:]
   // Using B=1, S=8, H=4, D=8 → x2 = q[..., 4:]

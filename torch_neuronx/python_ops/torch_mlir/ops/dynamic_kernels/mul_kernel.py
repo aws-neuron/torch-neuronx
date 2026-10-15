@@ -42,6 +42,11 @@ def _run_mul_loop(
     """
 
     def body(_i):
+        """Process one unrolled multiplication loop iteration.
+
+        Args:
+            _i (int): Loop iteration token, accepted but unused; the row cursor carries state.
+        """
         for slot in range(1, tiles_per_trip):
             nisa.tensor_scalar(
                 dst=row_start[slot],
@@ -133,15 +138,17 @@ def _run_mul_loop(
 
 @nki.jit()
 def mul_kernel(input_a, input_b, num_m_tiles):
-    """
-    Elementwise multiply: output = input_a * input_b
+    """Multiply two tensors over a runtime-dynamic row dimension.
 
     Args:
-        input_a: [m_static, hidden] bf16 on HBM
-        input_b: [m_static, hidden] bf16 on HBM
-        num_m_tiles: [1, 1] int32, number of 128-row tiles per program
+        input_a (tensor): First ``[m_static, hidden]`` HBM operand.
+        input_b (tensor): Second ``[m_static, hidden]`` HBM operand.
+        num_m_tiles (tensor): Int32 ``[1, 1]`` tensor whose first value is the
+            count of 128-row tiles per program.
+
     Returns:
-        output: [m_static, hidden] bf16 on HBM
+        tensor: HBM result with the first operand shape and dtype. The first
+            ``128 * num_m_tiles[0]`` rows contain products; later rows are unspecified.
     """
     m_static, hidden = input_a.shape
 

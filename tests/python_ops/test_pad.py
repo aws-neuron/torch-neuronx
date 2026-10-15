@@ -455,3 +455,102 @@ class TestPad:
 
         expected = torch.ops.aten.replication_pad1d(input_t, padding)
         torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    @pytest.mark.parametrize(
+        "shape,padding,fwd_op,bwd_op",
+        [
+            ((1, 3, 8), (2, 2), "aten::reflection_pad1d", "aten::reflection_pad1d_backward"),
+            ((2, 4, 16), (3, 1), "aten::reflection_pad1d", "aten::reflection_pad1d_backward"),
+            (
+                (1, 3, 8, 8),
+                (1, 1, 1, 1),
+                "aten::reflection_pad2d",
+                "aten::reflection_pad2d_backward",
+            ),
+            (
+                (2, 4, 16, 16),
+                (2, 2, 3, 3),
+                "aten::reflection_pad2d",
+                "aten::reflection_pad2d_backward",
+            ),
+            (
+                (1, 2, 4, 4, 4),
+                (1, 1, 1, 1, 1, 1),
+                "aten::reflection_pad3d",
+                "aten::reflection_pad3d_backward",
+            ),
+        ],
+    )
+    def test_reflection_pad_backward_autograd(self, shape, padding, fwd_op, bwd_op):
+        """Training reflection_pad runs the forward AND the backward on Neuron.
+
+        Without the backward lowering the dispatcher gets no Neuron gradient and
+        the whole op falls back to CPU. Assert both ops on device, then match the
+        input gradient against the CPU oracle."""
+        torch.manual_seed(0)
+        x_cpu = torch.randn(shape, requires_grad=True)
+        x_neuron = x_cpu.detach().to("neuron").requires_grad_(True)
+
+        with track_neuron_ops():
+            out_neuron = torch.nn.functional.pad(x_neuron, padding, mode="reflect")
+            (out_neuron * out_neuron).sum().backward()
+            assert_op_runs_on_neuron(fwd_op)
+            assert_op_runs_on_neuron(bwd_op)
+
+        out_cpu = torch.nn.functional.pad(x_cpu, padding, mode="reflect")
+        (out_cpu * out_cpu).sum().backward()
+        torch.testing.assert_close(x_neuron.grad.cpu(), x_cpu.grad)
+
+    @pytest.mark.parametrize(
+        "self_shape,padding,bwd_op",
+        [
+            ((1, 3, 8), (2, 2), "aten::reflection_pad1d_backward"),
+            ((1, 3, 8, 8), (1, 1, 1, 1), "aten::reflection_pad2d_backward"),
+            ((2, 4, 16, 16), (2, 2, 3, 3), "aten::reflection_pad2d_backward"),
+            ((1, 2, 4, 4, 4), (1, 1, 1, 1, 1, 1), "aten::reflection_pad3d_backward"),
+        ],
+    )
+    def test_reflection_pad_backward_direct(self, self_shape, padding, bwd_op):
+        """A direct aten::reflection_padNd_backward call dispatches to Neuron."""
+        torch.manual_seed(0)
+        self_cpu = torch.randn(self_shape)
+        out_shape = list(self_shape)
+        for i in range(len(padding) // 2):
+            out_shape[-(i + 1)] += padding[2 * i] + padding[2 * i + 1]
+        grad_output_cpu = torch.randn(out_shape)
+
+        bwd = getattr(torch.ops.aten, bwd_op.split("::")[1])
+        with track_neuron_ops():
+            result = bwd.default(grad_output_cpu.to("neuron"), self_cpu.to("neuron"), padding)
+        assert_op_runs_on_neuron(bwd_op)
+
+        expected = bwd.default(grad_output_cpu, self_cpu, padding)
+        torch.testing.assert_close(result.cpu(), expected)
+
+    @pytest.mark.parametrize(
+        "self_shape,padding,bwd_op",
+        [
+            ((1, 3, 8), (2, 2), "aten::reflection_pad1d_backward"),
+            ((1, 3, 8, 8), (1, 1, 1, 1), "aten::reflection_pad2d_backward"),
+            ((1, 2, 4, 4, 4), (1, 1, 1, 1, 1, 1), "aten::reflection_pad3d_backward"),
+        ],
+    )
+    def test_reflection_pad_backward_grad_input_variant(self, self_shape, padding, bwd_op):
+        """The .grad_input out variant writes the gradient and matches CPU."""
+        torch.manual_seed(0)
+        self_cpu = torch.randn(self_shape)
+        out_shape = list(self_shape)
+        for i in range(len(padding) // 2):
+            out_shape[-(i + 1)] += padding[2 * i] + padding[2 * i + 1]
+        grad_output = torch.randn(out_shape, device="neuron")
+        self_neuron = self_cpu.to("neuron")
+        grad_input = torch.empty(self_shape, device="neuron")
+
+        bwd = getattr(torch.ops.aten, bwd_op.split("::")[1])
+        with track_neuron_ops():
+            result = bwd.grad_input(grad_output, self_neuron, padding, grad_input=grad_input)
+        assert_op_runs_on_neuron(bwd_op + ".grad_input")
+
+        expected = bwd.default(grad_output.cpu(), self_cpu, padding)
+        torch.testing.assert_close(result.cpu(), expected)
+        torch.testing.assert_close(grad_input.cpu(), expected)

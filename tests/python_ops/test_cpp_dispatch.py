@@ -1,8 +1,7 @@
 """Tests for C++ NeuronDispatcher registration path.
 
-These tests verify that when TORCH_NEURONX_CPP_DISPATCH=1, torch-mlir and @neuron_op ops
-are registered through the C++ NeuronDispatcher (boxed handler) and produce
-correct results.
+These tests verify that torch-mlir and @neuron_op ops are registered through the
+C++ NeuronDispatcher (boxed handler) and produce correct results.
 
 Tests are structured in two groups:
 1. Registration tests — verify _register_neuron_op bindings and state
@@ -135,6 +134,30 @@ class TestCppDispatchRegistration:
             ("preprocess", torch.int32),
         ]
 
+    # register_aten takes no **kwargs sink, so an unknown flag is an import-time
+    # TypeError rather than a silent no-op. Swallowed, a dropped or misspelled
+    # preprocessing leaves it None: the op takes the plain-kernel path, the factory
+    # itself gets traced, lowering fails, and the op falls back to CPU.
+    @pytest.mark.parametrize(
+        "unknown_kwarg",
+        ["python_dispatch", "preprocesses_args", "relower_every_call", "preprocessng"],
+        ids=["removed-python-path", "removed-bool", "removed-relower", "typo"],
+    )
+    def test_unknown_kwarg_is_rejected(self, unknown_kwarg):
+        """Flags this migration removed, and typos in live ones, must not be accepted."""
+        from torch_neuronx.python_ops.torch_mlir.operation_registry import register_aten
+
+        with pytest.raises(TypeError):
+            register_aten("aten::_test_unknown_kwarg", **{unknown_kwarg: True})
+
+    @pytest.mark.parametrize("bad_value", ["shape_only", True, 0])
+    def test_preprocessing_must_be_an_enum_member(self, bad_value):
+        """The value routes dispatch, so a look-alike must not be accepted."""
+        from torch_neuronx.python_ops.torch_mlir.operation_registry import register_aten
+
+        with pytest.raises(ValueError, match="must be a Preprocessing member"):
+            register_aten("aten::_test_bad_preprocessing", preprocessing=bad_value)
+
 
 # ============================================================================
 # 2. LoweringResult (C++ bound class) tests
@@ -152,6 +175,7 @@ class TestLoweringResult:
         assert lr.stablehlo_bytes == b""
         assert lr.cache_key == ""
         assert lr.kept_input_indices == []
+        assert lr.ir_input_count == -1
         assert lr.kept_output_indices == []
         assert lr.output_specs == []
         assert lr.passthrough_mappings == {}
@@ -188,6 +212,7 @@ class TestLoweringResult:
             "stablehlo_bytes",
             "cache_key",
             "kept_input_indices",
+            "ir_input_count",
             "kept_output_indices",
             "output_specs",
             "original_output_specs",

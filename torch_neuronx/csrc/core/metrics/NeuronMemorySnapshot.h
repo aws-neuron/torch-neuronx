@@ -97,10 +97,11 @@ struct TraceEntry {
   int64_t timestamp_us = 0;               // Timestamp in microseconds
   std::shared_ptr<StackContext> context;  // Optional stack trace
   size_t device_free = 0;                 // Only for OOM: free memory at failure time
+  uint64_t trace_id = 0;  // NRT system trace correlation ID (from nrt_tensor_get_trace_id)
 
   TraceEntry() = default;
   TraceEntry(TraceAction act, int dev, size_t address, size_t sz, c10::StreamId str, int64_t ts,
-             std::shared_ptr<StackContext> ctx, size_t dev_free, size_t blk_sz)
+             std::shared_ptr<StackContext> ctx, size_t dev_free, size_t blk_sz, uint64_t tid = 0)
       : action(act),
         device(dev),
         addr(address),
@@ -109,7 +110,8 @@ struct TraceEntry {
         stream(str),
         timestamp_us(ts),
         context(std::move(ctx)),
-        device_free(dev_free) {}
+        device_free(dev_free),
+        trace_id(tid) {}
 };
 
 // =============================================================================
@@ -179,7 +181,8 @@ void RecordHistory(bool enabled, RecordContext when = RecordContext::NEVER,
  * @param device_free Free memory (only for OOM events)
  */
 void RecordTrace(TraceAction action, int device, size_t addr, size_t size, c10::StreamId stream,
-                 std::shared_ptr<StackContext> context, size_t device_free, size_t block_size);
+                 std::shared_ptr<StackContext> context, size_t device_free, size_t block_size,
+                 uint64_t trace_id = 0);
 
 /**
  * Capture current memory snapshot.
@@ -210,6 +213,14 @@ bool ShouldIncludeCppFrames();
  * Reuses GetCurrentTimeNs() from NeuronMetrics and converts to microseconds.
  */
 int64_t GetCurrentTimestampUs();
+
+/**
+ * Get the clock domain offset (system_clock - steady_clock) in microseconds.
+ * This offset is applied to all trace timestamps so they align with the
+ * framework profiler and runtime system trace (both use system_clock).
+ * Returns 0 if recording has not been enabled.
+ */
+int64_t GetClockDomainOffsetUs();
 
 /**
  * Convert TraceAction to string for serialization.

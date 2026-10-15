@@ -505,6 +505,7 @@ class TestBarrier:
         post_tensor = torch.ones(1, device="neuron") * rank
 
         stream = torch_neuronx.Stream()
+        stream.wait_stream(torch_neuronx.current_stream())
         with torch_neuronx.stream(stream):
             prior_work = dist.all_reduce(tensor, async_op=True)
             assert prior_work is not None
@@ -516,7 +517,8 @@ class TestBarrier:
             assert post_work is not None
 
             barrier_work.wait()
-            post_work.wait()
+
+        post_work.wait()
 
         expected_prior = torch.ones(4, 4, device="neuron") * ((size * (size - 1)) / 2)
         expected_post = torch.ones(1, device="neuron") * sum(range(size))
@@ -545,6 +547,7 @@ class TestNonDefaultStream:
 
         # Create and use non-default stream (similar to NCCL's getStreamFromPool)
         stream = torch_neuronx.Stream()
+        stream.wait_stream(torch_neuronx.current_stream())
         with torch_neuronx.stream(stream):
             work = dist.all_reduce(tensor, async_op=True)
 
@@ -567,6 +570,7 @@ class TestNonDefaultStream:
             tensor = torch.zeros(4, 4, device="neuron")
 
         stream = torch_neuronx.Stream()
+        stream.wait_stream(torch_neuronx.current_stream())
         with torch_neuronx.stream(stream):
             work = dist.broadcast(tensor, src=root_rank, async_op=True)
 
@@ -590,6 +594,8 @@ class TestNonDefaultStream:
         # Create two different streams
         stream1 = torch_neuronx.Stream()
         stream2 = torch_neuronx.Stream()
+        stream1.wait_stream(torch_neuronx.current_stream())
+        stream2.wait_stream(torch_neuronx.current_stream())
 
         # Launch on different streams
         with torch_neuronx.stream(stream1):

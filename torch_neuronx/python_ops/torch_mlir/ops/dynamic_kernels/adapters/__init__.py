@@ -9,6 +9,7 @@ package ``__init__`` calls it behind the feature flag.
 
 
 def register_all():
+    """Register every dynamic NKI adapter in this package."""
     from . import (
         bitwise,
         cast,

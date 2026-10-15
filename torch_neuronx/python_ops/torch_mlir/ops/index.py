@@ -39,7 +39,7 @@ op_error_handlers.register("aten::index", _index_error_handler)
 
 
 class IndexMLIRImpl(OperationImplementation):
-    """index implementation using MLIR"""
+    """Implement advanced tensor indexing with Torch-MLIR."""
 
     def __init__(self):
         """Initialize the index kernel"""
@@ -47,6 +47,24 @@ class IndexMLIRImpl(OperationImplementation):
 
         def index_fn(tensor, indices, *, out=None):
             # Handle negative index values
+            """Select tensor values with normalized advanced indices.
+
+            Args:
+                tensor (torch.Tensor): Source tensor.
+                indices (list[torch.Tensor | None]): Integer index tensors and omitted dimensions.
+                out (torch.Tensor, optional): Unused out-variant placeholder.
+                    Defaults to ``None``.
+
+            Returns:
+                torch.Tensor: Values selected by the normalized indices.
+
+            Raises:
+                IndexError: If an index is outside its dimension's valid negative or positive range.
+
+            Note:
+                Performs device bounds checks unless preconditions are disabled and wraps negative
+                indices. Boolean indices are expanded before this function is called.
+            """
             normalized_indices = []
             for i, idx in enumerate(indices):
                 if idx is None:
@@ -66,11 +84,39 @@ class IndexMLIRImpl(OperationImplementation):
         self.kernel = TorchMlirKernel(index_fn, "aten::index")
 
     def can_handle(self, tensor, indices, out=None):
+        """Check whether indexing can run on the Neuron device.
+
+        Args:
+            tensor (torch.Tensor): Source tensor to inspect.
+            indices (list): Indices accepted for dispatch compatibility.
+            out (torch.Tensor, optional): Output tensor accepted for dispatch
+                compatibility. Defaults to ``None``.
+
+        Returns:
+            bool: ``True`` when ``tensor`` is on a Neuron device.
+        """
         return tensor.device.type == "neuron"
 
     def execute(self, *args, **kwargs) -> ExecutionResult:
         # Capture original tensor before base class downcasts float64→float32,
         # so the kernel can infer correct output dtypes for upcast.
+        """Execute indexing while preserving original dtype metadata.
+
+        Args:
+            *args (Any): Positional indexing arguments.
+            **kwargs (Any): Keyword indexing arguments.
+
+        Returns:
+            ExecutionResult: Selected values or failure information.
+
+        Raises:
+            IndexError: If an index has a floating-point dtype or is out of bounds.
+            TypeError: If an unsupported ``float64`` output buffer is supplied.
+
+        Note:
+            Captures the source before base-class ``float64`` downcasting so output dtype inference
+                can restore it.
+        """
         self._original_tensor = args[0]
         return super().execute(*args, **kwargs)
 
@@ -133,15 +179,28 @@ class IndexMLIRImpl(OperationImplementation):
             return ExecutionResult(success=False, error_msg=str(e))
 
     def get_lower_func(self):
-        """Return a lower function for C++ dispatch of index.
+        """Return the C++ dispatch lowering callable for indexing.
 
-        Boolean→integer index conversion is done here (before tracing)
-        to avoid dynamic shapes in the traced graph. The kernel's index_fn
-        only handles negative-index normalization (static shapes).
+        Returns:
+            Callable: Function that converts boolean indices before MLIR lowering.
+
+        Note:
+            Boolean-to-integer conversion occurs before tracing to avoid dynamic shapes; the traced
+                kernel only normalizes negative indices.
         """
         kernel = self.kernel
 
         def index_lower(tensor, indices, **kwargs):
+            """Convert indices and lower the indexing operation.
+
+            Args:
+                tensor (torch.Tensor): Source tensor.
+                indices (list): Integer, boolean, or omitted indices by dimension.
+                **kwargs (Any): Original-argument metadata forwarded to the kernel.
+
+            Returns:
+                LoweringResult: Lowered indexing operation.
+            """
             original_args = kwargs.pop("original_args", None)
             original_kwargs = kwargs.pop("original_kwargs", None)
             kwargs.pop("out", None)

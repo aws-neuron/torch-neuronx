@@ -45,24 +45,72 @@ try:
     # Callers must handle 0-dim scalar tensors before invoking these ops.
     @nki_op("torch_neuronx::add_scalar", mutates_args={})
     def add_scalar_nki(data: torch.Tensor, scalar_tensor: torch.Tensor) -> torch.Tensor:
+        """Apply scalar addition with an NKI kernel.
+
+        Args:
+            data (torch.Tensor): Input tensor.
+            scalar_tensor (torch.Tensor): Scalar value tensor.
+
+        Returns:
+            torch.Tensor: Elementwise sum.
+
+        Note:
+            ``data`` must be nonempty and non-scalar.
+        """
         return _add_scalar_kernel[(int(get_logical_neuron_cores()),)](
             data, _scalar_tensor(scalar_tensor), data.numel()
         )
 
     @nki_op("torch_neuronx::sub_scalar", mutates_args={})
     def sub_scalar_nki(data: torch.Tensor, scalar_tensor: torch.Tensor) -> torch.Tensor:
+        """Apply scalar subtraction with an NKI kernel.
+
+        Args:
+            data (torch.Tensor): Input tensor.
+            scalar_tensor (torch.Tensor): Scalar value tensor.
+
+        Returns:
+            torch.Tensor: Elementwise difference.
+
+        Note:
+            ``data`` must be nonempty and non-scalar.
+        """
         return _sub_scalar_kernel[(int(get_logical_neuron_cores()),)](
             data, _scalar_tensor(scalar_tensor), data.numel()
         )
 
     @nki_op("torch_neuronx::mul_scalar", mutates_args={})
     def mul_scalar_nki(data: torch.Tensor, scalar_tensor: torch.Tensor) -> torch.Tensor:
+        """Apply scalar multiplication with an NKI kernel.
+
+        Args:
+            data (torch.Tensor): Input tensor.
+            scalar_tensor (torch.Tensor): Scalar value tensor.
+
+        Returns:
+            torch.Tensor: Elementwise product.
+
+        Note:
+            ``data`` must be nonempty and non-scalar.
+        """
         return _mul_scalar_kernel[(int(get_logical_neuron_cores()),)](
             data, _scalar_tensor(scalar_tensor), data.numel()
         )
 
     @nki_op("torch_neuronx::div_scalar", mutates_args={})
     def div_scalar_nki(data: torch.Tensor, scalar_tensor: torch.Tensor) -> torch.Tensor:
+        """Apply scalar division with an NKI kernel.
+
+        Args:
+            data (torch.Tensor): Input tensor.
+            scalar_tensor (torch.Tensor): Scalar divisor tensor.
+
+        Returns:
+            torch.Tensor: Elementwise quotient.
+
+        Note:
+            ``data`` must be nonempty and non-scalar.
+        """
         return _div_scalar_kernel[(int(get_logical_neuron_cores()),)](
             data, _scalar_tensor(scalar_tensor), data.numel()
         )
@@ -71,6 +119,19 @@ try:
     def add_tensor_nki(
         data1: torch.Tensor, data2: torch.Tensor, alpha_tensor: torch.Tensor
     ) -> torch.Tensor:
+        """Apply scaled tensor addition with an NKI kernel.
+
+        Args:
+            data1 (torch.Tensor): Base tensor.
+            data2 (torch.Tensor): Tensor to add.
+            alpha_tensor (torch.Tensor): Scale factor tensor for ``data2``.
+
+        Returns:
+            torch.Tensor: Elementwise scaled sum.
+
+        Note:
+            ``data1`` must be nonempty and non-scalar.
+        """
         return _add_tensor_kernel[(int(get_logical_neuron_cores()),)](
             data1, data2, _scalar_tensor(alpha_tensor), data1.numel()
         )
@@ -79,16 +140,53 @@ try:
     def sub_tensor_nki(
         data1: torch.Tensor, data2: torch.Tensor, alpha_tensor: torch.Tensor
     ) -> torch.Tensor:
+        """Apply scaled tensor subtraction with an NKI kernel.
+
+        Args:
+            data1 (torch.Tensor): Base tensor.
+            data2 (torch.Tensor): Tensor to subtract.
+            alpha_tensor (torch.Tensor): Scale factor tensor for ``data2``.
+
+        Returns:
+            torch.Tensor: Elementwise scaled difference.
+
+        Note:
+            ``data1`` must be nonempty and non-scalar.
+        """
         return _sub_tensor_kernel[(int(get_logical_neuron_cores()),)](
             data1, data2, _scalar_tensor(alpha_tensor), data1.numel()
         )
 
     @nki_op("torch_neuronx::mul_tensor", mutates_args={})
     def mul_tensor_nki(data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
+        """Apply tensor multiplication with an NKI kernel.
+
+        Args:
+            data1 (torch.Tensor): First input tensor.
+            data2 (torch.Tensor): Second input tensor.
+
+        Returns:
+            torch.Tensor: Elementwise product.
+
+        Note:
+            ``data1`` must be nonempty and non-scalar.
+        """
         return _mul_tensor_kernel[(int(get_logical_neuron_cores()),)](data1, data2, data1.numel())
 
     @nki_op("torch_neuronx::div_tensor", mutates_args={})
     def div_tensor_nki(data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
+        """Apply tensor division with an NKI kernel.
+
+        Args:
+            data1 (torch.Tensor): Dividend tensor.
+            data2 (torch.Tensor): Divisor tensor.
+
+        Returns:
+            torch.Tensor: Elementwise quotient.
+
+        Note:
+            ``data1`` must be nonempty and non-scalar.
+        """
         return _div_tensor_kernel[(int(get_logical_neuron_cores()),)](data1, data2, data1.numel())
 
     @nki_op("torch_neuronx::addcdiv", mutates_args={})
@@ -98,6 +196,20 @@ try:
         data2: torch.Tensor,
         value_tensor: torch.Tensor,
     ) -> torch.Tensor:
+        """Apply scaled tensor division and addition with an NKI kernel.
+
+        Args:
+            data (torch.Tensor): Base tensor.
+            data1 (torch.Tensor): Dividend tensor.
+            data2 (torch.Tensor): Divisor tensor.
+            value_tensor (torch.Tensor): Scale factor tensor for the quotient.
+
+        Returns:
+            torch.Tensor: Elementwise result of the scaled quotient and addition.
+
+        Note:
+            ``data`` must be nonempty and non-scalar.
+        """
         return _addcdiv_kernel[(int(get_logical_neuron_cores()),)](
             data, data1, data2, _scalar_tensor(value_tensor), data.numel()
         )
@@ -109,6 +221,20 @@ try:
         data2: torch.Tensor,
         value_tensor: torch.Tensor,
     ) -> torch.Tensor:
+        """Apply scaled tensor multiplication and addition with an NKI kernel.
+
+        Args:
+            data (torch.Tensor): Base tensor.
+            data1 (torch.Tensor): First multiplicand tensor.
+            data2 (torch.Tensor): Second multiplicand tensor.
+            value_tensor (torch.Tensor): Scale factor tensor for the product.
+
+        Returns:
+            torch.Tensor: Elementwise result of the scaled product and addition.
+
+        Note:
+            ``data`` must be nonempty and non-scalar.
+        """
         return _addcmul_kernel[(int(get_logical_neuron_cores()),)](
             data, data1, data2, _scalar_tensor(value_tensor), data.numel()
         )
@@ -119,12 +245,36 @@ try:
         end: torch.Tensor,
         weight_tensor: torch.Tensor,
     ) -> torch.Tensor:
+        """Apply linear interpolation with an NKI kernel.
+
+        Args:
+            data (torch.Tensor): Starting tensor.
+            end (torch.Tensor): Ending tensor.
+            weight_tensor (torch.Tensor): Scalar interpolation weight tensor.
+
+        Returns:
+            torch.Tensor: Elementwise interpolated tensor.
+
+        Note:
+            ``data`` must be nonempty and non-scalar.
+        """
         return _lerp_kernel[(int(get_logical_neuron_cores()),)](
             data, end, _scalar_tensor(weight_tensor), data.numel()
         )
 
     @nki_op("torch_neuronx::sqrt", mutates_args={})
     def sqrt_nki(data: torch.Tensor) -> torch.Tensor:
+        """Apply square roots with an NKI kernel.
+
+        Args:
+            data (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Elementwise square roots.
+
+        Note:
+            ``data`` must be nonempty and non-scalar.
+        """
         return _sqrt_kernel[(int(get_logical_neuron_cores()),)](data, data.numel())
 
     SCALAR_NKI_OPS = {
@@ -181,7 +331,20 @@ def _cast_to_dtype(t: torch.Tensor, target_dtype: torch.dtype) -> torch.Tensor:
 
 # Generic foreach wrappers
 def foreach_scalar_nki(tensors, scalar, op="mul"):
-    """Foreach op with scalar."""
+    """Apply a scalar operation to a tensor sequence.
+
+    Args:
+        tensors (Sequence[torch.Tensor]): Input tensors.
+        scalar (Scalar): Scalar operand.
+        op (str, optional): Operation name. Defaults to ``"mul"``.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Results cast to the first input tensor dtype.
+
+    Note:
+        Uses NKI when kernels are available for tensors with more than one element and a
+        PyTorch fallback otherwise. Empty outputs alias their corresponding input tensors.
+    """
     orig_dtype = tensors[0].dtype
     compute_dtype = torch.result_type(tensors[0], scalar)
     if not isinstance(scalar, torch.Tensor):
@@ -203,7 +366,20 @@ def foreach_scalar_nki(tensors, scalar, op="mul"):
 
 
 def foreach_scalarlist_nki(tensors, scalars, op="mul"):
-    """Foreach op with scalar list."""
+    """Apply paired scalar operations to a tensor sequence.
+
+    Args:
+        tensors (Sequence[torch.Tensor]): Input tensors.
+        scalars (Sequence[Scalar]): Scalar operand for each tensor.
+        op (str, optional): Operation name. Defaults to ``"mul"``.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Results cast to their corresponding input dtypes.
+
+    Note:
+        Scalar-list NKI is disabled, so nonempty tensors use the PyTorch fallback.
+        Empty outputs alias their inputs; pairing stops at the shorter sequence.
+    """
     torch_op = TORCH_OPS[op]
     nki_op_fn = SCALAR_NKI_OPS[op] if _has_nki_elementwise_kernels else None
 
@@ -224,7 +400,21 @@ def foreach_scalarlist_nki(tensors, scalars, op="mul"):
 
 
 def foreach_list_nki(tensors1, tensors2, op="mul", alpha=1):
-    """Foreach op between tensor lists."""
+    """Apply an operation between paired tensor sequences.
+
+    Args:
+        tensors1 (Sequence[torch.Tensor]): First input tensor sequence.
+        tensors2 (Sequence[torch.Tensor]): Second input tensor sequence.
+        op (str, optional): Operation name. Defaults to ``"mul"``.
+        alpha (Scalar, optional): Scale for addition or subtraction. Defaults to ``1``.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Results in the promoted input dtype.
+
+    Note:
+        Uses NKI for eligible equal-shaped tensors and an MLIR fallback otherwise.
+        Empty outputs alias ``tensors1``; pairing stops at the shorter sequence.
+    """
     needs_alpha = op in ("add", "sub")
 
     # Lambda ops for small tensors / MLIR fallback
@@ -272,50 +462,196 @@ def foreach_list_nki(tensors1, tensors2, op="mul", alpha=1):
 
 # Convenience functions for each op
 def foreach_add_scalar_nki(tensors, scalar):
+    """Apply foreach addition with one scalar.
+
+    Args:
+        tensors (Sequence[torch.Tensor]): Input tensors.
+        scalar (Scalar): Scalar to add.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise sums.
+
+    Note:
+        Empty outputs alias their corresponding input tensors.
+    """
     return foreach_scalar_nki(tensors, scalar, "add")
 
 
 def foreach_add_scalarlist_nki(tensors, scalars):
+    """Apply foreach addition with paired scalars.
+
+    Args:
+        tensors (Sequence[torch.Tensor]): Input tensors.
+        scalars (Sequence[Scalar]): Scalar to add to each tensor.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise sums.
+
+    Note:
+        Empty outputs alias their inputs; pairing stops at the shorter sequence.
+    """
     return foreach_scalarlist_nki(tensors, scalars, "add")
 
 
 def foreach_add_list_nki(tensors1, tensors2, alpha=1):
+    """Apply foreach addition between tensor sequences.
+
+    Args:
+        tensors1 (Sequence[torch.Tensor]): Base tensors.
+        tensors2 (Sequence[torch.Tensor]): Tensors to add.
+        alpha (Scalar, optional): Scale for ``tensors2``. Defaults to ``1``.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise scaled sums.
+
+    Note:
+        Empty outputs alias ``tensors1``; pairing stops at the shorter sequence.
+    """
     return foreach_list_nki(tensors1, tensors2, "add", alpha)
 
 
 def foreach_sub_scalar_nki(tensors, scalar):
+    """Apply foreach subtraction with one scalar.
+
+    Args:
+        tensors (Sequence[torch.Tensor]): Input tensors.
+        scalar (Scalar): Scalar to subtract.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise differences.
+
+    Note:
+        Empty outputs alias their corresponding input tensors.
+    """
     return foreach_scalar_nki(tensors, scalar, "sub")
 
 
 def foreach_sub_scalarlist_nki(tensors, scalars):
+    """Apply foreach subtraction with paired scalars.
+
+    Args:
+        tensors (Sequence[torch.Tensor]): Input tensors.
+        scalars (Sequence[Scalar]): Scalar to subtract from each tensor.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise differences.
+
+    Note:
+        Empty outputs alias their inputs; pairing stops at the shorter sequence.
+    """
     return foreach_scalarlist_nki(tensors, scalars, "sub")
 
 
 def foreach_sub_list_nki(tensors1, tensors2, alpha=1):
+    """Apply foreach subtraction between tensor sequences.
+
+    Args:
+        tensors1 (Sequence[torch.Tensor]): Base tensors.
+        tensors2 (Sequence[torch.Tensor]): Tensors to subtract.
+        alpha (Scalar, optional): Scale for ``tensors2``. Defaults to ``1``.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise scaled differences.
+
+    Note:
+        Empty outputs alias ``tensors1``; pairing stops at the shorter sequence.
+    """
     return foreach_list_nki(tensors1, tensors2, "sub", alpha)
 
 
 def foreach_mul_scalar_nki(tensors, scalar):
+    """Apply foreach multiplication with one scalar.
+
+    Args:
+        tensors (Sequence[torch.Tensor]): Input tensors.
+        scalar (Scalar): Scalar multiplier.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise products.
+
+    Note:
+        Empty outputs alias their corresponding input tensors.
+    """
     return foreach_scalar_nki(tensors, scalar, "mul")
 
 
 def foreach_mul_scalarlist_nki(tensors, scalars):
+    """Apply foreach multiplication with paired scalars.
+
+    Args:
+        tensors (Sequence[torch.Tensor]): Input tensors.
+        scalars (Sequence[Scalar]): Scalar multiplier for each tensor.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise products.
+
+    Note:
+        Empty outputs alias their inputs; pairing stops at the shorter sequence.
+    """
     return foreach_scalarlist_nki(tensors, scalars, "mul")
 
 
 def foreach_mul_list_nki(tensors1, tensors2):
+    """Apply foreach multiplication between tensor sequences.
+
+    Args:
+        tensors1 (Sequence[torch.Tensor]): First input tensors.
+        tensors2 (Sequence[torch.Tensor]): Second input tensors.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise products.
+
+    Note:
+        Empty outputs alias ``tensors1``; pairing stops at the shorter sequence.
+    """
     return foreach_list_nki(tensors1, tensors2, "mul")
 
 
 def foreach_div_scalar_nki(tensors, scalar):
+    """Apply foreach division by one scalar.
+
+    Args:
+        tensors (Sequence[torch.Tensor]): Dividend tensors.
+        scalar (Scalar): Scalar divisor.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise quotients.
+
+    Note:
+        Empty outputs alias their corresponding input tensors.
+    """
     return foreach_scalar_nki(tensors, scalar, "div")
 
 
 def foreach_div_scalarlist_nki(tensors, scalars):
+    """Apply foreach division by paired scalars.
+
+    Args:
+        tensors (Sequence[torch.Tensor]): Dividend tensors.
+        scalars (Sequence[Scalar]): Scalar divisor for each tensor.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise quotients.
+
+    Note:
+        Empty outputs alias their inputs; pairing stops at the shorter sequence.
+    """
     return foreach_scalarlist_nki(tensors, scalars, "div")
 
 
 def foreach_div_list_nki(tensors1, tensors2):
+    """Apply foreach division between tensor sequences.
+
+    Args:
+        tensors1 (Sequence[torch.Tensor]): Dividend tensors.
+        tensors2 (Sequence[torch.Tensor]): Divisor tensors.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise quotients.
+
+    Note:
+        Empty outputs alias ``tensors1``; pairing stops at the shorter sequence.
+    """
     return foreach_list_nki(tensors1, tensors2, "div")
 
 
@@ -323,7 +659,18 @@ def foreach_div_list_nki(tensors1, tensors2):
 
 
 def foreach_sqrt_nki(tensors):
-    """Foreach sqrt with MLIR fallback."""
+    """Apply foreach square roots with an MLIR fallback.
+
+    Args:
+        tensors (Sequence[torch.Tensor]): Input tensors.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise square roots.
+
+    Note:
+        Uses NKI only for tensors containing more than one element. Empty outputs
+        alias their corresponding input tensors.
+    """
     result = []
     for t in tensors:
         if t.numel() == 0:
@@ -420,21 +767,77 @@ def _foreach_addcop_scalarlist_nki(self, tensor1, tensor2, scalars, nki_fn, torc
 
 
 def foreach_addcdiv_scalar_nki(self, tensor1, tensor2, value=1):
+    """Apply foreach scaled division and addition with one scalar.
+
+    Args:
+        self (Sequence[torch.Tensor]): Base tensors.
+        tensor1 (Sequence[torch.Tensor]): Dividend tensors.
+        tensor2 (Sequence[torch.Tensor]): Divisor tensors.
+        value (Scalar, optional): Quotient scale. Defaults to ``1``.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise scaled quotients added to ``self``.
+
+    Note:
+        Empty outputs alias ``self``; pairing stops at the shortest tensor sequence.
+    """
     _nki_fn = addcdiv_nki if _has_nki_elementwise_kernels else None
     return _foreach_addcop_scalar_nki(self, tensor1, tensor2, value, _nki_fn, torch.div)
 
 
 def foreach_addcdiv_scalarlist_nki(self, tensor1, tensor2, scalars):
+    """Apply foreach scaled division and addition with paired scalars.
+
+    Args:
+        self (Sequence[torch.Tensor]): Base tensors.
+        tensor1 (Sequence[torch.Tensor]): Dividend tensors.
+        tensor2 (Sequence[torch.Tensor]): Divisor tensors.
+        scalars (Sequence[Scalar]): Quotient scale for each tensor tuple.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise scaled quotients added to ``self``.
+
+    Note:
+        Empty outputs alias ``self``; pairing stops at the shortest sequence.
+    """
     _nki_fn = addcdiv_nki if _has_nki_elementwise_kernels else None
     return _foreach_addcop_scalarlist_nki(self, tensor1, tensor2, scalars, _nki_fn, torch.div)
 
 
 def foreach_addcmul_scalar_nki(self, tensor1, tensor2, value=1):
+    """Apply foreach scaled multiplication and addition with one scalar.
+
+    Args:
+        self (Sequence[torch.Tensor]): Base tensors.
+        tensor1 (Sequence[torch.Tensor]): First multiplicand tensors.
+        tensor2 (Sequence[torch.Tensor]): Second multiplicand tensors.
+        value (Scalar, optional): Product scale. Defaults to ``1``.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise scaled products added to ``self``.
+
+    Note:
+        Empty outputs alias ``self``; pairing stops at the shortest tensor sequence.
+    """
     _nki_fn = addcmul_nki if _has_nki_elementwise_kernels else None
     return _foreach_addcop_scalar_nki(self, tensor1, tensor2, value, _nki_fn, torch.mul)
 
 
 def foreach_addcmul_scalarlist_nki(self, tensor1, tensor2, scalars):
+    """Apply foreach scaled multiplication and addition with paired scalars.
+
+    Args:
+        self (Sequence[torch.Tensor]): Base tensors.
+        tensor1 (Sequence[torch.Tensor]): First multiplicand tensors.
+        tensor2 (Sequence[torch.Tensor]): Second multiplicand tensors.
+        scalars (Sequence[Scalar]): Product scale for each tensor tuple.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise scaled products added to ``self``.
+
+    Note:
+        Empty outputs alias ``self``; pairing stops at the shortest sequence.
+    """
     _nki_fn = addcmul_nki if _has_nki_elementwise_kernels else None
     return _foreach_addcop_scalarlist_nki(self, tensor1, tensor2, scalars, _nki_fn, torch.mul)
 
@@ -443,7 +846,20 @@ def foreach_addcmul_scalarlist_nki(self, tensor1, tensor2, scalars):
 
 
 def foreach_lerp_scalar_nki(self, tensors1, weight):
-    """Foreach lerp with scalar weight, with MLIR fallback."""
+    """Linearly interpolate tensor pairs with one scalar weight.
+
+    Args:
+        self (Sequence[torch.Tensor]): Starting tensors.
+        tensors1 (Sequence[torch.Tensor]): Ending tensors.
+        weight (Scalar): Shared interpolation weight.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Interpolated tensors cast to the first input dtype.
+
+    Note:
+        Uses NKI for eligible tensors and an MLIR fallback otherwise. Empty outputs
+        alias ``self``; pairing stops at the shorter tensor sequence.
+    """
     orig_dtype = self[0].dtype
     compute_dtype = torch.result_type(self[0], weight)
 
@@ -472,7 +888,20 @@ def foreach_lerp_scalar_nki(self, tensors1, weight):
 
 
 def foreach_lerp_scalarlist_nki(self, tensors1, weights):
-    """Foreach lerp with scalar list weights, with MLIR fallback."""
+    """Linearly interpolate tensor pairs with paired scalar weights.
+
+    Args:
+        self (Sequence[torch.Tensor]): Starting tensors.
+        tensors1 (Sequence[torch.Tensor]): Ending tensors.
+        weights (Sequence[Scalar]): Interpolation weight for each tensor pair.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Interpolated tensors cast to their input dtypes.
+
+    Note:
+        Uses NKI for eligible tensors and an MLIR fallback otherwise. Empty outputs
+        alias ``self``; pairing stops at the shortest sequence.
+    """
     _nki_fn = lerp_nki if _has_nki_elementwise_kernels else None
     result = []
     for s, t, w in zip(self, tensors1, weights, strict=False):
@@ -494,7 +923,20 @@ def foreach_lerp_scalarlist_nki(self, tensors1, weights):
 
 
 def foreach_lerp_list_nki(self, tensors1, weights):
-    """Foreach lerp with tensor list weights, with MLIR fallback."""
+    """Linearly interpolate tensor pairs with tensor weights.
+
+    Args:
+        self (Sequence[torch.Tensor]): Starting tensors.
+        tensors1 (Sequence[torch.Tensor]): Ending tensors.
+        weights (Sequence[torch.Tensor]): Interpolation weights.
+
+    Returns:
+        tuple[torch.Tensor, ...]: Elementwise interpolated tensors.
+
+    Note:
+        Uses the MLIR fallback because the NKI kernel accepts only scalar weights.
+        Empty outputs alias ``self``; pairing stops at the shortest sequence.
+    """
     # Weight tensors are per-element tensors, use scalar NKI kernel per pair
     _nki_fn = lerp_nki if _has_nki_elementwise_kernels else None
     result = []

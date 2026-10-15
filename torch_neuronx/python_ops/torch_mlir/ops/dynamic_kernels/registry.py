@@ -16,7 +16,28 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DynamicNkiEntry:
-    """Adapter for a dynamic-shape NKI kernel."""
+    """Describe compilation, eligibility, and I/O for a dynamic NKI kernel.
+
+    Args:
+        compile_fn (Callable): Function returning HLO bytes and a cache key for a compile key.
+        can_handle (Callable): Predicate that accepts or declines an operation invocation.
+        prepare_io (Callable): Function returning inputs, outputs, and the runtime dynamic size.
+        reshape_output (Callable, optional): Function restoring the operation's output shape.
+            Defaults to ``None``.
+        compile_key_fn (Callable, optional): Function deriving dimensions baked into the NEFF.
+            Defaults to ``None``.
+        run_fn (Callable, optional): Composite execution path that may return ``None`` to
+            fall through.
+            Defaults to ``None``.
+        _compiled (dict, optional): Per-key HLO-byte and cache-key tuples. Defaults to
+            an empty dictionary.
+        _exec_count (int, optional): Number of recorded dynamic executions. Defaults to ``0``.
+        _exec_ms (set, optional): Distinct recorded runtime dynamic sizes. Defaults to an empty set.
+
+    Note:
+        Execution instrumentation distinguishes a dynamic NEFF run from silent CPU fallback
+        or default lowering.
+    """
 
     # compile_fn(compile_key) -> (hlo_bytes, cache_key). compile_key = dims baked
     # into NEFF (everything except runtime-dynamic M). Memoized per compile_key.
@@ -47,11 +68,27 @@ class DynamicNkiEntry:
     _exec_ms: set = field(default_factory=set, repr=False)
 
     def record_exec(self, actual_m: int):
+        """Record one dynamic-kernel execution and its runtime row count.
+
+        Args:
+            actual_m (int): Runtime dynamic leading-dimension size.
+        """
         self._exec_count += 1
         self._exec_ms.add(int(actual_m))
 
     def get_compiled(self, compile_key=None) -> tuple[bytes, str]:
-        """Lazily compile the dynamic kernel for `compile_key`, memoized per key."""
+        """Compile or retrieve the dynamic kernel for a compile key.
+
+        Args:
+            compile_key (object, optional): Dimensions and attributes baked into the NEFF.
+                Defaults to ``None``.
+
+        Returns:
+            tuple: Compiled HLO bytes and cache key.
+
+        Note:
+            Compilation is memoized once per distinct key, including the single ``None`` key.
+        """
         if compile_key not in self._compiled:
             logger.debug(
                 "dynamic NKI get_compiled: memo MISS key=%s -> running compile_fn=%s",
@@ -77,10 +114,26 @@ _registry: dict[str, DynamicNkiEntry] = {}
 
 
 def register_dynamic_nki(op_name: str, entry: DynamicNkiEntry):
+    """Register a dynamic NKI entry under a dispatch key.
+
+    Args:
+        op_name (str): Short operation name or synthetic dispatch key.
+        entry (DynamicNkiEntry): Entry to store in the process-wide registry.
+    """
     _registry[op_name] = entry
 
 
 def get_dynamic_nki_entry(op_name: str) -> DynamicNkiEntry | None:
+    """Return a registered dynamic NKI entry when dynamic dispatch permits it.
+
+    Args:
+        op_name (str): Short operation name or synthetic dispatch key to look up.
+
+    Returns:
+        DynamicNkiEntry or None: Registered entry, or ``None`` when dynamic NKI
+            kernels are disabled, the optional allowlist excludes the key, or the key
+            is unregistered.
+    """
     if os.environ.get("TORCH_NEURONX_USE_DYNAMIC_NKI_KERNELS") != "1":
         return None
     # Minimal list of dynamic-NKI kernels to (a) avoid recompilation on the pure-TP4
@@ -102,11 +155,16 @@ def get_dynamic_nki_entry(op_name: str) -> DynamicNkiEntry | None:
 
 
 def get_dynamic_nki_usage() -> dict[str, dict]:
-    """Report the dynamic NKI kernels that ran in this process, per ATen op.
+    """Report dynamic NKI kernels executed by the current process.
 
-    An op appears only after it executes. ``kernels`` names the NEFFs it compiled; a
-    composite op (dim-0 cat) has none of its own, because it runs other ops' kernels.
-    Not flag-gated: the registry is already empty when the feature is off.
+    Returns:
+        dict: Per-operation dictionaries with ``exec_count``, ``neffs``, ``kernels``,
+            ``m_min``, ``m_max``, and ``m_distinct`` keys.
+
+    Note:
+        Operations appear only after execution; composite operations list no kernels of their
+        own. This query is not feature-flag gated because feature-off dispatch does not record
+        executions.
     """
     usage = {}
     for op_name, entry in _registry.items():

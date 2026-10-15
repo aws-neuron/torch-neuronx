@@ -32,7 +32,7 @@ def _split_copy_fn(input_tensor, split_sizes=None, dim=0, out=None):
 
 @neuron_op("aten::split_with_sizes_copy.out", disable_dtype_autocast=True, priority=90)
 class SplitWithSizesCopyMLIR(TorchMlirOpImpl):
-    """MLIR-based split_with_sizes_copy that compiles to a single kernel."""
+    """Implement fused ``split_with_sizes_copy.out`` with Torch-MLIR."""
 
     def __init__(self):
         super().__init__(
@@ -44,10 +44,15 @@ class SplitWithSizesCopyMLIR(TorchMlirOpImpl):
         )
 
     def translate_args(self, *args, **kwargs):
-        """Translate ATen split_with_sizes_copy.out args to kernel format.
+        """Translate raw ATen split arguments into kernel arguments.
 
-        ATen schema: (input, split_sizes, dim, *, out)
-        Kernel expects: (input_tensor, split_sizes=..., dim=..., out=...)
+        Args:
+            *args (Any): Input tensor, split sizes, and optional dimension.
+            **kwargs (Any): Keyword dimension and output tensors.
+
+        Returns:
+            tuple: A one-item positional-argument tuple and a dictionary of static
+                split arguments and output tensors.
         """
         input_tensor = args[0]
         split_sizes = tuple(int(s) for s in args[1]) if len(args) > 1 else ()
@@ -56,7 +61,15 @@ class SplitWithSizesCopyMLIR(TorchMlirOpImpl):
         return (input_tensor,), {"split_sizes": split_sizes, "dim": dim, "out": out}
 
     def can_handle(self, *args, **kwargs) -> bool:
-        """Handle when input is on Neuron device."""
+        """Check whether the input and outputs use a Neuron device.
+
+        Args:
+            *args (Any): Positional split arguments with the input tensor first.
+            **kwargs (Any): Keyword arguments containing the output tensors.
+
+        Returns:
+            bool: ``True`` when the input and every output are Neuron tensors.
+        """
         input_tensor = args[0]
         if not isinstance(input_tensor, torch.Tensor):
             return False
@@ -69,9 +82,18 @@ class SplitWithSizesCopyMLIR(TorchMlirOpImpl):
         return all(t.device.type == "neuron" for t in out)
 
     def execute(self, *args, **kwargs):
-        """Execute split_with_sizes_copy using MLIR backend.
+        """Execute fused split copies through Torch-MLIR.
 
-        Receives translated args: (input_tensor,), {split_sizes, dim, out}
+        Args:
+            *args (Any): Translated arguments with the input tensor first.
+            **kwargs (Any): Static split sizes, dimension, and output tensors.
+
+        Returns:
+            ExecutionResult: Success with ``output=None`` for empty work or completed
+                output writes; otherwise failure details.
+
+        Note:
+            Non-contiguous inputs are materialized contiguously before kernel execution.
         """
         input_tensor = args[0]
         split_sizes = kwargs.get("split_sizes", ())

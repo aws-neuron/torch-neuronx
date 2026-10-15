@@ -2,7 +2,7 @@ from .base import Operation
 
 
 class IndexOp(Operation):
-    """Index operation"""
+    """Provide the ATen index operation with an MLIR implementation."""
 
     def _setup_implementations(self):
         from .torch_mlir.ops.index import IndexMLIRImpl
@@ -11,6 +11,11 @@ class IndexOp(Operation):
 
     @property
     def op_name(self) -> str:
+        """Return the ATen operation name.
+
+        Returns:
+            str: ``"index"``.
+        """
         return "index"
 
 

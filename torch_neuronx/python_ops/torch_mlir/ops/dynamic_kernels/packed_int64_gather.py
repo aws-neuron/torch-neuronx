@@ -23,11 +23,20 @@ _SUPPORTED_LNCS = (1, 2)
 
 @nki.jit
 def packed_int64_dynamic_gather_kernel(grouped_in, control):
-    """Gather packed low words in fixed per-program tiles.
+    """Gather packed int64 low words in fixed per-program tiles.
 
-    Each program owns an equal-sized disjoint range. ``control`` contains its
-    runtime bulk-tile count and packed/output offsets. For odd lengths, a final
-    synchronized iteration fills the center element.
+    Args:
+        grouped_in (nl.NkiTensor): Interleaved int32 low and high words in shared HBM.
+        control (nl.NkiTensor): Per-program bulk counts and packed/output offsets.
+
+    Returns:
+        nl.NkiTensor: Contiguous int32 tensor containing the gathered low words.
+
+    Note:
+        With two programs, the programs write equal disjoint ranges around the center.
+        For odd lengths, an extra synchronized iteration writes the center on one program
+        and rewrites the last element on the other. With one program, the normal bulk and
+        tail paths gather every low word without the extra iteration.
     """
     num_progs = nl.num_programs(0)
     prog_id = nl.program_id(0)
@@ -46,6 +55,11 @@ def packed_int64_dynamic_gather_kernel(grouped_in, control):
     nisa.register_load(extra_count_reg, control_sbuf[0:1, 5:6])
 
     def bulk_body(_i):
+        """Copy one packed bulk tile into the contiguous output.
+
+        Args:
+            _i (int): Unused loop iteration index supplied by ``nl.fori_loop``.
+        """
         packed_tile = nl.ndarray((tile_size, 2), dtype=nl.int32, buffer=nl.sbuf)
         nisa.dma_copy(
             dst=packed_tile,
@@ -103,6 +117,12 @@ def packed_int64_dynamic_gather_kernel(grouped_in, control):
     )
 
     def extra_body(_i):
+        """Run one synchronized odd-length copy.
+
+        Args:
+            _i (int): Unused loop index; one program writes the center while the other
+                rewrites its final element.
+        """
         extra_low_word = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
         nisa.dma_copy(
             dst=extra_low_word,
@@ -129,7 +149,19 @@ def packed_int64_dynamic_gather_kernel(grouped_in, control):
 
 @nki.jit
 def packed_int64_dynamic_gather_small_kernel(grouped_in, control):
-    """Gather fewer than 128 packed low words with one-element accesses."""
+    """Gather fewer than 128 packed int64 low words element by element.
+
+    Args:
+        grouped_in (nl.NkiTensor): Interleaved int32 low and high words in shared HBM.
+        control (nl.NkiTensor): Per-program element counts and packed/output offsets.
+
+    Returns:
+        nl.NkiTensor: Contiguous int32 tensor containing the gathered low words.
+
+    Note:
+        For odd lengths, an extra synchronized iteration writes the center on one program
+        and rewrites the last element on the other.
+    """
     prog_id = nl.program_id(0)
     result = nl.ndarray((grouped_in.shape[0] // 2,), dtype=nl.int32, buffer=nl.shared_hbm)
 
@@ -145,6 +177,11 @@ def packed_int64_dynamic_gather_small_kernel(grouped_in, control):
     nisa.register_load(extra_count_reg, control_sbuf[0:1, 3:4])
 
     def body(_i):
+        """Copy one packed low word into the contiguous output.
+
+        Args:
+            _i (int): Unused loop iteration index supplied by ``nl.fori_loop``.
+        """
         low_word = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
         nisa.dma_copy(
             dst=low_word,
@@ -170,6 +207,12 @@ def packed_int64_dynamic_gather_small_kernel(grouped_in, control):
     nl.fori_loop(0, numel_reg, body)
 
     def extra_body(_i):
+        """Run one synchronized odd-length copy.
+
+        Args:
+            _i (int): Unused loop index; one program writes the center while the other
+                rewrites its final element.
+        """
         extra_low_word = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
         nisa.dma_copy(
             dst=extra_low_word,
@@ -200,6 +243,15 @@ _wrapped_small_gather = wrap_nki(packed_int64_dynamic_gather_small_kernel)
 
 @nki_op("nki_kernels::packed_int64_dynamic_gather", mutates_args={})
 def packed_int64_dynamic_gather(grouped_in: torch.Tensor, control: torch.Tensor) -> torch.Tensor:
+    """Launch the tiled packed-int64 low-word gather.
+
+    Args:
+        grouped_in (torch.Tensor): Interleaved int32 low and high words.
+        control (torch.Tensor): Per-program tiled gather controls.
+
+    Returns:
+        torch.Tensor: Contiguous tensor of gathered low words.
+    """
     return _wrapped_gather[(_LNC,)](grouped_in, control)
 
 
@@ -207,6 +259,15 @@ def packed_int64_dynamic_gather(grouped_in: torch.Tensor, control: torch.Tensor)
 def packed_int64_dynamic_gather_small(
     grouped_in: torch.Tensor, control: torch.Tensor
 ) -> torch.Tensor:
+    """Launch the small packed-int64 low-word gather.
+
+    Args:
+        grouped_in (torch.Tensor): Interleaved int32 low and high words.
+        control (torch.Tensor): Per-program elementwise gather controls.
+
+    Returns:
+        torch.Tensor: Contiguous tensor of gathered low words.
+    """
     return _wrapped_small_gather[(_LNC,)](grouped_in, control)
 
 
@@ -283,7 +344,20 @@ def _packed_gather_control(numel: int, device: torch.device) -> torch.Tensor:
 
 
 def try_run_dynamic_packed_int64_gather(grouped, out, numel: int) -> bool:
-    """Run the dynamic packed gather, or return False for an unsupported LNC."""
+    """Queue the dynamic packed-int64 gather when the LNC is supported.
+
+    Args:
+        grouped (torch.Tensor): Interleaved int32 low and high words.
+        out (torch.Tensor): Contiguous destination written by the queued compiled graph.
+        numel (int): Number of low words to gather.
+
+    Returns:
+        bool: ``True`` after scheduling, or ``False`` when the logical Neuron core count is
+            unsupported.
+
+    Note:
+        Execution is asynchronous unless ``NEURON_LAUNCH_BLOCKING=1``.
+    """
     if _LNC not in _SUPPORTED_LNCS:
         return False
 

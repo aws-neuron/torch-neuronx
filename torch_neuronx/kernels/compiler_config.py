@@ -7,10 +7,20 @@ from ..utils import get_logical_neuron_cores, get_platform_target
 
 @dataclass
 class CompilerConfig:
-    """Configuration for neuronx-cc compiler.
+    """Configure a ``neuronx-cc`` invocation.
 
-    This class encapsulates all compiler settings to avoid hardcoding
-    them throughout the codebase.
+    Args:
+        target (str, optional): Target platform. Defaults to the detected platform.
+        model_type (str, optional): Model optimization hint. Defaults to ``transformer``.
+        optimization_level (str, optional): Optimization flag. Defaults to ``-O1``.
+        auto_cast (str, optional): Automatic casting mode. Defaults to ``none``.
+        framework (str, optional): Input framework. Defaults to ``XLA``.
+        lnc (str, optional): Logical NeuronCore count. Defaults to the detected value.
+        extra_flags (list[str], optional): Additional compiler flags. Defaults to an
+            empty list.
+
+    Raises:
+        RuntimeError: If the default target or logical NeuronCore count cannot be detected.
     """
 
     # Target hardware
@@ -40,15 +50,16 @@ class CompilerConfig:
         output_file: str,
         lnc_value: str | None = None,
     ) -> list[str]:
-        """Generate neuronx-cc command line arguments.
+        """Build command-line arguments for ``neuronx-cc``.
 
         Args:
-            input_file: Path to input HLO protobuf file
-            output_file: Path to output NEFF file
-            lnc_value: Override for logical neuron cores (uses self.lnc if not provided)
+            input_file (str): Input HLO or MLIR file path.
+            output_file (str): Output NEFF file path.
+            lnc_value (str | None, optional): Logical NeuronCore override. A falsey value
+                uses ``self.lnc``. Defaults to ``None``.
 
         Returns:
-            List of command line arguments for neuronx-cc
+            list[str]: Compiler arguments beginning with the ``compile`` command.
         """
         args = [
             "compile",

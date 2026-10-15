@@ -248,6 +248,65 @@ func.func @torch.aten.gather$rank0(%arg0: !torch.vtensor<[],bf16>, %arg1: !torch
 
 // -----
 
+// CHECK-LABEL:  func.func @torch.aten.gather$batched(
+// CHECK-SAME:         %[[INPUT:.*]]: !torch.vtensor<[2,8,1,4],f32>,
+// CHECK-SAME:         %[[INDEX:.*]]: !torch.vtensor<[2,3,1,4],si64>) -> !torch.vtensor<[2,3,1,4],f32> {
+// CHECK-DAG:     %[[INPUT_BUILTIN:.*]] = torch_c.to_builtin_tensor %[[INPUT]] : !torch.vtensor<[2,8,1,4],f32> -> tensor<2x8x1x4xf32>
+// CHECK-DAG:     %[[INDEX_BUILTIN:.*]] = torch_c.to_builtin_tensor %[[INDEX]] : !torch.vtensor<[2,3,1,4],si64> -> tensor<2x3x1x4xi64>
+// CHECK-NOT:     stablehlo.iota
+// CHECK:         %[[RESHAPED_INDEX:.*]] = stablehlo.dynamic_reshape %[[INDEX_BUILTIN]]
+// CHECK:         %[[GATHER_INDEX:.*]] = stablehlo.concatenate %[[RESHAPED_INDEX]], dim = 4
+// CHECK:         %[[RESULT:.*]] = "stablehlo.gather"(%[[INPUT_BUILTIN]], %[[GATHER_INDEX]]) <{dimension_numbers = #stablehlo.gather<collapsed_slice_dims = [1], operand_batching_dims = [0, 2, 3], start_indices_batching_dims = [0, 2, 3], start_index_map = [1], index_vector_dim = 4>, slice_sizes = array<i64: 1, 1, 1, 1>}> : (tensor<2x8x1x4xf32>, tensor<2x3x1x4x1xi64>) -> tensor<2x3x1x4xf32>
+// CHECK:         %[[OUTPUT:.*]] = torch_c.from_builtin_tensor %[[RESULT]] : tensor<2x3x1x4xf32> -> !torch.vtensor<[2,3,1,4],f32>
+// CHECK:         return %[[OUTPUT]] : !torch.vtensor<[2,3,1,4],f32>
+func.func @torch.aten.gather$batched(%arg0: !torch.vtensor<[2,8,1,4],f32>, %arg1: !torch.vtensor<[2,3,1,4],si64>) -> !torch.vtensor<[2,3,1,4],f32> {
+  %int1 = torch.constant.int 1
+  %false = torch.constant.bool false
+  %0 = torch.aten.gather %arg0, %int1, %arg1, %false : !torch.vtensor<[2,8,1,4],f32>, !torch.int, !torch.vtensor<[2,3,1,4],si64>, !torch.bool -> !torch.vtensor<[2,3,1,4],f32>
+  return %0 : !torch.vtensor<[2,3,1,4],f32>
+}
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.gather$smaller_batch(
+// CHECK:         stablehlo.dynamic_iota
+// CHECK:         stablehlo.concatenate
+// CHECK:         "stablehlo.gather"
+func.func @torch.aten.gather$smaller_batch(%arg0: !torch.vtensor<[3,8],f32>, %arg1: !torch.vtensor<[2,4],si64>) -> !torch.vtensor<[2,4],f32> {
+  %int1 = torch.constant.int 1
+  %false = torch.constant.bool false
+  %0 = torch.aten.gather %arg0, %int1, %arg1, %false : !torch.vtensor<[3,8],f32>, !torch.int, !torch.vtensor<[2,4],si64>, !torch.bool -> !torch.vtensor<[2,4],f32>
+  return %0 : !torch.vtensor<[2,4],f32>
+}
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.gather$mismatched_batch(
+// CHECK:         stablehlo.dynamic_iota
+// CHECK:         stablehlo.concatenate
+// CHECK:         "stablehlo.gather"{{.*}}collapsed_slice_dims = [0, 1], operand_batching_dims = [2], start_indices_batching_dims = [2], start_index_map = [0, 1], index_vector_dim = 3
+func.func @torch.aten.gather$mismatched_batch(%arg0: !torch.vtensor<[3,8,4],f32>, %arg1: !torch.vtensor<[2,5,4],si64>) -> !torch.vtensor<[2,5,4],f32> {
+  %int1 = torch.constant.int 1
+  %false = torch.constant.bool false
+  %0 = torch.aten.gather %arg0, %int1, %arg1, %false : !torch.vtensor<[3,8,4],f32>, !torch.int, !torch.vtensor<[2,5,4],si64>, !torch.bool -> !torch.vtensor<[2,5,4],f32>
+  return %0 : !torch.vtensor<[2,5,4],f32>
+}
+
+// -----
+
+// CHECK-LABEL:  func.func @torch.aten.gather$dynamic_batch(
+// CHECK:         stablehlo.dynamic_iota
+// CHECK:         stablehlo.concatenate
+// CHECK:         "stablehlo.gather"{{.*}}collapsed_slice_dims = [0, 1], operand_batching_dims = [2], start_indices_batching_dims = [2], start_index_map = [0, 1], index_vector_dim = 3
+func.func @torch.aten.gather$dynamic_batch(%arg0: !torch.vtensor<[?,8,4],f32>, %arg1: !torch.vtensor<[?,3,4],si64>) -> !torch.vtensor<[?,3,4],f32> {
+  %int1 = torch.constant.int 1
+  %false = torch.constant.bool false
+  %0 = torch.aten.gather %arg0, %int1, %arg1, %false : !torch.vtensor<[?,8,4],f32>, !torch.int, !torch.vtensor<[?,3,4],si64>, !torch.bool -> !torch.vtensor<[?,3,4],f32>
+  return %0 : !torch.vtensor<[?,3,4],f32>
+}
+
+// -----
+
 // CHECK-LABEL:  func.func @torch.aten.index_select$rank0(
 // CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[],f32>, %[[ARG1:.*]]: !torch.vtensor<[],si64>) -> !torch.vtensor<[],f32> {
 // CHECK:         return %[[ARG0]] : !torch.vtensor<[],f32>

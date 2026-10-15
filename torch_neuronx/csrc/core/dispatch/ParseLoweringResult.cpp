@@ -76,6 +76,7 @@ std::shared_ptr<DispatchCacheEntry> ParseLoweringResult(const py::object& result
 
   entry->neff_cache_key = lr.cache_key;
   entry->kept_input_indices = lr.kept_input_indices;
+  entry->ir_input_count = lr.ir_input_count;
   entry->kept_output_indices = lr.kept_output_indices;
   entry->output_specs = ParseOutputSpecs(lr.output_specs, /*allow_none_dtype=*/false);
   entry->original_output_specs =
@@ -118,7 +119,7 @@ std::shared_ptr<DispatchCacheEntry> ParseLoweringResult(const py::object& result
   TORCH_NEURONX_DISPATCH_DEBUG(
       "[ParseLoweringResult] parsed successfully", " op_name=", entry->op_name,
       " neff_cache_key=", entry->neff_cache_key, " stablehlo_bytes=", entry->stablehlo_bytes.size(),
-      " kept_inputs=", entry->kept_input_indices.size(),
+      " kept_inputs=", entry->kept_input_indices.size(), " ir_input_count=", entry->ir_input_count,
       " kept_outputs=", entry->kept_output_indices.size(),
       " output_specs=", entry->output_specs.size(),
       " original_output_specs=", entry->original_output_specs.size(),

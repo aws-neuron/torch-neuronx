@@ -39,7 +39,7 @@ class NeuronHooksInterface : public at::PrivateUse1HooksInterface {
   }
 
   // Get the default generator for random number generation
-  at::Generator getDefaultGenerator(c10::DeviceIndex device_index);
+  const at::Generator& getDefaultGenerator(c10::DeviceIndex device_index) const override;
 
   // Get a new generator for a specific device
   at::Generator getNewGenerator(c10::DeviceIndex device_index) const;

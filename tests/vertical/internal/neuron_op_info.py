@@ -109,8 +109,8 @@ def _tensor_from_spec(spec, device, default_dtype):
         dt = dt if dt is not None else default_dtype
         if dt in (torch.long, torch.int32):
             if spec.get("distinct"):
-                # A permutation guarantees each output row receives at most one add,
-                # making the comparison order-independent
+                # Draw each index only once. A repeated index makes an overwrite undefined
+                # and makes the order of an accumulate unknown.
                 low, high = spec.get("low", 0), spec.get("high", 4)
                 n = int(prod(shape))
                 t = (low + torch.randperm(high - low, device=device)[:n]).to(dt).reshape(shape)

@@ -27,6 +27,8 @@ from ..utils import DistributedTester
 WORLD_SIZE = 8
 PP_SIZE = 2
 
+pytestmark = pytest.mark.neuron_cores(WORLD_SIZE)
+
 SCHEDULE_CLASSES = [
     ScheduleGPipe,
     Schedule1F1B,

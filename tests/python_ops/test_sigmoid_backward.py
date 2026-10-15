@@ -181,31 +181,24 @@ class TestSigmoidRegistration:
         dtypes, tensor shapes, sizes, and value ranges.
         """
 
-        def run_sigmoid(device):
-            torch.manual_seed(0)
-            x = generate_test_input(input_shape, value_type, dtype=dtype)
-            x.retain_grad()
+        torch.manual_seed(0)
+        x_cpu = generate_test_input(input_shape, value_type, dtype=dtype).detach()
+        grad_output_cpu = torch.randn_like(x_cpu)
 
-            if device == "neuron":
-                x = x.to(device)
-                x.retain_grad()
-                # Track neuron ops only for neuron device
-                with track_neuron_ops():
-                    output = torch.nn.functional.sigmoid(x)
-                    grad_output = torch.randn_like(output)
-                    output.backward(grad_output)
-            else:
-                output = torch.nn.functional.sigmoid(x)
-                grad_output = torch.randn_like(output)
-                output.backward(grad_output)
+        # CPU reference
+        x_ref = x_cpu.clone().requires_grad_(True)
+        cpu_out = torch.nn.functional.sigmoid(x_ref)
+        cpu_out.backward(grad_output_cpu)
+        cpu_grad = x_ref.grad
 
-            return output, x.grad
+        # Neuron
+        x_neuron = x_cpu.clone().to("neuron").requires_grad_(True)
+        with track_neuron_ops():
+            neuron_out = torch.nn.functional.sigmoid(x_neuron)
+            neuron_out.backward(grad_output_cpu.to("neuron"))
+        neuron_grad = x_neuron.grad
 
-        # Run on both devices
-        neuron_output, neuron_grad = run_sigmoid("neuron")
-        cpu_output, cpu_grad = run_sigmoid("cpu")
-        assert neuron_output.dtype == dtype
-
+        assert neuron_out.dtype == dtype
         torch.testing.assert_close(neuron_grad.cpu(), cpu_grad, atol=atol, rtol=rtol)
         assert_op_runs_on_neuron("aten::sigmoid_backward")
 

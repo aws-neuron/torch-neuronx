@@ -173,6 +173,10 @@ class CompilationCacheKey {
     InvalidateCachedStrings();
   }
 
+  /** @brief True when the key carries IR, so it can address its NEFF by content.
+   *  False for NeffDirectKernelExecution, in both gate settings. */
+  bool HasHloBytes() const { return hlo_bytes_ptr_ != nullptr && !hlo_bytes_ptr_->empty(); }
+
  private:
   // In-memory cache key
   std::string base_key_;

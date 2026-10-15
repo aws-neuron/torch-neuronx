@@ -40,14 +40,14 @@ def _compile_and_run(device):
     class Model(nn.Module):
         def __init__(self):
             super().__init__()
-            self.linear = nn.Linear(64, 32, bias=False, device=device)
+            self.linear = nn.Linear(64, 32, bias=False)
 
         def forward(self, x):
             return self.linear(x)
 
-    compiled = torch.compile(Model(), backend="neuron", fullgraph=True)
+    compiled = torch.compile(Model().to(device), backend="neuron", fullgraph=True)
     with torch.no_grad():
-        compiled(torch.randn(2, 64, device=device))
+        compiled(torch.randn(2, 64).to(device))
     torch.neuron.synchronize()
 
 

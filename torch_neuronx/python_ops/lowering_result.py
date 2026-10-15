@@ -15,21 +15,18 @@ from torch_neuronx._C import LoweringResult  # noqa: F401 — re-export
 
 @dataclass
 class InputSpec:
-    """Describes how one IR input is derived from a raw PyTorch positional arg.
+    """Describe how an IR input derives from a positional PyTorch argument.
 
-    Used within the Python lowering pipeline only (not parsed by C++).
+    Args:
+        source_arg_index (int): Position in the raw positional arguments.
+        source_type (str): Either ``"tensor"`` or ``"tensor_list"``. Defaults to
+            ``"tensor"``.
+        elem_index (int): Tensor-list element to select. Defaults to ``0``.
+        target_dtype (torch.dtype, optional): IR dtype to cast to, or ``None`` when no
+            cast is needed. Defaults to ``None``.
 
-    Attributes:
-        source_arg_index: Position in the raw PyTorch positional args.
-        source_type: How to interpret the raw arg:
-            "tensor"        — arg is already a Tensor
-            "scalar_int"    — arg is a Python int, convert to tensor
-            "scalar_float"  — arg is a Python float, convert to tensor
-            "tensor_list"   — arg is a TensorList, elem_index selects which element
-        elem_index: For tensor_list source_type, which element in the list.
-        target_dtype: torch.dtype the IR expects for this input.
-            If None, no dtype cast is needed (use as-is).
-            If set and differs from the raw tensor's dtype, C++ must cast.
+    Note:
+        This specification is used only by Python lowering and is not parsed by C++ dispatch.
     """
 
     source_arg_index: int
@@ -40,15 +37,18 @@ class InputSpec:
 
 @dataclass
 class KwInputSpec:
-    """Describes how one IR input is derived from a keyword argument.
+    """Describe how an IR input derives from a PyTorch keyword argument.
 
-    Used within the Python lowering pipeline only (not parsed by C++).
+    Args:
+        kwarg_name (str): Name of the raw keyword argument, such as ``"out"``.
+        source_type (str): Either ``"tensor"`` or ``"tensor_list"``. Defaults to
+            ``"tensor"``.
+        elem_index (int): Tensor-list element to select. Defaults to ``0``.
+        target_dtype (torch.dtype, optional): IR dtype to cast to, or ``None`` when no
+            cast is needed. Defaults to ``None``.
 
-    Attributes:
-        kwarg_name: Name of the keyword argument (e.g., "out", "alpha").
-        source_type: Same as InputSpec.source_type.
-        elem_index: Same as InputSpec.elem_index.
-        target_dtype: Same as InputSpec.target_dtype.
+    Note:
+        This specification is used only by Python lowering and is not parsed by C++ dispatch.
     """
 
     kwarg_name: str

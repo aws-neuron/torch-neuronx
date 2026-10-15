@@ -672,6 +672,12 @@ torch_neuronx_cc_test(
 )
 
 torch_neuronx_cc_test(
+    name = "ScalarDeviceMemoryCacheTest",
+    srcs = ["core/allocator/ScalarDeviceMemoryCacheTest.cpp"],
+    deps = ["//:runtime"],
+)
+
+torch_neuronx_cc_test(
 name = "FunctionPruneUtilsTest",
     srcs = ["core/concatenation/FunctionPruneUtilsTest.cpp"],
     deps = [

@@ -11,6 +11,8 @@ Two target modes (index and probability) are unified behind a single
 traced function, branching on a shape comparison resolved at trace time.
 """
 
+import sys
+
 import torch
 from torch._guards import detect_fake_mode
 from torch._refs.nn.functional import TensorLikeType
@@ -41,7 +43,23 @@ def nll_loss(
     output: TensorLikeType | None = None,
     total_weight: TensorLikeType | None = None,
 ):
-    """NLL loss forward using PyTorch decomposition."""
+    """Compute NLL loss with the PyTorch decomposition.
+
+    Args:
+        input (torch.Tensor): Input log-probability tensor.
+        target (torch.Tensor): Target class-index tensor.
+        weight (torch.Tensor or None): Per-class weights, or ``None`` for no weighting.
+        reduction (int): Reduction mode encoded by the ATen schema.
+        ignore_index (int): Target index excluded from the loss.
+        output (torch.Tensor, optional): Optional out-variant tensor. Defaults to ``None``.
+        total_weight (torch.Tensor, optional): Optional weight output. Defaults to ``None``.
+
+    Returns:
+        tuple: Loss output and total weight from ``nll_loss_forward``.
+
+    Raises:
+        ValueError: If one-dimensional input has an incompatible target size.
+    """
     if input.dim() == 1 and target.dim() == 1 and target.size(0) != 1:
         raise ValueError("For 1D input, 1D target must have size 1")
     return torch.ops.aten.nll_loss_forward(input, target, weight, reduction, ignore_index)
@@ -62,7 +80,21 @@ def nll_loss_backward(
     total_weight: TensorLikeType,
     grad_input: TensorLikeType | None = None,
 ):
-    """NLL loss backward using PyTorch decomposition."""
+    """Compute the NLL loss input gradient with the PyTorch decomposition.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the reduced loss.
+        input (torch.Tensor): Input log-probability tensor.
+        target (torch.Tensor): Target class-index tensor.
+        weight (torch.Tensor or None): Per-class weights, or ``None`` for no weighting.
+        reduction (int): Reduction mode encoded by the ATen schema.
+        ignore_index (int): Target index excluded from the loss.
+        total_weight (torch.Tensor): Total class weight from the forward pass.
+        grad_input (torch.Tensor, optional): Optional out-variant tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Gradient with respect to ``input``.
+    """
     return torch.ops.aten.nll_loss_backward(
         grad_output, input, target, weight, reduction, ignore_index, total_weight
     )
@@ -193,12 +225,26 @@ def cross_entropy_loss(
     ignore_index: int = -100,
     label_smoothing: float = 0.0,
 ):
-    """Validate the arguments and return the traced ``_ce_fwd``.
+    """Validate cross-entropy inputs and select the traced forward.
 
-    The spatial flatten and the no-batch unsqueeze happen inside ``_ce_fwd``, not
-    here, because the cached path feeds the NEFF the raw ATen input. Flattening here
-    would compile a NEFF that expects the flattened layout while C++ hands it the
-    row-major buffer, giving a wrong loss for inputs with more than 2 dimensions.
+    Args:
+        input (torch.Tensor): Logits in the raw ATen input layout.
+        target (torch.Tensor): Class indices or class probabilities.
+        weight (torch.Tensor, optional): Per-class weights. Defaults to ``None``.
+        reduction (int, optional): ATen reduction mode. Defaults to ``1``.
+        ignore_index (int, optional): Excluded class index. Defaults to ``-100``.
+        label_smoothing (float, optional): Uniform smoothing amount. Defaults to ``0.0``.
+
+    Returns:
+        tuple: Traced function, raw arguments, and empty keyword arguments.
+
+    Raises:
+        RuntimeError: If shapes, weights, or ``label_smoothing`` are invalid.
+        IndexError: If a nonignored class index is outside the class range during execution.
+
+    Note:
+        Spatial flattening and no-batch expansion occur inside the traced function so the cached
+            NEFF consumes the raw input layout.
     """
     _validate_ce_inputs(input, target, weight, ignore_index, label_smoothing)
     return (
@@ -463,11 +509,23 @@ def cross_entropy_loss_backward(
     ignore_index: int = -100,
     label_smoothing: float = 0.0,
 ):
-    """Preprocessing (eager): detect shapes, return ``_ce_bwd``.
+    """Select the traced cross-entropy backward computation.
 
-    ``input`` is the first positional arg to match the autograd formula's
-    calling convention. All reshaping is deferred to the traced function so
-    the output shape matches input without aliasing its storage.
+    Args:
+        input (torch.Tensor): Saved logits from the forward pass.
+        grad_output (torch.Tensor): Gradient of the loss output.
+        target (torch.Tensor): Class indices or class probabilities.
+        weight (torch.Tensor, optional): Per-class weights. Defaults to ``None``.
+        reduction (int, optional): ATen reduction mode. Defaults to ``1``.
+        ignore_index (int, optional): Excluded class index. Defaults to ``-100``.
+        label_smoothing (float, optional): Uniform smoothing amount. Defaults to ``0.0``.
+
+    Returns:
+        tuple: Traced function, raw arguments, and empty keyword arguments.
+
+    Note:
+        Reshaping is deferred to the traced function to preserve input shape without aliasing its
+            storage.
     """
     return (
         _ce_bwd,
@@ -743,6 +801,23 @@ class _CrossEntropyAutograd(torch.autograd.Function):
         # _op_dk(PrivateUse1) goes straight to the C++ cached kernel, skipping the
         # autograd key (this Function IS the autograd) and the DTensor key (handled
         # in cross_entropy_autograd_privateuse1).
+        """Run the cached cross-entropy kernel and save backward inputs.
+
+        Args:
+            ctx (Any): Autograd context used to save tensors and static arguments.
+            input (torch.Tensor): Logits tensor.
+            target (torch.Tensor): Class indices or class probabilities.
+            weight (torch.Tensor or None): Optional per-class weights.
+            reduction (int): Reduction mode encoded by the ATen schema.
+            ignore_index (int): Class index excluded for index targets.
+            label_smoothing (float): Amount of uniform label smoothing.
+
+        Returns:
+            torch.Tensor: Cross-entropy loss from the PrivateUse1 kernel.
+
+        Note:
+            Saves only ``input``, ``target``, and ``weight`` to limit memory use.
+        """
         output = torch.ops.aten.cross_entropy_loss.default._op_dk(
             torch._C.DispatchKey.PrivateUse1,
             input,
@@ -760,6 +835,16 @@ class _CrossEntropyAutograd(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Run the cached chunked cross-entropy backward kernel.
+
+        Args:
+            ctx (Any): Autograd context containing saved forward inputs.
+            grad_output (torch.Tensor): Gradient of the loss output.
+
+        Returns:
+            tuple: Six entries: the ``input`` gradient, then ``None`` for ``target``, ``weight``,
+            ``reduction``, ``ignore_index``, and ``label_smoothing``.
+        """
         input, target, weight = ctx.saved_tensors
 
         # Same C++ cached path as the forward; requires the schema declared above.
@@ -781,21 +866,44 @@ class _CrossEntropyAutograd(torch.autograd.Function):
 
 
 def cross_entropy_autograd_privateuse1(*args, **kwargs):
-    """AutogradPrivateUse1 implementation for cross_entropy_loss.
+    """Attach cross-entropy autograd or decompose distributed inputs.
 
-    This is where the grad_fn is attached (the forward itself is now the pure
-    C++ cached kernel, which has no autograd).
+    Args:
+        *args (Any): Positional ``cross_entropy_loss`` arguments.
+        **kwargs (Any): Keyword arguments forwarded to the upstream decomposition during
+            internal fake-tensor compilation; otherwise unused.
 
-    For DTensor inputs (TP training with loss_parallel), decomposes into
-    log_softmax + nll_loss so upstream loss_parallel() handlers process them
-    efficiently on sharded logits with autograd tracking.
+    Returns:
+        torch.Tensor: Loss with the appropriate autograd behavior.
 
-    For plain Tensor inputs, applies _CrossEntropyAutograd (which runs the
-    forward on the C++ cached PrivateUse1 kernel and attaches our memory-lean
-    chunked backward as the grad_fn).
+    Raises:
+        DataDependentOutputException: If fake-tensor tracing requires an eager graph break.
+
+    Note:
+        DTensor logits decompose to ``log_softmax`` and ``nll_loss`` for sharded loss processing;
+            this branch does not forward ``label_smoothing``. Plain tensors use a memory-lean
+            chunked backward, while fake tensors use the upstream decomposition.
     """
     import torch._C
     from torch.distributed.tensor import DTensor, Replicate
+
+    mode_key_type = getattr(torch._C, "_TorchDispatchModeKey", None)
+    fake_mode_key = getattr(mode_key_type, "FAKE", None)
+    get_dispatch_mode = getattr(torch._C, "_get_dispatch_mode", None)
+    module_auto_compile = sys.modules.get("torch_neuronx.module_auto_compile")
+    internal_compile_active = getattr(module_auto_compile, "_internal_module_compile_active", None)
+    if (
+        callable(internal_compile_active)
+        and internal_compile_active()
+        and fake_mode_key is not None
+        and callable(get_dispatch_mode)
+        and get_dispatch_mode(fake_mode_key) is not None
+    ):
+        return torch.ops.aten.cross_entropy_loss.default._op_dk(
+            torch._C.DispatchKey.CompositeImplicitAutograd,
+            *args,
+            **kwargs,
+        )
 
     x = args[0]
     if isinstance(x, DTensor):
@@ -840,15 +948,13 @@ def cross_entropy_autograd_privateuse1(*args, **kwargs):
     # (see _validate_ce_inputs) and target values are checked inside the graph.
 
     if detect_fake_mode(input) is not None:
-        # aten::cross_entropy_loss is CompositeImplicitAutograd in core, and Dynamo
-        # relies on that decomposition to propagate fake tensors. This kernel overrides
-        # it, and the chunked lowering cannot be traced with fake tensors, so decompose
-        # here the same way get_compile_decomposition_table() does.
-        log_probs = torch.log_softmax(input, dim=1 if input.dim() > 1 else 0)
-        loss, _ = torch.ops.aten.nll_loss_forward(
-            log_probs, target, weight, reduction, ignore_index
-        )
-        return loss
+        # Force a graph break during tracing to run the loss in eager mode, not compiled.
+        # When compiled, the backward keeps the entire (seq_len, vocab_size) tensor, which
+        # exceeds device memory for a large enough vocab_size.
+        # TODO: support the loss in compile mode.
+        from torch._subclasses.fake_tensor import DataDependentOutputException
+
+        raise DataDependentOutputException(torch.ops.aten.cross_entropy_loss.default)
 
     # Attach the grad_fn only when the logits need one. A differentiable target or
     # weight is accepted and receives no gradient, matching the previous behaviour.
@@ -888,7 +994,17 @@ def mse_loss(
     reduction: int = 1,
     out: TensorLikeType | None = None,
 ):
-    """MSE loss forward."""
+    """Compute MSE loss with the PyTorch decomposition.
+
+    Args:
+        input (torch.Tensor): Predicted values.
+        target (torch.Tensor): Target values.
+        reduction (int, optional): ATen reduction mode. Defaults to ``1``.
+        out (torch.Tensor, optional): Optional out-variant tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise or reduced mean squared error.
+    """
     return torch.ops.aten.mse_loss(input, target, reduction)
 
 
@@ -904,5 +1020,16 @@ def mse_loss_backward(
     reduction: int,
     grad_input: TensorLikeType | None = None,
 ):
-    """MSE loss backward using PyTorch decomposition."""
+    """Compute the MSE loss input gradient with the PyTorch decomposition.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the loss output.
+        input (torch.Tensor): Predicted values from the forward pass.
+        target (torch.Tensor): Target values.
+        reduction (int): Reduction mode encoded by the ATen schema.
+        grad_input (torch.Tensor, optional): Optional out-variant tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Gradient with respect to ``input``.
+    """
     return torch.ops.aten.mse_loss_backward(grad_output, input, target, reduction)

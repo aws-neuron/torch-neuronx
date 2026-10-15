@@ -61,6 +61,7 @@ static Value createInitialValueForAtenPoolingOp(Operation *op, Type elementTy,
                                            constAttr);
     } else if (isa<mlir::IntegerType>(elementTy) &&
                elementTy.getIntOrFloatBitWidth() != 8) {
+      // TODO: SignedMinValue can tie with real input. Promote to wider type first.
       auto constAttr = DenseElementsAttr::get(
           constType,
           {APInt::getSignedMinValue(elementTy.getIntOrFloatBitWidth())});
@@ -369,6 +370,12 @@ LogicalResult ConvertAtenOp<AtenMaxPool2dWithIndicesOp>::matchAndRewrite(
   if (!matchPattern(op.getCeilMode(), m_TorchConstantBool(&ceilMode)))
     return rewriter.notifyMatchFailure(op, "non-const ceil_mode");
 
+  // TODO: A 1-element list is valid in PyTorch (broadcast to both spatial
+  // dims) but is not handled here (the per-dim indexing below assumes size 2).
+  // Broadcast size-1 lists to 2, reusing the broadcastToDim approach from
+  // ConvertAtenAvgPoolOp. The normal compile path pre-normalizes scalars to 2
+  // elements, so this only affects explicit 1-element lists.
+
   SmallVector<int64_t> winDims(inputRank, 1);
   SmallVector<int64_t> winStrides(inputRank, 1);
   std::copy(kernelSize.begin(), kernelSize.end(),
@@ -436,6 +443,7 @@ LogicalResult ConvertAtenOp<AtenMaxPool2dWithIndicesOp>::matchAndRewrite(
           rewriter.getI64Type()),
       noPadding);
   DenseI64ArrayAttr baseDilations;
+  // TODO: dilation parameter is unused; windowDilations is never populated.
   DenseI64ArrayAttr windowDilations;
 
   auto reduceWindowOp = stablehlo::ReduceWindowOp::create(

@@ -103,6 +103,14 @@ def _prepare_io(condition, input_a, input_b, dest=None, **_):
     device = input_a.device
 
     def to_2d(t):
+        """Flatten and pad an operand to the shared kernel shape.
+
+        Args:
+            t (torch.Tensor): Operand to reshape and pad.
+
+        Returns:
+            torch.Tensor: Contiguous or padded tensor with shape ``[M_ceil, H]``.
+        """
         return _pad_or_contig(t.reshape(-1, H), M_ceil)
 
     # Pad/contiguify the bool condition, then view it as int16 ([M_ceil, H//2]) so
@@ -125,6 +133,7 @@ def _reshape_output(outputs, original_args):
 
 
 def register():
+    """Register the dynamic element-selection adapter."""
     register_dynamic_nki(
         "where",
         DynamicNkiEntry(

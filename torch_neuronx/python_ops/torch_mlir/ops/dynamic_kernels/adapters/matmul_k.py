@@ -92,6 +92,7 @@ def _reshape_mm_k_output(outputs, original_args):
 
 
 def register():
+    """Register the dynamic-contraction matrix multiplication adapter."""
     register_dynamic_nki(
         "mm_k",
         DynamicNkiEntry(

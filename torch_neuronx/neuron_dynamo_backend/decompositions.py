@@ -21,11 +21,12 @@ import torch
 import torch._decomp as decomp
 import torch.nn.functional as F  # noqa: N812
 from nkilib.core.attention.attention_bwd import attention_bwd
-from nkilib.core.attention.attention_cte import attention_cte
+from nkilib.core.attention.attention_cte import AttnConfig, attention_cte
 from torch._decomp import get_decompositions
 
 from torch_neuronx import _im2col_maps as im2col_maps
 from torch_neuronx import _interpolation_maps as interpolation_maps
+from torch_neuronx._sdpa_math import compute_attention, compute_attention_backward
 from torch_neuronx.neuron_dynamo_backend.settings import _getenv_bool, _getenv_int
 from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
     _has_nki_elementwise_kernels as _has_nki_foreach,
@@ -33,6 +34,11 @@ from torch_neuronx.python_ops.nki_kernels.foreach_elementwise import (
 from torch_neuronx.python_ops.nki_kernels.foreach_norm import _has_nki_norm_kernels
 from torch_neuronx.python_ops.nki_kernels.nonzero import _has_nki_nonzero
 from torch_neuronx.python_ops.nki_kernels.rng_state import _has_nki_rng
+from torch_neuronx.python_ops.nki_kernels.triangular_solve import (
+    triangular_solve_batched_nki as _triangular_solve_batched_nki_kernel,
+)
+from torch_neuronx.python_ops.torch_mlir.ops.random import normal_fill, uniform_fill
+from torch_neuronx.python_ops.torch_mlir.ops.reduction import cummaxmin_scan
 
 if _has_nki_nonzero:
     from torch_neuronx.python_ops.nki_kernels.nonzero import _wrapped_nonzero
@@ -67,10 +73,21 @@ _T = TypeVar("_T")
 _P = ParamSpec("_P")
 
 aten = torch.ops.aten
+
 from torch_neuronx.nki_hop import wrap_nki
+from torch_neuronx.python_ops.nki_kernels.tril_indices import (
+    trilu_nki_eligible,
+    trilu_nki_indices,
+    trilu_numel,
+    trilu_raise_oversize,
+)
+from torch_neuronx.python_ops.torch_mlir.ops.binary_math import logaddexp2_ref
 from torch_neuronx.utils import get_logical_neuron_cores
 
 wrapped_flash_fwd = wrap_nki(attention_cte)
+# The attention kernel accepts a V head dim that differs from Q/K (MLA) only once its config
+# carries d_v; older nkilib releases assert v.shape[-1] == d.
+_NKI_ATTENTION_SUPPORTS_V_HEAD_DIM = "d_v" in getattr(AttnConfig, "__dataclass_fields__", {})
 wrapped_flash_bwd = wrap_nki(attention_bwd)
 
 from torch_neuronx.python_ops.nki_kernels.embedding_dense_backward_nki import (
@@ -78,6 +95,7 @@ from torch_neuronx.python_ops.nki_kernels.embedding_dense_backward_nki import (
 )
 
 wrapped_embedding_dense_backward_nki = wrap_nki(_embedding_dense_backward_nki_kernel)
+wrapped_triangular_solve_batched_nki = wrap_nki(_triangular_solve_batched_nki_kernel)
 
 # Build the base decomposition table from standard PyTorch decompositions
 # for ops that are not supported by the backend (yet)
@@ -104,6 +122,9 @@ neuron_decompositions = get_decompositions(
         aten.reflection_pad1d,
         aten.reflection_pad2d,
         aten.reflection_pad3d,
+        aten.reflection_pad1d_backward,
+        aten.reflection_pad2d_backward,
+        aten.reflection_pad3d_backward,
         aten.embedding,
         aten.native_layer_norm_backward,
         aten.nll_loss_backward,
@@ -121,6 +142,7 @@ neuron_decompositions = get_decompositions(
         aten._softmax_backward_data,
         aten.select_backward,
         aten.softplus_backward,
+        aten.mish_backward,
         aten.lerp,
         aten.elu,
         aten.elu_backward,
@@ -138,6 +160,7 @@ neuron_decompositions = get_decompositions(
         aten.smooth_l1_loss_backward,
         aten.soft_margin_loss,
         aten.soft_margin_loss_backward,
+        aten.glu,
         aten.glu_backward,
         aten.hardsigmoid_backward,
         aten.hardswish_backward,
@@ -158,7 +181,6 @@ neuron_decompositions = get_decompositions(
         aten.index_fill,
         aten._unsafe_masked_index,
         aten._unsafe_masked_index_put_accumulate,
-        aten.isin,
         aten.std_mean.correction,
         aten.all.dims,
         aten.any.dims,
@@ -182,12 +204,9 @@ neuron_decompositions = get_decompositions(
         # upsample/interpolate is registered explicitly below (see
         # _interpolation_maps), not pulled in: PyTorch's nearest builtin casts its
         # index map to int without a floor, which samples the wrong pixel on Neuron.
-        # count_nonzero, multi_margin_loss, and multilabel_margin_loss_forward
-        # all have correct built-in decompositions wrapped with ``@out_wrapper``,
-        # so pulling in the packet covers both the ``.default`` and the
-        # ``.out``/``.output`` overloads without any custom code on our side.
-        # The ``.default`` overloads already lowered fine on Neuron; the
-        # ``.out``/``.output`` overloads fail to legalize without a decomp.
+        # count_nonzero and multi_margin_loss have correct built-in
+        # decompositions wrapped with ``@out_wrapper``, so pulling in the
+        # packet covers both the default and out overloads.
         aten.count_nonzero,
         aten.multi_margin_loss,
         # ``multilabel_margin_loss_forward.default`` uses PyTorch's built-in
@@ -215,7 +234,7 @@ def register_decomposition(
         Callable: Decorator that registers the decorated function.
 
     Raises:
-        ValueError: If any operator is already registered in neuron_decompositions.
+        ValueError: If any operator is already registered in ``neuron_decompositions``.
     """
     for op in ops if isinstance(ops, list) else [ops]:
         # Guards against duplicates
@@ -232,6 +251,17 @@ def _register_fake(qualname: str, override: bool = False):
     work around broken upstream meta registrations)."""
 
     def deco(fn):
+        """Attempt to register a fake implementation and suppress registration failures.
+
+        Args:
+            fn (Callable): Fake implementation to register.
+
+        Returns:
+            Callable: The supplied function, whether registration succeeds or fails.
+
+        Note:
+            Any ``RuntimeError`` from ``torch.library.register_fake`` is logged and suppressed.
+        """
         try:
             torch.library.register_fake(qualname, fn, allow_override=override)
         except RuntimeError as e:
@@ -249,25 +279,76 @@ def _bmm_dtype_out_fake(self, mat2, out_dtype, *, out):
 
 @register_decomposition([aten.bmm.dtype])
 def bmm_dtype(self, mat2, out_dtype):
-    """Decompose bmm.dtype into a cast + plain bmm."""
+    """Decompose ``bmm.dtype`` into casts followed by ``bmm``.
+
+    Args:
+        self (torch.Tensor): First batch of matrices.
+        mat2 (torch.Tensor): Second batch of matrices.
+        out_dtype (torch.dtype): Dtype to which both inputs are cast.
+
+    Returns:
+        torch.Tensor: Batch matrix product computed in ``out_dtype``.
+    """
     return torch.bmm(self.to(out_dtype), mat2.to(out_dtype))
+
+
+@register_decomposition([aten._weight_norm_interface.default])
+def _weight_norm_interface(v, g, dim=0):
+    """Fused weight-norm forward, computed in fp32 to match aten's C++ kernel.
+
+    PyTorch's built-in decomp casts the fp32 norm back to the input dtype before
+    the division (``g / norm.to(g.dtype)``), so a bf16 weight-norm roundtrip
+    drifts past the test tolerance, and an fp16 norm is not upcast at all. aten's
+    C++ kernel keeps the norm and the division in fp32 and returns the norm as
+    fp32 for every floating input dtype. Match it: reduce and divide in fp32,
+    then cast only the weight back.
+    """
+    dim = dim % v.dim()
+    keep_dim = tuple(i for i in range(v.dim()) if i != dim)
+    vf = v.to(torch.float32)
+    norm = vf.norm(2, keep_dim, keepdim=True)
+    w = (vf * (g.to(torch.float32) / norm)).to(v.dtype)
+    return w, norm
+
+
+@register_decomposition([aten._weight_norm_interface_backward.default])
+def _weight_norm_interface_backward(grad_w, saved_v, saved_g, saved_norms, dim):
+    """Decompose the fused weight-norm backward, which torch-mlir cannot lower.
+
+    AOTAutograd emits ``_weight_norm_interface_backward`` in the compiled
+    backward graph (the autograd formula for the still-fused forward op), so a
+    forward-only decomposition is not enough. With ``w = g * v / ||v||`` (norm
+    reduced over every dim except ``dim``) the gradients are:
+
+        per_dim = sum_{d != dim}(grad_w * v)   (keepdim, shape of g)
+        grad_g  = per_dim / norm
+        grad_v  = (g / norm) * grad_w - (g / norm**3) * per_dim * v
+    """
+    ndim = saved_v.dim()
+    dim = dim % ndim
+    reduce_dims = [d for d in range(ndim) if d != dim]
+    per_dim_sums = (grad_w * saved_v).sum(reduce_dims, keepdim=True)
+    grad_g = per_dim_sums / saved_norms
+    grad_v = (saved_g / saved_norms) * grad_w - (
+        saved_g / saved_norms.pow(3)
+    ) * per_dim_sums * saved_v
+    return grad_v, grad_g
 
 
 @register_decomposition([aten.angle])
 def angle_decomp(x):
-    """Decompose real-valued aten::angle; torch-mlir has no StableHLO lowering.
+    """Decompose real-valued ``angle`` into comparisons and selection.
 
-    Registered here (not just as an eager op handler) so the eager and
-    torch.compile paths share one implementation — both trace through this
-    decomposition table. For a real tensor torch.angle is a piecewise constant:
-    pi on the negative side (including -inf) and 0 on the non-negative side
-    (including +0.0, -0.0, +inf). Integer/bool inputs promote to the default
-    float dtype, so the pi/0 constants are built in the promoted dtype; nan is
-    restored with an isnan mask (``x < 0`` is False for nan).
+    Real inputs produce pi for negative values and zero for nonnegative values,
+    preserve NaNs, and promote integer and Boolean inputs to the default floating
+    dtype. Complex inputs return ``NotImplemented`` for the framework path.
 
-    Complex inputs return NotImplemented so this real-only branch does not hijack
-    them; they fall through to the framework complex-decomposition path
-    (TORCH_NEURONX_COMPLEX_DECOMPOSE), which owns complex angle.
+    Args:
+        x (torch.Tensor): Input tensor.
+
+    Returns:
+        torch.Tensor | NotImplemented: Real-input angles, or ``NotImplemented``
+            for complex input.
     """
     if x.is_complex():
         return NotImplemented
@@ -277,21 +358,212 @@ def angle_decomp(x):
     return torch.where(torch.isnan(x), x, result)
 
 
+@register_decomposition([aten.cummax.default])
+def _cummax_decomp(self, dim):
+    return cummaxmin_scan(self, dim, is_max=True)
+
+
+@register_decomposition([aten.cummin.default])
+def _cummin_decomp(self, dim):
+    return cummaxmin_scan(self, dim, is_max=False)
+
+
+@register_decomposition([aten.isin.Tensor_Tensor, aten.isin.Tensor_Scalar, aten.isin.Scalar_Tensor])
+def isin_decomposition(elements, test_elements, *, assume_unique=False, invert=False):
+    """Test whether each element belongs to the test set.
+
+    Args:
+        elements (torch.Tensor | Number): Values to test.
+        test_elements (torch.Tensor | Number): Candidate values.
+        assume_unique (bool, optional): Ignored uniqueness hint. Defaults to ``False``.
+        invert (bool, optional): Whether to invert the membership result. Defaults to ``False``.
+
+    Returns:
+        torch.Tensor: Boolean membership results shaped like ``elements``.
+
+    Raises:
+        RuntimeError: If either tensor operand has boolean dtype.
+
+    Note:
+        Tensor test sets use a broadcast comparison and reduction. A scalar
+        ``test_elements`` operand uses equality directly. A scalar ``elements`` operand
+        becomes a zero-dimensional tensor. An empty test tensor avoids a zero-length reduction.
+    """
+    # Reject bool, matching CPU torch.isin (raises "Unsupported input type ... Bool").
+    for t in (elements, test_elements):
+        if isinstance(t, torch.Tensor) and t.dtype == torch.bool:
+            raise RuntimeError("Unsupported input type encountered for isin(): Bool")
+
+    # Scalar test set -> plain (in)equality.
+    if not isinstance(test_elements, torch.Tensor):
+        return torch.ne(elements, test_elements) if invert else torch.eq(elements, test_elements)
+    # Scalar element -> 1-element tensor, reuse the tensor path, squeeze to 0-dim.
+    if not isinstance(elements, torch.Tensor):
+        elements = torch.scalar_tensor(elements, device=test_elements.device)
+
+    # Empty test set: all-False (all-True when inverted). Returning zeros_like
+    # avoids an any-reduction over a zero-length dim, which the compiler rejects.
+    if test_elements.numel() == 0:
+        return torch.zeros_like(elements, dtype=torch.bool) != invert
+
+    common = torch.promote_types(elements.dtype, test_elements.dtype)
+    matches = elements.to(common).unsqueeze(-1) == test_elements.to(common).flatten()
+    return matches.any(dim=-1) != invert
+
+
+@register_decomposition([aten.polar])
+def polar_decomp(abs, angle):
+    """Construct complex values from magnitudes and angles.
+
+    Args:
+        abs (torch.Tensor): Magnitudes.
+        angle (torch.Tensor): Angles in radians.
+
+    Returns:
+        torch.Tensor: Complex values formed from real and imaginary components.
+
+    Note:
+        The lowering computes ``abs * cos(angle)`` and ``abs * sin(angle)`` with real
+        operations before packing them with ``view_as_complex``.
+    """
+    real = abs * torch.cos(angle)
+    imag = abs * torch.sin(angle)
+    return torch.view_as_complex(torch.stack([real, imag], dim=-1))
+
+
 @register_decomposition([aten.take])
 def take_decomposition(self, index):
-    """Static-shape take; the built-in decomp is index-advanced and breaks a 0-d index.
+    """Decompose ``take`` into static-shape flatten, selection, and reshape.
 
-    take(self, index) gathers self.flatten() at index; the output shape equals
-    index.shape. PyTorch's built-in decomposition uses ``self.flatten()[index]``,
-    whose advanced-index path makes an unbacked size for a 0-d index and fails
-    the Neuron data-dependent guard. Flatten, gather with index_select, then
-    reshape to index.shape. This keeps every shape static, so a 0-d or empty
-    index works. Normalize a negative index with the static ``numel``.
+    The static ``numel`` normalizes negative indices and avoids the unbacked size
+    produced by advanced indexing for scalar indices.
+
+    Args:
+        self (torch.Tensor): Input tensor to flatten and gather from.
+        index (torch.Tensor): Indices whose shape determines the output shape.
+
+    Returns:
+        torch.Tensor: Gathered values with the same shape as ``index``.
     """
     flat = self.reshape(-1)
     idx = index.reshape(-1)
     idx = torch.where(idx < 0, idx + flat.numel(), idx)
     return torch.index_select(flat, 0, idx).reshape(index.shape)
+
+
+# ── FFT family (real DFT matmul) ────────────────────────────────────
+# Neuron has no native FFT op. Express each transform as a matmul against
+# cosine and sine coefficient matrices, so the graph uses only real matmuls
+# that the backend supports. torch-mlir uses the same method for aten.fft_rfft
+# (DecomposeAtenFftRfftOp). torch.stft lowers to aten._fft_r2c, which torch-mlir
+# does not model, so decompose the low-level ops here. The cost is O(n^2) per
+# transform. The DFT runs in float32; a bfloat16 input is promoted and returns
+# a complex64 output. The op falls back (returns NotImplemented) for a
+# double-precision input, a float16 input (the complex32 output is not
+# lowerable), a multi-axis transform, a non-float input, and a transform longer
+# than _FFT_MAX_LENGTH (the O(n^2) DFT loses accuracy).
+
+
+# The O(n_samples^2) DFT loses fp32 accuracy for a long transform. Fall back
+# above this length. The limit comes from accuracy benchmark testing.
+_FFT_MAX_LENGTH = 1024
+
+
+def _fft_normalization_scale(normalization: int, n_samples: int) -> float | None:
+    """Return the FFT scale factor for an aten normalization mode.
+
+    The mode is 0 (none), 1 (1/sqrt(n)), or 2 (1/n). Return None for an
+    unknown mode. The caller then defers to the default lowering. The name
+    matches the upstream C++ ``fft_normalization`` enum.
+    """
+    if normalization == 0:
+        return 1.0
+    if normalization == 1:
+        return 1.0 / math.sqrt(n_samples)
+    if normalization == 2:
+        return 1.0 / n_samples
+    return None
+
+
+def _dft_cos_sin(n_samples: int, n_bins: int, device, dtype, use_negative_sine: bool):
+    """Build the (n_samples, n_bins) cosine and signed-sine DFT matrices.
+
+    Column k holds the angle ``2*pi*t*k/n_samples`` for row t. Set
+    ``use_negative_sine`` for a forward transform (the imaginary part uses
+    ``-sin``); clear it for an inverse transform. Reduce ``t*k`` modulo
+    n_samples with exact integer math first, so the cosine argument stays in
+    [0, 2*pi). A raw ``2*pi*t*k/n_samples`` argument grows with the transform
+    length and loses fp32 precision, which is the dominant error in the result.
+    """
+    t = torch.arange(n_samples, device=device, dtype=torch.int64).unsqueeze(1)
+    k = torch.arange(n_bins, device=device, dtype=torch.int64).unsqueeze(0)
+    ang = ((t * k) % n_samples).to(dtype) * (2.0 * math.pi / n_samples)
+    sin = torch.sin(ang)
+    return torch.cos(ang), (-sin if use_negative_sine else sin)
+
+
+@register_decomposition([aten._fft_r2c.default])
+def _fft_r2c_decomp(self, dim, normalization, onesided):
+    """Decompose a real-to-complex FFT into cosine and sine matmuls.
+
+    This is a direct DFT (an O(n_samples^2) matmul), not a fast FFT. Neuron has
+    no FFT primitive, so a dense DFT matmul is the practical lowering.
+    """
+    # Fall back for a multi-axis transform (only a single-axis DFT is modeled
+    # here) and for these input dtypes:
+    #   float64: this path computes the DFT in float32 (see the float32 cast
+    #     below). A float64 input would downcast to float32 and lose precision.
+    #     complex128 is a valid StableHLO type, so this is a deliberate choice
+    #     not to add a float64 path here, not a type limit.
+    #   float16: its output dtype is complex32, which StableHLO does not
+    #     support. stablehlo.complex needs an f32 or f64 operand
+    #     (HLO_Fp32Or64Tensor; see StablehloOps.td def StableHLO_ComplexOp), so
+    #     complex<f16> is not legal. bfloat16 has no complex type, so its output
+    #     is complex64 and lowers; bfloat16 stays supported.
+    if len(dim) != 1 or self.dtype in (torch.float64, torch.float16):
+        return NotImplemented
+    # Fall back for a non-float input (an integer or bool is not an FFT input).
+    if not self.is_floating_point():
+        return NotImplemented
+    # dim has length 1. torch.movedim and shape indexing both accept a negative
+    # axis, so use dim[0] directly.
+    fft_dim = dim[0]
+    n_samples = self.shape[fft_dim]
+    if n_samples > _FFT_MAX_LENGTH:
+        return NotImplemented
+    scale = _fft_normalization_scale(normalization, n_samples)
+    if scale is None:
+        return NotImplemented
+    x = torch.movedim(self, fft_dim, -1)
+    # Compute the DFT in float32. The twiddle matrix and the length-n reduction
+    # lose too much precision in bfloat16. Promote a low-precision input; the
+    # complex64 output already matches the promoted result dtype.
+    if x.dtype != torch.float32:
+        x = x.to(torch.float32)
+    n_bins = n_samples // 2 + 1 if onesided else n_samples
+    cos, nsin = _dft_cos_sin(n_samples, n_bins, x.device, x.dtype, use_negative_sine=True)
+    real = torch.matmul(x, cos) * scale
+    imag = torch.matmul(x, nsin) * scale
+    return torch.movedim(torch.complex(real, imag), -1, fft_dim)
+
+
+@register_decomposition([aten.expm1])
+def expm1_decomp(x):
+    """Compute ``exp(x) - 1`` with range-reduced arithmetic.
+
+    Args:
+        x (torch.Tensor): Input values.
+
+    Returns:
+        torch.Tensor: Elementwise exponential-minus-one values.
+
+    Note:
+        The torch-mlir hardware-exponential lowering misses the float32 tolerance, so
+        this decomposition uses the eager operation's accurate helper.
+    """
+    from torch_neuronx.python_ops.torch_mlir.ops.unary import _expm1_accurate
+
+    return _expm1_accurate(x)
 
 
 def _zero_result(shape, a, b):
@@ -307,7 +579,16 @@ def _zero_result(shape, a, b):
 
 @register_decomposition([aten.mm.default])
 def mm_empty_shortcut(a, b):
-    """Short-circuit 2D x 2D matmul on zero-element inputs (any of M/K/N == 0)."""
+    """Decompose empty-input ``mm`` into a zero-filled result.
+
+    Args:
+        a (torch.Tensor): Left matrix.
+        b (torch.Tensor): Right matrix.
+
+    Returns:
+        torch.Tensor | NotImplemented: Zero matrix with shape
+            ``(a.shape[0], b.shape[1])``, or ``NotImplemented`` for nonempty inputs.
+    """
     if a.numel() != 0 and b.numel() != 0:
         return NotImplemented
     return _zero_result((a.shape[0], b.shape[1]), a, b)
@@ -315,7 +596,17 @@ def mm_empty_shortcut(a, b):
 
 @register_decomposition([aten.bmm.default])
 def bmm_empty_shortcut(a, b):
-    """Short-circuit batched 3D x 3D matmul on zero-element inputs."""
+    """Decompose empty-input ``bmm`` into a zero-filled result.
+
+    Args:
+        a (torch.Tensor): Left batch of matrices.
+        b (torch.Tensor): Right batch of matrices.
+
+    Returns:
+        torch.Tensor | NotImplemented: Zero batch with shape
+            ``(a.shape[0], a.shape[1], b.shape[2])``, or ``NotImplemented``
+            for nonempty inputs.
+    """
     if a.numel() != 0 and b.numel() != 0:
         return NotImplemented
     return _zero_result((a.shape[0], a.shape[1], b.shape[2]), a, b)
@@ -323,7 +614,16 @@ def bmm_empty_shortcut(a, b):
 
 @register_decomposition([aten.mv.default])
 def mv_empty_shortcut(a, b):
-    """Short-circuit 2D x 1D matrix-vector product on zero-element inputs."""
+    """Decompose empty-input ``mv`` into a zero-filled result.
+
+    Args:
+        a (torch.Tensor): Input matrix.
+        b (torch.Tensor): Input vector.
+
+    Returns:
+        torch.Tensor | NotImplemented: Zero vector with length ``a.shape[0]``,
+            or ``NotImplemented`` for nonempty inputs.
+    """
     if a.numel() != 0 and b.numel() != 0:
         return NotImplemented
     return _zero_result((a.shape[0],), a, b)
@@ -331,7 +631,16 @@ def mv_empty_shortcut(a, b):
 
 @register_decomposition([aten.dot.default])
 def dot_empty_shortcut(a, b):
-    """Short-circuit 1D x 1D dot product on zero-element inputs → scalar 0."""
+    """Decompose empty-input ``dot`` into a scalar zero.
+
+    Args:
+        a (torch.Tensor): First input vector.
+        b (torch.Tensor): Second input vector.
+
+    Returns:
+        torch.Tensor | NotImplemented: Scalar zero, or ``NotImplemented`` for
+            nonempty inputs.
+    """
     if a.numel() != 0 and b.numel() != 0:
         return NotImplemented
     return _zero_result((), a, b)
@@ -360,17 +669,21 @@ def _fused_rms_norm_fallback(input, normalized_shape, weight=None, eps=None):
 
 @register_decomposition([aten.ormqr.default])
 def ormqr_decomposition(self, input2, input3, left=True, transpose=False):
-    """Decompose ormqr into reflector reconstruction + matmul.
+    """Decompose ``ormqr`` into Householder reconstruction and matrix multiplication.
 
-    ``self`` holds the Householder vectors below the diagonal (shape
-    ``(*, mn, k)``), ``input2`` is tau (``(*, min(mn, k))``), and ``input3`` is
-    the matrix C to multiply. Computes ``op(Q) @ C`` when ``left`` else
-    ``C @ op(Q)``, where ``op(Q)`` is ``Q^T`` when ``transpose`` else ``Q`` and
-    ``Q = H_1 H_2 ... H_k`` with ``H_i = I - tau_i v_i v_i^T``.
+    Reconstructs ``Q = H_1 ... H_k`` from reflector vectors and ``tau``, then
+    multiplies ``op(Q)`` from the requested side. A plain transpose implements
+    ``op(Q)`` because Neuron supports only real dtypes here.
 
-    Neuron only supports real dtypes, so a plain transpose of the last two
-    dims is used rather than the conjugate transpose ``ormqr`` applies for
-    complex Q.
+    Args:
+        self (torch.Tensor): Householder reflector vectors.
+        input2 (torch.Tensor): Householder coefficients ``tau``.
+        input3 (torch.Tensor): Matrix to multiply by ``op(Q)``.
+        left (bool, optional): Multiply from the left. Defaults to ``True``.
+        transpose (bool, optional): Transpose ``Q`` before multiplying. Defaults to ``False``.
+
+    Returns:
+        torch.Tensor: Product with the reconstructed ``op(Q)``.
     """
     reflectors = self
     tau = input2
@@ -426,10 +739,19 @@ def _thnn_fused_lstm_cell_fake(input_gates, hidden_gates, cx, input_bias=None, h
 def thnn_fused_lstm_cell_decomposition(
     input_gates, hidden_gates, cx, input_bias=None, hidden_bias=None
 ):
-    """Decompose the fused LSTM cell into elementwise ops.
+    """Decompose the fused LSTM cell into elementwise ops because it lacks StableHLO lowering.
 
-    Returns ``(hy, cy, workspace)`` where ``workspace = cat([i, f, c, o])``
-    holds the activated gates for use by the backward pass.
+    Args:
+        input_gates (torch.Tensor): Input-to-hidden gate preactivations.
+        hidden_gates (torch.Tensor): Hidden-to-hidden gate preactivations.
+        cx (torch.Tensor): Previous cell state.
+        input_bias (torch.Tensor | None, optional): Optional input-gate bias. Defaults to ``None``.
+        hidden_bias (torch.Tensor | None, optional): Optional hidden-gate bias. Defaults to
+            ``None``.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Hidden state, cell state, and
+            activated-gate workspace ``cat([i, f, c, o])`` for the backward pass.
     """
     gates = input_gates + hidden_gates
     if input_bias is not None:
@@ -455,12 +777,22 @@ def thnn_fused_lstm_cell_decomposition(
 # may be None). Reads the activated gates back out of ``workspace``.
 @register_decomposition([aten._thnn_fused_lstm_cell_backward_impl.default])
 def thnn_fused_lstm_cell_backward_impl_decomposition(grad_hy, grad_cy, cx, cy, workspace, has_bias):
-    """Decompose the fused LSTM cell backward into elementwise ops.
+    """Decompose the fused LSTM backward implementation into elementwise ops.
 
-    Returns ``(grad_gates, grad_cx, grad_bias)``. ``grad_gates`` is the gradient
-    w.r.t. the (pre-activation) combined gates; the public wrapper feeds it to
-    both ``input_gates`` and ``hidden_gates``. ``grad_bias`` is None unless
-    ``has_bias``.
+    Args:
+        grad_hy (torch.Tensor | None): Optional hidden-state gradient.
+        grad_cy (torch.Tensor | None): Optional cell-state gradient.
+        cx (torch.Tensor): Previous cell state.
+        cy (torch.Tensor): Forward cell state.
+        workspace (torch.Tensor): Activated gates ``cat([i, f, c, o])``.
+        has_bias (bool): Whether to compute the combined gate-bias gradient.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]: Combined preactivation
+            gate gradient, previous-cell gradient, and optional bias gradient.
+
+    Note:
+        The public wrapper sends the combined gate gradient to both gate inputs.
     """
     ingate, forgetgate, cellgate, outgate = workspace.chunk(4, dim=1)
     tanh_cy = torch.tanh(cy)
@@ -505,11 +837,19 @@ def _thnn_fused_gru_cell_fake(input_gates, hidden_gates, hx, input_bias=None, hi
 def thnn_fused_gru_cell_decomposition(
     input_gates, hidden_gates, hx, input_bias=None, hidden_bias=None
 ):
-    """Decompose the fused GRU cell into elementwise ops.
+    """Decompose a fused GRU cell into elementwise operations.
 
-    Returns ``(hy, workspace)`` where ``workspace = cat([r, z, n, hx, h_n])``
-    carries the state consumed by the backward pass. Gate order is
-    ``(reset, update, new)`` matching PyTorch's GRU weight layout.
+    Args:
+        input_gates (torch.Tensor): Input-to-hidden gate preactivations.
+        hidden_gates (torch.Tensor): Hidden-to-hidden gate preactivations.
+        hx (torch.Tensor): Previous hidden state.
+        input_bias (torch.Tensor | None, optional): Optional input-gate bias. Defaults to ``None``.
+        hidden_bias (torch.Tensor | None, optional): Optional hidden-gate bias. Defaults to
+            ``None``.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Hidden state and workspace
+            ``cat([r, z, n, hx, h_n])`` in PyTorch's reset-update-new gate order.
     """
     ig = input_gates + input_bias if input_bias is not None else input_gates
     hg = hidden_gates + hidden_bias if hidden_bias is not None else hidden_gates
@@ -538,11 +878,16 @@ def _thnn_fused_gru_cell_backward_fake(grad_hy, workspace, has_bias):
 
 @register_decomposition([aten._thnn_fused_gru_cell_backward.default])
 def thnn_fused_gru_cell_backward_decomposition(grad_hy, workspace, has_bias):
-    """Decompose the fused GRU cell backward into elementwise ops.
+    """Decompose fused GRU cell backward into elementwise operations.
 
-    Reads ``r, z, n, hx, h_n`` back out of ``workspace`` and returns
-    ``(grad_input_gates, grad_hidden_gates, grad_hx, grad_input_bias,
-    grad_hidden_bias)``. The bias grads are None unless ``has_bias``.
+    Args:
+        grad_hy (torch.Tensor): Hidden-state gradient.
+        workspace (torch.Tensor): Forward state ``cat([r, z, n, hx, h_n])``.
+        has_bias (bool): Whether to compute gate-bias gradients.
+
+    Returns:
+        tuple: Input-gate, hidden-gate, and hidden-state gradients followed by the
+            optional input and hidden bias gradients.
     """
     r, z, n, hx, h_n = workspace.chunk(5, dim=1)
 
@@ -656,7 +1001,19 @@ def _fused_adam_tensor_lr_fake(
 # kernel could do exactly s squarings if this ever needs to be tightened.
 @register_decomposition([aten.linalg_matrix_exp.default])
 def linalg_matrix_exp_decomposition(a, taylor_order: int = 10, s_max: int = 18):
-    """Decompose matrix_exp via masked, per-batch adaptive scaling-and-squaring."""
+    """Decompose ``matrix_exp`` into fixed-order Taylor scaling-and-squaring for StableHLO.
+
+    Args:
+        a (torch.Tensor): Square matrix or batch of square matrices.
+        taylor_order (int, optional): Taylor-series order. Defaults to ``10``.
+        s_max (int, optional): Maximum masked squaring steps. Defaults to ``18``.
+
+    Returns:
+        torch.Tensor: Matrix exponential with the same shape as ``a``.
+
+    Note:
+        Per-batch masks avoid data-dependent control flow and matrix solves.
+    """
     *batch, n, _ = a.shape
     eye = torch.eye(n, dtype=a.dtype, device=a.device)  # broadcasts over batch
 
@@ -679,6 +1036,189 @@ def linalg_matrix_exp_decomposition(a, taylor_order: int = 10, s_max: int = 18):
     return R
 
 
+_TRIANGULAR_SOLVE_NKI_BLOCK_SIZE = 128
+_TRIANGULAR_SOLVE_NKI_RHS_TILE_SIZE = 512
+
+
+def _solve_triangular_nki_block(a, b, *, upper):
+    """Solve one unit-triangular block that fits the NKI partition dimension."""
+    batch_shape = a.shape[:-2]
+    batch = math.prod(batch_shape)
+    n = a.shape[-1]
+    rhs_columns = b.shape[-1]
+    if batch == 0 or rhs_columns == 0:
+        return b.clone()
+
+    matrix = a.reshape(batch * n, n).contiguous()
+    lnc = int(get_logical_neuron_cores())
+    if rhs_columns > _TRIANGULAR_SOLVE_NKI_RHS_TILE_SIZE:
+        # Move wide RHS tiles into the batch to keep one NKI call.
+        tiles = math.ceil(rhs_columns / _TRIANGULAR_SOLVE_NKI_RHS_TILE_SIZE)
+        padded_columns = tiles * _TRIANGULAR_SOLVE_NKI_RHS_TILE_SIZE
+        matrix = (
+            a.unsqueeze(-3)
+            .expand(*batch_shape, tiles, n, n)
+            .reshape(batch * tiles * n, n)
+            .contiguous()
+        )
+        rhs = (
+            F.pad(b, (0, padded_columns - rhs_columns))
+            .reshape(*batch_shape, n, tiles, _TRIANGULAR_SOLVE_NKI_RHS_TILE_SIZE)
+            .transpose(-3, -2)
+            .reshape(batch * tiles * n, _TRIANGULAR_SOLVE_NKI_RHS_TILE_SIZE)
+            .contiguous()
+        )
+        result = wrapped_triangular_solve_batched_nki[(lnc,)](
+            matrix,
+            rhs,
+            int(bool(upper)),
+            lnc,
+        )
+        return (
+            result.reshape(*batch_shape, tiles, n, _TRIANGULAR_SOLVE_NKI_RHS_TILE_SIZE)
+            .transpose(-3, -2)
+            .reshape(*batch_shape, n, padded_columns)[..., :rhs_columns]
+        )
+
+    result_tiles = []
+    for start in range(0, rhs_columns, _TRIANGULAR_SOLVE_NKI_RHS_TILE_SIZE):
+        end = min(rhs_columns, start + _TRIANGULAR_SOLVE_NKI_RHS_TILE_SIZE)
+        rhs = b[..., start:end].reshape(batch * n, end - start).contiguous()
+        result = wrapped_triangular_solve_batched_nki[(lnc,)](
+            matrix,
+            rhs,
+            int(bool(upper)),
+            lnc,
+        )
+        result_tiles.append(result.reshape(*batch_shape, n, end - start))
+    return torch.cat(result_tiles, dim=-1)
+
+
+def _solve_triangular_nki_blocked(a, b, *, upper):
+    """Solve a normalized unit-triangular system using exact NKI block solves."""
+    n = a.shape[-1]
+    if n == 0:
+        return b.clone()
+
+    if upper:
+        solution = None
+        for end in range(n, 0, -_TRIANGULAR_SOLVE_NKI_BLOCK_SIZE):
+            start = max(0, end - _TRIANGULAR_SOLVE_NKI_BLOCK_SIZE)
+            block_rhs = b[..., start:end, :]
+            if solution is not None:
+                block_rhs = block_rhs - torch.matmul(a[..., start:end, end:], solution)
+            block_solution = _solve_triangular_nki_block(
+                a[..., start:end, start:end],
+                block_rhs,
+                upper=True,
+            )
+            solution = (
+                block_solution
+                if solution is None
+                else torch.cat((block_solution, solution), dim=-2)
+            )
+        return solution
+
+    solution = None
+    for start in range(0, n, _TRIANGULAR_SOLVE_NKI_BLOCK_SIZE):
+        end = min(n, start + _TRIANGULAR_SOLVE_NKI_BLOCK_SIZE)
+        block_rhs = b[..., start:end, :]
+        if solution is not None:
+            block_rhs = block_rhs - torch.matmul(a[..., start:end, :start], solution)
+        block_solution = _solve_triangular_nki_block(
+            a[..., start:end, start:end],
+            block_rhs,
+            upper=False,
+        )
+        solution = (
+            block_solution if solution is None else torch.cat((solution, block_solution), dim=-2)
+        )
+    return solution
+
+
+@register_decomposition([aten.linalg_solve_triangular.default])
+def linalg_solve_triangular_decomposition(a, b, *, upper, left=True, unitriangular=False):
+    """Solve a triangular linear system.
+
+    Args:
+        a (torch.Tensor): Batched square triangular coefficient matrices.
+        b (torch.Tensor): Batched right-hand sides.
+        upper (bool): Whether ``a`` is upper triangular.
+        left (bool, optional): Whether to solve ``a @ x = b`` instead of ``x @ a = b``.
+            Defaults to ``True``.
+        unitriangular (bool, optional): Whether to treat the diagonal as ones. Defaults to
+            ``False``.
+
+    Returns:
+        torch.Tensor: Solution with the broadcast batch shape of ``a`` and ``b``.
+
+    Note:
+        Floating-point inputs use float32 blocked NKI solves and restore the input dtype;
+        right-sided systems are solved by transposing both operands.
+    """
+    b = b.to(a.dtype)
+    if not left:
+        x_t = linalg_solve_triangular_decomposition(
+            a.transpose(-1, -2),
+            b.transpose(-1, -2),
+            upper=not upper,
+            left=True,
+            unitriangular=unitriangular,
+        )
+        return x_t.transpose(-1, -2)
+
+    n = a.shape[-1]
+    if a.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        output_dtype = a.dtype
+        output_rows = n
+        rhs_columns = b.shape[-1]
+        a = a.to(torch.float32)
+        b = b.to(torch.float32)
+        if not unitriangular:
+            diagonal = torch.diagonal(a, dim1=-2, dim2=-1)
+            a = a / diagonal.unsqueeze(-1)
+            b = b / diagonal.unsqueeze(-1)
+        batch_shape = torch.broadcast_shapes(a.shape[:-2], b.shape[:-2])
+        a = torch.broadcast_to(a, (*batch_shape, n, n))
+        b = torch.broadcast_to(b, (*batch_shape, n, rhs_columns))
+        if n > _TRIANGULAR_SOLVE_NKI_BLOCK_SIZE:
+            pad = (-n) % _TRIANGULAR_SOLVE_NKI_BLOCK_SIZE
+            if pad:
+                a = F.pad(a, (0, pad, 0, pad))
+                b = F.pad(b, (0, 0, 0, pad))
+        return _solve_triangular_nki_blocked(
+            a,
+            b,
+            upper=upper,
+        )[..., :output_rows, :].to(output_dtype)
+
+    device = a.device
+    dtype = a.dtype
+    eye = torch.eye(n, dtype=dtype, device=device)
+
+    if unitriangular:
+        u = a
+        d_inv_b = b
+    else:
+        d_inv = torch.reciprocal(torch.diagonal(a, dim1=-2, dim2=-1))
+        u = a * d_inv.unsqueeze(-1)
+        d_inv_b = d_inv.unsqueeze(-1) * b
+
+    ones = torch.ones(n, n, dtype=torch.bool, device=device)
+    strict_keep = ones.triu(1) if upper else ones.tril(-1)
+    u = torch.where(strict_keep, u, eye)
+
+    n_mat = eye - u
+    num_squarings = math.ceil(math.log2(max(n, 2)))
+    u_inv = eye.expand_as(u)
+    p = n_mat
+    for _ in range(num_squarings):
+        u_inv = torch.matmul(u_inv, eye + p)
+        p = torch.matmul(p, p)
+
+    return torch.matmul(u_inv, d_inv_b)
+
+
 # ``aten::_stack`` is the internal variant of ``stack`` (it assumes all inputs
 # already share a shape). Unlike ``aten::stack`` it ships no meta kernel, so
 # Dynamo can't trace it and it reaches the backend as an opaque ``torch.operator``
@@ -696,7 +1236,15 @@ def _stack_out_fake(tensors, dim=0, *, out):
 
 @register_decomposition([aten._stack.default])
 def stack_decomposition(tensors, dim=0):
-    """Decompose the internal _stack into plain torch.stack (which lowers)."""
+    """Decompose internal ``_stack`` into ``torch.stack``.
+
+    Args:
+        tensors (Sequence[torch.Tensor]): Tensors with matching shapes to stack.
+        dim (int, optional): Dimension along which to stack. Defaults to ``0``.
+
+    Returns:
+        torch.Tensor: Input tensors stacked along ``dim``.
+    """
     return torch.stack(tensors, dim)
 
 
@@ -711,12 +1259,23 @@ def range_decomposition(
     device=None,
     pin_memory=None,
 ):
-    """Decompose torch.range into an arange-based formula.
+    """Decompose inclusive ``torch.range`` into ``arange`` arithmetic.
 
-    ``aten::range`` reaches the backend as an opaque ``torch.operator`` that
-    fails to legalize, while ``arange`` lowers natively. Unlike ``arange``,
-    ``range`` is *inclusive* of ``end``, so it has ``floor((end - start) / step)
-    + 1`` elements (matching PyTorch's range_out).
+    Args:
+        start (Number): Inclusive range start.
+        end (Number): Inclusive range end.
+        step (Number, optional): Distance between values. Defaults to ``1``.
+        dtype (torch.dtype | None, optional): Optional output dtype. Defaults to ``None``.
+        layout (torch.layout | None, optional): Unused layout placeholder. Defaults to ``None``.
+        device (torch.device | None, optional): Optional output device. Defaults to ``None``.
+        pin_memory (bool | None, optional): Unused pinned-memory placeholder. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Values from ``start`` through ``end``, inclusive.
+
+    Note:
+        The output length is ``int((end - start) / step) + 1``. Computation uses
+        ``float32`` when ``dtype`` is ``None``.
     """
     n = int((end - start) / step) + 1
     idx = torch.arange(n, device=device, dtype=torch.float32)
@@ -733,7 +1292,16 @@ def _mm_dtype_out_fake(self, mat2, out_dtype, *, out):
 
 @register_decomposition([aten.mm.dtype])
 def mm_dtype(self, mat2, out_dtype):
-    """Decompose mm.dtype into a cast + plain mm (2d analog of bmm.dtype)."""
+    """Decompose ``mm.dtype`` into casts followed by ``mm``.
+
+    Args:
+        self (torch.Tensor): Left matrix.
+        mat2 (torch.Tensor): Right matrix.
+        out_dtype (torch.dtype): Dtype to which both inputs are cast.
+
+    Returns:
+        torch.Tensor: Matrix product computed in ``out_dtype``.
+    """
     return torch.mm(self.to(out_dtype), mat2.to(out_dtype))
 
 
@@ -756,13 +1324,36 @@ def _norm_to_vector_norm(self, p, dim, keepdim, dtype=None):
 
 @register_decomposition([aten.norm.ScalarOpt_dim])
 def norm_scalaropt_dim(self, p, dim, keepdim=False):
-    """Decompose norm.ScalarOpt_dim (the functional form norm.out lowers to)."""
+    """Decompose ``norm.ScalarOpt_dim`` into ``linalg.vector_norm``.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        p (Number | str | None): Norm order; ``None`` and ``"fro"`` select order two.
+        dim (int | Sequence[int]): Dimension or dimensions to reduce.
+        keepdim (bool, optional): Preserve reduced dimensions. Defaults to ``False``.
+
+    Returns:
+        torch.Tensor | NotImplemented: Vector norm, or ``NotImplemented`` for
+            the unsupported nuclear norm.
+    """
     return _norm_to_vector_norm(self, p, dim, keepdim)
 
 
 @register_decomposition([aten.norm.ScalarOpt_dim_dtype])
 def norm_scalaropt_dim_dtype(self, p, dim, keepdim, dtype):
-    """Decompose norm.ScalarOpt_dim_dtype (functional form of norm.dtype_out)."""
+    """Decompose dtype-aware ``norm.ScalarOpt_dim`` into ``linalg.vector_norm``.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        p (Number | str | None): Norm order; ``None`` and ``"fro"`` select order two.
+        dim (int | Sequence[int]): Dimension or dimensions to reduce.
+        keepdim (bool): Whether to preserve reduced dimensions.
+        dtype (torch.dtype): Dtype used to compute the norm.
+
+    Returns:
+        torch.Tensor | NotImplemented: Vector norm computed with ``dtype``, or
+            ``NotImplemented`` for the unsupported nuclear norm.
+    """
     return _norm_to_vector_norm(self, p, dim, keepdim, dtype=dtype)
 
 
@@ -778,39 +1369,62 @@ def _clamp_promoted_dtype(self_dtype, *bounds):
 
 @register_decomposition([aten.special_erfcx.default])
 def special_erfcx_decomp(self):
-    """Lower erfcx piecewise (erfc + exp lower natively).
+    """Approximate the scaled complementary error function piecewise.
 
-    exp(x^2)*erfc(x) is exact for small x but overflows to inf for large +x (where
-    erfcx->0). For x>3 use the asymptotic series (1/(x*sqrt(pi)))*(1 - 1/2x^2 + ...);
-    clamp the exp arg so the unselected exact lane can't overflow (f16-safe). Bounded
-    across f32/bf16.
+    Args:
+        self (torch.Tensor): Input tensor.
+
+    Returns:
+        torch.Tensor: Values from the direct or asymptotic expression.
+
+    Note:
+        Uses ``exp(x**2) * erfc(x)`` for ``abs(x) <= 3`` and a four-correction-term
+        asymptotic expression above that threshold. Negative inputs use
+        ``2 * exp(x**2) - erfcx(|x|)``.
     """
-    x2 = self * self
-    exact = torch.exp(torch.clamp(x2, max=10.0)) * torch.erfc(self)
-    inv = 1.0 / (self * math.sqrt(math.pi))
+    ax = torch.abs(self)
+    ax2 = ax * ax
+    exact = torch.exp(ax2) * torch.erfc(ax)
+    inv = 1.0 / (ax * math.sqrt(math.pi))
     asymp = inv * (
         1.0
-        - 1.0 / (2 * x2)
-        + 3.0 / (4 * x2 * x2)
-        - 15.0 / (8 * x2 * x2 * x2)
-        + 105.0 / (16 * x2 * x2 * x2 * x2)
+        - 1.0 / (2 * ax2)
+        + 3.0 / (4 * ax2 * ax2)
+        - 15.0 / (8 * ax2 * ax2 * ax2)
+        + 105.0 / (16 * ax2 * ax2 * ax2 * ax2)
     )
-    return torch.where(self > 3.0, asymp, exact)
+    erfcx_abs = torch.where(ax > 3.0, asymp, exact)
+    return torch.where(self < 0.0, 2.0 * torch.exp(ax2) - erfcx_abs, erfcx_abs)
 
 
 @register_decomposition([aten.mvlgamma.default])
 def mvlgamma_decomp(self, p):
-    """Lower mvlgamma via an explicit lgamma sum."""
+    """Decompose ``mvlgamma`` into an explicit sum of ``lgamma`` terms.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        p (int): Dimension of the multivariate gamma function.
+
+    Returns:
+        torch.Tensor: Multivariate log-gamma values.
+    """
     acc = sum(torch.lgamma(self - i * 0.5) for i in range(p))
     return acc + (p * (p - 1) / 4.0) * math.log(math.pi)
 
 
 @register_decomposition([aten.special_zeta.self_scalar, aten.special_zeta.other_scalar])
 def special_zeta_scalar_decomp(self, other):
-    """Route zeta Scalar overloads to the tensor overload, which lowers.
+    """Decompose scalar ``special_zeta`` overloads through the tensor overload.
 
-    The tensor lowering emits non-broadcast chlo.zeta, so expand the scalar to
-    the tensor operand's shape rather than passing a 0-d tensor.
+    Expands the scalar operand to the tensor operand's shape because the tensor
+    lowering emits a non-broadcast ``chlo.zeta`` operation.
+
+    Args:
+        self (torch.Tensor | Number): First operand, scalar for ``other_scalar``.
+        other (torch.Tensor | Number): Second operand, scalar for ``self_scalar``.
+
+    Returns:
+        torch.Tensor: Zeta values from the broadcast tensor overload.
     """
     if not isinstance(self, torch.Tensor):
         self = torch.full_like(other, self)
@@ -821,7 +1435,17 @@ def special_zeta_scalar_decomp(self, other):
 
 @register_decomposition([aten.clamp.default])
 def clamp_decomp(self, min=None, max=None):
-    """Lower scalar-bounded clamp via maximum/minimum."""
+    """Decompose scalar-bounded ``clamp`` into maximum and minimum operations.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        min (Number | None, optional): Optional lower bound. Defaults to ``None``.
+        max (Number | None, optional): Optional upper bound. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: ``self`` unchanged when both bounds are ``None``; otherwise,
+            clamped values using PyTorch-compatible dtype promotion.
+    """
     dt = _clamp_promoted_dtype(self.dtype, min, max)
     out = self.to(dt) if dt != self.dtype else self
     if min is not None:
@@ -852,15 +1476,33 @@ def _gcd_unrolled(a, b, n_iter):
 
 @register_decomposition([aten.gcd.default])
 def gcd_decomp(self, other):
-    """Lower gcd via a fixed-count unrolled Euclidean algorithm (no data-dependent loop)."""
+    """Decompose ``gcd`` into a fixed-count unrolled Euclidean algorithm.
+
+    Args:
+        self (torch.Tensor): First integer tensor.
+        other (torch.Tensor): Second integer tensor.
+
+    Returns:
+        torch.Tensor: Elementwise greatest common divisors.
+    """
     n_iter = _GCD_ITERS.get(self.dtype, 64)
     return _gcd_unrolled(self, other, n_iter)
 
 
 @register_decomposition([aten.lcm.default])
 def lcm_decomp(self, other):
-    """Lower lcm as |a // gcd(a,b) * b|. Compute in int32 for narrow dtypes (matching
-    eager's internal promotion), then cast back."""
+    """Decompose ``lcm`` into division, ``gcd``, multiplication, and absolute value.
+
+    Narrow integer inputs are computed in ``int32`` before conversion back to
+    the input dtype.
+
+    Args:
+        self (torch.Tensor): First integer tensor.
+        other (torch.Tensor): Second integer tensor.
+
+    Returns:
+        torch.Tensor: Elementwise least common multiples cast to ``self.dtype``.
+    """
     orig = self.dtype
     compute = torch.int32 if orig in (torch.int8, torch.int16) else orig
     a = self.to(compute)
@@ -873,7 +1515,21 @@ def lcm_decomp(self, other):
 
 @register_decomposition([aten.cumprod.default])
 def cumprod_decomp(self, dim, *, dtype=None):
-    """Lower cumprod via a masked product."""
+    """Decompose ``cumprod`` into broadcast masking and product reduction.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        dim (int): Dimension along which to accumulate products.
+        dtype (torch.dtype | None, optional): Dtype to cast ``self`` to before reduction. Defaults
+            to ``None``.
+
+    Returns:
+        torch.Tensor: Cumulative products along ``dim``; a scalar input is cloned after the
+            optional cast.
+
+    Note:
+        Non-scalar integer reductions follow ``torch.prod`` promotion and return ``int64``.
+    """
     if dtype is not None:
         self = self.to(dtype)
     # cumprod over a 0-d tensor is identity (single element).
@@ -890,7 +1546,20 @@ def cumprod_decomp(self, dim, *, dtype=None):
 
 @register_decomposition([aten.unfold.default, aten.unfold_copy.default])
 def unfold_decomp(self, dimension, size, step):
-    """Lower unfold / unfold_copy via narrow + stack."""
+    """Lower ``unfold`` and ``unfold_copy`` through narrow and stack operations.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        dimension (int): Dimension along which to form windows.
+        size (int): Length of each window.
+        step (int): Distance between consecutive windows.
+
+    Returns:
+        torch.Tensor: Stacked non-scalar windows, or a scalar reshape view that aliases ``self``.
+
+    Note:
+        A scalar input is reshaped to a length-one tensor without using ``size`` or ``step``.
+    """
     if self.dim() == 0:
         # unfold of a scalar produces a length-1 vector.
         return self.reshape(1)
@@ -922,12 +1591,17 @@ def _adaptive_avg_pool_backward_weight(o_size, i_size, device, dtype):
 
 @register_decomposition([aten._adaptive_avg_pool2d_backward])
 def adaptive_avg_pool2d_backward_decomp(grad_output, self):
-    """Lower _adaptive_avg_pool2d_backward via two separable matmuls.
+    """Decompose adaptive average-pool backward into separable matrix products.
 
-    Adaptive avg-pool is separable over H and W, so the backward is
-    ``Wh @ grad_output @ Ww^T`` where each ``W`` (see
-    _adaptive_avg_pool_backward_weight) maps an output index to the input
-    indices it averaged over, scaled by that pooling window's size.
+    Per-dimension weight matrices support both divisible and nondivisible pool
+    sizes without the native torch-mlir lowering restriction.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the pooled output.
+        self (torch.Tensor): Forward input tensor supplying the input shape.
+
+    Returns:
+        torch.Tensor: Input gradient with the same shape as ``self``.
     """
     iH, iW = self.shape[-2], self.shape[-1]
     oH, oW = grad_output.shape[-2], grad_output.shape[-1]
@@ -989,19 +1663,23 @@ def avg_pool2d_backward_decomp(
     count_include_pad,
     divisor_override=None,
 ):
-    """Decompose avg_pool2d_backward into separable scatter matmuls.
+    """Decompose average-pool backward into separable scatter matrix products.
 
-    torch-mlir's DecomposeAtenAvgPool2dBackwardOp lowers to a grouped
-    convolution_backward that fails on Neuron for overlapping windows
-    (stride < kernel: 'torch.constant.int' fails to legalize) and refuses
-    count_include_pad=False outright. Rather than depend on it, compute the
-    backward directly: the gradient of an average is each output gradient split
-    equally over its window's inputs, so with a per-dim scatter matrix W (input
-    index in output window) and per-output divisor d,
-    ``grad_input = Wh @ (grad_output / d) @ Ww^T`` (separable over H and W).
-    This is the same stable einsum pattern as _adaptive_avg_pool2d_backward and
-    avoids convolution entirely. Verified against CPU across the full
-    kernel/stride/padding/ceil/count_include_pad/divisor_override matrix.
+    The matrices distribute each output gradient over its pooling window and
+    support overlapping windows, ceil mode, padding rules, and fixed divisors.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the pooled output.
+        self (torch.Tensor): Forward input tensor supplying the input shape.
+        kernel_size (int | Sequence[int]): Pooling kernel dimensions.
+        stride (int | Sequence[int] | None): Pooling strides.
+        padding (int | Sequence[int]): Pooling padding.
+        ceil_mode (bool): Unused; the ``grad_output`` shape already encodes ceil mode.
+        count_include_pad (bool): Whether explicit padding contributes to the divisor.
+        divisor_override (int | None, optional): Optional fixed divisor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Input gradient with the same spatial shape as ``self``.
     """
     kh, kw = _pool_pair(kernel_size)
     sh, sw = _pool_pair(stride if stride not in (None, []) else kernel_size)
@@ -1058,12 +1736,17 @@ def _adaptive_avg_pool3d_backward_out_fake(grad_output, self, *, out):
 
 @register_decomposition([aten._adaptive_avg_pool3d_backward])
 def adaptive_avg_pool3d_backward_decomp(grad_output, self):
-    """Lower _adaptive_avg_pool3d_backward via three separable matmuls.
+    """Decompose adaptive 3-D average-pool backward into separable matrix products.
 
-    The decomposition covers the .out overload too, so it needs no separate
-    .out decomposition. The .out overload also has its own fake impl
-    (_adaptive_avg_pool3d_backward_out_fake), but only to work around a broken
-    upstream meta. This is not needed for every .out op.
+    Args:
+        grad_output (torch.Tensor): Gradient of the pooled output.
+        self (torch.Tensor): Forward input tensor supplying the input shape.
+
+    Returns:
+        torch.Tensor: Input gradient with the same shape as ``self``.
+
+    Note:
+        The decomposition also covers the ``.out`` overload.
     """
     return _adaptive_avg_pool3d_backward_impl(grad_output, self)
 
@@ -1080,6 +1763,36 @@ def _is_static_contiguous_access(size, stride, storage_offset):
     row_major = [math.prod(sizes[d + 1 :]) for d in range(len(sizes))]
     # A size-1 dim's only index is 0, so its stride never reaches an address.
     return all(st == rm or sz == 1 for st, rm, sz in zip(stride, row_major, sizes, strict=False))
+
+
+def _clamp_slice_bound(v, full):
+    """Clamp one slice bound to PyTorch semantics: a negative counts back from the end."""
+    return max(0, min(full, v + full if v < 0 else v))
+
+
+def _pad_spec(rank, dim, low, high):
+    """Pad list padding only `dim`, by `low` then `high`; aten takes the pairs innermost first."""
+    return [0, 0] * (rank - 1 - dim) + [low, high]
+
+
+def _pad_select_span(dst, value, dim, low, high):
+    """Write `value` into `dst[low:high]` along `dim` by masking a zero-padded copy.
+
+    constant_pad_nd carries the span boundary in a pad attribute; cat carries it in a
+    tensor operand, and the backend adopts that operand's extent as the shard dim. Padding
+    plus a full-width select keeps the shard dim at the real one.
+    """
+    rank = dst.dim()
+    full = dst.shape[dim]
+    padded = torch.ops.aten.constant_pad_nd.default(
+        value, _pad_spec(rank, dim, low, full - high), 0
+    )
+
+    shape = [1] * rank
+    shape[dim] = full
+    idx = torch.arange(full, device=dst.device)
+    keep = ((idx >= low) & (idx < high)).reshape(shape)
+    return torch.where(keep, padded, dst)
 
 
 def _strided_runs_plan(size, stride, storage_offset, numel):
@@ -1138,26 +1851,24 @@ def _flatten_in_storage_order(t):
 
 @register_decomposition([aten.as_strided.default])
 def as_strided(input_tensor, size, stride, storage_offset=0):
-    """
-    Custom as_strided decomposition following torch-mlir pattern
+    """Decompose ``as_strided`` into contiguous slices or explicit index selection.
 
-    This implementation follows the exact decomposition pattern used in torch-mlir:
-    https://github.com/llvm/torch-mlir/blob/main/lib/Dialect/Torch/Transforms/DecomposeComplexOps.cpp
-
-    The pattern computes indices for each dimension and accumulates them to create
-    the final indexing pattern, then uses advanced indexing to gather elements.
-
-    That costs one int64 index per output element, so a contiguous reinterpretation of
-    a large buffer is served by narrow + reshape instead.
+    Uses ``narrow`` plus reshape for contiguous storage spans. Other layouts accumulate
+    per-dimension indices and gather from flattened storage, costing one ``int64``
+    index per output element.
 
     Args:
-        input_tensor: Input tensor to stride
-        size: Target size tuple
-        stride: Stride tuple
-        storage_offset: Storage offset (default: 0)
+        input_tensor (torch.Tensor): Tensor supplying the source storage values.
+        size (Sequence[int]): Output shape.
+        stride (Sequence[int]): Storage stride used to select each output value.
+        storage_offset (int | None, optional): Starting storage offset. Defaults to ``0``.
 
     Returns:
-        Tensor with the specified striding applied
+        torch.Tensor: Values with shape ``size``. Indexed gathers materialize; contiguous-run
+            paths may alias ``input_tensor``, but requested strides and aliasing are not guaranteed.
+
+    Note:
+        Follows torch-mlir's ``lib/Dialect/Torch/Transforms/DecomposeComplexOps.cpp`` pattern.
     """
     # Get the device from the input tensor to ensure all intermediate tensors
     # are created on the same device
@@ -1216,15 +1927,15 @@ def as_strided(input_tensor, size, stride, storage_offset=0):
 
 @register_decomposition([aten.split.Tensor])
 def split_decomposition(tensor, split_size, dim=0):
-    """Decompose split into narrow/slice ops instead of as_strided.
+    """Decompose ``split`` into slices instead of ``as_strided``.
 
     Args:
-        tensor: Input tensor.
-        split_size: Size of each chunk (int).
-        dim: Dimension to split along.
+        tensor (torch.Tensor): Tensor to split.
+        split_size (int): Maximum size of each chunk.
+        dim (int, optional): Dimension to split. Defaults to ``0``.
 
     Returns:
-        list[torch.Tensor]: List of split tensors.
+        list[torch.Tensor]: Slice views in dimension order that alias ``tensor``.
     """
     if dim < 0:
         dim += tensor.ndim
@@ -1240,15 +1951,15 @@ def split_decomposition(tensor, split_size, dim=0):
 
 @register_decomposition([aten.split_with_sizes.default])
 def split_with_sizes_decomposition(tensor, split_sizes, dim=0):
-    """Decompose split_with_sizes into narrow/slice ops instead of as_strided.
+    """Decompose ``split_with_sizes`` into slices instead of ``as_strided``.
 
     Args:
-        tensor: Input tensor.
-        split_sizes: List of sizes for each chunk.
-        dim: Dimension to split along.
+        tensor (torch.Tensor): Tensor to split.
+        split_sizes (Sequence[int]): Size of each output chunk.
+        dim (int, optional): Dimension to split. Defaults to ``0``.
 
     Returns:
-        list[torch.Tensor]: List of split tensors.
+        list[torch.Tensor]: Slice views in dimension order that alias ``tensor``.
     """
     if dim < 0:
         dim += tensor.ndim
@@ -1262,20 +1973,26 @@ def split_with_sizes_decomposition(tensor, split_sizes, dim=0):
 
 @register_decomposition([aten.topk.default])
 def topk_decomposition(x, k, dim=-1, largest=True, sorted=True):
-    """Decompose topk for non-standard dimension or parameter combinations.
+    """Decompose unsupported ``topk`` configurations through last-dimension floating-point ``topk``.
 
-    Handles cases where dim is not the last dimension or when largest=False
-    by transposing, applying topk, and transposing back.
+    Moves non-final dimensions to the end, negates inputs for smallest-value
+    selection, and casts integer inputs through ``float32``. The native path remains
+    in use for sorted largest-value selection on the final dimension.
 
     Args:
         x (torch.Tensor): Input tensor.
-        k (int): Number of top elements to return.
-        dim (int): Dimension to sort along. Defaults to -1.
-        largest (bool): If True, return largest elements. Defaults to True.
-        sorted (bool): If True, return sorted elements. Defaults to True.
+        k (int): Number of values to select.
+        dim (int, optional): Selection dimension. Defaults to ``-1``.
+        largest (bool, optional): Select largest values when true. Defaults to ``True``.
+        sorted (bool, optional): Forwarded for scalar and integer inputs; floating-point
+            decomposition paths may force sorted output. Defaults to ``True``.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]: (values, indices) tensors.
+        tuple[torch.Tensor, torch.Tensor] | NotImplemented: Selected values and indices,
+            or ``NotImplemented`` when the native final-dimension path should run.
+
+    Raises:
+        RuntimeError: If ``x`` has Boolean dtype.
     """
     # Match CPU behavior: topk does not support bool dtypes
     if x.dtype == torch.bool:
@@ -1341,22 +2058,27 @@ def scaled_dot_product_attention_decomposition(
     scale: float | None = None,
     enable_gqa: bool = False,
     philox_seed: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Decompose scaled_dot_product_attention into basic ops.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Decompose scaled-dot-product attention into primitive attention operations.
 
     Args:
-        query (torch.Tensor): Query tensor of shape (B, H, L, E).
-        key (torch.Tensor): Key tensor of shape (B, H, S, E).
-        value (torch.Tensor): Value tensor of shape (B, H, S, E).
-        attn_mask (torch.Tensor | None): Optional attention mask.
-        dropout_p (float): Dropout probability.
-        is_causal (bool): Whether to apply causal masking.
-        scale (float | None): Scale factor. Defaults to 1/sqrt(E).
-        enable_gqa (bool): Enable grouped-query attention.
-        philox_seed (torch.Tensor | None): Random seed for dropout.
+        query (torch.Tensor): Query tensor shaped ``(B, H_q, L, E)``.
+        key (torch.Tensor): Key tensor shaped ``(B, H_kv, S, E)``.
+        value (torch.Tensor): Value tensor shaped ``(B, H_kv, S, D_v)``.
+        attn_mask (torch.Tensor | None, optional): Broadcastable mask. Defaults to ``None``.
+        dropout_p (float, optional): Dropout probability; one-element masks are ignored.
+            Defaults to ``0.0``.
+        is_causal (bool, optional): Whether to apply causal masking. Defaults to ``False``.
+        scale (float | None, optional): Scale, or ``1 / sqrt(E)`` if absent. Defaults to ``None``.
+        enable_gqa (bool, optional): Repeat divisible key/value heads. Defaults to ``False``.
+        philox_seed (torch.Tensor | None, optional): Unused. Defaults to ``None``.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]: (attention_output, logsumexp).
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]: Output, float32 log-sum-exp
+            values, and a dropout mask, or ``None`` when dropout is disabled.
+
+    Raises:
+        ValueError: If ``dropout_p`` is outside ``[0, 1]``.
     """
     # Get dimensions - assume (B, H, L, E) layout
     B, q_heads, L, E = query.shape
@@ -1372,41 +2094,68 @@ def scaled_dot_product_attention_decomposition(
     if scale is None:
         scale = 1.0 / math.sqrt(E)
 
-    # Compute attention scores: (B, H, L, S)
-    scores = torch.matmul(query, key.transpose(-2, -1)) * scale
+    # compute_attention takes a single additive bias and signals "absent" with an empty
+    # tensor (it checks numel() > 0), since MLIR kernels cannot be handed None.
+    if attn_mask is None:
+        attn_bias = query.new_zeros((0,))
+    elif attn_mask.dtype == torch.bool:
+        attn_bias = torch.where(attn_mask, 0.0, float("-inf")).to(query.dtype)
+    else:
+        attn_bias = attn_mask
 
-    # Apply causal mask if needed
-    if is_causal:
-        # Create causal mask: positions can only attend to earlier positions
-        # Use scores.new_ones to derive tensor from existing tensor (avoids device issues)
-        causal_mask = torch.triu(scores.new_ones(L, S, dtype=torch.bool), diagonal=S - L + 1)
-        scores = scores.masked_fill(causal_mask, float("-inf"))
-
-    # Apply attention mask if provided
-    if attn_mask is not None:
-        if attn_mask.dtype == torch.bool:
-            scores = scores.masked_fill(~attn_mask, float("-inf"))
+    # The keep-mask has to survive to the backward, which reads it from the philox_seed slot.
+    if dropout_p > 0.0:
+        if dropout_p >= 1.0:
+            dropout_mask = query.new_zeros((B, q_heads, L, S), dtype=torch.bool)
         else:
-            scores = scores + attn_mask
+            dropout_mask = torch.ops.aten.native_dropout.default(
+                query.new_ones((B, q_heads, L, S)), dropout_p, True
+            )[1]
+    else:
+        dropout_mask = query.new_zeros((0,))
 
-    max_scores = torch.max(scores, dim=-1, keepdim=True)[0]
-    exp_scores = torch.exp(scores - max_scores)
-    sum_exp = torch.sum(exp_scores, dim=-1, keepdim=True)
-    attn_weights = exp_scores / sum_exp
+    output, lse = compute_attention(
+        query,
+        key,
+        value,
+        attn_bias,
+        dropout_mask,
+        scale,
+        is_causal,
+        dropout_p,
+    )
 
-    # Compute LSE
-    lse = max_scores.squeeze(-1) + torch.log(sum_exp.squeeze(-1))
-    lse = lse.to(torch.float32)
+    return (output, lse, dropout_mask if dropout_p > 0.0 else None)
 
-    dropout_mask = None
-    if dropout_p > 0:
-        attn_weights, dropout_mask = torch.ops.aten.native_dropout.default(
-            attn_weights, dropout_p, train=True
-        )
 
-    output = torch.matmul(attn_weights, value)
+def _nki_flash_attention_shapes_supported(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> bool:
+    if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+        return False
 
-    return (output, lse, dropout_mask)
+    B, H, L, E = query.shape
+    B_k, H_k, S, D = key.shape
+    B_v, H_v, S_v, D_v = value.shape
+    # The forward kernel converts FP16 input tiles to BF16. Use the math path for FP16.
+    return (
+        B > 0
+        and H > 0
+        and L > 0
+        and E > 0
+        and B == B_k == B_v
+        and H_k > 0
+        and H_k == H_v
+        and H % H_k == 0
+        and S > 0
+        and S_v == S
+        and E == D
+        and D_v > 0
+        and query.dtype == key.dtype == value.dtype
+        and query.dtype in (torch.bfloat16, torch.float32)
+    )
 
 
 def _can_use_nki_flash_attention(
@@ -1415,6 +2164,9 @@ def _can_use_nki_flash_attention(
     value: torch.Tensor,
     attn_bias: torch.Tensor | None = None,
     dropout_p: float = 0.0,
+    scale: float | None = None,
+    return_debug_mask: bool = False,
+    requires_lse: bool = True,
 ) -> bool:
     """Check if NKI flash attention kernel can be used.
 
@@ -1431,20 +2183,27 @@ def _can_use_nki_flash_attention(
     if not _getenv_bool("TORCH_NEURONX_ENABLE_NKI_SDPA", True):
         return False
 
-    B, H, L, E = query.shape
-    S = key.shape[-2]
-    D = key.shape[-1]
+    # attention_bwd resolves `softmax_scale or 1/sqrt(d)`, so an explicit scale=0.0 would
+    # become the default scale. Reject it in both gates so fwd and bwd take the same path.
+    if scale == 0.0:
+        return False
 
-    # Conditions to use NKI SDPA kernel
-    # NOTE: Limit for B * H needs to be set according to attention_cte kernel
+    if not _nki_flash_attention_shapes_supported(query, key, value):
+        return False
+
+    B, H, L, E = query.shape
+    D_v = value.shape[-1]
     return (
-        key.shape == value.shape
-        and L % 512 == 0
-        and S % 512 == 0
-        and D <= 128
+        E <= 512
+        and D_v <= 512
+        and D_v <= E
+        and (D_v == E or _NKI_ATTENTION_SUPPORTS_V_HEAD_DIM)
         and B * H <= 512
+        and (not requires_lse or L % 128 == 0)
         and attn_bias is None
         and dropout_p == 0
+        and not return_debug_mask
+        and int(get_logical_neuron_cores()) in (1, 2)
     )
 
 
@@ -1461,9 +2220,10 @@ def _compute_attention_nki(
 
     B, H, L, E = query.shape
     _, H_kv, S, D = key.shape
+    D_v = value.shape[-1]
     q_nki = query.reshape(B * H, L, E)
     k_nki = key.reshape(B * H_kv, S, D)
-    v_nki = value.reshape(B * H_kv, S, D)
+    v_nki = value.reshape(B * H_kv, S, D_v)
 
     # attention_cte NKI kernel uses different default scale value
     if scale is None:
@@ -1487,7 +2247,7 @@ def _compute_attention_nki(
         logsumexp = -(neg_max + torch.log(out_sum_recip))
         logsumexp = logsumexp.to(torch.float32).reshape(B, H, *logsumexp.shape[-2:])
         logsumexp = logsumexp.transpose(-2, -1).reshape(B, H, -1)
-        output = output.reshape(B, H, L, D)
+        output = output.reshape(B, H, L, D_v)
         return output, logsumexp
     else:
         output = wrapped_flash_fwd[grid](
@@ -1500,7 +2260,7 @@ def _compute_attention_nki(
             causal_mask=is_causal,
             cache_softmax=False,
         )
-        output = output.reshape(B, H, L, D)
+        output = output.reshape(B, H, L, D_v)
         return output
 
 
@@ -1515,23 +2275,26 @@ def sdpa_fused_overrideable(
     return_debug_mask: bool = False,
     scale: float | None = None,
 ):
-    """Decompose _scaled_dot_product_fused_attention_overrideable.
-
-    Routes to NKI SDPA kernel when possible, otherwise falls back to
-    the standard decomposition.
+    """Decompose fused overrideable attention through NKI or primitive attention ops.
 
     Args:
-        query (torch.Tensor): Query tensor of shape (B, H, L, E).
-        key (torch.Tensor): Key tensor of shape (B, H, S, D).
-        value (torch.Tensor): Value tensor of shape (B, H, S, D).
-        attn_bias (torch.Tensor | None): Optional attention bias.
-        dropout_p (float): Dropout probability.
-        is_causal (bool): Whether to apply causal masking.
-        return_debug_mask (bool): Whether to return debug mask.
-        scale (float | None): Scale factor. Defaults to 1/sqrt(E).
+        query (torch.Tensor): Query tensor of shape ``(B, H_q, L, E)``.
+        key (torch.Tensor): Key tensor of shape ``(B, H_kv, S, E)``.
+        value (torch.Tensor): Value tensor of shape ``(B, H_kv, S, D_v)``.
+        attn_bias (torch.Tensor | None, optional): Optional attention bias. Defaults to ``None``.
+        dropout_p (float, optional): Dropout probability. Defaults to ``0.0``.
+        is_causal (bool, optional): Whether to apply causal masking. Defaults to ``False``.
+        return_debug_mask (bool, optional): Force fallback; return no mask. Defaults to ``False``.
+        scale (float | None, optional): Scale; ``None`` means ``1 / sqrt(E)``. Defaults to ``None``.
 
     Returns:
-        tuple: (attention_output, logsumexp, philox_seed, philox_offset, debug_mask).
+        tuple: Nine values: output shaped ``(B, H_q, L, D_v)``, ``float32`` log-sum-exp shaped
+            ``(B, H_q, L)``, two ``None`` cumulative-sequence placeholders, ``L``, ``S``, a
+            fallback dropout mask, ``None``, or an NKI scalar zero ``int32`` seed; a zero
+            ``int32`` offset and a ``None`` debug-mask placeholder.
+
+    Raises:
+        RuntimeError: If fewer key heads than query heads do not divide ``H_q``.
     """
     B, H, L, E = query.shape
     _, Hkv, S, D = key.shape
@@ -1547,7 +2310,15 @@ def sdpa_fused_overrideable(
         philox_seed = (query.flatten()[0] * 0).to(torch.int32)
         philox_offset = (query.flatten()[0] * 0).to(torch.int32)
 
-    if _can_use_nki_flash_attention(query, key, value, attn_bias, dropout_p):
+    if _can_use_nki_flash_attention(
+        query,
+        key,
+        value,
+        attn_bias,
+        dropout_p,
+        scale=scale,
+        return_debug_mask=return_debug_mask,
+    ):
         try:
             output, logsumexp = _compute_attention_nki(
                 query, key, value, is_causal, scale, training=True
@@ -1603,6 +2374,8 @@ def _can_use_nki_flash_attention_backward(
     value: torch.Tensor,
     attn_bias: torch.Tensor | None = None,
     dropout_p: float = 0.0,
+    scale: float | None = None,
+    is_causal: bool = False,
 ) -> bool:
     """Check if NKI flash attention backward kernel can be used.
 
@@ -1619,17 +2392,35 @@ def _can_use_nki_flash_attention_backward(
     if not _getenv_bool("TORCH_NEURONX_ENABLE_NKI_SDPA", True):
         return False
 
-    if attn_bias is not None:
+    # See _can_use_nki_flash_attention: attention_bwd cannot express scale=0.0.
+    if scale == 0.0 or not _nki_flash_attention_shapes_supported(query, key, value):
         return False
 
-    _, _, L, E = query.shape
-    _, _, S, _ = key.shape
+    _, _, L, D = query.shape
+    S = key.shape[-2]
+    D_v = value.shape[-1]
+    qk_tiles = math.ceil(D / 128)
+    v_tiles = math.ceil(D_v / 128)
+    qk_tile_size = math.ceil(D / qk_tiles)
+    v_tile_size = math.ceil(D_v / v_tiles)
+    k_tile_size = min(512, S)
+    section_size = 8192 // (1 << (max(qk_tiles, v_tiles) - 1).bit_length())
+    if query.dtype == torch.float32:
+        section_size = max(k_tile_size, section_size // 2)
+
     return (
-        key.shape == value.shape
-        and L % 512 == 0
-        and S % 512 == 0
+        attn_bias is None
         and dropout_p == 0
-        and E % math.ceil(E / 128) == 0
+        and (D_v == D or _NKI_ATTENTION_SUPPORTS_V_HEAD_DIM)
+        and L % 128 == 0
+        and D % qk_tile_size == 0
+        and D_v % v_tile_size == 0
+        and S % k_tile_size == 0
+        and k_tile_size % 128 == 0
+        and section_size > 0
+        and section_size % k_tile_size == 0
+        and (not is_causal or L == S)
+        and int(get_logical_neuron_cores()) in (1, 2)
     )
 
 
@@ -1668,7 +2459,9 @@ def _compute_attention_backward_nki(
         lse_4d = logsumexp
 
     logical_neuron_cores = int(get_logical_neuron_cores())
-    grid = (logical_neuron_cores,) if B * kv_heads % logical_neuron_cores == 0 else (1,)
+    # Launch gridless when the work does not divide evenly: the kernel then runs
+    # unsharded, and it must not declare an LNC that the compile contradicts.
+    grid = (logical_neuron_cores,) if B * kv_heads % logical_neuron_cores == 0 else ()
 
     # Call NKI bwd kernel
     grad_q_nki, grad_k_nki, grad_v_nki = wrapped_flash_bwd[grid](
@@ -1701,99 +2494,43 @@ def compute_attention_backward_decomposition(
     scale: float,
     is_causal: bool,
     dropout_p: float,
-    mixed_precision: bool,
     philox_seed: torch.Tensor | None = None,
 ):
-    """Compute attention backward pass using torch decomposition.
+    """Decompose attention backward into matmul and softmax-gradient primitives.
 
     Args:
-        grad_out (torch.Tensor): Gradient of attention output.
-        query (torch.Tensor): Query tensor of shape (B, H, L, E).
-        key (torch.Tensor): Key tensor of shape (B, H, S, E).
-        value (torch.Tensor): Value tensor of shape (B, H, S, E).
-        attn_bias (torch.Tensor): Attention bias tensor.
-        out (torch.Tensor): Forward pass output (full/global). Used for the
-            flash-attention softmax-Jacobian identity so the result is correct
-            for ring/CP per-block calls, not only full-context calls.
-        lse (torch.Tensor): Logsumexp from forward pass.
-        scale (float): Attention scale factor.
+        grad_out (torch.Tensor): Attention-output gradient.
+        query (torch.Tensor): Query tensor of shape ``(B, H, L, E)``.
+        key (torch.Tensor): Key tensor of shape ``(B, H, S, E)``.
+        value (torch.Tensor): Value tensor of shape ``(B, H, S, E)``.
+        attn_bias (torch.Tensor): Attention bias or a one-element no-bias sentinel.
+        out (torch.Tensor): Full forward output used for ring/context-parallel correction.
+        lse (torch.Tensor): Forward log-sum-exp values.
+        scale (float): Attention scale.
         is_causal (bool): Whether to apply causal masking.
         dropout_p (float): Dropout probability.
-        mixed_precision (bool): Whether to use mixed precision.
-        philox_seed (torch.Tensor | None): Random seed for dropout.
+        philox_seed (torch.Tensor | None, optional): Dropout mask passed from the forward graph.
+            Defaults to ``None``.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (grad_query, grad_key, grad_value).
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]: Query, key,
+            value, and attention-bias gradients. Without a bias, the fourth element is
+            ``None``.
     """
-    orig_dtype = query.dtype
-    acc_dtype = torch.float32 if mixed_precision else orig_dtype
-
-    grad_out = grad_out.to(acc_dtype)
-    query = query.to(acc_dtype)
-    key = key.to(acc_dtype)
-    value = value.to(acc_dtype)
-    out = out.to(acc_dtype)
-    lse = lse.to(acc_dtype)
-    if attn_bias.numel() > 1:
-        attn_bias = attn_bias.to(acc_dtype)
-
-    logits = query @ key.transpose(-2, -1) * scale
-
-    if is_causal:
-        seq_len_q, seq_len_k = logits.shape[-2:]
-        temp_mask = torch.ones(seq_len_q, seq_len_k, dtype=torch.bool, device=query.device).tril(
-            diagonal=0
-        )
-        logits = logits.masked_fill(temp_mask.logical_not(), float("-inf"))
-    elif attn_bias.numel() > 1:
-        logits = logits + attn_bias
-
-    probs = torch.exp(logits - lse.unsqueeze(-1))
-
-    # use the dropout mask passed to the backwards FX graph
-    # via the philox_seed parameter
-    dropout_mask = philox_seed
-    masked_probs = probs
-    if dropout_mask is not None:
-        if dropout_p == 1:
-            masked_probs = probs * dropout_mask
-        else:
-            masked_probs = probs * dropout_mask * (1 / (1 - dropout_p))
-
-    grad_v = masked_probs.transpose(-2, -1) @ grad_out
-    grad_out_v = grad_out @ value.transpose(-2, -1)
-    grad_out_mask = grad_out_v
-    if dropout_mask is not None:
-        if dropout_p == 1:
-            grad_out_mask = grad_out_v * dropout_mask
-        else:
-            grad_out_mask = grad_out_v * dropout_mask * (1 / (1 - dropout_p))
-
-    # Preserve the full-context reduction order while adding contributions
-    # from other ring/CP blocks through the global output residual.
-    local_out = masked_probs @ value
-    sum_reduction = (grad_out_mask * probs).sum(dim=-1, keepdim=True) + (
-        grad_out * (out - local_out)
-    ).sum(dim=-1, keepdim=True)
-    ds = probs * (grad_out_mask - sum_reduction) * scale
-
-    if is_causal:
-        seq_len_q, seq_len_k = ds.shape[-2:]
-        temp_mask = torch.ones(seq_len_q, seq_len_k, dtype=torch.bool, device=query.device).tril(
-            diagonal=0
-        )
-        ds = ds.masked_fill(temp_mask.logical_not(), 0.0)
-
-    grad_q = ds @ key
-    grad_k = ds.transpose(-2, -1) @ query
-
-    grad_attn_bias = ds.to(orig_dtype) if attn_bias.numel() > 1 else attn_bias.to(orig_dtype)
-
-    grad_q = grad_q.to(orig_dtype)
-    grad_k = grad_k.to(orig_dtype)
-    grad_v = grad_v.to(orig_dtype)
-
-    return grad_q, grad_k, grad_v, grad_attn_bias
+    dropout_mask = philox_seed if dropout_p > 0.0 else query.new_zeros((0,))
+    return compute_attention_backward(
+        grad_out,
+        query,
+        key,
+        value,
+        attn_bias,
+        dropout_mask,
+        out,
+        lse,
+        scale,
+        is_causal,
+        dropout_p,
+    )
 
 
 def _prepare_backward_inputs(query, key, value, orig_k_shape, scale):
@@ -1829,7 +2566,17 @@ def _prepare_backward_inputs(query, key, value, orig_k_shape, scale):
     return B, q_heads, L, E, S, orig_kv_heads, scale, is_gqa, key, value
 
 
-def _reduce_gqa_gradients(grad_k, grad_v, is_gqa, b, orig_kv_heads, q_heads, s, e):
+def _reduce_gqa_gradients(
+    grad_k,
+    grad_v,
+    is_gqa,
+    b,
+    orig_kv_heads,
+    q_heads,
+    s,
+    qk_head_dim,
+    v_head_dim,
+):
     """Reduce GQA gradients back to original KV shapes.
 
     Args:
@@ -1847,8 +2594,8 @@ def _reduce_gqa_gradients(grad_k, grad_v, is_gqa, b, orig_kv_heads, q_heads, s, 
     """
     if is_gqa:
         repeat_factor = q_heads // orig_kv_heads
-        grad_k = grad_k.view(b, orig_kv_heads, repeat_factor, s, e).sum(dim=2)
-        grad_v = grad_v.view(b, orig_kv_heads, repeat_factor, s, e).sum(dim=2)
+        grad_k = grad_k.view(b, orig_kv_heads, repeat_factor, s, qk_head_dim).sum(dim=2)
+        grad_v = grad_v.view(b, orig_kv_heads, repeat_factor, s, v_head_dim).sum(dim=2)
     return grad_k, grad_v
 
 
@@ -1874,33 +2621,43 @@ def scaled_dot_product_fused_attention_overrideable_backward_decomposition(
     philox_offset: torch.Tensor | None = None,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Decompose scaled_dot_product_fused_attention_overrideable backward.
-
-    Routes to NKI kernel when possible, otherwise uses torch decomposition.
+    """Return attention gradients through NKI or primitive operations.
 
     Args:
-        grad_out (torch.Tensor): Gradient of attention output.
-        query (torch.Tensor): Query tensor of shape (B, H, L, E).
-        key (torch.Tensor): Key tensor of shape (B, H, S, E).
-        value (torch.Tensor): Value tensor of shape (B, H, S, E).
-        attn_bias (torch.Tensor | None): Optional attention bias.
-        grad_input_mask (list[bool] | None): Mask for which gradients to compute.
-        out (torch.Tensor | None): Forward pass output.
-        logsumexp (torch.Tensor | None): Logsumexp from forward pass.
-        cum_seq_q (torch.Tensor | None): Cumulative sequence lengths for queries.
-        cum_seq_k (torch.Tensor | None): Cumulative sequence lengths for keys.
-        max_q (int | None): Maximum query sequence length.
-        max_k (int | None): Maximum key sequence length.
-        dropout_p (float): Dropout probability.
-        is_causal (bool): Whether causal masking was applied.
-        philox_seed (torch.Tensor | None): Random seed from forward pass.
-        philox_offset (torch.Tensor | None): Random offset from forward pass.
-        scale (float | None): Scale factor used in forward pass.
+        grad_out (torch.Tensor): Attention-output gradient.
+        query (torch.Tensor): Query tensor shaped ``(B, H, L, E)``.
+        key (torch.Tensor): Key tensor shaped ``(B, H_kv, S, E)``.
+        value (torch.Tensor): Value tensor shaped ``(B, H_kv, S, D_v)``.
+        attn_bias (torch.Tensor | None, optional): Bias. Defaults to ``None``.
+        grad_input_mask (list[bool] | None, optional): Unused. Defaults to ``None``.
+        out (torch.Tensor | None, optional): Required forward output. Defaults to ``None``.
+        logsumexp (torch.Tensor | None, optional): Required forward LSE. Defaults to ``None``.
+        cum_seq_q (torch.Tensor | None, optional): Unused. Defaults to ``None``.
+        cum_seq_k (torch.Tensor | None, optional): Unused. Defaults to ``None``.
+        max_q (int | None, optional): Unused. Defaults to ``None``.
+        max_k (int | None, optional): Unused. Defaults to ``None``.
+        dropout_p (float, optional): Dropout probability. Defaults to ``0.0``.
+        is_causal (bool, optional): Apply causal masking. Defaults to ``False``.
+        philox_seed (torch.Tensor, optional): Mask; one element is ignored. Defaults to ``None``.
+        philox_offset (torch.Tensor | None, optional): Unused. Defaults to ``None``.
+        scale (float | None, optional): Attention scale. Defaults to ``None``.
 
     Returns:
-        tuple: (grad_query, grad_key, grad_value, grad_attn_bias).
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]: Query, key,
+            value, and optional attention-bias gradients.
+
+    Raises:
+        ValueError: If ``dropout_p`` is outside ``[0, 1]``.
     """
-    can_use_nki = _can_use_nki_flash_attention_backward(query, key, value, attn_bias, dropout_p)
+    can_use_nki = _can_use_nki_flash_attention_backward(
+        query,
+        key,
+        value,
+        attn_bias,
+        dropout_p,
+        scale=scale,
+        is_causal=is_causal,
+    )
     # Try NKI
     if can_use_nki:
         try:
@@ -1943,15 +2700,24 @@ def scaled_dot_product_fused_attention_overrideable_backward_decomposition(
         scale,
         is_causal,
         dropout_p,
-        True,
         philox_seed,
     )
 
     # Reduce gradients for GQA
-    grad_k, grad_v = _reduce_gqa_gradients(grad_k, grad_v, is_gqa, B, orig_kv_heads, q_heads, S, E)
+    grad_k, grad_v = _reduce_gqa_gradients(
+        grad_k,
+        grad_v,
+        is_gqa,
+        B,
+        orig_kv_heads,
+        q_heads,
+        S,
+        E,
+        value.shape[-1],
+    )
 
     # Handle grad_attn_bias
-    if grad_attn_bias.numel() == 1:
+    if grad_attn_bias is not None and grad_attn_bias.numel() == 1:
         grad_attn_bias = None
 
     return grad_q, grad_k, grad_v, grad_attn_bias
@@ -1965,17 +2731,17 @@ def scalar_tensor(
     device=None,
     pin_memory=None,
 ):
-    """Decompose scalar_tensor to full() for better StableHLO support.
+    """Decompose ``scalar_tensor`` into ``full`` for StableHLO support.
 
     Args:
-        value: Scalar value to convert to tensor.
-        dtype: Optional dtype for the tensor.
-        layout: Tensor layout (unused).
-        device: Target device.
-        pin_memory: Whether to pin memory (unused).
+        value (Number): Scalar value.
+        dtype (torch.dtype | None, optional): Optional tensor dtype. Defaults to ``None``.
+        layout (torch.layout | None, optional): Unused layout placeholder. Defaults to ``None``.
+        device (torch.device | None, optional): Optional tensor device. Defaults to ``None``.
+        pin_memory (bool | None, optional): Unused pinned-memory placeholder. Defaults to ``None``.
 
     Returns:
-        torch.Tensor: 0-dimensional tensor containing the scalar value.
+        torch.Tensor: Zero-dimensional tensor containing ``value``.
     """
     # Use full with empty shape to create a scalar tensor
     return torch.full((), value, dtype=dtype, device=device)
@@ -1983,7 +2749,16 @@ def scalar_tensor(
 
 @register_decomposition([torch.ops.prims.scalar_tensor.default])
 def prims_scalar_tensor(s, dtype=None, device=None):
-    """prims.scalar_tensor (emitted by Scalar-overload _refs) doesn't lower; full() does."""
+    """Decompose ``prims.scalar_tensor`` into zero-dimensional ``full``.
+
+    Args:
+        s (Number): Scalar value to store.
+        dtype (torch.dtype | None, optional): Optional tensor dtype. Defaults to ``None``.
+        device (torch.device | None, optional): Optional tensor device. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Zero-dimensional tensor containing ``s``.
+    """
     return torch.full((), s, dtype=dtype, device=device)
 
 
@@ -1999,52 +2774,127 @@ def _both_tensors(self, other):
 
 @register_decomposition([torch.ops.prims.shift_left.default])
 def prims_shift_left(self, other):
-    """prims.shift_left doesn't lower; route to the .Tensor leaf which does."""
+    """Decompose ``prims.shift_left`` into ``bitwise_left_shift.Tensor``.
+
+    Args:
+        self (torch.Tensor | Number): Left operand; one operand must be a tensor.
+        other (torch.Tensor | Number): Right operand; one operand must be a tensor.
+
+    Returns:
+        torch.Tensor: Elementwise left-shifted values.
+    """
     self, other = _both_tensors(self, other)
     return aten.bitwise_left_shift.Tensor(self, other)
 
 
 @register_decomposition([torch.ops.prims.shift_right_arithmetic.default])
 def prims_shift_right_arithmetic(self, other):
-    """Lower prims.shift_right_arithmetic to aten.bitwise_right_shift.Tensor."""
+    """Decompose ``prims.shift_right_arithmetic`` into the ATen tensor overload.
+
+    Args:
+        self (torch.Tensor | Number): Left operand; one operand must be a tensor.
+        other (torch.Tensor | Number): Right operand; one operand must be a tensor.
+
+    Returns:
+        torch.Tensor: Elementwise arithmetic right-shifted values.
+    """
     self, other = _both_tensors(self, other)
     return aten.bitwise_right_shift.Tensor(self, other)
 
 
 @register_decomposition([torch.ops.prims.remainder.default])
 def prims_remainder(self, other):
-    """Lower prims.remainder to aten.remainder.Tensor."""
+    """Decompose ``prims.remainder`` into ``aten.remainder.Tensor``.
+
+    Args:
+        self (torch.Tensor | Number): Dividend; one operand must be a tensor.
+        other (torch.Tensor | Number): Divisor; one operand must be a tensor.
+
+    Returns:
+        torch.Tensor: Elementwise remainders.
+    """
     self, other = _both_tensors(self, other)
     return aten.remainder.Tensor(self, other)
 
 
 @register_decomposition([torch.ops.prims.bitwise_and.default])
 def prims_bitwise_and(self, other):
-    """Lower prims.bitwise_and to aten.bitwise_and.Tensor."""
+    """Decompose ``prims.bitwise_and`` into ``aten.bitwise_and.Tensor``.
+
+    Args:
+        self (torch.Tensor | Number): Left operand; one operand must be a tensor.
+        other (torch.Tensor | Number): Right operand; one operand must be a tensor.
+
+    Returns:
+        torch.Tensor: Elementwise bitwise conjunction.
+    """
     self, other = _both_tensors(self, other)
     return aten.bitwise_and.Tensor(self, other)
 
 
 @register_decomposition([torch.ops.prims.bitwise_or.default])
 def prims_bitwise_or(self, other):
-    """Lower prims.bitwise_or to aten.bitwise_or.Tensor."""
+    """Decompose ``prims.bitwise_or`` into ``aten.bitwise_or.Tensor``.
+
+    Args:
+        self (torch.Tensor | Number): Left operand; one operand must be a tensor.
+        other (torch.Tensor | Number): Right operand; one operand must be a tensor.
+
+    Returns:
+        torch.Tensor: Elementwise bitwise disjunction.
+    """
     self, other = _both_tensors(self, other)
     return aten.bitwise_or.Tensor(self, other)
 
 
 @register_decomposition([torch.ops.prims.bitwise_xor.default])
 def prims_bitwise_xor(self, other):
-    """Lower prims.bitwise_xor to aten.bitwise_xor.Tensor."""
+    """Decompose ``prims.bitwise_xor`` into ``aten.bitwise_xor.Tensor``.
+
+    Args:
+        self (torch.Tensor | Number): Left operand; one operand must be a tensor.
+        other (torch.Tensor | Number): Right operand; one operand must be a tensor.
+
+    Returns:
+        torch.Tensor: Elementwise bitwise exclusive disjunction.
+    """
     self, other = _both_tensors(self, other)
     return aten.bitwise_xor.Tensor(self, other)
 
 
 @register_decomposition([aten.copysign.Scalar])
 def copysign_scalar(self, other):
-    """copysign.Scalar doesn't lower (its _refs route hits prims.signbit/where);
-    wrap the scalar and use the copysign.Tensor leaf, which does."""
+    """Decompose ``copysign.Scalar`` through the tensor overload.
+
+    The scalar reference otherwise reaches unsupported ``prims.signbit`` and
+    ``where`` operations.
+
+    Args:
+        self (torch.Tensor): Tensor supplying magnitudes, dtype, and device.
+        other (Number): Scalar supplying the result sign.
+
+    Returns:
+        torch.Tensor: Values with magnitudes from ``self`` and sign from ``other``.
+    """
     other = torch.full((), other, dtype=self.dtype, device=self.device)
     return aten.copysign.Tensor(self, other)
+
+
+@register_decomposition([aten.logaddexp2])
+def logaddexp2_decomposition(self, other):
+    """Compute base-two log-add-exp with the shared reference helper.
+
+    Args:
+        self (torch.Tensor): First input.
+        other (torch.Tensor): Second input.
+
+    Returns:
+        torch.Tensor: Elementwise ``log2(2**self + 2**other)`` values in the promoted dtype.
+
+    Note:
+        Computes in float32 before casting to the promoted input dtype.
+    """
+    return logaddexp2_ref(self, other)
 
 
 @register_decomposition(
@@ -2061,7 +2911,26 @@ def linspace_decomposition(
     pin_memory=False,
     requires_grad=False,
 ):
-    """Decompose linspace ensuring all intermediate tensors share the input device."""
+    """Decompose ``linspace`` into device-local ``arange`` interpolation.
+
+    Args:
+        start (Number | torch.Tensor): First output value.
+        end (Number | torch.Tensor): Last output value.
+        steps (int): Number of output values.
+        dtype (torch.dtype | None, optional): Output dtype. Defaults to ``None``.
+        device (torch.device | None, optional): Output or inferred tensor device. Defaults to
+            ``None``.
+        layout (torch.layout, optional): Unused layout. Defaults to ``torch.strided``.
+        pin_memory (bool, optional): Unused pinning option. Defaults to ``False``.
+        requires_grad (bool, optional): Unused gradient option. Defaults to ``False``.
+
+    Returns:
+        torch.Tensor: Empty for nonpositive steps, ``start`` for one step, or evenly spaced
+            values including both endpoints otherwise.
+
+    Note:
+        Computes interpolation in float64 before casting to ``dtype``.
+    """
     # Infer device from tensor inputs when not explicitly provided
     if device is None:
         if isinstance(start, torch.Tensor):
@@ -2108,6 +2977,10 @@ def index_copy(
 
     Returns:
         torch.Tensor: Result with source values scattered into input.
+
+    Note:
+        For a zero-dimensional input, returns ``source`` reshaped to the input shape without
+        using ``index``. The normalized ``dim`` does not affect the result.
     """
     if dim < 0:
         dim = input.dim() + dim
@@ -2188,20 +3061,21 @@ def nonzero_with_count(
     fill_value: int = -1,
     with_count: bool = False,
 ) -> tuple[torch.Tensor, int]:
-    """Find nonzero elements with fixed output size.
+    """Find nonzero coordinates with an optional fixed-size result.
 
-    Uses per-last-dim cumsum/scatter_add to keep reduce_window sizes small.
-    For shape (..., C), reduce_window sizes are C and prod(shape[:-1]), not numel.
-    No reshape needed — works directly on the original tensor shape.
+    Uses an NKI fast path when available. Otherwise, uses per-last-dimension cumulative
+    sums and scatter additions so reduction sizes remain below ``numel``.
 
     Args:
-        tensor (torch.Tensor): Input tensor to find nonzero elements.
-        size (int): Fixed output size. Pads with fill_value if fewer nonzeros.
-        fill_value (int): Padding value for unused slots. Defaults to -1.
-        with_count (bool): If True, return count of nonzero elements.
+        tensor (torch.Tensor): Input tensor.
+        size (int | None): Number of coordinate rows, or ``None`` to use the nonzero count.
+        fill_value (int, optional): Coordinate used to pad unused rows. Defaults to ``-1``.
+        with_count (bool, optional): Whether to return the scalar nonzero count with the indices.
+            Defaults to ``False``.
 
     Returns:
-        tuple[torch.Tensor, int]: (indices, count) if with_count, else just indices.
+        torch.Tensor | tuple[torch.Tensor, torch.Tensor]: Coordinate rows of shape
+            ``(size, tensor.ndim)``, optionally paired with the scalar nonzero count.
     """
     mask = tensor != 0
     num_nonzero = mask.sum()
@@ -2209,11 +3083,28 @@ def nonzero_with_count(
     if size is None:
         size = num_nonzero
 
+    # A 0-d input has no dimension to index. CPU returns shape (n, 0). The
+    # coords path below cannot build this, because torch.stack needs one tensor.
+    if tensor.dim() == 0:
+        result = torch.zeros((size, 0), dtype=torch.long, device=tensor.device)
+        if with_count:
+            return result, num_nonzero
+        return result
+
     if tensor.numel() == 0 or size == 0:
-        coords = tuple(
-            torch.zeros(size, dtype=torch.long, device=tensor.device) for _ in tensor.shape
-        )
+        # An empty input has no nonzero element, so every slot is padding.
+        # Reuse the shared helper to apply fill_value the same way as below.
+        coords = [torch.zeros(size, dtype=torch.long, device=tensor.device) for _ in tensor.shape]
+        coords = _apply_fill_value(coords, size, num_nonzero, fill_value, tensor.device)
         result = torch.stack(coords, dim=1)
+        if with_count:
+            return result, num_nonzero
+        else:
+            return result
+
+    # 0-dim (scalar) tensor: output is [count, 0] — no coordinates to report.
+    if tensor.dim() == 0:
+        result = torch.empty(size, 0, dtype=torch.long, device=tensor.device)
         if with_count:
             return result, num_nonzero
         else:
@@ -2303,25 +3194,40 @@ def nonzero_static_decomposition(
     fill_value: int = -1,
     out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, int]:
-    """Decompose nonzero_static to nonzero_with_count.
+    """Decompose ``nonzero_static`` into fixed-size ``nonzero_with_count`` indexing.
 
     Args:
-        tensor (torch.Tensor): Input tensor to find nonzero elements.
-        size (int): Maximum number of nonzero elements to return.
-        fill_value (int): Value to fill unused slots. Defaults to -1.
-        out (torch.Tensor | None): Optional output tensor.
+        tensor (torch.Tensor): Input tensor.
+        size (int): Fixed number of index rows to return.
+        fill_value (int, optional): Padding coordinate. Defaults to ``-1``.
+        out (torch.Tensor | None, optional): Unused output placeholder. Defaults to ``None``.
 
     Returns:
-        tuple[torch.Tensor, int]: (indices, count) of nonzero elements.
+        torch.Tensor: Fixed-size nonzero indices padded with ``fill_value``.
     """
     return nonzero_with_count(tensor, size=size, fill_value=fill_value)
 
 
 @register_decomposition([aten.linalg_vector_norm.default])
 def linalg_vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None):
-    """Custom decomposition for vector_norm to ensure correct results.
+    """Decompose ``linalg.vector_norm`` into reductions and elementwise powers.
 
-    Reference https://github.com/pytorch/pytorch/blob/bfa6f5e0730dead84017e779e02de6cea768ee33/torch/_refs/linalg/__init__.py#L131
+    Args:
+        x (torch.Tensor): Floating-point or complex input tensor.
+        ord (Number, optional): Norm order. Defaults to ``2``.
+        dim (int | Sequence[int] | None, optional): Dimensions to reduce. Defaults to ``None``.
+        keepdim (bool, optional): Preserve reduced dimensions. Defaults to ``False``.
+        dtype (torch.dtype | None, optional): Optional non-narrowing computation dtype. Defaults to
+            ``None``.
+
+    Returns:
+        torch.Tensor: Vector norm over the requested dimensions.
+
+    Raises:
+        RuntimeError: If the input or requested dtype is invalid or narrows the input.
+
+    Note:
+        Nonzero orders propagate NaNs; negative-order norms containing zeros return zero.
     """
     # Check input dtype
     if not (x.dtype.is_floating_point or x.dtype.is_complex):
@@ -2393,17 +3299,16 @@ def sigmoid_backward_decomposition(grad_output, output):
 
 @register_decomposition([aten.silu_backward.default])
 def silu_backward_decomposition(grad_output, x):
-    """Decompose silu_backward into primitive ops.
+    """Decompose SiLU backward into float32 sigmoid primitives to preserve bf16 precision.
 
-    Upcasts to float32 for intermediate computation to avoid precision loss
-    in bf16, particularly for the (1 - sigmoid_x) term and the chain of multiplies.
+    The upcast protects the ``1 - sigmoid_x`` term and its multiplication chain.
 
     Args:
-        grad_output (torch.Tensor): Gradient of the output.
-        x (torch.Tensor): Input tensor from forward pass.
+        grad_output (torch.Tensor): Output gradient.
+        x (torch.Tensor): Forward input tensor.
 
     Returns:
-        torch.Tensor: Gradient with respect to input.
+        torch.Tensor: Input gradient cast back to the original gradient dtype.
     """
     orig_dtype = grad_output.dtype
     grad_output = grad_output.to(torch.float32)
@@ -2420,15 +3325,22 @@ def _slice_backward_default(grad_output, input_sizes, dim, start, end, step):
 
 @register_decomposition([aten.slice_backward.default])
 def slice_backward_decomposition(grad_output, input_sizes, dim, start, end, step):
-    """Decompose slice_backward to constant_pad_nd for the common step==1 case.
+    """Decompose ``slice_backward`` into padding for contiguous slices.
 
-    PyTorch's default decomposition uses zeros + slice_scatter, which torch-mlir
-    lowers to stablehlo.scatter (indirect indexed writes). For contiguous
-    forward slices (step == 1), the gradient is just grad_output zero-padded
-    along dim, which lowers to stablehlo.pad (memset + DMA copy). RoPE
-    backward hits this path 4x per layer.
+    Args:
+        grad_output (torch.Tensor): Gradient of the sliced output.
+        input_sizes (Sequence[int]): Shape of the original input.
+        dim (int): Sliced dimension.
+        start (int): Slice start index.
+        end (int): Slice end index.
+        step (int): Slice stride.
 
-    Falls back to zeros + slice_scatter for step != 1 (rare, e.g. strided slices).
+    Returns:
+        torch.Tensor: Gradient padded to ``input_sizes``.
+
+    Note:
+        Uses ``constant_pad_nd`` for ``step == 1`` to avoid an indirect StableHLO scatter, and
+            falls back to ``slice_scatter`` otherwise.
     """
     if step != 1:
         return _slice_backward_default(grad_output, input_sizes, dim, start, end, step)
@@ -2437,27 +3349,86 @@ def slice_backward_decomposition(grad_output, input_sizes, dim, start, end, step
         dim = len(input_sizes) + dim
 
     full = input_sizes[dim]
-    # Clamp to PyTorch slice semantics: start/end are clamped to [0, full].
-    start_clamped = max(0, min(full, start if start >= 0 else full + start))
-    end_clamped = max(0, min(full, end if end >= 0 else full + end))
-    if end_clamped < start_clamped:
-        end_clamped = start_clamped
+    start_clamped = _clamp_slice_bound(start, full)
+    end_clamped = max(start_clamped, _clamp_slice_bound(end, full))
 
     low = start_clamped
     high = full - end_clamped
     if low < 0 or high < 0:
         return _slice_backward_default(grad_output, input_sizes, dim, start, end, step)
 
-    # constant_pad_nd takes pads in highest-dim-first pairs of (low, high).
-    # Build a flat list with zeros for trailing dims after `dim`.
-    rank = len(input_sizes)
-    pad = []
-    for d in range(rank - 1, dim - 1, -1):
-        if d == dim:
-            pad.extend([low, high])
-        else:
-            pad.extend([0, 0])
+    pad = _pad_spec(len(input_sizes), dim, low, high)
     return torch.ops.aten.constant_pad_nd.default(grad_output, pad, 0)
+
+
+# Largest destination (bytes) up to which a slice write is lowered as pad + select; larger
+# ones keep torch-mlir's scatter. Overridable via TORCH_NEURONX_SLICE_SCATTER_PAD_SELECT_MAX_BYTES.
+SLICE_SCATTER_PAD_SELECT_MAX_BYTES_DEFAULT = 1 << 20
+
+
+def _slice_scatter_prefers_pad_select(dst) -> bool:
+    """pad + select streams the whole destination but skips the scatter's per-row descriptor
+    DMA, so it only wins on small destinations; a symbolic size keeps the scatter (no guard)."""
+    numel = dst.numel()
+    if not isinstance(numel, int):
+        return False
+    max_bytes = _getenv_int(
+        "TORCH_NEURONX_SLICE_SCATTER_PAD_SELECT_MAX_BYTES",
+        SLICE_SCATTER_PAD_SELECT_MAX_BYTES_DEFAULT,
+    )
+    return numel * dst.element_size() <= max_bytes
+
+
+@register_decomposition([aten.slice_scatter.default])
+def slice_scatter_decomposition(input, src, dim=0, start=None, end=None, step=1):
+    """Decompose a static contiguous slice write into padding and selection.
+
+    Args:
+        input (torch.Tensor): Destination-shaped input tensor.
+        src (torch.Tensor): Values to write into the selected slice.
+        dim (int, optional): Slice dimension. Defaults to ``0``.
+        start (int | None, optional): Inclusive start index. Defaults to ``None``.
+        end (int | None, optional): Exclusive end index. Defaults to ``None``.
+        step (int, optional): Slice step. Defaults to ``1``.
+
+    Returns:
+        torch.Tensor | NotImplemented: Fresh updated tensor, or ``NotImplemented`` for
+            symbolic, strided, invalid-dimension, or large-destination writes.
+
+    Note:
+        Small dense writes avoid descriptor-generated StableHLO scatter DMA. Empty writes
+        return a clone of ``input``. Full-span and partial writes cast ``src`` to the input
+        dtype. The full-span result is also a fresh clone.
+    """
+    rank = input.dim()
+    d = dim + rank if dim < 0 else dim
+    if not 0 <= d < rank:
+        return NotImplemented
+
+    full = input.shape[d]
+    low = 0 if start is None else start
+    high = full if end is None else end
+    # Comparing a symbolic bound would plant a guard, or raise on an unbacked symint.
+    if not all(isinstance(v, int) for v in (step, full, low, high)):
+        return NotImplemented
+    if step != 1:
+        return NotImplemented
+
+    low = _clamp_slice_bound(low, full)
+    high = max(low, _clamp_slice_bound(high, full))  # an inverted range is empty, not negative
+
+    # aten returns a fresh tensor, so neither short circuit may hand back an input.
+    if high == low:
+        return input.clone()
+
+    # select would type-promote; aten casts src into the destination instead.
+    if low == 0 and high == full:
+        return src.to(input.dtype).clone()
+
+    if not _slice_scatter_prefers_pad_select(input):
+        return NotImplemented
+
+    return _pad_select_span(input, src.to(input.dtype), d, low, high)
 
 
 def _argsort_via_topk(x):
@@ -2519,10 +3490,10 @@ def _embedding_dense_backward_nki(
     src = grad_flat[order].contiguous()
 
     # D-shard the [E, D] table across logical cores (each owns a disjoint column
-    # slice). Fall back to single shard if embed_dim is not divisible by the core
-    # count (the kernel splits D evenly).
+    # slice). Launch gridless if embed_dim is not divisible by the core count (the
+    # kernel splits D evenly, and it must not declare a contradicting LNC).
     logical_neuron_cores = int(get_logical_neuron_cores())
-    grid = (logical_neuron_cores,) if embed_dim % logical_neuron_cores == 0 else (1,)
+    grid = (logical_neuron_cores,) if embed_dim % logical_neuron_cores == 0 else ()
     return wrapped_embedding_dense_backward_nki[grid](num_weights, idx_i32, src)
 
 
@@ -2534,11 +3505,23 @@ def embedding_dense_backward_decomposition(
     padding_idx: int,
     scale_grad_by_freq: bool,
 ) -> torch.Tensor:
-    """Decompose embedding_dense_backward, dispatching on the [E, D] table size.
+    """Decompose embedding backward into index-add or NKI scatter operations.
 
-    Small [E, D]: fp32 index_add. Large: the bounded-scratchpad NKI kernel. Threshold
-    (E*D elements) overridable via TORCH_NEURONX_EMBEDDING_BWD_NKI_THRESHOLD; default
-    2**28 = a 1GB fp32 [E, D] index_add accumulator.
+    Args:
+        grad_output (torch.Tensor): Gradients for the embedding lookups.
+        indices (torch.Tensor): Embedding row indices.
+        num_weights (int): Number of embedding rows.
+        padding_idx (int): Nonnegative row excluded from accumulation; a negative value
+            disables padding-row exclusion.
+        scale_grad_by_freq (bool): Whether to divide gradients by index frequency.
+
+    Returns:
+        torch.Tensor: Dense embedding-weight gradient.
+
+    Note:
+        Tables at or below ``TORCH_NEURONX_EMBEDDING_BWD_NKI_THRESHOLD`` use an ``fp32``
+            index-add accumulator; larger tables use the bounded-scratchpad NKI path. The
+            default ``2**28``-element threshold corresponds to a 1 GiB fp32 accumulator.
     """
     threshold = _getenv_int("TORCH_NEURONX_EMBEDDING_BWD_NKI_THRESHOLD", 2**28)
     embed_dim = grad_output.shape[-1]
@@ -2553,19 +3536,18 @@ def embedding_dense_backward_decomposition(
 
 @register_decomposition([aten.linear_backward])
 def linear_backward_decomposition(input_, grad_output_, weight_, output_mask):
-    """Decompose linear backward pass into 2D matmuls.
-
-    Linear forward: y = xA^T + b
+    """Decompose a linear backward pass into two-dimensional matrix products.
 
     Args:
-        input_ (torch.Tensor): Input tensor (x).
-        grad_output_ (torch.Tensor): Output gradient (dy).
-        weight_ (torch.Tensor): Weight matrix (A).
-        output_mask (list[bool]): Which gradients to compute:
-            [0] input gradient, [1] weight gradient, [2] bias gradient.
+        input_ (torch.Tensor): Forward input tensor.
+        grad_output_ (torch.Tensor): Output gradient.
+        weight_ (torch.Tensor): Forward weight matrix.
+        output_mask (list[bool]): Requested input, weight, and bias gradients.
 
     Returns:
-        tuple: (grad_input, grad_weight, grad_bias), None for masked outputs.
+        tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]: Input,
+            weight, and bias gradients. The input gradient follows its mask; weight and
+            bias are computed together when either of their masks is true.
     """
     grad_input = None
     grad_weight = None
@@ -2621,7 +3603,15 @@ def _foreach_abs_decomp(self):
 
 @register_decomposition([aten.__rshift__.Scalar])
 def rshift_scalar_decomp(x, shift):
-    """Decompose right shift into floor division by power of 2"""
+    """Decompose scalar right shift into floor division by a power of two.
+
+    Args:
+        x (torch.Tensor): Integer tensor to shift.
+        shift (int): Number of bits to shift right.
+
+    Returns:
+        torch.Tensor: Floor-divided values cast to the input dtype.
+    """
     divisor = 2**shift
     return torch.div(x, divisor, rounding_mode="floor").to(x.dtype)
 
@@ -2633,16 +3623,39 @@ def rshift_scalar_decomp(x, shift):
 # torch.compile fails to lower while `x >> y` succeeds.
 @register_decomposition([aten.__lshift__.Tensor, aten.__lshift__.Scalar])
 def lshift_decomp(x, shift):
-    """Decompose left shift into the equivalent bitwise_left_shift"""
+    """Decompose operator-form left shift into ``bitwise_left_shift``.
+
+    Args:
+        x (torch.Tensor): Integer tensor to shift.
+        shift (int | torch.Tensor): Number of bits to shift left.
+
+    Returns:
+        torch.Tensor: Bitwise left-shifted values.
+
+    Note:
+        The operator-form left shift lacks the StableHLO conversion available to the bitwise
+            overload.
+    """
     return torch.bitwise_left_shift(x, shift)
 
 
 @register_decomposition([aten.as_strided_scatter.default])
 def as_strided_scatter_decomp(input, src, size, stride, storage_offset=0):
-    """Decompose as_strided_scatter to a concat of the spans around src.
+    """Decompose ``as_strided_scatter`` into padding and selection or indexed copying.
 
-    A contiguous write needs no index tensor, just a concat of src with the spans it does
-    not touch. Everything else falls back to index_copy, one index per written element.
+    Args:
+        input (torch.Tensor): Tensor providing the destination values and logical layout.
+        src (torch.Tensor): Values written into the strided view.
+        size (Sequence[int]): Shape of the destination view.
+        stride (Sequence[int]): Storage strides of the destination view.
+        storage_offset (int | None, optional): Starting storage offset. Defaults to ``0``.
+
+    Returns:
+        torch.Tensor: Updated tensor in the input's logical layout.
+
+    Note:
+        Contiguous writes pad ``src`` and select it into the destination span. Other layouts
+        use ``index_copy`` with one index per written element.
     """
     if storage_offset is None:
         storage_offset = 0
@@ -2654,16 +3667,13 @@ def as_strided_scatter_decomp(input, src, size, stride, storage_offset=0):
         numel_out = math.prod(size)
         # Defensive: a view past the end of storage is invalid per aten anyway.
         if storage_offset + numel_out <= input_flat.numel():
-            # A rank-1 slice_scatter lowers to one DMA descriptor per written element; concat
-            # avoids that. Spans are conditional so no zero-size node lands in the trace.
-            spans = []
-            if storage_offset:
-                spans.append(torch.narrow(input_flat, 0, 0, storage_offset))
-            spans.append(torch.reshape(src, (-1,)).to(input_flat.dtype))
-            tail = input_flat.numel() - storage_offset - numel_out
-            if tail:
-                spans.append(torch.narrow(input_flat, 0, storage_offset + numel_out, tail))
-            result = spans[0] if len(spans) == 1 else torch.cat(spans)
+            result = _pad_select_span(
+                input_flat,
+                torch.reshape(src, (-1,)).to(input_flat.dtype),
+                0,
+                storage_offset,
+                storage_offset + numel_out,
+            )
             out = torch.reshape(result, base_shape)
             return out if inverse is None else out.permute(inverse)
 
@@ -2692,38 +3702,75 @@ def _true_rank(flat_mask):
     )
 
 
+def _blocked_prefix_sum(x):
+    # Inclusive prefix sum over a 1-D tensor. A flat cumsum lowers to an [N, N]
+    # triangular matmul; block into [R, C] with C ~ sqrt(N) so compile cost is
+    # ~sqrt(N), not N^2. Stays in fp32, like the flat cumsum.
+    n = x.shape[0]
+    c = int(math.isqrt(n - 1)) + 1  # ceil(sqrt(n)) for n >= 1
+    r = (n + c - 1) // c
+    pad = r * c - n
+    if pad:
+        x = torch.cat([x, x.new_zeros(pad)])
+    xm = x.reshape(r, c)
+    tri_c = torch.ones(c, c, dtype=xm.dtype, device=xm.device).triu()
+    row_csum = torch.matmul(xm, tri_c)  # inclusive within each row
+    tri_r = torch.ones(r, r, dtype=xm.dtype, device=xm.device).triu(1)  # exclusive over rows
+    row_offset = torch.matmul(row_csum[:, -1], tri_r)
+    full = row_csum + row_offset.unsqueeze(1)
+    return full.reshape(-1)[:n]
+
+
 @register_decomposition([aten.masked_scatter.default])
 def masked_scatter_decomposition(self, mask, source):
-    """Decompose masked_scatter into flatten + prefix-sum gather + where.
+    """Decompose ``masked_scatter`` into broadcasting, prefix ranks, gathering, and ``where``.
 
-    ``self`` and ``mask`` broadcast to a common shape (the result shape), and
-    the ``i``-th ``True`` position of the broadcast mask is filled with the
-    ``i``-th element of ``source`` (read in row-major order). This mirrors the
-    algorithm torch-mlir's ``DecomposeAtenMaskedScatterOp`` uses, but keys every
-    intermediate off the broadcast result shape rather than ``self``'s shape.
+    Args:
+        self (torch.Tensor): Input tensor to update functionally.
+        mask (torch.Tensor): Boolean-compatible selection mask.
+        source (torch.Tensor): Row-major values written at true mask positions.
 
-    Keying off ``self`` (as the C++ pattern originally did) is incorrect whenever
-    the broadcast result is larger than ``self`` (e.g. ``self=[N]``,
-    ``mask=[N, N]``): the ``mask + zeros_like(self)`` step is typed as ``self``'s
-    shape while actually broadcasting to the larger shape, which fails
-    ``chlo.broadcast_add`` type inference during StableHLO conversion. Doing the
-    decomposition in Python lets ordinary torch broadcasting define the result
-    shape, so the bug cannot occur and no torch-mlir patch is needed.
+    Returns:
+        torch.Tensor: Broadcast result with selected positions replaced.
+
+    Note:
+        Intermediates use the common broadcast shape rather than ``self.shape`` to avoid the
+            torch-mlir decomposition's invalid ``chlo.broadcast_add`` shape when the mask is
+            larger than ``self``.
     """
     mask = mask.to(torch.bool)
     shape = torch.broadcast_shapes(self.shape, mask.shape)  # == result shape
-    self_b = self.broadcast_to(shape)
-    mask_b = mask.broadcast_to(shape)
+    self_flat = self.broadcast_to(shape).flatten()
+    mask_flat = mask.broadcast_to(shape).flatten()
+    if mask_flat.numel() == 0:
+        return self_flat.reshape(shape)
 
-    gather_idx = _true_rank(mask_b.flatten())
-    picked = torch.index_select(source.flatten(), 0, gather_idx).reshape(shape)
-    return torch.where(mask_b, picked, self_b)
+    # Derive the select mask from the prefix sum, not from mask_flat directly. The
+    # compiler mis-folds a select whose condition and whose gathered operand both
+    # trace to one broadcast of the mask. For some partial broadcast masks the
+    # fused select and gather then collapse toward source[0] and give wrong
+    # results. The prefix-sum chain gives the condition a separate origin and
+    # stops the fold.
+    csum = _blocked_prefix_sum(mask_flat.to(torch.float32))
+    prev = torch.cat([csum.new_zeros(1), csum[:-1]])
+    is_true = (csum - prev) > 0.5
+    gather_idx = torch.clamp(csum - 1.0, min=0).to(torch.int64)
+    picked = torch.index_select(source.flatten(), 0, gather_idx)
+    return torch.where(is_true, picked, self_flat).reshape(shape)
 
 
 @register_decomposition([aten.masked_scatter_backward.default])
 def masked_scatter_backward_decomposition(grad_output, mask, sizes):
-    """Gradient of masked_scatter w.r.t. source: scatter each True position's grad,
-    in row-major rank order, into a source-shaped buffer."""
+    """Decompose masked-scatter source backward into ranked ``scatter_add`` operations.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the scattered output.
+        mask (torch.Tensor): Forward selection mask.
+        sizes (Sequence[int]): Shape of the forward source tensor.
+
+    Returns:
+        torch.Tensor: Source gradient populated in row-major true-mask order.
+    """
     numel = math.prod(sizes)
     if numel == 0:
         return grad_output.new_zeros(sizes)
@@ -2738,37 +3785,6 @@ def masked_scatter_backward_decomposition(grad_output, mask, sizes):
     target = grad_output.new_zeros(numel)
     target = target.scatter_add(0, rank, contrib)
     return target.reshape(sizes)
-
-
-@register_decomposition([aten._grouped_mm.default])
-def grouped_mm_decomposition(a, b, offs):
-    """Decompose grouped matmul for torch.compile/MLIR paths.
-
-    2D x 2D: a (d1, t), b (t, d2), offs (g,) -> (g, d1, d2) - calls NKI kernel
-    2D x 3D: a (t, d1), b (g, d1, d2), offs (g,) -> (t, d2) - decomposes to primitives
-    """
-    # 2D x 2D case - call NKI kernel
-    if a.dim() == 2 and b.dim() == 2:
-        from torch_neuronx.python_ops.nki_kernels.grouped_mm import grouped_mm_2d_2d_nki
-
-        return grouped_mm_2d_2d_nki(a, b, offs)
-
-    # 2D x 3D case - decompose to primitives
-    if a.dim() == 2 and b.dim() == 3:
-        from torch_neuronx.utils import get_gmm_align
-
-        t, d1 = a.shape
-        g, _, d2 = b.shape
-        align = get_gmm_align()
-
-        b_index = (offs[:, None] // align <= torch.arange(t // align, device=a.device)).sum(0)
-        b_index = torch.clamp(b_index, 0, g - 1)
-        a_batched = a.reshape(t // align, align, d1)
-        b_batched = b[b_index]
-        r_batched = a_batched @ b_batched
-        return r_batched.reshape(t, d2)
-
-    return NotImplemented
 
 
 def _validate_convolution_inputs(
@@ -2901,6 +3917,29 @@ def torch_convolution_backward_overrideable(
     output_mask,
     **kwargs,
 ):
+    """Return input, weight, and bias convolution gradients after validating arguments.
+
+    Args:
+        grad_output (torch.Tensor): Output gradient.
+        input (torch.Tensor): Forward input.
+        weight (torch.Tensor): Forward weights.
+        bias_sizes (Sequence[int] | None): Bias shape, or ``None`` to omit the bias gradient.
+        stride (Sequence[int]): Forward strides.
+        padding (Sequence[int]): Forward padding.
+        dilation (Sequence[int]): Forward dilations.
+        transposed (bool): Whether the forward convolution was transposed.
+        output_padding (Sequence[int]): Transposed-convolution output padding.
+        groups (int): Channel-group count.
+        output_mask (Sequence[bool]): Requested input, weight, and bias gradients.
+        **kwargs (Any): Unused schema-compatible keywords.
+
+    Returns:
+        tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]: Input, weight,
+            and bias gradients. Unrequested values and absent bias return ``None``.
+
+    Raises:
+        RuntimeError: If dimensions, groups, convolution parameters, or channels are invalid.
+    """
     dtype = input.dtype
     ndim = input.ndim - 2  # spatial dimensions (1, 2, or 3)
 
@@ -3102,14 +4141,25 @@ def value_selecting_reduction_backward(grad, dim, indices, sizes, keepdim):
 def searchsorted_tensor_decomposition(
     sorted_sequence, values, *, out_int32=False, right=False, side=None, sorter=None
 ):
-    """Decompose searchsorted into comparison + sum.
+    """Decompose tensor ``searchsorted`` into broadcast comparisons and summation.
 
-    For each value, counts how many elements in sorted_sequence satisfy the
-    boundary condition. This is O(N*M) rather than O(N*log M), but maps
-    cleanly to StableHLO (no data-dependent control flow).
+    Args:
+        sorted_sequence (torch.Tensor): Sorted innermost-dimension boundaries.
+        values (torch.Tensor): Values whose insertion positions are requested.
+        out_int32 (bool, optional): Whether to return ``int32`` indices. Defaults to ``False``.
+        right (bool, optional): Whether to select the upper insertion boundary. Defaults to
+            ``False``.
+        side (str | None, optional): ``"right"`` selects the upper boundary; every other
+            non-``None`` value selects the lower boundary. Defaults to ``None``.
+        sorter (torch.Tensor | None, optional): Optional permutation that sorts the sequence.
+            Defaults to ``None``.
 
-    Warning: Creates an intermediate [..., N, M] tensor from broadcasting
-    values (N) against sorted_sequence (M). Large inputs may cause OOM.
+    Returns:
+        torch.Tensor: Insertion indices for ``values``.
+
+    Note:
+        This lowerable ``O(N*M)`` formulation materializes a broadcast comparison tensor and can
+            consume substantial memory for large inputs.
     """
     if side is not None:
         right = side == "right"
@@ -3137,11 +4187,26 @@ def searchsorted_tensor_decomposition(
 def searchsorted_scalar_decomposition(
     sorted_sequence, value, *, out_int32=False, right=False, side=None, sorter=None
 ):
-    """Decompose scalar searchsorted by wrapping the scalar as a tensor.
+    """Decompose scalar ``searchsorted`` by promoting it to a one-element tensor.
 
-    Promote the scalar via ``torch.result_type`` rather than forcing it to the
-    sequence dtype: a fractional ``value`` against an integer ``sorted_sequence``
-    must not be truncated before the comparison (matches upstream promotion)."""
+    Args:
+        sorted_sequence (torch.Tensor): Sorted innermost-dimension boundaries.
+        value (Number): Scalar insertion value.
+        out_int32 (bool, optional): Whether to return an ``int32`` index. Defaults to ``False``.
+        right (bool, optional): Whether to select the upper insertion boundary. Defaults to
+            ``False``.
+        side (str | None, optional): ``"right"`` selects the upper boundary; every other
+            non-``None`` value selects the lower boundary. Defaults to ``None``.
+        sorter (torch.Tensor | None, optional): Optional permutation that sorts the sequence.
+            Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Scalar insertion index.
+
+    Note:
+        Uses ``torch.result_type`` so fractional values are not truncated against integer
+            boundaries.
+    """
     values = sorted_sequence.new_full((1,), value, dtype=torch.result_type(value, sorted_sequence))
     result = searchsorted_tensor_decomposition(
         sorted_sequence, values, out_int32=out_int32, right=right, side=side, sorter=sorter
@@ -3153,6 +4218,23 @@ def searchsorted_scalar_decomposition(
 def searchsorted_scalar_out_decomposition(
     sorted_sequence, value, *, out_int32=False, right=False, side=None, sorter=None, out
 ):
+    """Decompose scalar ``searchsorted.out`` through the functional scalar decomposition.
+
+    Args:
+        sorted_sequence (torch.Tensor): Sorted innermost-dimension boundaries.
+        value (Number): Scalar insertion value.
+        out_int32 (bool, optional): Whether to produce an ``int32`` index. Defaults to ``False``.
+        right (bool, optional): Whether to select the upper insertion boundary. Defaults to
+            ``False``.
+        side (str | None, optional): ``"right"`` selects the upper boundary; every other
+            non-``None`` value selects the lower boundary. Defaults to ``None``.
+        sorter (torch.Tensor | None, optional): Optional permutation that sorts the sequence.
+            Defaults to ``None``.
+        out (torch.Tensor): Destination tensor that is mutated and returned.
+
+    Returns:
+        torch.Tensor: The same ``out`` tensor after copying the insertion index.
+    """
     result = searchsorted_scalar_decomposition(
         sorted_sequence, value, out_int32=out_int32, right=right, side=side, sorter=sorter
     )
@@ -3162,19 +4244,23 @@ def searchsorted_scalar_out_decomposition(
 
 @register_decomposition([aten.bucketize.Scalar])
 def bucketize_scalar_decomposition(a, boundaries, *, out_int32=False, right=False):
-    """Route .Scalar to .Tensor with the scalar embedded via torch.full.
+    """Decompose scalar ``bucketize`` through the statically shaped tensor overload.
 
-    Upstream ``_refs.bucketize`` promotes ``a`` via ``torch.tensor(a)`` into a
-    0-D fake tensor, which propagates 0-D-ness into ``boundaries[mid]``; the
-    ``aten.index.Tensor`` meta rule then allocates an unbacked SymInt for the
-    output shape and trips ``GuardOnDataDependentSymNode``. Using
-    ``torch.full((1,), a, ...)`` keeps ``a`` as a Python constant on the
-    ``aten.full`` FX node so every intermediate is rank-1 and statically
-    shaped.
+    Args:
+        a (Number): Scalar value to bucketize.
+        boundaries (torch.Tensor): Monotonically increasing bucket boundaries.
+        out_int32 (bool, optional): Whether to return an ``int32`` index. Defaults to ``False``.
+        right (bool, optional): Whether to select the upper insertion boundary. Defaults to
+            ``False``.
 
-    The scalar is promoted via ``torch.result_type`` rather than forced to
-    ``boundaries.dtype``: a fractional ``a`` against integer ``boundaries``
-    must not be truncated before bucketing (matches upstream promotion)."""
+    Returns:
+        torch.Tensor: Scalar bucket index.
+
+    Note:
+        Embeds ``a`` in a rank-1 ``full`` tensor to avoid an unbacked shape from the upstream
+            0-D fake-tensor indexing path, and uses ``torch.result_type`` to preserve scalar
+            promotion.
+    """
     a_t = torch.full((1,), a, dtype=torch.result_type(a, boundaries), device=boundaries.device)
     result = aten.bucketize.Tensor(a_t, boundaries, out_int32=out_int32, right=right)
     return result.squeeze(0)
@@ -3195,6 +4281,19 @@ def _bucketize_scalar_out_fake(a, boundaries, *, out_int32=False, right=False, o
 
 @register_decomposition([aten.bucketize.Scalar_out])
 def bucketize_scalar_out_decomposition(a, boundaries, *, out_int32=False, right=False, out):
+    """Decompose scalar ``bucketize.out`` through the functional scalar decomposition.
+
+    Args:
+        a (Number): Scalar value to bucketize.
+        boundaries (torch.Tensor): Monotonically increasing bucket boundaries.
+        out_int32 (bool, optional): Whether to produce an ``int32`` index. Defaults to ``False``.
+        right (bool, optional): Whether to select the upper insertion boundary. Defaults to
+            ``False``.
+        out (torch.Tensor): Destination tensor that is mutated and returned.
+
+    Returns:
+        torch.Tensor: The same ``out`` tensor after copying the bucket index.
+    """
     result = bucketize_scalar_decomposition(a, boundaries, out_int32=out_int32, right=right)
     out.copy_(result)
     return out
@@ -3202,12 +4301,21 @@ def bucketize_scalar_out_decomposition(a, boundaries, *, out_int32=False, right=
 
 @register_decomposition([aten.histc.default])
 def histc_decomposition(input, bins=100, min=0, max=0):
-    """Decompose histc into basic ops
+    """Decompose one-dimensional ``histc`` into comparisons and reductions.
 
-    Matches PyTorch's histc behavior:
-    - Values in [min, max] are binned
-    - Values < min or > max are ignored
-    - Values exactly at max go to the last bin
+    Args:
+        input (torch.Tensor): One-dimensional values to histogram.
+        bins (int, optional): Number of equal-width bins. Defaults to ``100``.
+        min (Number, optional): Lower histogram bound. Defaults to ``0``.
+        max (Number, optional): Upper histogram bound. Defaults to ``0``.
+
+    Returns:
+        torch.Tensor: Per-bin counts in the input dtype, except that an identical-value
+            auto-range result uses float32.
+
+    Note:
+        Values outside ``[min, max]`` are ignored, ``max`` enters the last bin, and identical
+        auto-ranged values enter the middle bin. Multidimensional input is not flattened.
     """
     if max == min:
         min = input.min().item()
@@ -3240,9 +4348,19 @@ def histc_decomposition(input, bins=100, min=0, max=0):
 
 @register_decomposition([aten.index_select_backward])
 def index_select_backward_decomposition(grad_output, input_sizes, dim, index):
-    """Decompose index_select_backward for torch.compile compatibility.
+    """Decompose ``index_select_backward`` into zero initialization and ``scatter_add``.
 
-    This needs to be decomposed here otherwise will fail lowering in torch-mlir.
+    Args:
+        grad_output (torch.Tensor): Gradient of the selected output.
+        input_sizes (Sequence[int]): Shape of the original input.
+        dim (int): Dimension selected in the forward pass.
+        index (torch.Tensor): Forward selection indices.
+
+    Returns:
+        torch.Tensor: Gradient accumulated into the original input shape.
+
+    Note:
+        This decomposition avoids an unsupported torch-mlir lowering.
     """
     if dim < 0:
         dim = len(input_sizes) + dim
@@ -3258,9 +4376,19 @@ def index_select_backward_decomposition(grad_output, input_sizes, dim, index):
 
 @register_decomposition([aten.repeat_interleave.Tensor])
 def repeat_interleave_tensor_decomposition(repeats, output_size=None):
-    """Decompose repeat_interleave.Tensor for torch.compile compatibility.
+    """Decompose tensor ``repeat_interleave`` into cumulative-boundary comparisons.
 
-    Computes output size upfront to avoid graph breaks from .item() calls.
+    Args:
+        repeats (torch.Tensor): Repeat count for each source position.
+        output_size (int | None, optional): Total output length, used without validation.
+            Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Source indices repeated according to ``repeats`` in its dtype.
+
+    Note:
+        An omitted size remains a scalar tensor to avoid a graph break. A mismatched supplied
+        size truncates or extends the generated indices; empty ``repeats`` returns empty.
     """
     if repeats.numel() == 0:
         return torch.empty_like(repeats)
@@ -3285,20 +4413,17 @@ def repeat_interleave_tensor_decomposition(repeats, output_size=None):
 
 @register_decomposition([aten.select_scatter.default])
 def select_scatter_decomposition(input, src, dim, index):
-    """Normalize negative index for select_scatter.
-
-    Converts negative index to positive, then delegates to the original op.
-    Positive indices pass through without decomposition.
+    """Normalize negative dimensions or indices for ``select_scatter``.
 
     Args:
         input (torch.Tensor): Input tensor.
         src (torch.Tensor): Source tensor to scatter.
         dim (int): Dimension along which to scatter.
-        index (int): Index at which to scatter. Negative values are normalized.
+        index (int): Index at which to scatter.
 
     Returns:
-        torch.Tensor or NotImplemented: Result with normalized index, or
-            NotImplemented for non-negative indices.
+        torch.Tensor | NotImplemented: Result after normalizing either negative argument,
+            or ``NotImplemented`` when both ``dim`` and ``index`` are nonnegative.
     """
     if index >= 0 and dim >= 0:
         return NotImplemented
@@ -3329,10 +4454,22 @@ def _scatter_reduce_via_scatter_reduce_two(input, dim, index, src, reduce):
 
 @register_decomposition([aten.scatter.reduce])
 def scatter_reduce_tensor_decomposition(input, dim, index, src, reduce):
-    """Decompose scatter.reduce to scatter_reduce.two.
+    """Decompose reduced tensor scatter through ``scatter_reduce.two``.
 
-    torch-mlir lacks a lowering for `aten.scatter.reduce`; route through
-    `aten.scatter_reduce.two`, which is supported.
+    Args:
+        input (torch.Tensor): Base tensor included in the reduction.
+        dim (int): Scatter dimension.
+        index (torch.Tensor): Destination indices.
+        src (torch.Tensor): Values to reduce into ``input``.
+        reduce (str): Legacy scatter reduction name.
+
+    Returns:
+        torch.Tensor | NotImplemented: Reduced tensor, or ``NotImplemented`` for unsupported
+            reductions.
+
+    Note:
+        torch-mlir lowers ``scatter_reduce.two`` but not ``scatter.reduce``; only the equivalent
+            ``add`` to ``sum`` route is used.
     """
     if isinstance(src, torch.Tensor) and src.dim() == 0:
         src = src.expand_as(index)
@@ -3341,29 +4478,45 @@ def scatter_reduce_tensor_decomposition(input, dim, index, src, reduce):
 
 @register_decomposition([aten.scatter.value_reduce])
 def scatter_value_reduce_decomposition(input, dim, index, value, reduce):
-    """Decompose scatter.value_reduce to scatter_reduce.two with a tensor src."""
+    """Decompose reduced scalar scatter through a tensor source and ``scatter_reduce.two``.
+
+    Args:
+        input (torch.Tensor): Base tensor included in the reduction.
+        dim (int): Scatter dimension.
+        index (torch.Tensor): Destination indices.
+        value (Number): Scalar value scattered at every index.
+        reduce (str): Legacy scatter reduction name.
+
+    Returns:
+        torch.Tensor | NotImplemented: Reduced tensor, or ``NotImplemented`` for unsupported
+            reductions.
+    """
     src = torch.full_like(index, value, dtype=input.dtype)
     return _scatter_reduce_via_scatter_reduce_two(input, dim, index, src, reduce)
 
 
 @register_decomposition([aten.index_reduce.default])
 def index_reduce_decomposition(input, dim, index, source, reduce, include_self=True):
-    """Decompose index_reduce by reducing each source row into the indexed
-    output position with the requested reduction.
+    """Decompose ``index_reduce`` into scatter operations and functional indexed updates.
 
-    `index_reduce(self, dim, index, source, reduce, include_self=True)` semantics:
-    - `index` is 1-D of length `source.shape[dim]`.
-    - For each `i`: out[..., index[i], ...] = reduce(out[..., index[i], ...],
-      source[..., i, ...]).
-    - `include_self=True` keeps the original `self` value as a participant in
-      the reduction; `include_self=False` first overwrites positions that any
-      index targets with the reduction identity.
-    - Indices may repeat — those source rows accumulate together.
+    Args:
+        input (torch.Tensor): Base tensor for the reduction.
+        dim (int): Indexed dimension.
+        index (torch.Tensor): One-dimensional destination indices.
+        source (torch.Tensor): Source rows reduced at each index.
+        reduce (str): Reduction name: ``prod``, ``mean``, ``amax``, or ``amin``.
+        include_self (bool, optional): Include original values. Defaults to ``True``.
 
-    We implement this via a Python loop over the source axis (size is small —
-    typically a few hundred rows), each step doing a functional `index_copy`-
-    like reduce. This avoids the `scatter_reduce.two` overload mismatch that
-    produced wrong results for untouched positions.
+    Returns:
+        torch.Tensor | NotImplemented: Reduced tensor, or ``NotImplemented`` for an unsupported
+            reduction when ``input`` is not scalar.
+
+    Raises:
+        AttributeError: If ``input`` is scalar and ``reduce`` is unsupported.
+
+    Note:
+        Repeated indices accumulate, and untouched positions retain ``input``. A static Python loop
+            preserves non-mean repeated-index semantics on a Neuron device.
     """
     if dim < 0:
         dim += input.ndim
@@ -3465,11 +4618,17 @@ def index_reduce_decomposition(input, dim, index, source, reduce, include_self=T
 
 @register_decomposition([aten.diagonal_scatter.default])
 def diagonal_scatter_decomposition(input, src, offset=0, dim1=0, dim2=1):
-    """Decompose diagonal_scatter via flat-index scatter.
+    """Decompose ``diagonal_scatter`` into flat-index construction and functional scatter.
 
-    diagonal_scatter writes `src` into the diagonal of (a copy of) `input`
-    selected by (offset, dim1, dim2). We compute the flat positions in `input`
-    that the diagonal would occupy, then scatter `src` into those positions.
+    Args:
+        input (torch.Tensor): Tensor whose selected diagonal is replaced.
+        src (torch.Tensor): Values written along the diagonal.
+        offset (int, optional): Diagonal offset. Defaults to ``0``.
+        dim1 (int, optional): First diagonal dimension. Defaults to ``0``.
+        dim2 (int, optional): Second diagonal dimension. Defaults to ``1``.
+
+    Returns:
+        torch.Tensor: Copy of ``input`` with the selected diagonal replaced.
     """
     if dim1 < 0:
         dim1 += input.ndim
@@ -3592,11 +4751,25 @@ def segment_reduce_decomposition(
     unsafe=False,
     initial=None,
 ):
-    """Decompose segment_reduce for axis 0, lengths= or offsets= modes.
+    """Decompose axis-zero segment reduction into offsets and scatter reductions.
 
-    Lengths mode: convert lengths → offsets via cumsum, then handle as offsets.
-    Indices mode is not handled (returns NotImplemented) — uncommon and falls
-    back to PyTorch's kernel when CPU fallback is allowed.
+    Args:
+        data (torch.Tensor): Values partitioned into segments.
+        reduce (str): Reduction name; only ``sum`` and ``mean`` are handled.
+        lengths (torch.Tensor | None, optional): Segment lengths used when offsets are absent.
+            Defaults to ``None``.
+        indices (torch.Tensor | None, optional): Unsupported mode. Defaults to ``None``.
+        offsets (torch.Tensor | None, optional): Segment boundaries, preferred over lengths.
+            Defaults to ``None``.
+        axis (int, optional): Reduction axis. Defaults to ``0``.
+        unsafe (bool, optional): Unused bounds flag. Defaults to ``False``.
+        initial (Number | None, optional): Value added before each reduction. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: Segment sums or means, or ``NotImplemented``.
+
+    Note:
+        Unsupported modes return ``NotImplemented``. Empty means without ``initial`` become zero.
     """
     if axis != 0 or indices is not None:
         return NotImplemented
@@ -3674,15 +4847,24 @@ def avg_pool3d_backward_decomposition(
     count_include_pad,
     divisor_override=None,
 ):
-    """avg_pool3d_backward via conv_transpose3d with an all-ones depthwise kernel.
+    """Decompose batched 3-D average-pool backward into transposed convolution.
 
-    Each output gradient is divided by the pooling window size, then 'spread'
-    back to the input positions it summed over. Matches PyTorch's behavior
-    when count_include_pad=True (the default) or there is no padding.
+    Args:
+        grad_output (torch.Tensor): Gradient of the pooled output.
+        input (torch.Tensor): Batched forward input tensor.
+        kernel_size (Sequence[int]): Pooling kernel dimensions.
+        stride (Sequence[int]): Pooling strides.
+        padding (Sequence[int]): Pooling padding.
+        ceil_mode (bool): Ignored forward setting.
+        count_include_pad (bool): Ignored forward setting.
+        divisor_override (int | None, optional): Optional fixed divisor. Defaults to ``None``.
 
-    For count_include_pad=False with padding>0, edge windows have a smaller
-    real divisor; that variant is uncommon and not handled here. Add per-position
-    divisor correction if a model needs it.
+    Returns:
+        torch.Tensor: Gradient produced by the depthwise transposed convolution.
+
+    Note:
+        Channels are read from dimension one, so unbatched inputs fail. Ceil-mode geometry can
+        exceed ``input``; no per-position divisor correction is applied.
     """
     kT, kH, kW = _tuple(kernel_size, 3)
     sT, sH, sW = _tuple(stride, 3) if stride else (kT, kH, kW)
@@ -3729,12 +4911,24 @@ def max_pool3d_with_indices_decomposition(
     dilation=1,
     ceil_mode=False,
 ):
-    """Decompose max_pool3d_with_indices via per-kernel slicing + max.
+    """Decompose 3-D max pooling into window slices, maximum reduction, and flat indices.
 
-    Returns (values, indices). indices[..., t', h', w'] is the flat position in
-    the input's per-channel spatial volume (D*H*W) of the element that won max.
+    Args:
+        input (torch.Tensor): Input tensor.
+        kernel_size (Sequence[int]): Pooling kernel dimensions.
+        stride (Sequence[int] | None, optional): Pooling strides, or the kernel size when omitted.
+            Defaults to ``None``.
+        padding (Sequence[int] | int, optional): Spatial padding. Defaults to ``0``.
+        dilation (Sequence[int] | int, optional): Kernel dilation. Defaults to ``1``.
+        ceil_mode (bool, optional): Whether to use ceil-mode output sizing. Defaults to ``False``.
 
-    Handles dilation=1, ceil_mode=False — common case.
+    Returns:
+        tuple[torch.Tensor, torch.Tensor] | NotImplemented: Pooled values and per-channel
+            spatial indices, or ``NotImplemented`` outside the supported case.
+
+    Note:
+        Handles dilation one and ``ceil_mode=False``; padded positions use negative infinity and
+            ties follow stacked row-major kernel order.
     """
     kT, kH, kW = _tuple(kernel_size, 3)
     sT, sH, sW = _tuple(stride, 3) if stride else (kT, kH, kW)
@@ -3810,12 +5004,20 @@ def max_pool3d_with_indices_backward_decomposition(
     ceil_mode,
     indices,
 ):
-    """Decompose max_pool3d_with_indices_backward via scatter_add over flat T*H*W.
+    """Decompose 3-D max-pool backward into flat spatial ``scatter_add``.
 
-    `indices` from the forward pass holds, for each output position, the flat
-    position in the input's per-channel spatial volume (D*H*W) of the winning
-    element. We flatten the last 3 input dims, scatter-add the upstream
-    gradients into those positions, and reshape back.
+    Args:
+        grad_output (torch.Tensor): Gradient of the pooled values.
+        input (torch.Tensor): Forward input tensor.
+        kernel_size (Sequence[int]): Unused forward kernel dimensions.
+        stride (Sequence[int]): Unused forward strides.
+        padding (Sequence[int]): Unused forward padding.
+        dilation (Sequence[int]): Unused forward dilation.
+        ceil_mode (bool): Unused forward ceil-mode setting.
+        indices (torch.Tensor): Forward per-channel flat spatial indices.
+
+    Returns:
+        torch.Tensor: Gradient accumulated into the input shape.
     """
     # Unused — kept to match the op signature.
     del kernel_size, stride, padding, dilation, ceil_mode
@@ -3868,13 +5070,18 @@ def _neg_fill(x):
 
 @register_decomposition([aten.adaptive_max_pool2d.default])
 def adaptive_max_pool2d_decomposition(self, output_size):
-    """adaptive_max_pool2d via per-output window gather + masked max.
+    """Decompose adaptive 2-D max pooling into window gathers and masked maxima.
 
-    Returns (values, indices) where indices are flat positions in the input's
-    per-channel H*W plane (matching aten). Adaptive windows are non-uniform, so
-    we gather a fixed max-width window per dim, mask the padding to -inf, and max
-    over the (wH, wW) window. Ties pick the first element in row-major (H, then
-    W) order, matching aten.
+    Args:
+        self (torch.Tensor): Input tensor.
+        output_size (Sequence[int]): Requested output height and width.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Pooled values and flat per-channel spatial indices.
+
+    Note:
+        Fixed-width gathered windows are masked to represent nonuniform adaptive windows; ties
+            choose the first row-major element as ATen does.
     """
     iH, iW = self.shape[-2], self.shape[-1]
     oH, oW = int(output_size[0]), int(output_size[1])
@@ -3906,7 +5113,16 @@ def adaptive_max_pool2d_decomposition(self, output_size):
 
 @register_decomposition([aten.adaptive_max_pool2d_backward.default])
 def adaptive_max_pool2d_backward_decomposition(grad_output, self, indices):
-    """adaptive_max_pool2d_backward via scatter_add over flat H*W."""
+    """Decompose adaptive 2-D max-pool backward into flat spatial ``scatter_add``.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the pooled values.
+        self (torch.Tensor): Forward input tensor.
+        indices (torch.Tensor): Forward per-channel flat spatial indices.
+
+    Returns:
+        torch.Tensor: Gradient accumulated into the input shape.
+    """
     iH, iW = self.shape[-2], self.shape[-1]
     leading = self.shape[:-2]
     grad_in = torch.zeros((*leading, iH * iW), dtype=grad_output.dtype, device=grad_output.device)
@@ -3918,9 +5134,17 @@ def adaptive_max_pool2d_backward_decomposition(grad_output, self, indices):
 
 @register_decomposition([aten.adaptive_max_pool3d.default])
 def adaptive_max_pool3d_decomposition(self, output_size):
-    """adaptive_max_pool3d via per-output window gather + masked max (3d analog
-    of adaptive_max_pool2d). Indices are flat positions in the input's per-channel
-    D*H*W volume.
+    """Decompose adaptive 3-D max pooling into window gathers and masked maxima.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        output_size (Sequence[int]): Requested output depth, height, and width.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Pooled values and flat per-channel spatial indices.
+
+    Note:
+        Fixed-width gathered windows are masked to represent nonuniform adaptive windows.
     """
     iD, iH, iW = self.shape[-3], self.shape[-2], self.shape[-1]
     oD, oH, oW = int(output_size[0]), int(output_size[1]), int(output_size[2])
@@ -3964,7 +5188,16 @@ def adaptive_max_pool3d_decomposition(self, output_size):
 
 @register_decomposition([aten.adaptive_max_pool3d_backward.default])
 def adaptive_max_pool3d_backward_decomposition(grad_output, self, indices):
-    """adaptive_max_pool3d_backward via scatter_add over flat D*H*W."""
+    """Decompose adaptive 3-D max-pool backward into flat spatial ``scatter_add``.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the pooled values.
+        self (torch.Tensor): Forward input tensor.
+        indices (torch.Tensor): Forward per-channel flat spatial indices.
+
+    Returns:
+        torch.Tensor: Gradient accumulated into the input shape.
+    """
     iD, iH, iW = self.shape[-3], self.shape[-2], self.shape[-1]
     leading = self.shape[:-3]
     grad_in = torch.zeros(
@@ -3987,7 +5220,21 @@ def max_pool2d_with_indices_backward_decomposition(
     ceil_mode,
     indices,
 ):
-    """max_pool2d_with_indices_backward via scatter_add over flat H*W."""
+    """Decompose 2-D max-pool backward into flat spatial ``scatter_add``.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the pooled values.
+        self (torch.Tensor): Forward input tensor.
+        kernel_size (Sequence[int]): Unused forward kernel dimensions.
+        stride (Sequence[int]): Unused forward strides.
+        padding (Sequence[int]): Unused forward padding.
+        dilation (Sequence[int]): Unused forward dilation.
+        ceil_mode (bool): Unused forward ceil-mode setting.
+        indices (torch.Tensor): Forward per-channel flat spatial indices.
+
+    Returns:
+        torch.Tensor: Gradient accumulated into the input shape.
+    """
     del kernel_size, stride, padding, dilation, ceil_mode
 
     iH, iW = self.shape[-2], self.shape[-1]
@@ -4023,9 +5270,21 @@ def _fractional_starts(samples, i_size, o_size, pool_size):
 
 @register_decomposition([aten.fractional_max_pool2d.default])
 def fractional_max_pool2d_decomposition(self, kernel_size, output_size, random_samples):
-    """fractional_max_pool2d via per-(N,C) start-index gather + windowed max.
+    """Decompose fractional 2-D max pooling into sampled-window gathers and maxima.
 
-    Per aten, random_samples[..., 0] is the W sample and [..., 1] is the H sample.
+    Args:
+        self (torch.Tensor): Four-dimensional input tensor.
+        kernel_size (Sequence[int]): Fixed pooling window dimensions.
+        output_size (Sequence[int]): Requested output height and width.
+        random_samples (torch.Tensor): Per-batch, per-channel width and height samples.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor] | NotImplemented: Pooled values and flat spatial
+            indices, or ``NotImplemented`` for non-4-D inputs.
+
+    Note:
+        Ports ATen's sampled interval construction; sample component zero selects width and
+            component one selects height.
     """
     if self.ndim != 4:
         return NotImplemented
@@ -4060,9 +5319,21 @@ def fractional_max_pool2d_decomposition(self, kernel_size, output_size, random_s
 
 @register_decomposition([aten.fractional_max_pool3d.default])
 def fractional_max_pool3d_decomposition(self, kernel_size, output_size, random_samples):
-    """fractional_max_pool3d via per-(N,C) start-index gather + windowed max.
+    """Decompose fractional 3-D max pooling into sampled-window gathers and maxima.
 
-    Per aten, random_samples[..., 0/1/2] are the T(=D)/H/W samples respectively.
+    Args:
+        self (torch.Tensor): Five-dimensional input tensor.
+        kernel_size (Sequence[int]): Fixed pooling window dimensions.
+        output_size (Sequence[int]): Requested output depth, height, and width.
+        random_samples (torch.Tensor): Per-batch, per-channel depth, height, and width samples.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor] | NotImplemented: Pooled values and flat spatial
+            indices, or ``NotImplemented`` for non-5-D inputs.
+
+    Note:
+        Ports ATen's sampled interval construction; sample components zero, one, and two select
+            depth, height, and width.
     """
     if self.ndim != 5:
         return NotImplemented
@@ -4109,34 +5380,56 @@ def fractional_max_pool3d_decomposition(self, kernel_size, output_size, random_s
 
 @register_decomposition([aten.argsort.default, aten.argsort.stable])
 def argsort_decomposition(input, dim=-1, descending=False, stable=False):
-    """Decompose argsort to sort"""
+    """Decompose ``argsort`` into the indices returned by ``sort``.
+
+    Args:
+        input (torch.Tensor): Values to order.
+        dim (int, optional): Sorting dimension. Defaults to ``-1``.
+        descending (bool, optional): Whether to sort greatest first. Defaults to ``False``.
+        stable (bool, optional): Whether equal values preserve input order. Defaults to
+            ``False``.
+
+    Returns:
+        torch.Tensor: Indices that order ``input`` along ``dim``.
+    """
     return torch.sort(input, dim=dim, descending=descending, stable=stable)[1]
 
 
 @register_decomposition([aten.sort.default, aten.sort.stable])
 def sort_decomposition(self, dim=-1, descending=False, *, stable=None):
-    """Lower sort (default and stable) to topk; stability is best-effort."""
+    """Decompose ``sort`` into full-length ``topk``.
+
+    Args:
+        self (torch.Tensor): Values to sort.
+        dim (int, optional): Sorting dimension. Defaults to ``-1``.
+        descending (bool, optional): Whether to sort greatest first. Defaults to ``False``.
+        stable (bool | None, optional): Ignored compatibility argument; tie ordering follows
+            ``topk``. Defaults to ``None``.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Sorted values and their indices.
+    """
     k = self.size(dim) if self.dim() > 0 else 1
     return torch.topk(self, k, dim=dim, largest=descending, sorted=True)
 
 
 @register_decomposition([aten.mode.default])
 def mode_decomposition(self, dim=-1, keepdim=False):
-    """Decompose mode (most-frequent value along dim) into primitive ops.
+    """Decompose ``mode`` into pairwise frequency counts and reductions.
 
-    aten.mode has no PyTorch reference decomposition and no torch-mlir
-    lowering, so it reaches the backend as an unlegalizable ``torch.operator``.
+    Args:
+        self (torch.Tensor): Input values.
+        dim (int, optional): Reduction dimension. Defaults to ``-1``.
+        keepdim (bool, optional): Whether to retain the reduced dimension. Defaults to
+            ``False``.
 
-    Returns ``(values, indices)`` matching aten's semantics:
-    * ``values``: the value that occurs most often along ``dim``; ties are
-      broken by choosing the *smallest* such value (matches CPU, whose kernel
-      sorts and picks the first max-length run).
-    * ``indices``: the *last* position along ``dim`` at which that value occurs.
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Modal values and their last occurrence indices.
 
-    Implementation counts each element's frequency via a pairwise equality
-    matrix (O(N^2) along the reduced axis, like the searchsorted decomp). The
-    ``.values`` out-variant functionalizes to ``mode.default``, so this single
-    decomposition covers it too.
+    Note:
+        Frequency ties choose the smallest value to match ATen. The pairwise equality matrix
+            costs ``O(N**2)`` along the reduced dimension. The ``mode.values`` out variant
+            functionalizes to ``mode.default`` and is also covered by this decomposition.
     """
     # 0-d: the scalar is its own mode at index 0.
     if self.dim() == 0:
@@ -4177,7 +5470,24 @@ def mode_decomposition(self, dim=-1, keepdim=False):
 
 @register_decomposition([aten.median.dim, aten.median.dim_values])
 def median_dim_decomposition(input, dim=-1, keepdim=False, **kwargs):
-    """Decompose median.dim into topk (smallest k elements) + select last."""
+    """Decompose dimensional ``median`` into smallest-value ``topk`` and selection.
+
+    Args:
+        input (torch.Tensor): Input values.
+        dim (int, optional): Reduction dimension. Defaults to ``-1``.
+        keepdim (bool, optional): Whether to retain the reduced dimension. Defaults to
+            ``False``.
+        **kwargs (Any): Unused schema-compatible keyword arguments.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Selected lower-middle values and source indices.
+
+    Raises:
+        IndexError: If the reduced dimension is empty.
+
+    Note:
+        NaNs follow ``topk`` ordering instead of ATen median's NaN propagation.
+    """
     if input.ndim == 0:
         return input.clone(), torch.zeros((), dtype=torch.int64, device=input.device)
     if dim < 0:
@@ -4197,7 +5507,20 @@ def median_dim_decomposition(input, dim=-1, keepdim=False, **kwargs):
 
 @register_decomposition([aten.median.default])
 def median_decomposition(input):
-    """Decompose scalar median into topk of flattened tensor."""
+    """Decompose nondimensional ``median`` into flattened smallest-value ``topk``.
+
+    Args:
+        input (torch.Tensor): Input values.
+
+    Returns:
+        torch.Tensor: Selected lower-middle value of the flattened input.
+
+    Raises:
+        IndexError: If ``input`` is empty.
+
+    Note:
+        NaNs follow ``topk`` ordering instead of ATen median's NaN propagation.
+    """
     flat = input.flatten()
     n = flat.shape[0]
     k = (n - 1) // 2 + 1
@@ -4207,7 +5530,24 @@ def median_decomposition(input):
 
 @register_decomposition([aten.nanmedian.dim, aten.nanmedian.dim_values])
 def nanmedian_dim_decomposition(input, dim=-1, keepdim=False, **kwargs):
-    """Decompose nanmedian.dim by replacing NaN with +inf then using topk."""
+    """Decompose dimensional ``nanmedian`` into NaN replacement, ``topk``, and gathering.
+
+    Args:
+        input (torch.Tensor): Input values.
+        dim (int, optional): Reduction dimension. Defaults to ``-1``.
+        keepdim (bool, optional): Whether to retain the reduced dimension. Defaults to
+            ``False``.
+        **kwargs (Any): Unused schema-compatible keyword arguments.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Non-NaN lower medians and source indices.
+
+    Raises:
+        RuntimeError: If the reduced dimension is empty.
+
+    Note:
+        All-NaN slices return NaN with index zero.
+    """
     if input.ndim == 0:
         return input.clone(), torch.zeros((), dtype=torch.int64, device=input.device)
     if dim < 0:
@@ -4232,7 +5572,18 @@ def nanmedian_dim_decomposition(input, dim=-1, keepdim=False, **kwargs):
 
 @register_decomposition([aten.nanmedian.default])
 def nanmedian_decomposition(input):
-    """Decompose scalar nanmedian by replacing NaN with +inf then using topk."""
+    """Decompose scalar ``nanmedian`` into NaN replacement and flattened ``topk``.
+
+    Args:
+        input (torch.Tensor): Input values.
+
+    Returns:
+        torch.Tensor: Lower median of the non-NaN flattened values, or NaN when all values are
+            NaN.
+
+    Raises:
+        RuntimeError: If ``input`` is empty.
+    """
     flat = input.flatten()
     filled = torch.where(torch.isnan(flat), torch.full_like(flat, float("inf")), flat)
     n = flat.shape[0]
@@ -4245,7 +5596,19 @@ def nanmedian_decomposition(input):
 
 @register_decomposition([aten.native_dropout.default])
 def native_dropout_decomposition(input, p: float, train: bool = True):
-    """Decompose native_dropout using on-device RNG."""
+    """Decompose native dropout into seeded uniform sampling and masking.
+
+    Args:
+        input (torch.Tensor): Tensor to mask.
+        p (float): Drop probability.
+        train (bool, optional): Whether to apply dropout. Defaults to ``True``.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Scaled output and Boolean keep mask.
+
+    Raises:
+        RuntimeError: If training is enabled and ``p`` lies outside ``[0, 1]``.
+    """
     if train and not (0.0 <= float(p) <= 1.0):
         raise RuntimeError(f"dropout probability has to be between 0 and 1, but got {p}")
 
@@ -4297,17 +5660,7 @@ def _standard_normal(ref: torch.Tensor, shape, dtype: torch.dtype = torch.float3
     Returns:
         Tensor of shape ``shape`` with iid N(0, 1) samples cast to ``dtype``.
     """
-    shape_list = list(shape)
-    if _has_nki_rng:
-        u = rand(ref, shape_list, torch.float32)
-    else:
-        u = torch.rand(shape_list, dtype=torch.float32, device=ref.device)
-    # ``rand`` returns [0, 1). ``2*u - 1`` therefore lands in [-1, 1) and
-    # ``erfinv(-1)`` is -inf, so clamp the input away from ±1 by one
-    # float32 ulp on each end.
-    u = torch.clamp(u, 2**-24, 1.0 - 2**-24)
-    z = math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0)
-    return z.to(dtype)
+    return normal_fill(ref, shape, 0.0, 1.0, dtype)
 
 
 def _normal_from_std(mean, std, shape, ref, dtype):
@@ -4316,8 +5669,7 @@ def _normal_from_std(mean, std, shape, ref, dtype):
     ``mean`` and ``std`` may be tensors or Python scalars; broadcasting is
     handled by the arithmetic on ``z``. ``ref`` supplies the device.
     """
-    z = _standard_normal(ref, shape, dtype)
-    return mean + std * z
+    return normal_fill(ref, shape, mean, std, dtype)
 
 
 def _standard_uniform(
@@ -4332,18 +5684,26 @@ def _standard_uniform(
     whole ``rand``/``randn``/``uniform``/``bernoulli`` family onto the seeded
     path so they reproduce under ``torch.manual_seed`` in the compiled graph.
     """
-    shape_list = list(shape)
-    if _has_nki_rng:
-        u = rand(ref, shape_list, torch.float32)
-    else:
-        u = torch.rand(shape_list, dtype=torch.float32, device=ref.device)
-    if low != 0.0 or high != 1.0:
-        u = low + (high - low) * u
-    return u.to(dtype)
+    return uniform_fill(ref, shape, low, high, dtype)
 
 
 @register_decomposition([aten.rand.default])
 def rand_decomp(size, *, dtype=None, layout=None, device=None, pin_memory=None):
+    """Decompose ``rand`` into seeded on-device uniform sampling.
+
+    Args:
+        size (Sequence[int]): Requested output shape.
+        dtype (torch.dtype | None, optional): Output dtype. Defaults to ``None``.
+        layout (torch.layout | None, optional): Unused layout. Defaults to ``None``.
+        device (torch.device | None, optional): Output device. Defaults to ``None``.
+        pin_memory (bool | None, optional): Unused pinning option. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Uniform samples in ``[0, 1)`` for real floating output dtypes.
+
+    Note:
+        Complex dtype fills and returns the scalar reference instead of honoring ``size``.
+    """
     out_dtype = dtype if dtype is not None else torch.get_default_dtype()
     ref = torch.empty((), device=device, dtype=out_dtype)
     return _standard_uniform(ref, size, out_dtype)
@@ -4353,11 +5713,40 @@ def rand_decomp(size, *, dtype=None, layout=None, device=None, pin_memory=None):
 def rand_like_decomp(
     self, *, dtype=None, layout=None, device=None, pin_memory=None, memory_format=None
 ):
+    """Decompose ``rand_like`` into seeded on-device uniform sampling.
+
+    Args:
+        self (torch.Tensor): Tensor supplying output shape, device, and default dtype.
+        dtype (torch.dtype | None, optional): Output dtype. Defaults to ``None``.
+        layout (torch.layout | None, optional): Unused layout. Defaults to ``None``.
+        device (torch.device | None, optional): Unused device. Defaults to ``None``.
+        pin_memory (bool | None, optional): Unused pinning option. Defaults to ``None``.
+        memory_format (torch.memory_format | None, optional): Unused format. Defaults to
+            ``None``.
+
+    Returns:
+        torch.Tensor: Uniform samples shaped like ``self`` for real floating output dtypes.
+
+    Note:
+        Complex ``self`` is mutated and returned; complex dtype with real ``self`` fails.
+    """
     return _standard_uniform(self, self.shape, dtype if dtype is not None else self.dtype)
 
 
 @register_decomposition([aten.randn.default])
 def randn_decomp(size, *, dtype=None, layout=None, device=None, pin_memory=None):
+    """Decompose ``randn`` into seeded uniform sampling and a Box-Muller transform.
+
+    Args:
+        size (Sequence[int]): Output shape.
+        dtype (torch.dtype | None, optional): Optional output dtype. Defaults to ``None``.
+        layout (torch.layout | None, optional): Unused layout placeholder. Defaults to ``None``.
+        device (torch.device | None, optional): Optional output device. Defaults to ``None``.
+        pin_memory (bool | None, optional): Unused pinned-memory placeholder. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Standard-normal samples.
+    """
     out_dtype = dtype if dtype is not None else torch.get_default_dtype()
     ref = torch.empty((), device=device, dtype=out_dtype)
     return _standard_normal(ref, size, out_dtype)
@@ -4367,6 +5756,23 @@ def randn_decomp(size, *, dtype=None, layout=None, device=None, pin_memory=None)
 def randn_like_decomp(
     self, *, dtype=None, layout=None, device=None, pin_memory=None, memory_format=None
 ):
+    """Decompose ``randn_like`` through seeded Box-Muller sampling.
+
+    Args:
+        self (torch.Tensor): Tensor supplying output shape, device, and default dtype.
+        dtype (torch.dtype | None, optional): Output dtype. Defaults to ``None``.
+        layout (torch.layout | None, optional): Unused layout. Defaults to ``None``.
+        device (torch.device | None, optional): Unused device. Defaults to ``None``.
+        pin_memory (bool | None, optional): Unused pinning option. Defaults to ``None``.
+        memory_format (torch.memory_format | None, optional): Unused format. Defaults to
+            ``None``.
+
+    Returns:
+        torch.Tensor: Standard-normal samples shaped like ``self`` for real floating dtypes.
+
+    Note:
+        Complex ``self`` is mutated and returned; complex dtype with real ``self`` fails.
+    """
     return _standard_normal(self, self.shape, dtype if dtype is not None else self.dtype)
 
 
@@ -4374,6 +5780,21 @@ def randn_like_decomp(
 def rand_generator_decomp(
     size, *, generator=None, dtype=None, layout=None, device=None, pin_memory=None
 ):
+    """Decompose generator-overload ``rand`` through the default overload.
+
+    Args:
+        size (Sequence[int]): Output shape.
+        generator (torch.Generator | None, optional): Unsupported explicit generator. Defaults to
+            ``None``.
+        dtype (torch.dtype | None, optional): Optional output dtype. Defaults to ``None``.
+        layout (torch.layout | None, optional): Optional output layout. Defaults to ``None``.
+        device (torch.device | None, optional): Optional output device. Defaults to ``None``.
+        pin_memory (bool | None, optional): Optional pinned-memory setting. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: Random tensor, or ``NotImplemented`` for an explicit
+            generator.
+    """
     if generator is not None:
         return NotImplemented
     return aten.rand.default(size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory)
@@ -4383,6 +5804,22 @@ def rand_generator_decomp(
 def randint_generator_decomp(
     high, size, *, generator=None, dtype=torch.long, layout=None, device=None, pin_memory=None
 ):
+    """Decompose generator-overload ``randint`` through the default overload.
+
+    Args:
+        high (int): Exclusive upper bound.
+        size (Sequence[int]): Output shape.
+        generator (torch.Generator | None, optional): Unsupported explicit generator. Defaults to
+            ``None``.
+        dtype (torch.dtype, optional): Output dtype. Defaults to ``torch.long``.
+        layout (torch.layout | None, optional): Optional output layout. Defaults to ``None``.
+        device (torch.device | None, optional): Optional output device. Defaults to ``None``.
+        pin_memory (bool | None, optional): Optional pinned-memory setting. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: Integer samples in ``[0, high)``, or ``NotImplemented``
+            for an explicit generator.
+    """
     if generator is not None:
         return NotImplemented
     return aten.randint.default(
@@ -4392,6 +5829,19 @@ def randint_generator_decomp(
 
 @register_decomposition([aten.randint.generator_out])
 def randint_generator_out_decomp(high, size, *, generator=None, out):
+    """Decompose generator-overload ``randint.out`` through the non-generator out overload.
+
+    Args:
+        high (int): Exclusive upper bound.
+        size (Sequence[int]): Output shape.
+        generator (torch.Generator | None, optional): Unsupported explicit generator. Defaults to
+            ``None``.
+        out (torch.Tensor): Destination tensor.
+
+    Returns:
+        torch.Tensor | NotImplemented: ``out`` filled from ``[0, high)``, or ``NotImplemented``
+            for an explicit generator.
+    """
     if generator is not None:
         return NotImplemented
     return aten.randint.out(high, size, out=out)
@@ -4401,6 +5851,23 @@ def randint_generator_out_decomp(high, size, *, generator=None, out):
 def randint_low_generator_decomp(
     low, high, size, *, generator=None, dtype=torch.long, layout=None, device=None, pin_memory=None
 ):
+    """Decompose bounded generator-overload ``randint`` through the default bounded overload.
+
+    Args:
+        low (int): Inclusive lower bound.
+        high (int): Exclusive upper bound.
+        size (Sequence[int]): Output shape.
+        generator (torch.Generator | None, optional): Unsupported explicit generator. Defaults to
+            ``None``.
+        dtype (torch.dtype, optional): Output dtype. Defaults to ``torch.long``.
+        layout (torch.layout | None, optional): Optional output layout. Defaults to ``None``.
+        device (torch.device | None, optional): Optional output device. Defaults to ``None``.
+        pin_memory (bool | None, optional): Optional pinned-memory setting. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: Integer samples in ``[low, high)``, or ``NotImplemented``
+            for an explicit generator.
+    """
     if generator is not None:
         return NotImplemented
     return aten.randint.low(
@@ -4410,6 +5877,20 @@ def randint_low_generator_decomp(
 
 @register_decomposition([aten.randint.low_generator_out])
 def randint_low_generator_out_decomp(low, high, size, *, generator=None, out):
+    """Decompose bounded generator-overload ``randint.out`` through the bounded out overload.
+
+    Args:
+        low (int): Inclusive lower bound.
+        high (int): Exclusive upper bound.
+        size (Sequence[int]): Output shape.
+        generator (torch.Generator | None, optional): Unsupported explicit generator. Defaults to
+            ``None``.
+        out (torch.Tensor): Destination tensor.
+
+    Returns:
+        torch.Tensor | NotImplemented: ``out`` filled from ``[low, high)``, or
+            ``NotImplemented`` for an explicit generator.
+    """
     if generator is not None:
         return NotImplemented
     return aten.randint.low_out(low, high, size, out=out)
@@ -4417,7 +5898,23 @@ def randint_low_generator_out_decomp(low, high, size, *, generator=None, out):
 
 @register_decomposition([aten.uniform.default])
 def uniform_decomp(self, from_=0.0, to=1.0, *, generator=None):
-    """Functional ``uniform`` (what ``uniform_`` is functionalized into)."""
+    """Decompose functional uniform sampling into the seeded on-device RNG path.
+
+    Args:
+        self (torch.Tensor): Tensor supplying output shape, dtype, and device.
+        from_ (float, optional): Inclusive lower bound. Defaults to ``0.0``.
+        to (float, optional): Exclusive upper bound. Defaults to ``1.0``.
+        generator (torch.Generator | None, optional): Unsupported explicit generator. Defaults
+            to ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: Uniform samples, or ``NotImplemented`` for an explicit
+            generator.
+
+    Note:
+        Endpoint ordering is not validated. Complex ``self`` is filled in place and returned,
+        despite this overload's functional contract.
+    """
     if generator is not None:
         return NotImplemented
     return _standard_uniform(self, self.shape, self.dtype, float(from_), float(to))
@@ -4425,7 +5922,17 @@ def uniform_decomp(self, from_=0.0, to=1.0, *, generator=None):
 
 @register_decomposition([aten.bernoulli.default])
 def bernoulli_decomp(self, *, generator=None):
-    """``bernoulli(self)``: element is 1 with probability ``self[i]``."""
+    """Decompose tensor-probability Bernoulli sampling into seeded uniform comparison.
+
+    Args:
+        self (torch.Tensor): Values compared as success probabilities without range validation.
+        generator (torch.Generator | None, optional): Unsupported explicit generator. Defaults to
+            ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: Zero-one samples in ``self.dtype``, or ``NotImplemented``
+            for an explicit generator.
+    """
     if generator is not None:
         return NotImplemented
     return (_standard_uniform(self, self.shape, self.dtype) < self).to(self.dtype)
@@ -4433,7 +5940,19 @@ def bernoulli_decomp(self, *, generator=None):
 
 @register_decomposition([aten.bernoulli.p])
 def bernoulli_p_decomp(self, p=0.5, *, generator=None):
-    """``bernoulli.p``: every element is 1 with probability scalar ``p``."""
+    """Decompose scalar-probability Bernoulli sampling into seeded uniform comparison.
+
+    Args:
+        self (torch.Tensor): Tensor supplying output shape, dtype, and device.
+        p (float, optional): Success probability, used without range validation. Defaults to
+            ``0.5``.
+        generator (torch.Generator | None, optional): Unsupported explicit generator. Defaults to
+            ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: Zero-one samples in ``self.dtype``, or ``NotImplemented``
+            for an explicit generator.
+    """
     if generator is not None:
         return NotImplemented
     return (_standard_uniform(self, self.shape, self.dtype) < float(p)).to(self.dtype)
@@ -4441,12 +5960,20 @@ def bernoulli_p_decomp(self, p=0.5, *, generator=None):
 
 @register_decomposition([aten.normal.Tensor_Tensor])
 def normal_tensor_tensor(mean, std, *, generator=None):
-    """``normal(mean, std)`` with per-element mean/std tensors.
+    """Generate normal samples from tensor means and scales.
 
-    Output shape is the broadcast of ``mean.shape`` and ``std.shape``.
-    A user-supplied ``generator`` would need an on-device seeded RNG that
-    the coverage suite doesn't exercise; fall through with ``NotImplemented``
-    so PyTorch handles it if that path is ever hit.
+    Args:
+        mean (torch.Tensor): Per-element means and random-sample metadata source.
+        std (torch.Tensor): Per-element scales, used without nonnegative validation.
+        generator (torch.Generator | None, optional): Unsupported explicit generator. Defaults
+            to ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: Broadcast samples in ``mean.dtype``, or
+            ``NotImplemented`` when ``generator`` is provided.
+
+    Note:
+        Complex ``mean`` can fail when the helper's trailing real/imag axis does not broadcast.
     """
     if generator is not None:
         return NotImplemented
@@ -4456,7 +5983,22 @@ def normal_tensor_tensor(mean, std, *, generator=None):
 
 @register_decomposition([aten.normal.Tensor_Tensor_out])
 def normal_tensor_tensor_out(mean, std, *, generator=None, out):
-    """``.out`` variant: compute functional result, copy_ into ``out``."""
+    """Write tensor-parameter normal samples to an output tensor.
+
+    Args:
+        mean (torch.Tensor): Per-element means and random-sample metadata source.
+        std (torch.Tensor): Per-element scales, used without nonnegative validation.
+        generator (torch.Generator | None, optional): Unsupported explicit generator. Defaults
+            to ``None``.
+        out (torch.Tensor): Destination tensor to mutate and return.
+
+    Returns:
+        torch.Tensor | NotImplemented: ``out`` after copying real-valued broadcast samples, or
+            ``NotImplemented`` when ``generator`` is provided.
+
+    Note:
+        Complex ``mean`` can fail before ``out`` is written because of helper broadcasting.
+    """
     if generator is not None:
         return NotImplemented
     result = normal_tensor_tensor(mean, std)
@@ -4466,9 +6008,18 @@ def normal_tensor_tensor_out(mean, std, *, generator=None, out):
 
 @register_decomposition([aten.normal.Tensor_float])
 def normal_tensor_float(mean, std=1.0, *, generator=None):
-    """``normal(mean, std=1.0)`` with tensor mean and scalar std.
+    """Generate normal samples from tensor means and a scalar standard deviation.
 
-    Output shape equals ``mean.shape``.
+    Args:
+        mean (torch.Tensor): Per-element means, output shape, dtype, and device source.
+        std (float, optional): Shared standard deviation, used without nonnegative
+            validation. Defaults to ``1.0``.
+        generator (torch.Generator | None, optional): Explicit generator, which is unsupported.
+            Defaults to ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: Samples shaped like ``mean``, or ``NotImplemented``
+            when ``generator`` is provided.
     """
     if generator is not None:
         return NotImplemented
@@ -4477,6 +6028,23 @@ def normal_tensor_float(mean, std=1.0, *, generator=None):
 
 @register_decomposition([aten.normal.Tensor_float_out])
 def normal_tensor_float_out(mean, std=1.0, *, generator=None, out):
+    """Write tensor-mean and scalar-scale normal samples to an output tensor.
+
+    Args:
+        mean (torch.Tensor): Per-element means and random-sample metadata source.
+        std (float, optional): Shared scale, used without nonnegative validation. Defaults to
+            ``1.0``.
+        generator (torch.Generator | None, optional): Unsupported explicit generator. Defaults
+            to ``None``.
+        out (torch.Tensor): Destination tensor to mutate and return.
+
+    Returns:
+        torch.Tensor | NotImplemented: ``out`` after copying samples for a real-valued mean,
+            or ``NotImplemented`` when ``generator`` is provided.
+
+    Note:
+        Complex ``mean`` can fail before ``out`` is written because of helper broadcasting.
+    """
     if generator is not None:
         return NotImplemented
     result = normal_tensor_float(mean, std)
@@ -4486,9 +6054,18 @@ def normal_tensor_float_out(mean, std=1.0, *, generator=None, out):
 
 @register_decomposition([aten.normal.float_Tensor])
 def normal_float_tensor(mean, std, *, generator=None):
-    """``normal(mean=0, std)`` with scalar mean and tensor std.
+    """Generate normal samples from a scalar mean and tensor standard deviations.
 
-    Output shape equals ``std.shape``.
+    Args:
+        mean (float): Shared mean.
+        std (torch.Tensor): Per-element standard deviations and output metadata source, used without
+            nonnegative validation.
+        generator (torch.Generator | None, optional): Explicit generator, which is unsupported.
+            Defaults to ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: Samples shaped like ``std``, or ``NotImplemented``
+            when ``generator`` is provided.
     """
     if generator is not None:
         return NotImplemented
@@ -4507,11 +6084,24 @@ def normal_float_float(
     device=None,
     pin_memory=None,
 ):
-    """``normal(mean, std, size)`` with both scalars and an explicit size.
+    """Generate normal samples from scalar parameters and an explicit size.
 
-    Reached via ``torch.normal(mean, std, size, device=...)``. When
-    ``device`` is None we let PyTorch's default device drive the ref
-    tensor (matches non-compile semantics).
+    Args:
+        mean (float): Shared mean.
+        std (float): Shared standard deviation, used without nonnegative validation.
+        size (Sequence[int]): Output shape.
+        generator (torch.Generator | None, optional): Explicit generator, which is unsupported.
+            Defaults to ``None``.
+        dtype (torch.dtype | None, optional): Output dtype, or the default dtype when ``None``.
+            Defaults to ``None``.
+        layout (torch.layout | None, optional): Unused layout argument. Defaults to ``None``.
+        device (torch.device | str | None, optional): Output device, or the default device when
+            ``None``. Defaults to ``None``.
+        pin_memory (bool | None, optional): Unused pinned-memory argument. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: Samples with ``size``, or ``NotImplemented`` when
+            ``generator`` is provided.
     """
     if generator is not None:
         return NotImplemented
@@ -4522,11 +6112,50 @@ def normal_float_float(
 
 @register_decomposition([aten.normal.float_float_out])
 def normal_float_float_out(mean, std, size, *, generator=None, out):
+    """Write scalar-parameter normal samples of an explicit size to an output tensor.
+
+    Args:
+        mean (float): Shared mean.
+        std (float): Shared standard deviation, used without nonnegative validation.
+        size (Sequence[int]): Sample shape.
+        generator (torch.Generator | None, optional): Explicit generator, which is unsupported.
+            Defaults to ``None``.
+        out (torch.Tensor): Destination and output metadata source.
+
+    Returns:
+        torch.Tensor | NotImplemented: ``out`` after copying samples, or ``NotImplemented``
+            when ``generator`` is provided.
+    """
     if generator is not None:
         return NotImplemented
     z = _standard_normal(out, size, out.dtype)
     out.copy_(mean + std * z)
     return out
+
+
+@register_decomposition([aten.normal_functional.default])
+def normal_functional_decomp(self, mean=0.0, std=1.0, *, generator=None):
+    """Generate functionalized in-place normal samples.
+
+    Args:
+        self (torch.Tensor): Tensor supplying shape, dtype, and device.
+        mean (float, optional): Distribution mean. Defaults to ``0.0``.
+        std (float, optional): Distribution scale, used without nonnegative validation.
+            Defaults to ``1.0``.
+        generator (torch.Generator | None, optional): Unsupported explicit generator. Defaults
+            to ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: Fresh normal samples, or ``NotImplemented`` when an
+            explicit generator is provided.
+
+    Note:
+        The shared eager Box-Muller fill avoids the bfloat16 ``erfinv`` NaN produced by the
+        generic fallback.
+    """
+    if generator is not None:
+        return NotImplemented
+    return _normal_from_std(mean, std, self.shape, self, self.dtype)
 
 
 # ── in-place ``random_`` (fill self with random values) ─────────────────────
@@ -4571,25 +6200,40 @@ def _random_functional_full_range(self):
     if self.dtype == torch.bool:
         return (raw & 1).to(torch.bool)
     if self.dtype in (torch.int32, torch.int64):
-        # int32: raw is already the right dtype and range.
-        # int64: Neuron casts to int32 internally, so the natural width is
-        # int32; cast raw directly.
-        return raw.to(self.dtype)
+        # int32: mask off the sign bit so bare random_() stays non-negative
+        # (ATen from=0 default), matching the eager lowering.
+        # int64: Neuron casts to int32 internally, so the natural width is int32.
+        return (raw & 0x7FFFFFFF).to(self.dtype)
     if self.dtype.is_floating_point:
         # Sample in [0, 2**24) so every integer is exactly representable in
         # every float dtype we care about (float32 mantissa = 23 bits, bf16
         # mantissa = 7 bits — the cast rounds gracefully). No 64-bit
         # arithmetic needed.
         return ((raw & ((1 << 24) - 1)).to(torch.float32)).to(self.dtype)
-    # int8 / int16 / uint8: mod the raw down to the dtype range.
+    # int8 / int16 / uint8: bare random_() defaults from=0, so fold the raw bits
+    # into [0, iinfo.max] with a bitmask (iinfo.max is 2**k - 1), staying
+    # non-negative to match the eager lowering and ATen semantics.
     iinfo = torch.iinfo(self.dtype)
-    span = iinfo.max - iinfo.min + 1  # 256 / 65536 / 256 — all fit in int32
-    return (raw % int(span) + iinfo.min).to(self.dtype)
+    return (raw & int(iinfo.max)).to(self.dtype)
 
 
 @register_decomposition([aten.random_.default])
 def random_inplace(self, *, generator=None):
-    """Fill ``self`` in place with random values covering its dtype range."""
+    """Fill a tensor in place with random values for its dtype.
+
+    Args:
+        self (torch.Tensor): Tensor to mutate.
+        generator (torch.Generator | None, optional): Explicit generator, which is unsupported.
+            Defaults to ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: The mutated ``self``, or ``NotImplemented`` when
+            ``generator`` is provided.
+
+    Note:
+        Integer outputs use ``[0, iinfo.max]`` except ``int64``, which is limited to
+        ``[0, int32.max]``; floating outputs convert integers sampled from ``[0, 2**24)``.
+    """
     if generator is not None:
         return NotImplemented
     self.copy_(_random_functional_full_range(self))
@@ -4598,11 +6242,21 @@ def random_inplace(self, *, generator=None):
 
 @register_decomposition([aten.random_.to])
 def random_inplace_to(self, to, *, generator=None):
-    """Fill ``self`` in place with integers uniformly in ``[0, to)``.
+    """Fill a tensor in place from masked ``int32`` values modulo ``to``.
 
-    Matches ``torch.Tensor.random_(0, to)``. ``to`` is a Python int and
-    must fit in int32 for the ``raw % to`` modulus (this is enforced by
-    the coverage suite's sample generator, which uses small bounds).
+    Args:
+        self (torch.Tensor): Tensor to mutate and whose dtype receives the values.
+        to (int): Modulus divisor converted with ``int`` without positivity validation.
+        generator (torch.Generator | None, optional): Explicit generator, which is unsupported.
+            Defaults to ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: The mutated ``self``, or ``NotImplemented`` when
+            ``generator`` is provided.
+
+    Note:
+        Positive ``to`` values produce integers in ``[0, to)`` before conversion to
+        ``self.dtype``.
     """
     if generator is not None:
         return NotImplemented
@@ -4623,7 +6277,21 @@ def random_inplace_to(self, to, *, generator=None):
 
 @register_decomposition([aten.random.default])
 def random_functional(self, *, generator=None):
-    """Functional ``random(self)`` — same semantics as ``random_`` without mutation."""
+    """Create a random tensor for the functionalized unbounded ``random_`` operation.
+
+    Args:
+        self (torch.Tensor): Tensor supplying output shape, dtype, and device.
+        generator (torch.Generator | None, optional): Explicit generator, which is unsupported.
+            Defaults to ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: A fresh random tensor, or ``NotImplemented`` when
+            ``generator`` is provided.
+
+    Note:
+        ``int64`` output is limited to ``[0, 2**31)``; floating output converts integers
+        sampled from ``[0, 2**24)``.
+    """
     if generator is not None:
         return NotImplemented
     return _random_functional_full_range(self)
@@ -4631,7 +6299,21 @@ def random_functional(self, *, generator=None):
 
 @register_decomposition([aten.random.to])
 def random_functional_to(self, to, *, generator=None):
-    """Functional ``random.to(self, to)`` — non-mutating counterpart of ``random_.to``."""
+    """Create random values from masked ``int32`` values modulo ``to``.
+
+    Args:
+        self (torch.Tensor): Tensor supplying output shape, dtype, and device.
+        to (int): Modulus divisor converted with ``int`` without positivity validation.
+        generator (torch.Generator | None, optional): Explicit generator, which is unsupported.
+            Defaults to ``None``.
+
+    Returns:
+        torch.Tensor | NotImplemented: Fresh modulo results in ``self.dtype``, or
+            ``NotImplemented`` when ``generator`` is provided.
+
+    Note:
+        Positive ``to`` values produce integers in ``[0, to)`` before dtype conversion.
+    """
     if generator is not None:
         return NotImplemented
     raw = _random_int32_raw(self)
@@ -4640,7 +6322,21 @@ def random_functional_to(self, to, *, generator=None):
 
 @register_decomposition([aten.addbmm.default])
 def addbmm(self, batch1, batch2, *, beta=1, alpha=1):
-    """Decompose addbmm: beta * self + alpha * (batch1 @ batch2).sum(dim=0)"""
+    """Compute a scaled batch matrix-product sum plus a scaled input.
+
+    Args:
+        self (torch.Tensor): Additive input tensor.
+        batch1 (torch.Tensor): First batch of matrices.
+        batch2 (torch.Tensor): Second batch of matrices.
+        beta (Number, optional): Multiplier for ``self``. Defaults to ``1``.
+        alpha (Number, optional): Multiplier for the summed batch products. Defaults to ``1``.
+
+    Returns:
+        torch.Tensor: ``beta * self + alpha * bmm(batch1, batch2).sum(0)``.
+
+    Note:
+        When ``beta`` is zero, ``self`` is not read and its NaNs do not affect the result.
+    """
     bmm_result = torch.bmm(batch1, batch2).sum(dim=0)
     if alpha != 1:
         bmm_result = bmm_result * alpha
@@ -4653,7 +6349,19 @@ def addbmm(self, batch1, batch2, *, beta=1, alpha=1):
 
 @register_decomposition([aten.hypot.default])
 def hypot(self, other):
-    """Numerically stable hypot: max(|a|,|b|) * sqrt(1 + (min/max)^2)."""
+    """Compute an elementwise hypotenuse from scaled magnitudes.
+
+    Args:
+        self (torch.Tensor): First input tensor.
+        other (torch.Tensor): Second input tensor.
+
+    Returns:
+        torch.Tensor: Larger magnitude times ``sqrt(1 + (smaller / larger)**2)``.
+
+    Note:
+        Two zero operands return zero. Two infinite operands produce NaN because their
+        magnitude ratio is undefined.
+    """
     a = torch.abs(self)
     b = torch.abs(other)
     max_val = torch.maximum(a, b)
@@ -4664,8 +6372,16 @@ def hypot(self, other):
 
 @register_decomposition([aten.batch_norm_stats.default])
 def batch_norm_stats_decomposition(input, eps):
-    """Compute batch normalization statistics (mean and inverse std)."""
+    """Compute per-channel batch-normalization mean and inverse standard deviation.
 
+    Args:
+        input (torch.Tensor): Input whose non-channel dimensions are reduced.
+        eps (float): Value added to the biased variance before reciprocal square root.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Per-channel mean and inverse standard deviation.
+
+    """
     # Reduction axes: all except channel dimension (index 1)
     reduction_axes = tuple(i for i in range(input.ndim) if i != 1)
 
@@ -4681,7 +6397,19 @@ def batch_norm_stats_decomposition(input, eps):
 
 @register_decomposition([aten.batch_norm_elemt.default])
 def batch_norm_elemt_decomposition(input, weight, bias, mean, invstd, eps):
-    """Decompose batch_norm_elemt: (input - mean) * invstd * weight + bias."""
+    """Normalize batch elements with optional per-channel affine parameters.
+
+    Args:
+        input (torch.Tensor): Batch input.
+        weight (torch.Tensor | None): Per-channel scale, or no scaling when ``None``.
+        bias (torch.Tensor | None): Per-channel offset, or no offset when ``None``.
+        mean (torch.Tensor): Per-channel mean.
+        invstd (torch.Tensor): Per-channel inverse standard deviation.
+        eps (float): Schema argument not used by this decomposition.
+
+    Returns:
+        torch.Tensor: Normalized input after optional affine scaling and offset.
+    """
     shape = [1] * input.ndim
     shape[1] = -1
     mean_reshaped = mean.view(shape)
@@ -4696,7 +6424,22 @@ def batch_norm_elemt_decomposition(input, weight, bias, mean, invstd, eps):
 def batch_norm_backward_elemt_decomposition(
     grad_output, input, mean, invstd, weight, sum_dy, sum_dy_xmu, count
 ):
-    """Decompose batch_norm_backward_elemt into primitive ops."""
+    """Compute the batch-normalization gradient with respect to the input.
+
+    Args:
+        grad_output (torch.Tensor): Gradient with respect to normalized output.
+        input (torch.Tensor): Original batch input.
+        mean (torch.Tensor): Per-channel mean.
+        invstd (torch.Tensor): Per-channel inverse standard deviation.
+        weight (torch.Tensor | None): Per-channel scale, or no scaling when ``None``.
+        sum_dy (torch.Tensor): Per-channel sum of output gradients.
+        sum_dy_xmu (torch.Tensor): Per-channel sum of gradients times centered inputs.
+        count (torch.Tensor | Number): Count tensor summed to obtain the normalization count,
+            or a scalar normalization count.
+
+    Returns:
+        torch.Tensor: Gradient with respect to ``input``.
+    """
     shape = [1] * input.ndim
     shape[1] = -1
     mean_reshaped = mean.reshape(shape)
@@ -4717,7 +6460,22 @@ def batch_norm_backward_elemt_decomposition(
 def batch_norm_backward_reduce_decomposition(
     grad_output, input, mean, invstd, weight, input_g, weight_g, bias_g
 ):
-    """Decompose batch_norm_backward_reduce into sum reductions."""
+    """Reduce batch-normalization backward intermediates and affine gradients.
+
+    Args:
+        grad_output (torch.Tensor): Gradient with respect to normalized output.
+        input (torch.Tensor): Original batch input.
+        mean (torch.Tensor): Per-channel mean.
+        invstd (torch.Tensor): Per-channel inverse standard deviation.
+        weight (torch.Tensor | None): Schema argument not used by this decomposition.
+        input_g (bool): Requested input-gradient flag, currently ignored.
+        weight_g (bool): Requested weight-gradient flag, currently ignored.
+        bias_g (bool): Requested bias-gradient flag, currently ignored.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: Reduced gradient
+            sums, centered-gradient sums, weight gradients, and bias gradients.
+    """
     # input_g, weight_g, bias_g are unused here because we unconditionally
     # return the grads - may be worth optimizing in the future
 
@@ -4739,33 +6497,25 @@ def batch_norm_backward_reduce_decomposition(
 def batch_norm_gather_stats_with_counts_decomposition(
     input, mean, invstd, running_mean, running_var, momentum, eps, counts
 ):
-    """Decompose batch_norm_gather_stats_with_counts.
+    """Pool per-worker batch-normalization statistics using element counts.
 
-    Aggregates per-worker (mean, invstd) into a single global (mean, invstd)
-    weighted by per-worker element counts. Mirrors the CUDA reference
-    (``aten/src/ATen/native/cuda/Normalization.cuh``).
+    Args:
+        input (torch.Tensor): Schema input not used by the pooling calculation.
+        mean (torch.Tensor): Per-worker channel means.
+        invstd (torch.Tensor): Per-worker channel inverse standard deviations.
+        running_mean (torch.Tensor | None): Optional running mean updated in place.
+        running_var (torch.Tensor | None): Optional running variance updated in place.
+        momentum (float): Running-statistics update factor.
+        eps (float): Epsilon used to recover and normalize variances.
+        counts (torch.Tensor): Scalar, per-worker, or per-worker-per-channel counts.
 
-    Shapes (typical SyncBatchNorm use):
-      mean       : (num_workers, num_channels)
-      invstd     : (num_workers, num_channels)
-      counts     : (num_workers,) — element count per worker, or a scalar
-                   when every worker contributed the same number of elements
-      running_mean/running_var: (num_channels,) or None
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Pooled mean and inverse standard deviation.
 
-    Combined-mean/variance formula (Welford-style pooling):
-      N_total  = sum(counts)
-      mean_g   = sum(counts * mean) / N_total                    (over workers)
-      var_i    = 1/invstd_i^2 - eps
-      var_g    = sum(counts * (var_i + (mean_i - mean_g)^2)) / N_total
-      invstd_g = 1 / sqrt(var_g + eps)
-
-    Running stats (when provided) are updated with the unbiased variance
-    (``var_g * N_total / (N_total - 1)``) using the standard momentum rule;
-    when ``N_total <= 1`` the unbiased correction is skipped (matches CUDA).
-
-    Only the ``(mean_g, invstd_g)`` pair is returned — the running-stats
-    aliases are updated in-place. Under torch.compile, functionalization
-    lifts the in-place update to a functional copy on the SSA graph.
+    Note:
+        The CUDA-reference pooled-variance formula guards zero total counts. Running stats
+        use momentum and an unbiased correction above one; functionalization lifts their
+        in-place updates to functional copies in the compiled graph.
     """
     dtype = mean.dtype
     counts_f = counts.to(dtype)
@@ -4961,22 +6711,107 @@ _replace_builtin_decomposition(
 )
 
 
+def _trilu_checks(name: str, row: int, col: int, dtype: torch.dtype):
+    torch._check(row >= 0, lambda: f"row must be non-negative, got {row}")
+    torch._check(col >= 0, lambda: f"col must be non-negative, got {col}")
+    torch._check(
+        dtype in (torch.int32, torch.int64),
+        lambda: f"\"{name}\" not implemented for '{dtype}'",
+    )
+
+
+@register_decomposition([aten.tril_indices.default])
+def tril_indices_decomposition(
+    row: int,
+    col: int,
+    offset: int = 0,
+    *,
+    dtype: torch.dtype = torch.long,
+    device=None,
+    **kwargs,
+) -> torch.Tensor:
+    """Generate lower-triangular matrix indices with integer-exact fences.
+
+    Args:
+        row (int): Number of matrix rows.
+        col (int): Number of matrix columns.
+        offset (int, optional): Diagonal offset. Defaults to ``0``.
+        dtype (torch.dtype, optional): Output integer dtype. Defaults to ``torch.long``.
+        device (torch.device | None, optional): Output device. Defaults to ``None``.
+        **kwargs (Any): Unused schema-compatible keyword arguments.
+
+    Returns:
+        torch.Tensor: Index pairs with shape ``(2, N)``.
+
+    Raises:
+        RuntimeError: If a dimension is negative or ``dtype`` is not int32 or int64.
+        NotImplementedError: If the kernel's int32 index arithmetic would overflow.
+
+    Note:
+        Exact integer fences correct float32 square-root rounding at triangular boundaries.
+    """
+    dtype = torch.long if dtype is None else dtype
+    _trilu_checks("tril_indices", row, col, dtype)
+    if trilu_numel(row, col, offset, False) == 0:
+        return torch.empty((2, 0), dtype=dtype, device=device)
+    if not trilu_nki_eligible(row, col, offset, False):
+        trilu_raise_oversize("tril_indices", row, col, offset)
+    return trilu_nki_indices(False, row, col, offset, dtype, device)
+
+
+@register_decomposition([aten.triu_indices.default])
+def triu_indices_decomposition(
+    row: int,
+    col: int,
+    offset: int = 0,
+    *,
+    dtype: torch.dtype = torch.long,
+    device=None,
+    **kwargs,
+) -> torch.Tensor:
+    """Generate upper-triangular matrix indices with integer-exact fences.
+
+    Args:
+        row (int): Number of matrix rows.
+        col (int): Number of matrix columns.
+        offset (int, optional): Diagonal offset. Defaults to ``0``.
+        dtype (torch.dtype, optional): Output integer dtype. Defaults to ``torch.long``.
+        device (torch.device | None, optional): Output device. Defaults to ``None``.
+        **kwargs (Any): Unused schema-compatible keyword arguments.
+
+    Returns:
+        torch.Tensor: Index pairs with shape ``(2, N)``.
+
+    Raises:
+        RuntimeError: If a dimension is negative or ``dtype`` is not int32 or int64.
+        NotImplementedError: If the kernel's int32 index arithmetic would overflow.
+
+    Note:
+        Exact integer fences correct float32 square-root rounding at triangular boundaries.
+    """
+    dtype = torch.long if dtype is None else dtype
+    _trilu_checks("triu_indices", row, col, dtype)
+    if trilu_numel(row, col, offset, True) == 0:
+        return torch.empty((2, 0), dtype=dtype, device=device)
+    if not trilu_nki_eligible(row, col, offset, True):
+        trilu_raise_oversize("triu_indices", row, col, offset)
+    return trilu_nki_indices(True, row, col, offset, dtype, device)
+
+
 @register_decomposition([aten.frexp.Tensor])
 def frexp_decomposition(self):
-    """Decompose ``frexp`` into ``(mantissa, exponent)`` via ``log2 + floor``.
+    """Split floating-point values into binary mantissas and exponents.
 
-    ``frexp(x)`` returns ``(m, e)`` such that ``x = m * 2**e`` and
-    ``|m| in [0.5, 1)`` for finite non-zero ``x``. For ``x in {0, +inf, -inf,
-    NaN}`` PyTorch returns ``m = x`` and ``e = 0``.
+    Args:
+        self (torch.Tensor): Floating-point input values.
 
-    Implementation:
-      exponent = floor(log2(|x|)) + 1
-      mantissa = x / 2**exponent
-    The specials are handled with a mask so ``log2(0)``/``log2(inf)`` don't
-    propagate into the finite-nonzero path (we substitute 1.0 there via
-    ``torch.where`` before taking the log).
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Mantissas computed by dividing finite nonzero
+            inputs by ``2**(floor(log2(abs(self))) + 1)`` and the corresponding ``int32``
+            exponents.
 
-    Mantissa keeps the input dtype; exponent is ``int32`` (matches CPU).
+    Note:
+        Zeros, infinities, and NaNs retain their input mantissa and receive exponent zero.
     """
     is_finite_nonzero = torch.isfinite(self) & (self != 0)
     abs_self = torch.abs(self)
@@ -5006,19 +6841,51 @@ def frexp_decomposition(self):
 
 @register_decomposition([aten.addcmul.default])
 def addcmul_decomposition(input, tensor1, tensor2, value=1):
-    """Decompose addcmul: input + value * tensor1 * tensor2."""
+    """Compute an elementwise scaled product added to an input.
+
+    Args:
+        input (torch.Tensor): Additive input.
+        tensor1 (torch.Tensor): First multiplicative input.
+        tensor2 (torch.Tensor): Second multiplicative input.
+        value (Number, optional): Product multiplier. Defaults to ``1``.
+
+    Returns:
+        torch.Tensor: ``input + value * tensor1 * tensor2``.
+    """
     return input + value * tensor1 * tensor2
 
 
 @register_decomposition([aten.addcdiv.default])
 def addcdiv_decomposition(input, tensor1, tensor2, value=1):
-    """Decompose addcdiv: input + value * tensor1 / tensor2."""
+    """Compute an elementwise scaled quotient added to an input.
+
+    Args:
+        input (torch.Tensor): Additive input.
+        tensor1 (torch.Tensor): Quotient numerator.
+        tensor2 (torch.Tensor): Quotient denominator.
+        value (Number, optional): Quotient multiplier. Defaults to ``1``.
+
+    Returns:
+        torch.Tensor: ``input + value * tensor1 / tensor2``.
+    """
     return input + value * tensor1 / tensor2
 
 
 @register_decomposition([aten.erfinv.default])
 def erfinv_decomposition(y):
-    """Decompose erfinv using rational polynomial approximation."""
+    """Approximate the inverse error function elementwise.
+
+    Args:
+        y (torch.Tensor): Input values, promoted to float32 when non-floating.
+
+    Returns:
+        torch.Tensor: Approximate values ``x`` satisfying ``erf(x) = y``; values outside
+            ``[-1, 1]`` become NaN and endpoints become signed infinity.
+
+    Note:
+        The implementation uses a rational polynomial in ``y**2`` for ``abs(y) <= 0.7``
+        and a rational expression in ``sqrt(-log((1 - abs(y)) / 2))`` above that range.
+    """
     if not y.is_floating_point():
         y = y.to(torch.float32)
 
@@ -5051,12 +6918,21 @@ def erfinv_decomposition(y):
 
 @register_decomposition([aten.argmin.default])
 def argmin_decomposition(self, dim=None, keepdim=False):
-    """Decompose argmin via min.dim.
+    """Find indices of minimum values through the ``min`` reduction.
 
-    aten.argmin has no direct Neuron lowering, but min.dim does and carries the
-    winning index as its second result. argmax is not decomposed here.
-    TorchToNeuron lowers it to the AwsNeuronArgMax custom call when it can, and
-    otherwise leaves it for this same min.dim/max.dim shape.
+    Args:
+        self (torch.Tensor): Input tensor.
+        dim (int | None, optional): Reduction dimension, or all elements when ``None``. Defaults to
+            ``None``.
+        keepdim (bool, optional): Whether to retain a specified reduction dimension. Defaults to
+            ``False``.
+
+    Returns:
+        torch.Tensor: Indices of minimum values.
+
+    Note:
+        When ``dim`` is ``None``, the implementation flattens the input and ignores
+        ``keepdim``.
     """
     if dim is None:
         return self.reshape(-1).min(dim=0).indices
@@ -5065,12 +6941,21 @@ def argmin_decomposition(self, dim=None, keepdim=False):
 
 @register_decomposition([aten.kthvalue.default])
 def kthvalue_decomposition(self, k, dim=-1, keepdim=False):
-    """Decompose kthvalue into topk(largest=False).
+    """Select the k-th smallest values and their indices through ascending ``topk``.
 
-    The k smallest values (sorted ascending) are the first k of an ascending
-    topk; the k-th value/index is the last of those. topk already has a
-    Neuron-friendly decomposition above, whereas kthvalue leaves an
-    unlegalized ``torch.constant.bool``.
+    Args:
+        self (torch.Tensor): Input tensor.
+        k (int): One-based order statistic.
+        dim (int, optional): Selection dimension. Defaults to ``-1``.
+        keepdim (bool, optional): Whether to retain the selected dimension. Defaults to
+            ``False``.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: K-th values and their source indices.
+
+    Note:
+        Ascending ``topk`` avoids an unlegalized constant. A scalar input returns a clone and
+        scalar index zero without validating ``k`` or ``dim``.
     """
     # 0-d input: only k==1 is valid; the result is the scalar itself at index 0.
     if self.dim() == 0:
@@ -5101,19 +6986,21 @@ def _diagonal_flat_indices(rows, cols, offset, num_cols, device):
 
 @register_decomposition([aten.diagonal_copy.default])
 def diagonal_copy_decomposition(self, offset=0, dim1=0, dim2=1):
-    """Decompose diagonal extraction via a flattened index_select.
+    """Extract a tensor diagonal through permutation, flattening, and index selection.
 
-    ``aten::diag`` (2-D), ``aten::diagonal`` and ``aten::diagonal_copy`` all
-    extract a diagonal. ``diag`` and ``diagonal`` are CompositeImplicitAutograd,
-    so PyTorch lowers them to ``aten.diagonal_copy.default`` *before* the Neuron
-    decomposition table is consulted — registering on ``aten.diag``/
-    ``aten.diagonal`` would never fire. The direct ``diagonal_copy`` lowering
-    leaves an unlegalized ``torch.constant.int`` (its dim/offset args), so we
-    instead move the two diagonal dims to the end, gather the diagonal from the
-    flattened (rows x cols) plane, and keep the remaining (batch) dims.
+    Args:
+        self (torch.Tensor): Input tensor.
+        offset (int, optional): Diagonal offset. Defaults to ``0``.
+        dim1 (int, optional): First diagonal dimension. Defaults to ``0``.
+        dim2 (int, optional): Second diagonal dimension. Defaults to ``1``.
 
-    The 1-D ``diag`` case (build a matrix from a vector) decomposes to
-    ``diag_embed`` — already in the table — and never reaches this op.
+    Returns:
+        torch.Tensor: Selected diagonal with nondiagonal dimensions preserved.
+
+    Note:
+        Flattened index selection avoids the unlegalized integer constants in the direct
+        lowering. Composite matrix extraction reaches this op; vector construction uses
+        ``diag_embed`` instead.
     """
     nd = self.dim()
     dim1 %= nd
@@ -5157,16 +7044,18 @@ def _logcumsumexp_out_fake(self, dim, *, out):
 
 @register_decomposition([aten.logcumsumexp.default, aten._logcumsumexp.default])
 def logcumsumexp_decomposition(self, dim):
-    """Decompose (_)logcumsumexp into log(prefix_sum(exp(x))).
+    """Compute cumulative log-sum-exp values without using ``cumsum``.
 
-    The direct lowering leaves a dangling ``torch.constant.int`` that fails to
-    legalize, and ``cumsum`` itself is banned in the Neuron pipeline, so the
-    prefix sum is computed via a triangular matmul (see ``_prefix_sum``).
+    Args:
+        self (torch.Tensor): Input tensor.
+        dim (int): Dimension along which prefixes are accumulated.
 
-    Numerically stabilized by factoring out the per-``dim`` max:
-    ``log(sum_j<=i exp(x_j)) = m + log(sum_j<=i exp(x_j - m))`` for any m.
-    The all-(-inf) slice is guarded by zeroing an infinite max so we don't
-    compute ``-inf - (-inf) = nan``.
+    Returns:
+        torch.Tensor: Logarithms of cumulative exponential sums.
+
+    Note:
+        Scalar input is cloned without validating ``dim``. For nonscalars, a stabilized
+        upper-triangular matmul avoids banned ``cumsum`` and guards all-``-inf`` slices.
     """
     # logcumsumexp over a 0-d tensor is identity (single element); _prefix_sum
     # would index a nonexistent last axis (IndexError).
@@ -5207,6 +7096,20 @@ def _make_foreach_list_decomp(op):
     nki_kernel = _FOREACH_TENSOR_KERNELS.get(op)
 
     def decomp(self, other, alpha=1):
+        """Apply a foreach binary operation to paired tensor lists.
+
+        Args:
+            self (Sequence[torch.Tensor]): Left operand tensors.
+            other (Sequence[torch.Tensor]): Right operand tensors.
+            alpha (Number, optional): Multiplier used by add and subtract. Defaults to ``1``.
+
+        Returns:
+            list[torch.Tensor]: Per-pair results.
+
+        Note:
+            Pairing stops at the shorter input. Empty left operands alias the input; eligible
+            shapes use NKI, and kernel failures fall back to torch.
+        """
         grid = (int(get_logical_neuron_cores()),)
         result = []
         for a, b in zip(self, other, strict=False):
@@ -5241,6 +7144,19 @@ def _make_foreach_scalar_decomp(op):
     nki_kernel = _FOREACH_SCALAR_KERNELS.get(op)
 
     def decomp(self, scalar):
+        """Apply a foreach binary operation between tensors and a scalar.
+
+        Args:
+            self (Sequence[torch.Tensor]): Input tensors.
+            scalar (Number): Shared right operand.
+
+        Returns:
+            list[torch.Tensor]: Per-tensor results using promoted compute dtypes.
+
+        Note:
+            Nontrivial tensors use an NKI kernel when available; integer division promotes
+            to float32, and kernel failures fall back to the torch operation.
+        """
         grid = (int(get_logical_neuron_cores()),)
         result = []
         for t in self:
@@ -5273,6 +7189,20 @@ def _make_foreach_tensor_decomp(op):
     nki_kernel = _FOREACH_SCALAR_KERNELS.get(op)
 
     def decomp(self, other, alpha=1):
+        """Apply a foreach binary operation between tensors and a scalar tensor.
+
+        Args:
+            self (Sequence[torch.Tensor]): Input tensors.
+            other (torch.Tensor): Shared scalar tensor operand.
+            alpha (Number, optional): Multiplier used by add operations. Defaults to ``1``.
+
+        Returns:
+            list[torch.Tensor]: Per-tensor results.
+
+        Note:
+            Empty inputs are returned directly and alias their corresponding input. Nontrivial
+            tensors use an NKI scalar kernel when available and otherwise fall back to torch.
+        """
         grid = (int(get_logical_neuron_cores()),)
         effective = other * alpha if has_alpha else other
         result = []
@@ -5309,11 +7239,24 @@ def _make_foreach_list_inplace_decomp(op):
     if has_alpha:
 
         def decomp(self, other, alpha=1):
+            """Apply pairwise foreach operations in place with an optional multiplier.
+
+            Args:
+                self (Sequence[torch.Tensor]): Tensors to mutate.
+                other (Sequence[torch.Tensor]): Per-position right operands.
+                alpha (Number, optional): Multiplier for each right operand. Defaults to ``1``.
+            """
             for s, o in zip(self, other, strict=False):
                 torch_op(s, o, alpha=alpha, out=s)
     else:
 
         def decomp(self, other):
+            """Apply pairwise foreach operations in place.
+
+            Args:
+                self (Sequence[torch.Tensor]): Tensors to mutate.
+                other (Sequence[torch.Tensor]): Per-position right operands.
+            """
             for s, o in zip(self, other, strict=False):
                 torch_op(s, o, out=s)
 
@@ -5324,6 +7267,12 @@ def _make_foreach_scalar_inplace_decomp(op):
     torch_op = _FOREACH_OPS[op]
 
     def decomp(self, scalar):
+        """Apply a foreach scalar operation in place.
+
+        Args:
+            self (Sequence[torch.Tensor]): Tensors to mutate.
+            scalar (Number): Shared right operand.
+        """
         for s in self:
             torch_op(s, scalar, out=s)
 
@@ -5382,6 +7331,17 @@ for _cop_name, (_cop_fn, _cop_binop) in _FOREACH_ADDCOP.items():
 
     def _make_addcop_scalar(cop_fn):
         def decomp(self, tensor1, tensor2, value=1):
+            """Apply scalar-valued foreach addcmul or addcdiv operations.
+
+            Args:
+                self (Sequence[torch.Tensor]): Additive input tensors.
+                tensor1 (Sequence[torch.Tensor]): First product or quotient inputs.
+                tensor2 (Sequence[torch.Tensor]): Second product or quotient inputs.
+                value (Number, optional): Shared multiplier. Defaults to ``1``.
+
+            Returns:
+                list[torch.Tensor]: Per-position addcmul or addcdiv results.
+            """
             return [
                 cop_fn(s, t1, t2, value=value)
                 for s, t1, t2 in zip(self, tensor1, tensor2, strict=False)
@@ -5393,6 +7353,14 @@ for _cop_name, (_cop_fn, _cop_binop) in _FOREACH_ADDCOP.items():
         inplace_fn = getattr(torch.Tensor, f"{cop_name}_")
 
         def decomp(self, tensor1, tensor2, value=1):
+            """Apply scalar-valued foreach addcmul or addcdiv operations in place.
+
+            Args:
+                self (Sequence[torch.Tensor]): Additive tensors to mutate.
+                tensor1 (Sequence[torch.Tensor]): First product or quotient inputs.
+                tensor2 (Sequence[torch.Tensor]): Second product or quotient inputs.
+                value (Number, optional): Shared multiplier. Defaults to ``1``.
+            """
             for s, t1, t2 in zip(self, tensor1, tensor2, strict=False):
                 inplace_fn(s, t1, t2, value=value)
 
@@ -5400,6 +7368,17 @@ for _cop_name, (_cop_fn, _cop_binop) in _FOREACH_ADDCOP.items():
 
     def _make_addcop_scalarlist(cop_fn):
         def decomp(self, tensor1, tensor2, scalars):
+            """Apply scalar-list foreach addcmul or addcdiv operations.
+
+            Args:
+                self (Sequence[torch.Tensor]): Additive input tensors.
+                tensor1 (Sequence[torch.Tensor]): First product or quotient inputs.
+                tensor2 (Sequence[torch.Tensor]): Second product or quotient inputs.
+                scalars (Sequence[Number]): Per-position multipliers.
+
+            Returns:
+                list[torch.Tensor]: Per-position addcmul or addcdiv results.
+            """
             return [
                 cop_fn(s, t1, t2, value=v)
                 for s, t1, t2, v in zip(self, tensor1, tensor2, scalars, strict=False)
@@ -5411,6 +7390,17 @@ for _cop_name, (_cop_fn, _cop_binop) in _FOREACH_ADDCOP.items():
         inplace_fn = getattr(torch.Tensor, f"{cop_name}_")
 
         def decomp(self, tensor1, tensor2, scalars):
+            """Apply scalar-list foreach addcmul or addcdiv operations in place.
+
+            Args:
+                self (Sequence[torch.Tensor]): Additive tensors to mutate.
+                tensor1 (Sequence[torch.Tensor]): First product or quotient inputs.
+                tensor2 (Sequence[torch.Tensor]): Second product or quotient inputs.
+                scalars (Sequence[Number]): Per-position multipliers.
+
+            Note:
+                Processing stops at the shortest input without validating equal lengths.
+            """
             for s, t1, t2, v in zip(self, tensor1, tensor2, scalars, strict=False):
                 inplace_fn(s, t1, t2, value=v)
 
@@ -5418,6 +7408,20 @@ for _cop_name, (_cop_fn, _cop_binop) in _FOREACH_ADDCOP.items():
 
     def _make_addcop_tensor(binop):
         def decomp(self, tensor1, tensor2, scalars):
+            """Apply tensor-scaled foreach addcmul or addcdiv operations.
+
+            Args:
+                self (Sequence[torch.Tensor]): Additive input tensors.
+                tensor1 (Sequence[torch.Tensor]): First product or quotient inputs.
+                tensor2 (Sequence[torch.Tensor]): Second product or quotient inputs.
+                scalars (torch.Tensor): Indexed multipliers.
+
+            Returns:
+                list[torch.Tensor]: Per-position product- or quotient-based sums.
+
+            Note:
+                Tensor-list processing stops at the shortest list; scalar count is not validated.
+            """
             if binop == "mul":
                 return [
                     s + scalars[i] * t1 * t2
@@ -5433,6 +7437,17 @@ for _cop_name, (_cop_fn, _cop_binop) in _FOREACH_ADDCOP.items():
 
     def _make_addcop_tensor_inplace(binop):
         def decomp(self, tensor1, tensor2, scalars):
+            """Apply tensor-scaled foreach addcmul or addcdiv operations in place.
+
+            Args:
+                self (Sequence[torch.Tensor]): Additive tensors to mutate.
+                tensor1 (Sequence[torch.Tensor]): First product or quotient inputs.
+                tensor2 (Sequence[torch.Tensor]): Second product or quotient inputs.
+                scalars (torch.Tensor): Indexed multipliers.
+
+            Note:
+                Tensor-list processing stops at the shortest list; scalar count is not validated.
+            """
             for i, (s, t1, t2) in enumerate(zip(self, tensor1, tensor2, strict=False)):
                 if binop == "mul":
                     s.add_(scalars[i] * t1 * t2)
@@ -5468,6 +7483,21 @@ def _make_foreach_scalarlist_decomp(op):
     nki_kernel = _FOREACH_SCALAR_KERNELS.get(op)
 
     def decomp(self, scalars, alpha=1):
+        """Apply per-position scalar foreach operations.
+
+        Args:
+            self (Sequence[torch.Tensor]): Input tensors.
+            scalars (Sequence[Number]): Per-position scalar operands.
+            alpha (Number, optional): Multiplier used by add and subtract operations. Defaults to
+                ``1``.
+
+        Returns:
+            list[torch.Tensor]: Per-position results using promoted compute dtypes.
+
+        Note:
+            Nontrivial tensors use an NKI kernel when available; integer division promotes
+            to float32, and failures fall back to the torch operation.
+        """
         grid = (int(get_logical_neuron_cores()),)
         result = []
         for t, s in zip(self, scalars, strict=False):
@@ -5503,11 +7533,24 @@ def _make_foreach_scalarlist_inplace_decomp(op):
     if has_alpha:
 
         def decomp(self, scalars, alpha=1):
+            """Apply per-position scalar foreach operations in place with a multiplier.
+
+            Args:
+                self (Sequence[torch.Tensor]): Tensors to mutate.
+                scalars (Sequence[Number]): Per-position scalar operands.
+                alpha (Number, optional): Multiplier for each scalar. Defaults to ``1``.
+            """
             for s, sc in zip(self, scalars, strict=False):
                 torch_op(s, sc * alpha, out=s)
     else:
 
         def decomp(self, scalars):
+            """Apply per-position scalar foreach operations in place.
+
+            Args:
+                self (Sequence[torch.Tensor]): Tensors to mutate.
+                scalars (Sequence[Number]): Per-position scalar operands.
+            """
             for s, sc in zip(self, scalars, strict=False):
                 torch_op(s, sc, out=s)
 
@@ -5557,12 +7600,25 @@ for _op_name, _torch_op in _FOREACH_UNARY_OPS.items():
 
     def _make_unary(torch_op):
         def decomp(self):
+            """Apply a unary torch operation to each tensor.
+
+            Args:
+                self (Sequence[torch.Tensor]): Input tensors.
+
+            Returns:
+                list[torch.Tensor]: Per-tensor unary results.
+            """
             return [torch_op(t) for t in self]
 
         return decomp
 
     def _make_unary_inplace(torch_op):
         def decomp(self):
+            """Apply a unary torch operation to each tensor in place.
+
+            Args:
+                self (Sequence[torch.Tensor]): Tensors to mutate.
+            """
             for s in self:
                 torch_op(s, out=s)
 
@@ -5728,7 +7784,7 @@ def _foreach_norm_decomp(self, ord=2):
             continue
         try:
             data = t.float() if t.dtype == torch.float64 else t
-            out = nki_kernel[(2,)](data, data.numel())[0, 0]
+            out = nki_kernel(data, data.numel())[0, 0]
             result.append(out.to(torch.float64) if t.dtype == torch.float64 else out)
         except Exception:
             # Fall back to the torch op if the NKI kernel fails
@@ -5739,10 +7795,15 @@ def _foreach_norm_decomp(self, ord=2):
 
 @register_decomposition([aten.hardshrink_backward.default])
 def hardshrink_backward_decomposition(grad_out, self, lambd):
-    """Decompose hardshrink_backward.
+    """Propagate hard-shrinkage gradients outside the threshold interval.
 
-    hardshrink zeros values in [-lambd, lambd], so the gradient passes through
-    only where |self| > lambd and is zero elsewhere.
+    Args:
+        grad_out (torch.Tensor): Upstream gradient.
+        self (torch.Tensor): Forward input used to form the mask.
+        lambd (Number): Symmetric threshold.
+
+    Returns:
+        torch.Tensor: ``grad_out`` where ``abs(self) > lambd`` and zero elsewhere.
     """
     mask = (self > lambd) | (self < -lambd)
     return grad_out * mask.to(grad_out.dtype)
@@ -5750,10 +7811,15 @@ def hardshrink_backward_decomposition(grad_out, self, lambd):
 
 @register_decomposition([aten.softshrink_backward.default])
 def softshrink_backward_decomposition(grad_output, self, lambd):
-    """Decompose softshrink_backward.
+    """Propagate soft-shrinkage gradients outside the threshold interval.
 
-    softshrink is linear (slope 1) outside [-lambd, lambd] and zero inside, so
-    its gradient is the indicator |self| > lambd.
+    Args:
+        grad_output (torch.Tensor): Upstream gradient.
+        self (torch.Tensor): Forward input used to form the mask.
+        lambd (Number): Symmetric threshold.
+
+    Returns:
+        torch.Tensor: ``grad_output`` where ``abs(self) > lambd`` and zero elsewhere.
     """
     mask = (self > lambd) | (self < -lambd)
     return grad_output * mask.to(grad_output.dtype)
@@ -5796,7 +7862,24 @@ def _window_trivial(window_length, dtype, device):
 def hann_window_decomposition(
     window_length, periodic=True, *, dtype=None, layout=None, device=None, pin_memory=None
 ):
-    """Hann window: 0.5 - 0.5*cos(2*pi*n/denom)."""
+    """Construct a Hann window from its cosine formula.
+
+    Args:
+        window_length (int): Number of output points.
+        periodic (bool, optional): Whether to produce a periodic window. Defaults to ``True``.
+        dtype (torch.dtype | None, optional): Output dtype, or the default dtype when ``None``.
+            Defaults to ``None``.
+        layout (torch.layout | None, optional): Unused layout argument. Defaults to ``None``.
+        device (torch.device | str | None, optional): Output device. Defaults to ``None``.
+        pin_memory (bool | None, optional): Unused pinned-memory argument. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Values ``0.5 - 0.5 * cos(2*pi*n/denominator)``.
+
+    Note:
+        Nonpositive lengths return empty tensors, length one returns one, and periodic
+        mode uses the symmetric window denominator ``window_length``.
+    """
     trivial = _window_trivial(window_length, dtype, device)
     if trivial is not None:
         return trivial
@@ -5823,7 +7906,26 @@ def hamming_window_decomposition(
     device=None,
     pin_memory=None,
 ):
-    """Hamming window: alpha - beta*cos(2*pi*n/denom)."""
+    """Construct a Hamming window from its cosine formula.
+
+    Args:
+        window_length (int): Number of output points.
+        periodic (bool, optional): Whether to produce a periodic window. Defaults to ``True``.
+        alpha (float, optional): Constant coefficient. Defaults to ``0.54``.
+        beta (float, optional): Cosine coefficient. Defaults to ``0.46``.
+        dtype (torch.dtype | None, optional): Output dtype, or the default dtype when ``None``.
+            Defaults to ``None``.
+        layout (torch.layout | None, optional): Unused layout argument. Defaults to ``None``.
+        device (torch.device | str | None, optional): Output device. Defaults to ``None``.
+        pin_memory (bool | None, optional): Unused pinned-memory argument. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Values ``alpha - beta * cos(2*pi*n/denominator)``.
+
+    Note:
+        Nonpositive lengths return empty tensors, length one returns one, and periodic
+        mode uses denominator ``window_length``.
+    """
     trivial = _window_trivial(window_length, dtype, device)
     if trivial is not None:
         return trivial
@@ -5835,7 +7937,24 @@ def hamming_window_decomposition(
 def bartlett_window_decomposition(
     window_length, periodic=True, *, dtype=None, layout=None, device=None, pin_memory=None
 ):
-    """Bartlett (triangular) window: 1 - |2*n/denom - 1|."""
+    """Construct a Bartlett triangular window.
+
+    Args:
+        window_length (int): Number of output points.
+        periodic (bool, optional): Whether to produce a periodic window. Defaults to ``True``.
+        dtype (torch.dtype | None, optional): Output dtype, or the default dtype when ``None``.
+            Defaults to ``None``.
+        layout (torch.layout | None, optional): Unused layout argument. Defaults to ``None``.
+        device (torch.device | str | None, optional): Output device. Defaults to ``None``.
+        pin_memory (bool | None, optional): Unused pinned-memory argument. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Values ``1 - abs(2*n/denominator - 1)``.
+
+    Note:
+        Nonpositive lengths return empty tensors, length one returns one, and periodic
+        mode uses denominator ``window_length``.
+    """
     trivial = _window_trivial(window_length, dtype, device)
     if trivial is not None:
         return trivial
@@ -5847,7 +7966,24 @@ def bartlett_window_decomposition(
 def blackman_window_decomposition(
     window_length, periodic=True, *, dtype=None, layout=None, device=None, pin_memory=None
 ):
-    """Blackman window: 0.42 - 0.5*cos(x) + 0.08*cos(2*x), x = 2*pi*n/denom."""
+    """Construct a Blackman window from two cosine harmonics.
+
+    Args:
+        window_length (int): Number of output points.
+        periodic (bool, optional): Whether to produce a periodic window. Defaults to ``True``.
+        dtype (torch.dtype | None, optional): Output dtype, or the default dtype when ``None``.
+            Defaults to ``None``.
+        layout (torch.layout | None, optional): Unused layout argument. Defaults to ``None``.
+        device (torch.device | str | None, optional): Output device. Defaults to ``None``.
+        pin_memory (bool | None, optional): Unused pinned-memory argument. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Values ``0.42 - 0.5*cos(x) + 0.08*cos(2*x)``.
+
+    Note:
+        Here ``x = 2*pi*n/denominator``; periodic mode uses ``window_length`` as the
+        denominator, and nonpositive lengths or length one use shared trivial results.
+    """
     trivial = _window_trivial(window_length, dtype, device)
     if trivial is not None:
         return trivial
@@ -5910,7 +8046,25 @@ def kaiser_window_decomposition(
     device=None,
     pin_memory=None,
 ):
-    """Kaiser window: I0(beta*sqrt(1-((n-a)/a)^2)) / I0(beta), a = (denom)/2."""
+    """Construct a Kaiser window from the modified Bessel function ``I0``.
+
+    Args:
+        window_length (int): Number of output points.
+        periodic (bool, optional): Whether to produce a periodic window. Defaults to ``True``.
+        beta (float, optional): Shape parameter. Defaults to ``12.0``.
+        dtype (torch.dtype | None, optional): Output dtype, or the default dtype when ``None``.
+            Defaults to ``None``.
+        layout (torch.layout | None, optional): Unused layout argument. Defaults to ``None``.
+        device (torch.device | str | None, optional): Output device. Defaults to ``None``.
+        pin_memory (bool | None, optional): Unused pinned-memory argument. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Values ``I0(beta * sqrt(1 - ratio**2)) / I0(beta)``.
+
+    Note:
+        ``I0`` uses a polynomial below magnitude ``3.75`` and an asymptotic expression
+        otherwise; nonpositive lengths and length one use shared trivial results.
+    """
     trivial = _window_trivial(window_length, dtype, device)
     if trivial is not None:
         return trivial
@@ -6087,6 +8241,19 @@ def _special_upcast(fn):
     """Upcast bf16/fp16 to fp32 for A&S polynomial evaluation, cast back at the end."""
 
     def wrapper(x, *args, **kwargs):
+        """Evaluate a special function with low-precision inputs promoted to float32.
+
+        Args:
+            x (torch.Tensor): Primary input tensor.
+            *args (Any): Additional positional arguments forwarded to the wrapped function.
+            **kwargs (Any): Additional keyword arguments forwarded to the wrapped function.
+
+        Returns:
+            torch.Tensor: Wrapped result, cast back to the original dtype after promotion.
+
+        Note:
+            Only float16 and bfloat16 inputs are promoted.
+        """
         orig = x.dtype
         if orig in (torch.float16, torch.bfloat16):
             return fn(x.to(torch.float32), *args, **kwargs).to(orig)
@@ -6097,26 +8264,88 @@ def _special_upcast(fn):
 
 @register_decomposition([aten.i0.default])
 def i0_decomp(x):
+    """Evaluate the modified Bessel function ``I0`` elementwise.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+
+    Returns:
+        torch.Tensor: Approximate ``I0(x)`` values.
+
+    Note:
+        The implementation uses an Abramowitz-Stegun polynomial for ``abs(x) < 3.75``
+        and an exponential asymptotic expression otherwise, with low-precision upcasting.
+    """
     return _special_upcast(_i0_approx)(x)
 
 
 @register_decomposition([aten.special_i0e.default])
 def special_i0e_decomp(x):
+    """Evaluate the exponentially scaled modified Bessel function ``I0e`` elementwise.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+
+    Returns:
+        torch.Tensor: Approximate ``exp(-abs(x)) * I0(x)`` values.
+
+    Note:
+        The implementation uses a scaled polynomial for ``abs(x) < 3.75`` and drops the
+        exponential from the asymptotic branch otherwise, with low-precision upcasting.
+    """
     return _special_upcast(_i0e_approx)(x)
 
 
 @register_decomposition([aten.special_i1.default])
 def special_i1_decomp(x):
+    """Evaluate the modified Bessel function ``I1`` elementwise.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+
+    Returns:
+        torch.Tensor: Approximate odd-function values ``I1(x)``.
+
+    Note:
+        The implementation uses an Abramowitz-Stegun polynomial for ``abs(x) < 3.75``
+        and a signed exponential asymptotic expression otherwise, with low-precision upcasting.
+    """
     return _special_upcast(_i1_approx)(x)
 
 
 @register_decomposition([aten.special_bessel_j0.default])
 def special_bessel_j0_decomp(x):
+    """Evaluate the Bessel function ``J0`` of the first kind elementwise.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+
+    Returns:
+        torch.Tensor: Approximate even-function values ``J0(x)``.
+
+    Note:
+        The implementation uses an Abramowitz-Stegun polynomial for ``abs(x) <= 3``
+        and an oscillatory amplitude-phase asymptotic expression otherwise, with
+        low-precision upcasting.
+    """
     return _special_upcast(_bessel_j0_approx)(x)
 
 
 @register_decomposition([aten.special_bessel_j1.default])
 def special_bessel_j1_decomp(x):
+    """Evaluate the Bessel function ``J1`` of the first kind elementwise.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+
+    Returns:
+        torch.Tensor: Approximate odd-function values ``J1(x)``.
+
+    Note:
+        The implementation uses an Abramowitz-Stegun polynomial for ``abs(x) <= 3``
+        and a signed amplitude-phase asymptotic expression otherwise. It promotes
+        float16 and bfloat16 inputs to float32 during evaluation.
+    """
     return _special_upcast(_bessel_j1_approx)(x)
 
 
@@ -6132,12 +8361,34 @@ def _spherical_bessel_j0_impl(x):
 
 @register_decomposition([aten.special_spherical_bessel_j0.default])
 def special_spherical_bessel_j0_decomp(x):
+    """Evaluate the spherical Bessel function ``j0(x) = sin(x) / x`` elementwise.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+
+    Returns:
+        torch.Tensor: Approximate spherical Bessel values.
+
+    Note:
+        The implementation uses a fourth-order Taylor expression for ``abs(x) < 1e-4``
+        and the sine quotient elsewhere. It promotes low-precision inputs to float32.
+    """
     return _special_upcast(_spherical_bessel_j0_impl)(x)
 
 
 @register_decomposition([aten.special_ndtri.default])
 def special_ndtri_decomp(p):
-    """ndtri(p) = sqrt(2) * erfinv(2p - 1)."""
+    """Evaluate the inverse standard-normal cumulative distribution function.
+
+    Args:
+        p (torch.Tensor): Cumulative probabilities.
+
+    Returns:
+        torch.Tensor: Quantiles computed as ``sqrt(2) * erfinv(2 * p - 1)``.
+
+    Note:
+        The ``erfinv`` decomposition uses its piecewise rational approximation.
+    """
     return math.sqrt(2.0) * torch.erfinv(2.0 * p - 1.0)
 
 
@@ -6153,6 +8404,19 @@ def _log_ndtr_impl(x):
 
 @register_decomposition([aten.special_log_ndtr.default])
 def special_log_ndtr_decomp(x):
+    """Evaluate the logarithm of the standard-normal cumulative distribution function.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+
+    Returns:
+        torch.Tensor: Approximate ``log(Phi(x))`` values.
+
+    Note:
+        The implementation uses an ``erfc`` identity for ``x > -8`` and a
+        Mills-ratio asymptotic expansion for the lower tail. Low-precision inputs
+        are evaluated in float32.
+    """
     return _special_upcast(_log_ndtr_impl)(x)
 
 
@@ -6262,13 +8526,41 @@ def _igamma_impl(a, x, *, upper):
 
 @register_decomposition([aten.igamma.default, aten.special_gammainc.default])
 def igamma_decomp(a, x):
-    """P(a, x) — regularized lower incomplete gamma (a=self, x=other)."""
+    """Evaluate the regularized lower incomplete gamma function ``P(a, x)``.
+
+    Args:
+        a (torch.Tensor): Shape parameter.
+        x (torch.Tensor): Integration limit.
+
+    Returns:
+        torch.Tensor: Regularized lower incomplete gamma values.
+
+    Note:
+        The lower branch uses 100 recurrence updates for ``x < a + 1``; otherwise it
+        complements a 100-step continued fraction. When the promoted result dtype is float16
+        or bfloat16, evaluation uses float32. Invalid domains return NaN; ``a == 0, x > 0``
+        returns one.
+    """
     return _igamma_impl(a, x, upper=False)
 
 
 @register_decomposition([aten.igammac.default, aten.special_gammaincc.default])
 def igammac_decomp(a, x):
-    """Q(a, x) = 1 - P(a, x) — regularized upper incomplete gamma."""
+    """Evaluate the regularized upper incomplete gamma function ``Q(a, x)``.
+
+    Args:
+        a (torch.Tensor): Shape parameter.
+        x (torch.Tensor): Integration limit.
+
+    Returns:
+        torch.Tensor: Regularized upper incomplete gamma values.
+
+    Note:
+        The lower branch uses 100 recurrence updates for ``x < a + 1`` and is complemented;
+        otherwise a 100-step continued fraction is used. When the promoted result dtype is
+        float16 or bfloat16, evaluation uses float32. Invalid domains return NaN;
+        ``a == 0, x > 0`` returns zero.
+    """
     return _igamma_impl(a, x, upper=True)
 
 
@@ -6349,6 +8641,24 @@ def _laguerre_tensor_n_impl(x, n):
 
 @register_decomposition([aten.special_laguerre_polynomial_l.default])
 def laguerre_polynomial_l_default_decomp(x, n):
+    """Evaluate the Laguerre polynomial ``L_n(x)`` with scalar or tensor orders.
+
+    Args:
+        x (torch.Tensor): Polynomial input.
+        n (int | float | torch.Tensor): Scalar or per-element polynomial order.
+
+    Returns:
+        torch.Tensor: Laguerre polynomial values.
+
+    Raises:
+        ValueError: If a Python scalar order is NaN.
+        OverflowError: If a Python scalar order is infinite.
+
+    Note:
+        Scalar orders are truncated; negative orders return zero. Tensor orders are truncated
+        toward zero and return zero below zero. Orders above 16 produce NaN for floating-point
+        ``x``; tensor-order results are otherwise converted to ``x.dtype``.
+    """
     n_int = _extract_int_scalar(n)
     if n_int is not None:
         # Compile-time scalar order: exact unroll (any order); n<0 -> 0.
@@ -6361,6 +8671,24 @@ def laguerre_polynomial_l_default_decomp(x, n):
 
 @register_decomposition([aten.special_laguerre_polynomial_l.n_scalar])
 def laguerre_polynomial_l_n_scalar_decomp(x, n):
+    """Evaluate ``L_n(x)`` for a Python scalar order.
+
+    Args:
+        x (torch.Tensor): Polynomial input.
+        n (int | float): Polynomial order converted to an integer.
+
+    Returns:
+        torch.Tensor: Laguerre recurrence result.
+
+    Raises:
+        ValueError: If ``n`` is NaN.
+        OverflowError: If ``n`` is infinite.
+
+    Note:
+        Float16 and bfloat16 inputs are promoted during evaluation and restored afterward. A
+        negative order returns ``1 - x``. Integer ``x`` stays integer only for order zero;
+        other orders follow arithmetic promotion.
+    """
     return _special_upcast(_laguerre_impl)(x, int(n))
 
 
@@ -6368,15 +8696,42 @@ def laguerre_polynomial_l_n_scalar_decomp(x, n):
 def laguerre_polynomial_l_x_scalar_decomp(x, n):
     # x is a Python scalar; n is a per-element tensor of orders. Broadcast x to
     # n's shape (as fp32) and reuse the tensor-n recurrence.
+    """Evaluate Laguerre polynomials for a scalar input and tensor orders.
+
+    Args:
+        x (Number): Shared polynomial input.
+        n (torch.Tensor): Per-element polynomial orders.
+
+    Returns:
+        torch.Tensor: Float32 Laguerre polynomial values shaped like ``n``.
+
+    Note:
+        The scalar input is broadcast in float32. Tensor orders are truncated toward zero
+        and evaluated through order 16. Orders whose truncation is negative return zero.
+        Orders whose truncation exceeds 16 return NaN.
+    """
     x_t = torch.full_like(n, float(x), dtype=torch.float32)
     return _laguerre_tensor_n_impl(x_t, n)
 
 
 @register_decomposition([aten.polygamma.default])
 def polygamma_decomp(n, x):
-    """polygamma(n, x) = (-1)^(n+1) * n! * zeta(n+1, x) for n >= 1.
+    """Evaluate positive-order polygamma through the Hurwitz zeta function.
 
-    n == 0 (digamma) diverges under this identity — bail so aten.digamma runs.
+    Args:
+        n (int | float): Derivative order available as a Python scalar.
+        x (torch.Tensor): Function input.
+
+    Returns:
+        torch.Tensor | NotImplemented: Polygamma values, or ``NotImplemented`` for
+            tensor orders and converted order zero.
+
+    Raises:
+        ValueError: If ``int(n)`` is negative.
+
+    Note:
+        For converted ``n >= 1``, evaluates
+        ``(-1)**(n + 1) * n! * zeta(n + 1, x)``.
     """
     if not isinstance(n, int | float):
         # n must be a Python scalar to compute factorial and the sign at trace time.
@@ -6474,6 +8829,16 @@ def _resolve_vec_sizes(in_spatial, output_size, scale_factors):
 
 @register_decomposition([aten.upsample_nearest1d.default])
 def upsample_nearest1d_decomposition(self, output_size, scales=None):
+    """Decompose one-dimensional nearest-neighbor upsampling into index gathering.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        output_size (Sequence[int]): Requested output length.
+        scales (float | None, optional): Optional explicit scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Nearest-neighbor resampled tensor.
+    """
     return interpolation_maps.nearest_forward(
         self, output_size, [scales], exact=False, short_circuit=False
     )
@@ -6481,12 +8846,37 @@ def upsample_nearest1d_decomposition(self, output_size, scales=None):
 
 @register_decomposition([aten.upsample_nearest1d.vec])
 def upsample_nearest1d_vec_decomposition(input, output_size, scale_factors):
+    """Decompose vector-form one-dimensional nearest-neighbor upsampling.
+
+    Args:
+        input (torch.Tensor): Input tensor.
+        output_size (Sequence[int] | None): Requested output length; when non-``None``,
+            this takes precedence over ``scale_factors``.
+        scale_factors (Sequence[float] | None): Scale used to derive the output length
+            when ``output_size`` is ``None``.
+
+    Returns:
+        torch.Tensor: Nearest-neighbor resampled tensor.
+
+    Note:
+        A scale-derived length is computed as ``int(input_length * scale)``.
+    """
     sizes, scales = _resolve_vec_sizes(input.shape[-1:], output_size, scale_factors)
     return upsample_nearest1d_decomposition(input, sizes, scales[0])
 
 
 @register_decomposition([aten._upsample_nearest_exact1d.default])
 def upsample_nearest_exact1d_decomposition(self, output_size, scales=None):
+    """Decompose exact one-dimensional nearest-neighbor upsampling into index gathering.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        output_size (Sequence[int]): Requested output length.
+        scales (float | None, optional): Optional explicit scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Tensor resampled with exact-nearest source coordinates.
+    """
     return interpolation_maps.nearest_forward(
         self, output_size, [scales], exact=True, short_circuit=False
     )
@@ -6494,12 +8884,38 @@ def upsample_nearest_exact1d_decomposition(self, output_size, scales=None):
 
 @register_decomposition([aten._upsample_nearest_exact1d.vec])
 def upsample_nearest_exact1d_vec_decomposition(input, output_size, scale_factors):
+    """Decompose vector-form exact one-dimensional nearest-neighbor upsampling.
+
+    Args:
+        input (torch.Tensor): Input tensor.
+        output_size (Sequence[int] | None): Requested output length; when non-``None``,
+            this takes precedence over ``scale_factors``.
+        scale_factors (Sequence[float] | None): Scale used to derive the output length
+            when ``output_size`` is ``None``.
+
+    Returns:
+        torch.Tensor: Tensor resampled with exact-nearest source coordinates.
+
+    Note:
+        A scale-derived length is computed as ``int(input_length * scale)``.
+    """
     sizes, scales = _resolve_vec_sizes(input.shape[-1:], output_size, scale_factors)
     return upsample_nearest_exact1d_decomposition(input, sizes, scales[0])
 
 
 @register_decomposition([aten.upsample_nearest2d.default])
 def upsample_nearest2d_decomposition(self, output_size, scales_h=None, scales_w=None):
+    """Decompose two-dimensional nearest-neighbor upsampling into separable gathers.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        output_size (Sequence[int]): Requested output height and width.
+        scales_h (float | None, optional): Optional height scale. Defaults to ``None``.
+        scales_w (float | None, optional): Optional width scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Nearest-neighbor resampled tensor.
+    """
     return interpolation_maps.nearest_forward(
         self, output_size, [scales_h, scales_w], exact=False, short_circuit=True
     )
@@ -6507,12 +8923,38 @@ def upsample_nearest2d_decomposition(self, output_size, scales_h=None, scales_w=
 
 @register_decomposition([aten.upsample_nearest2d.vec])
 def upsample_nearest2d_vec_decomposition(input, output_size, scale_factors):
+    """Decompose vector-form two-dimensional nearest-neighbor upsampling.
+
+    Args:
+        input (torch.Tensor): Input tensor.
+        output_size (Sequence[int] | None): Requested height and width; when non-``None``,
+            these take precedence over ``scale_factors``.
+        scale_factors (Sequence[float] | None): Per-dimension scales used to derive the
+            output size when ``output_size`` is ``None``.
+
+    Returns:
+        torch.Tensor: Nearest-neighbor resampled tensor.
+
+    Note:
+        Each scale-derived extent is computed as ``int(input_extent * scale)``.
+    """
     sizes, scales = _resolve_vec_sizes(input.shape[-2:], output_size, scale_factors)
     return upsample_nearest2d_decomposition(input, sizes, scales[0], scales[1])
 
 
 @register_decomposition([aten._upsample_nearest_exact2d.default])
 def upsample_nearest_exact2d_decomposition(self, output_size, scales_h=None, scales_w=None):
+    """Decompose exact two-dimensional nearest-neighbor upsampling into separable gathers.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        output_size (Sequence[int]): Requested output height and width.
+        scales_h (float | None, optional): Optional height scale. Defaults to ``None``.
+        scales_w (float | None, optional): Optional width scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Tensor resampled with exact-nearest source coordinates.
+    """
     return interpolation_maps.nearest_forward(
         self, output_size, [scales_h, scales_w], exact=True, short_circuit=False
     )
@@ -6520,12 +8962,38 @@ def upsample_nearest_exact2d_decomposition(self, output_size, scales_h=None, sca
 
 @register_decomposition([aten._upsample_nearest_exact2d.vec])
 def upsample_nearest_exact2d_vec_decomposition(input, output_size, scale_factors):
+    """Decompose vector-form exact two-dimensional nearest-neighbor upsampling.
+
+    Args:
+        input (torch.Tensor): Input tensor.
+        output_size (Sequence[int] | None): Requested height and width; when non-``None``,
+            these take precedence over ``scale_factors``.
+        scale_factors (Sequence[float] | None): Per-dimension scales used to derive the
+            output size when ``output_size`` is ``None``.
+
+    Returns:
+        torch.Tensor: Tensor resampled with exact-nearest source coordinates.
+
+    Note:
+        Each scale-derived extent is computed as ``int(input_extent * scale)``.
+    """
     sizes, scales = _resolve_vec_sizes(input.shape[-2:], output_size, scale_factors)
     return upsample_nearest_exact2d_decomposition(input, sizes, scales[0], scales[1])
 
 
 @register_decomposition([aten.upsample_linear1d.default])
 def upsample_linear1d_decomposition(self, output_size, align_corners, scales=None):
+    """Decompose one-dimensional linear upsampling into two-tap interpolation.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        output_size (Sequence[int]): Requested output length.
+        align_corners (bool): Whether input and output corner points align.
+        scales (float | None, optional): Optional explicit scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Linearly resampled tensor.
+    """
     return interpolation_maps.bimode_forward(
         self, output_size, align_corners, [scales], cubic=False
     )
@@ -6533,6 +9001,22 @@ def upsample_linear1d_decomposition(self, output_size, align_corners, scales=Non
 
 @register_decomposition([aten.upsample_linear1d.vec])
 def upsample_linear1d_vec_decomposition(input, output_size, align_corners, scale_factors):
+    """Decompose vector-form one-dimensional linear upsampling.
+
+    Args:
+        input (torch.Tensor): Input tensor.
+        output_size (Sequence[int] | None): Requested output length; when non-``None``,
+            this takes precedence over ``scale_factors``.
+        align_corners (bool): Whether input and output corner points align.
+        scale_factors (Sequence[float] | None): Scale used to derive the output length
+            when ``output_size`` is ``None``.
+
+    Returns:
+        torch.Tensor: Linearly resampled tensor.
+
+    Note:
+        A scale-derived length is computed as ``int(input_length * scale)``.
+    """
     sizes, scales = _resolve_vec_sizes(input.shape[-1:], output_size, scale_factors)
     return upsample_linear1d_decomposition(input, sizes, align_corners, scales[0])
 
@@ -6541,6 +9025,18 @@ def upsample_linear1d_vec_decomposition(input, output_size, align_corners, scale
 def upsample_bilinear2d_decomposition(
     self, output_size, align_corners, scales_h=None, scales_w=None
 ):
+    """Decompose two-dimensional bilinear upsampling into separable two-tap interpolation.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        output_size (Sequence[int]): Requested output height and width.
+        align_corners (bool): Whether input and output corner points align.
+        scales_h (float | None, optional): Optional height scale. Defaults to ``None``.
+        scales_w (float | None, optional): Optional width scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Bilinearly resampled tensor.
+    """
     return interpolation_maps.bimode_forward(
         self, output_size, align_corners, [scales_h, scales_w], cubic=False
     )
@@ -6548,6 +9044,22 @@ def upsample_bilinear2d_decomposition(
 
 @register_decomposition([aten.upsample_bilinear2d.vec])
 def upsample_bilinear2d_vec_decomposition(input, output_size, align_corners, scale_factors):
+    """Decompose vector-form two-dimensional bilinear upsampling.
+
+    Args:
+        input (torch.Tensor): Input tensor.
+        output_size (Sequence[int] | None): Requested height and width, or ``None`` when
+            ``scale_factors`` supplies them.
+        align_corners (bool): Whether input and output corner points align.
+        scale_factors (Sequence[float] | None): Height and width scales, or ``None`` when
+            ``output_size`` supplies the extents.
+
+    Returns:
+        torch.Tensor: Bilinearly resampled tensor.
+
+    Note:
+        Scale-derived extents use ``int(input_extent * scale)``.
+    """
     sizes, scales = _resolve_vec_sizes(input.shape[-2:], output_size, scale_factors)
     return upsample_bilinear2d_decomposition(input, sizes, align_corners, scales[0], scales[1])
 
@@ -6556,6 +9068,18 @@ def upsample_bilinear2d_vec_decomposition(input, output_size, align_corners, sca
 def upsample_bicubic2d_decomposition(
     self, output_size, align_corners, scales_h=None, scales_w=None
 ):
+    """Decompose two-dimensional bicubic upsampling into separable four-tap interpolation.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        output_size (Sequence[int]): Requested output height and width.
+        align_corners (bool): Whether input and output corner points align.
+        scales_h (float | None, optional): Optional height scale. Defaults to ``None``.
+        scales_w (float | None, optional): Optional width scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Bicubically resampled tensor.
+    """
     return interpolation_maps.bimode_forward(
         self, output_size, align_corners, [scales_h, scales_w], cubic=True
     )
@@ -6563,12 +9087,39 @@ def upsample_bicubic2d_decomposition(
 
 @register_decomposition([aten.upsample_bicubic2d.vec])
 def upsample_bicubic2d_vec_decomposition(input, output_size, align_corners, scale_factors):
+    """Decompose vector-form two-dimensional bicubic upsampling.
+
+    Args:
+        input (torch.Tensor): Input tensor.
+        output_size (Sequence[int] | None): Requested height and width, or ``None`` when
+            ``scale_factors`` supplies them.
+        align_corners (bool): Whether input and output corner points align.
+        scale_factors (Sequence[float] | None): Height and width scales, or ``None`` when
+            ``output_size`` supplies the extents.
+
+    Returns:
+        torch.Tensor: Bicubically resampled tensor.
+
+    Note:
+        Scale-derived extents use ``int(input_extent * scale)``.
+    """
     sizes, scales = _resolve_vec_sizes(input.shape[-2:], output_size, scale_factors)
     return upsample_bicubic2d_decomposition(input, sizes, align_corners, scales[0], scales[1])
 
 
 @register_decomposition([aten.upsample_nearest1d_backward.default])
 def upsample_nearest1d_backward_decomposition(grad_output, output_size, input_size, scales=None):
+    """Decompose one-dimensional nearest-neighbor backward into indexed gradient scatter.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the resampled output.
+        output_size (Sequence[int]): Forward output length.
+        input_size (Sequence[int]): Full forward input shape.
+        scales (float | None, optional): Optional forward scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Gradient accumulated into the input shape.
+    """
     return interpolation_maps.nearest_backward(
         grad_output, output_size, input_size, [scales], exact=False
     )
@@ -6578,6 +9129,17 @@ def upsample_nearest1d_backward_decomposition(grad_output, output_size, input_si
 def upsample_nearest_exact1d_backward_decomposition(
     grad_output, output_size, input_size, scales=None
 ):
+    """Decompose exact one-dimensional nearest-neighbor backward into gradient scatter.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the resampled output.
+        output_size (Sequence[int]): Forward output length.
+        input_size (Sequence[int]): Full forward input shape.
+        scales (float | None, optional): Optional forward scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Gradient accumulated with exact-nearest source coordinates.
+    """
     return interpolation_maps.nearest_backward(
         grad_output, output_size, input_size, [scales], exact=True
     )
@@ -6587,6 +9149,18 @@ def upsample_nearest_exact1d_backward_decomposition(
 def upsample_nearest2d_backward_decomposition(
     grad_output, output_size, input_size, scales_h=None, scales_w=None
 ):
+    """Decompose two-dimensional nearest-neighbor backward into separable gradient scatters.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the resampled output.
+        output_size (Sequence[int]): Forward output height and width.
+        input_size (Sequence[int]): Full forward input shape.
+        scales_h (float | None, optional): Optional forward height scale. Defaults to ``None``.
+        scales_w (float | None, optional): Optional forward width scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Gradient accumulated into the input shape.
+    """
     return interpolation_maps.nearest_backward(
         grad_output, output_size, input_size, [scales_h, scales_w], exact=False
     )
@@ -6596,6 +9170,18 @@ def upsample_nearest2d_backward_decomposition(
 def upsample_nearest_exact2d_backward_decomposition(
     grad_output, output_size, input_size, scales_h=None, scales_w=None
 ):
+    """Decompose exact two-dimensional nearest-neighbor backward into gradient scatters.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the resampled output.
+        output_size (Sequence[int]): Forward output height and width.
+        input_size (Sequence[int]): Full forward input shape.
+        scales_h (float | None, optional): Optional forward height scale. Defaults to ``None``.
+        scales_w (float | None, optional): Optional forward width scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Gradient accumulated with exact-nearest source coordinates.
+    """
     return interpolation_maps.nearest_backward(
         grad_output, output_size, input_size, [scales_h, scales_w], exact=True
     )
@@ -6605,6 +9191,18 @@ def upsample_nearest_exact2d_backward_decomposition(
 def upsample_linear1d_backward_decomposition(
     grad_output, output_size, input_size, align_corners, scales=None
 ):
+    """Decompose one-dimensional linear backward into weighted gradient scatter.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the resampled output.
+        output_size (Sequence[int]): Forward output length.
+        input_size (Sequence[int]): Full forward input shape.
+        align_corners (bool): Forward corner-alignment setting.
+        scales (float | None, optional): Optional forward scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Gradient accumulated with two-tap linear weights.
+    """
     return interpolation_maps.bimode_backward(
         grad_output, output_size, input_size, align_corners, [scales], cubic=False
     )
@@ -6614,6 +9212,19 @@ def upsample_linear1d_backward_decomposition(
 def upsample_bilinear2d_backward_decomposition(
     grad_output, output_size, input_size, align_corners, scales_h=None, scales_w=None
 ):
+    """Decompose two-dimensional bilinear backward into weighted gradient scatters.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the resampled output.
+        output_size (Sequence[int]): Forward output height and width.
+        input_size (Sequence[int]): Full forward input shape.
+        align_corners (bool): Forward corner-alignment setting.
+        scales_h (float | None, optional): Optional forward height scale. Defaults to ``None``.
+        scales_w (float | None, optional): Optional forward width scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Gradient accumulated with separable two-tap weights.
+    """
     return interpolation_maps.bimode_backward(
         grad_output, output_size, input_size, align_corners, [scales_h, scales_w], cubic=False
     )
@@ -6623,6 +9234,19 @@ def upsample_bilinear2d_backward_decomposition(
 def upsample_bicubic2d_backward_decomposition(
     grad_output, output_size, input_size, align_corners, scales_h=None, scales_w=None
 ):
+    """Decompose two-dimensional bicubic backward into weighted gradient scatters.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the resampled output.
+        output_size (Sequence[int]): Forward output height and width.
+        input_size (Sequence[int]): Full forward input shape.
+        align_corners (bool): Forward corner-alignment setting.
+        scales_h (float | None, optional): Optional forward height scale. Defaults to ``None``.
+        scales_w (float | None, optional): Optional forward width scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Gradient accumulated with separable four-tap weights.
+    """
     return interpolation_maps.bimode_backward(
         grad_output, output_size, input_size, align_corners, [scales_h, scales_w], cubic=True
     )
@@ -6636,6 +9260,7 @@ _UPSAMPLE_FORWARD_PACKETS = (
     aten.upsample_linear1d,
     aten.upsample_bilinear2d,
     aten.upsample_bicubic2d,
+    aten.upsample_trilinear3d,
 )
 
 
@@ -6673,42 +9298,116 @@ def _release_upsample_builtin_python_decompositions():
 _release_upsample_builtin_python_decompositions()
 
 
+def _trilinear_resample_matrix(in_size, out_size, scale, align_corners, device, dtype):
+    """Per-axis linear resample matrix; identity when the axis size is unchanged.
+
+    aten copies an unchanged axis and ignores its scale. Identity reproduces that
+    copy, so a passed-but-ignored scale cannot perturb the result.
+    """
+    if in_size == out_size:
+        return torch.eye(in_size, device=device, dtype=dtype)
+    return _linear_resample_matrix(in_size, out_size, scale, align_corners, False, device, dtype)
+
+
 @register_decomposition([aten.upsample_trilinear3d.default])
 def upsample_trilinear3d_decomposition(
     self, output_size, align_corners, scales_d=None, scales_h=None, scales_w=None
 ):
-    """Decompose 3-D trilinear upsample as three separable matmuls."""
+    """Decompose three-dimensional trilinear upsampling into separable matrix products.
+
+    Args:
+        self (torch.Tensor): Input of shape ``(N, C, D, H, W)``.
+        output_size (Sequence[int]): Requested output depth, height, and width.
+        align_corners (bool): Whether input and output corner points align.
+        scales_d (float | None, optional): Optional depth scale. Defaults to ``None``.
+        scales_h (float | None, optional): Optional height scale. Defaults to ``None``.
+        scales_w (float | None, optional): Optional width scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Resampled tensor of shape ``(N, C, *output_size)``.
+
+    Note:
+        The implementation builds one linear resampling matrix per spatial dimension.
+    """
     od, oh, ow = output_size
     in_d, in_h, in_w = self.shape[-3:]
-    wd = _linear_resample_matrix(in_d, od, scales_d, align_corners, False, self.device, self.dtype)
-    wh = _linear_resample_matrix(in_h, oh, scales_h, align_corners, False, self.device, self.dtype)
-    ww = _linear_resample_matrix(in_w, ow, scales_w, align_corners, False, self.device, self.dtype)
+    wd = _trilinear_resample_matrix(in_d, od, scales_d, align_corners, self.device, self.dtype)
+    wh = _trilinear_resample_matrix(in_h, oh, scales_h, align_corners, self.device, self.dtype)
+    ww = _trilinear_resample_matrix(in_w, ow, scales_w, align_corners, self.device, self.dtype)
     # input dims p,q,r -> output d,h,w; n,m are batch/channel
     return torch.einsum("dp,hq,wr,nmpqr->nmdhw", wd, wh, ww, self)
 
 
 @register_decomposition([aten.upsample_trilinear3d.vec])
 def upsample_trilinear3d_vec_decomposition(input, output_size, align_corners, scale_factors):
-    """Decompose the .vec overload by resolving sizes/scales then delegating."""
+    """Decompose vector-form three-dimensional trilinear upsampling.
+
+    Args:
+        input (torch.Tensor): Input tensor.
+        output_size (Sequence[int] | None): Requested depth, height, and width, or ``None``
+            when ``scale_factors`` supplies them.
+        align_corners (bool): Whether input and output corner points align.
+        scale_factors (Sequence[float] | None): Depth, height, and width scales, or ``None``
+            when ``output_size`` supplies the extents.
+
+    Returns:
+        torch.Tensor: Trilinearly resampled tensor.
+
+    Note:
+        Scale-derived extents use ``int(input_extent * scale)``.
+    """
     sizes, scales = _resolve_vec_sizes(input.shape[-3:], output_size, scale_factors)
     return upsample_trilinear3d_decomposition(input, sizes, align_corners, *scales)
+
+
+@register_decomposition([aten.upsample_trilinear3d_backward.default])
+def upsample_trilinear3d_backward_decomposition(
+    grad_output, output_size, input_size, align_corners, scales_d=None, scales_h=None, scales_w=None
+):
+    """Compute trilinear upsampling gradients with transposed resampling matrices.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the resampled output.
+        output_size (Sequence[int]): Forward output depth, height, and width.
+        input_size (Sequence[int]): Forward input shape.
+        align_corners (bool): Whether forward input and output corners align.
+        scales_d (float | None, optional): Optional forward depth scale. Defaults to ``None``.
+        scales_h (float | None, optional): Optional forward height scale. Defaults to ``None``.
+        scales_w (float | None, optional): Optional forward width scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Gradient accumulated into the forward input shape.
+    """
+    od, oh, ow = output_size
+    in_d, in_h, in_w = input_size[-3:]
+    dtype, device = grad_output.dtype, grad_output.device
+    wd = _trilinear_resample_matrix(in_d, od, scales_d, align_corners, device, dtype)
+    wh = _trilinear_resample_matrix(in_h, oh, scales_h, align_corners, device, dtype)
+    ww = _trilinear_resample_matrix(in_w, ow, scales_w, align_corners, device, dtype)
+    return torch.einsum("dp,hq,wr,nmdhw->nmpqr", wd, wh, ww, grad_output)
 
 
 @register_decomposition([aten._upsample_bilinear2d_aa.default])
 def upsample_bilinear2d_aa_decomposition(
     self, output_size, align_corners, scales_h=None, scales_w=None
 ):
-    """Decompose anti-aliased bilinear upsample as two separable matmuls.
+    """Decompose anti-aliased bilinear resampling into separable matrix products.
 
-    Identical to the plain bilinear decomposition but with the anti-aliasing
-    filter widening enabled in the weight matrix. Handles both align_corners
-    values (the matrix builder reproduces aten's degenerate AA+align_corners
-    behavior bit-exactly).
+    Args:
+        self (torch.Tensor): Input of shape ``(N, C, H, W)``.
+        output_size (Sequence[int]): Requested output height and width.
+        align_corners (bool): Whether input and output corner points align.
+        scales_h (float | None, optional): Optional height scale. Defaults to ``None``.
+        scales_w (float | None, optional): Optional width scale. Defaults to ``None``.
 
-    The blend runs in a float accumulator (fp32 for fp16/bf16/uint8) and narrows
-    once, so Neuron gains the bf16/fp16 path aten's CPU kernel lacks. For a uint8
-    output the width pass is narrowed before the height pass, matching aten's
-    per-pass kernel (a tap matrix built in uint8 would round every weight to 0/1).
+    Returns:
+        torch.Tensor: Resampled tensor of shape ``(N, C, *output_size)``.
+
+    Note:
+        Downsampling widens the triangular filters. Float16 and bfloat16 inputs
+        accumulate in float32 and narrow at the output. Uint8 inputs are rounded
+        into range after the width pass before the height pass. With corner alignment,
+        the weights reproduce ATen's position-degenerate anti-aliased behavior.
     """
     oh, ow = output_size
     in_h, in_w = self.shape[-2:]
@@ -6725,8 +9424,22 @@ def upsample_bilinear2d_aa_decomposition(
 
 @register_decomposition([aten._upsample_bilinear2d_aa.vec])
 def upsample_bilinear2d_aa_vec_decomposition(input, output_size, align_corners, scale_factors):
-    """Decompose the .vec overload by resolving output_size/scales then
-    delegating to the default AA decomposition."""
+    """Decompose vector-form anti-aliased bilinear resampling.
+
+    Args:
+        input (torch.Tensor): Input tensor.
+        output_size (Sequence[int] | None): Requested height and width, or ``None`` when
+            ``scale_factors`` supplies them.
+        align_corners (bool): Whether input and output corner points align.
+        scale_factors (Sequence[float] | None): Height and width scales, or ``None`` when
+            ``output_size`` supplies the extents.
+
+    Returns:
+        torch.Tensor: Anti-aliased bilinearly resampled tensor.
+
+    Note:
+        Scale-derived extents use ``int(input_extent * scale)``.
+    """
     sizes, scales = _resolve_vec_sizes(input.shape[-2:], output_size, scale_factors)
     return upsample_bilinear2d_aa_decomposition(input, sizes, align_corners, scales[0], scales[1])
 
@@ -6735,12 +9448,24 @@ def upsample_bilinear2d_aa_vec_decomposition(input, output_size, align_corners, 
 def upsample_bilinear2d_aa_backward_decomposition(
     grad_output, output_size, input_size, align_corners, scales_h=None, scales_w=None
 ):
-    """Decompose AA bilinear backward as the transpose of the forward matmuls.
+    """Decompose anti-aliased bilinear backward with transposed resampling matrices.
 
-    Forward is ``out = Wh @ x @ Ww^T``; the gradient wrt the input is therefore
-    ``Wh^T @ grad @ Ww``. Handles both align_corners values. Floating-only, so
-    the blend runs in the float accumulator and narrows once, with no integral
-    rounding.
+    Args:
+        grad_output (torch.Tensor): Gradient of the resampled output.
+        output_size (Sequence[int]): Unused schema argument; output extents come from
+            ``grad_output``.
+        input_size (Sequence[int]): Forward input shape whose height and width set the
+            destination spatial extents.
+        align_corners (bool): Forward corner-alignment setting.
+        scales_h (float | None, optional): Optional forward height scale. Defaults to ``None``.
+        scales_w (float | None, optional): Optional forward width scale. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Gradient accumulated into the input shape.
+
+    Note:
+        The backward products use the transposes of the widened forward filters.
+        Float16 and bfloat16 gradients accumulate in float32 and narrow once.
     """
     N, C, H, W = input_size
     oh, ow = grad_output.shape[-2:]
@@ -6759,11 +9484,43 @@ def upsample_bilinear2d_aa_backward_decomposition(
 
 @register_decomposition([aten.im2col.default])
 def im2col_decomposition(self, kernel_size, dilation, padding, stride):
+    """Decompose ``im2col`` into block reshaping or indexed gathering.
+
+    Args:
+        self (torch.Tensor): Batched or unbatched image tensor.
+        kernel_size (Sequence[int]): Two-dimensional kernel size.
+        dilation (Sequence[int]): Two-dimensional kernel dilation.
+        padding (Sequence[int]): Two-dimensional input padding.
+        stride (Sequence[int]): Two-dimensional block stride.
+
+    Returns:
+        torch.Tensor: Sliding image blocks arranged as columns.
+
+    Note:
+        Nonoverlapping unit-dilation tiles use a reshape-and-permute path. Other
+        configurations gather from a flattened padded image.
+    """
     return im2col_maps.im2col_forward(self, kernel_size, dilation, padding, stride)
 
 
 @register_decomposition([aten.col2im.default])
 def col2im_decomposition(self, output_size, kernel_size, dilation, padding, stride):
+    """Decompose ``col2im`` into indexed accumulation of image blocks.
+
+    Args:
+        self (torch.Tensor): Batched or unbatched columns tensor.
+        output_size (Sequence[int]): Two-dimensional output image size.
+        kernel_size (Sequence[int]): Two-dimensional kernel size.
+        dilation (Sequence[int]): Two-dimensional kernel dilation.
+        padding (Sequence[int]): Two-dimensional output padding.
+        stride (Sequence[int]): Two-dimensional block stride.
+
+    Returns:
+        torch.Tensor: Reconstructed image with overlapping blocks summed.
+
+    Note:
+        The implementation accumulates through an axis-zero index addition.
+    """
     return im2col_maps.col2im_forward(self, output_size, kernel_size, dilation, padding, stride)
 
 
@@ -6833,11 +9590,30 @@ def _grid_sample_3d_impl(input, grid, interpolation_mode, padding_mode, align_co
         return NotImplemented
 
     def unnormalize(coords, size):
+        """Map normalized grid coordinates to source coordinates.
+
+        Args:
+            coords (torch.Tensor): Coordinates in the normalized grid space.
+            size (int): Source extent for one spatial dimension.
+
+        Returns:
+            torch.Tensor: Source coordinates for the captured corner-alignment mode.
+        """
         mul = (size * 0.5 - 0.5) if align_corners else (size * 0.5)
         ofs = size * 0.5 - 0.5
         return coords * mul + ofs
 
     def reflect(coords, twice_low, twice_high):
+        """Reflect coordinates between two doubled boundary values.
+
+        Args:
+            coords (torch.Tensor): Source coordinates to reflect.
+            twice_low (int): Twice the lower reflection boundary.
+            twice_high (int): Twice the upper reflection boundary.
+
+        Returns:
+            torch.Tensor: Coordinates folded into the reflection interval.
+        """
         if twice_low == twice_high:
             return torch.zeros_like(coords)
         coords_min = twice_low / 2
@@ -6848,6 +9624,16 @@ def _grid_sample_3d_impl(input, grid, interpolation_mode, padding_mode, align_co
         return torch.where(flips & 1 == 0, extra + coords_min, coords_span + coords_min - extra)
 
     def compute_coordinates(coords, size):
+        """Apply the captured grid-padding rule to source coordinates.
+
+        Args:
+            coords (torch.Tensor): Unnormalized source coordinates.
+            size (int): Source extent for one spatial dimension.
+
+        Returns:
+            torch.Tensor: Unchanged, clamped, or reflected coordinates for zero, border,
+                or reflection padding.
+        """
         if padding_mode == 0:
             return coords
         if padding_mode == 1:
@@ -6860,38 +9646,62 @@ def _grid_sample_3d_impl(input, grid, interpolation_mode, padding_mode, align_co
         return torch.clamp(coords_reflected, 0, size - 1)
 
     def compute_source_index(coords, size):
+        """Convert normalized grid coordinates to padded source indices.
+
+        Args:
+            coords (torch.Tensor): Coordinates in the normalized grid space.
+            size (int): Source extent for one spatial dimension.
+
+        Returns:
+            torch.Tensor: Unnormalized coordinates after the captured padding transform.
+        """
         return compute_coordinates(unnormalize(coords, size), size)
 
     N, C, iD, iH, iW = input.shape
     _, oD, oH, oW, three = grid.shape
+
     if three != 3:
         raise AssertionError(f"grid last dimension must be 3 (x, y, z) for 3D, got {three}")
 
-    # Broadcast grid across the channel axis so a single indexed gather can
-    # emit one output tensor instead of gather-per-channel.
-    grid = grid.view(N, 1, oD, oH, oW, three).expand(N, C, oD, oH, oW, 3)
-
-    N_idx = torch.arange(N, device=input.device).view(N, 1, 1, 1, 1)
-    C_idx = torch.arange(C, device=input.device).view(1, C, 1, 1, 1)
+    # Gather each corner with one 2D gather over [N*C, iD*iH*iW]. A 5D advanced
+    # index lowers to costly HLO on neuronx-cc. A linear spatial index has no
+    # channel axis, so it lowers to a simple 2D gather. Out-of-bounds corners map to 0.
+    input_flat = input.reshape(N * C, iD * iH * iW)
+    M = oD * oH * oW
 
     def in_bounds(xs, ys, zs):
+        """Test whether three-dimensional source coordinates are in bounds.
+
+        Args:
+            xs (torch.Tensor): Width coordinates.
+            ys (torch.Tensor): Height coordinates.
+            zs (torch.Tensor): Depth coordinates.
+
+        Returns:
+            torch.Tensor: Boolean mask for coordinates inside the captured input shape.
+        """
         return (xs >= 0) & (xs < iW) & (ys >= 0) & (ys < iH) & (zs >= 0) & (zs < iD)
 
-    def clip(xs, ys, zs, ws):
-        cond = in_bounds(xs, ys, zs)
-        return tuple(
-            torch.where(cond, t, 0).view(N, C, oD, oH, oW)
-            for t in (
-                xs.to(dtype=torch.int64),
-                ys.to(dtype=torch.int64),
-                zs.to(dtype=torch.int64),
-                ws,
-            )
-        )
-
     def summand(ix, iy, iz, w):
-        idx_x, idx_y, idx_z, w_ = clip(ix, iy, iz, w)
-        return input[N_idx, C_idx, idx_z, idx_y, idx_x] * w_
+        """Gather and weight one corner of a three-dimensional interpolation window.
+
+        Args:
+            ix (torch.Tensor): Width coordinates.
+            iy (torch.Tensor): Height coordinates.
+            iz (torch.Tensor): Depth coordinates.
+            w (torch.Tensor): Corner weights.
+
+        Returns:
+            torch.Tensor: Gathered input values multiplied by valid corner weights.
+        """
+        cond = in_bounds(ix, iy, iz)
+        cz = torch.where(cond, iz.to(dtype=torch.int64), 0)
+        cy = torch.where(cond, iy.to(dtype=torch.int64), 0)
+        cx = torch.where(cond, ix.to(dtype=torch.int64), 0)
+        lin = cz * (iH * iW) + cy * iW + cx
+        index = lin.view(N, 1, M).expand(N, C, M).reshape(N * C, M)
+        gathered = torch.gather(input_flat, 1, index).reshape(N, C, oD, oH, oW)
+        return gathered * torch.where(cond, w, 0).view(N, 1, oD, oH, oW)
 
     x = grid[..., 0]
     y = grid[..., 1]
@@ -6935,6 +9745,24 @@ def _grid_sample_3d_impl(input, grid, interpolation_mode, padding_mode, align_co
 
 @register_decomposition([aten.grid_sampler_3d.default])
 def grid_sampler_3d_decomp(input, grid, interpolation_mode, padding_mode, align_corners):
+    """Decompose three-dimensional grid sampling into gather-based interpolation.
+
+    Args:
+        input (torch.Tensor): Input tensor of shape ``(N, C, D, H, W)``.
+        grid (torch.Tensor): Normalized grid of shape ``(N, oD, oH, oW, 3)``.
+        interpolation_mode (int): Zero for trilinear or one for nearest interpolation.
+        padding_mode (int): ``0`` for zero, ``1`` for border, or ``2`` for reflection
+            padding.
+        align_corners (bool): Whether normalized endpoints map to voxel corners.
+
+    Returns:
+        torch.Tensor | NotImplemented: Resampled tensor, or ``NotImplemented`` for
+            an unsupported interpolation or padding mode.
+
+    Raises:
+        AssertionError: If supported interpolation and padding modes are requested and the
+            grid's final dimension is not three.
+    """
     return _grid_sample_3d_impl(input, grid, interpolation_mode, padding_mode, align_corners)
 
 
@@ -6942,11 +9770,517 @@ def grid_sampler_3d_decomp(input, grid, interpolation_mode, padding_mode, align_
 def grid_sampler_3d_out_decomp(
     input, grid, interpolation_mode, padding_mode, align_corners, *, out
 ):
+    """Write decomposed three-dimensional grid sampling into an output tensor.
+
+    Args:
+        input (torch.Tensor): Input tensor of shape ``(N, C, D, H, W)``.
+        grid (torch.Tensor): Normalized grid of shape ``(N, oD, oH, oW, 3)``.
+        interpolation_mode (int): Zero for trilinear or one for nearest interpolation.
+        padding_mode (int): ``0`` for zero, ``1`` for border, or ``2`` for reflection
+            padding.
+        align_corners (bool): Whether normalized endpoints map to voxel corners.
+        out (torch.Tensor): Destination tensor.
+
+    Returns:
+        torch.Tensor | NotImplemented: ``out`` after copying the result, or
+            ``NotImplemented`` for an unsupported mode.
+
+    Raises:
+        AssertionError: If supported interpolation and padding modes are requested and the
+            grid's final dimension is not three.
+    """
     result = _grid_sample_3d_impl(input, grid, interpolation_mode, padding_mode, align_corners)
     if result is NotImplemented:
         return NotImplemented
     out.copy_(result)
     return out
+
+
+# ── grid_sampler_{2,3}d_backward — analytic adjoint of the forward ───────
+# grad_input scatter-adds the per-corner weighted grad_output; grad_grid sums
+# the value-weighted coord-weight derivatives over C and scales by the coord
+# transform gradient. The trace runs under torch.no_grad, so this vjp is analytic.
+_GRID_CUBIC_A = -0.75
+
+
+def _grid_unnorm_mul(size, align_corners):
+    return (size * 0.5 - 0.5) if align_corners else (size * 0.5)
+
+
+def _grid_unnormalize(coord, size, align_corners):
+    return coord * _grid_unnorm_mul(size, align_corners) + (size * 0.5 - 0.5)
+
+
+def _grid_clip_and_grad(coord, size):
+    outside = (coord <= 0) | (coord >= (size - 1))
+    clipped = torch.clamp(coord, 0, size - 1)
+    gmult = torch.where(outside, torch.zeros_like(coord), torch.ones_like(coord))
+    return clipped, gmult
+
+
+def _grid_reflect_and_grad(coord, twice_low, twice_high):
+    if twice_low == twice_high:
+        return torch.zeros_like(coord), torch.zeros_like(coord)
+    coords_min = twice_low / 2
+    span = (twice_high - twice_low) / 2
+    shifted = coord - coords_min
+    sign = torch.where(shifted < 0, -torch.ones_like(coord), torch.ones_like(coord))
+    shifted = shifted.abs()
+    extra = torch.fmod(shifted, span)
+    # floor before the int cast so neuronx-cc does not sample the wrong parity.
+    flips = (shifted / span).floor()
+    even = (flips.to(torch.int64) & 1) == 0
+    reflected = torch.where(even, extra + coords_min, span - extra + coords_min)
+    gmult = torch.where(even, sign, -sign)
+    return reflected, gmult
+
+
+def _grid_source_index_and_grad(coord, size, padding_mode, align_corners):
+    mul = _grid_unnorm_mul(size, align_corners)
+    unnorm = coord * mul + (size * 0.5 - 0.5)
+    if padding_mode == 0:
+        return unnorm, torch.full_like(unnorm, mul)
+    if padding_mode == 1:
+        clipped, gclip = _grid_clip_and_grad(unnorm, size)
+        return clipped, mul * gclip
+    if align_corners:
+        reflected, grefl = _grid_reflect_and_grad(unnorm, 0, 2 * (size - 1))
+    else:
+        reflected, grefl = _grid_reflect_and_grad(unnorm, -1, 2 * size - 1)
+    clipped, gclip = _grid_clip_and_grad(reflected, size)
+    return clipped, mul * grefl * gclip
+
+
+def _grid_compute_coordinates(coord, size, padding_mode, align_corners):
+    if padding_mode == 0:
+        return coord
+    if padding_mode == 1:
+        return torch.clamp(coord, 0, size - 1)
+    if align_corners:
+        reflected, _ = _grid_reflect_and_grad(coord, 0, 2 * (size - 1))
+    else:
+        reflected, _ = _grid_reflect_and_grad(coord, -1, 2 * size - 1)
+    return torch.clamp(reflected, 0, size - 1)
+
+
+def _grid_cubic_convolution1(x, a):
+    return ((a + 2) * x - (a + 3)) * x * x + 1
+
+
+def _grid_cubic_convolution2(x, a):
+    return ((a * x - 5 * a) * x + 8 * a) * x - 4 * a
+
+
+def _grid_cubic_dconvolution1(x, a):
+    return 3 * (a + 2) * x * x - 2 * (a + 3) * x
+
+
+def _grid_cubic_dconvolution2(x, a):
+    return 3 * a * x * x - 10 * a * x + 8 * a
+
+
+def _grid_cubic_weights(t):
+    A = _GRID_CUBIC_A
+    return (
+        _grid_cubic_convolution2(t + 1, A),
+        _grid_cubic_convolution1(t, A),
+        _grid_cubic_convolution1(1 - t, A),
+        _grid_cubic_convolution2(2 - t, A),
+    )
+
+
+def _grid_cubic_weight_grads(t):
+    A = _GRID_CUBIC_A
+    return (
+        _grid_cubic_dconvolution2(t + 1, A),
+        _grid_cubic_dconvolution1(t, A),
+        -_grid_cubic_dconvolution1(1 - t, A),
+        -_grid_cubic_dconvolution2(2 - t, A),
+    )
+
+
+def _grid_sampler_2d_backward_impl(
+    grad_output, input, grid, interpolation_mode, padding_mode, align_corners, output_mask
+):
+    N, C, iH, iW = input.shape
+    _, oH, oW, _ = grid.shape
+    device = input.device
+    x = grid[..., 0]
+    y = grid[..., 1]
+    N_idx = torch.arange(N, device=device).view(N, 1, 1, 1)
+    C_idx = torch.arange(C, device=device).view(1, C, 1, 1)
+    go = grad_output
+
+    grad_input = input.new_zeros(input.shape) if output_mask[0] else None
+    grad_grid = None
+
+    def bcast_idx(coord, cond):
+        """Broadcast valid spatial coordinates across channels.
+
+        Args:
+            coord (torch.Tensor): Spatial coordinates.
+            cond (torch.Tensor): In-bounds mask.
+
+        Returns:
+            torch.Tensor: Int64 indices shaped ``(N, C, oH, oW)`` with invalid entries zeroed.
+        """
+        idx = torch.where(cond, coord, torch.zeros_like(coord)).to(torch.int64)
+        return idx.view(N, 1, oH, oW).expand(N, C, oH, oW)
+
+    def gather(cx, cy, cond):
+        """Gather input values at valid two-dimensional coordinates.
+
+        Args:
+            cx (torch.Tensor): Width coordinates.
+            cy (torch.Tensor): Height coordinates.
+            cond (torch.Tensor): In-bounds mask.
+
+        Returns:
+            torch.Tensor: Gathered values with out-of-bounds positions zeroed.
+        """
+        val = input[N_idx, C_idx, bcast_idx(cy, cond), bcast_idx(cx, cond)]
+        return torch.where(cond.view(N, 1, oH, oW), val, torch.zeros_like(val))
+
+    if interpolation_mode == 1:  # nearest
+        ix, _ = _grid_source_index_and_grad(x, iW, padding_mode, align_corners)
+        iy, _ = _grid_source_index_and_grad(y, iH, padding_mode, align_corners)
+        cx = ix.round()
+        cy = iy.round()
+        cond = (cx >= 0) & (cx < iW) & (cy >= 0) & (cy < iH)
+        if output_mask[0]:
+            contrib = torch.where(cond.view(N, 1, oH, oW), go, torch.zeros_like(go))
+            grad_input = torch.index_put(
+                grad_input, (N_idx, C_idx, bcast_idx(cy, cond), bcast_idx(cx, cond)), contrib, True
+            )
+        if output_mask[1]:
+            grad_grid = grid.new_zeros(grid.shape)
+        return grad_input, grad_grid
+
+    if interpolation_mode == 0:  # bilinear
+        ix, gix_mul = _grid_source_index_and_grad(x, iW, padding_mode, align_corners)
+        iy, giy_mul = _grid_source_index_and_grad(y, iH, padding_mode, align_corners)
+        ix0 = ix.floor()
+        iy0 = iy.floor()
+        fx = ix - ix0
+        fy = iy - iy0
+        gix = torch.zeros(N, oH, oW, device=device, dtype=input.dtype)
+        giy = torch.zeros_like(gix)
+        for bx in (0, 1):
+            for by in (0, 1):
+                cx = ix0 + bx
+                cy = iy0 + by
+                wx = (1 - fx) if bx == 0 else fx
+                wy = (1 - fy) if by == 0 else fy
+                sx = -1.0 if bx == 0 else 1.0
+                sy = -1.0 if by == 0 else 1.0
+                cond = (cx >= 0) & (cx < iW) & (cy >= 0) & (cy < iH)
+                if output_mask[0]:
+                    contrib = torch.where(
+                        cond.view(N, 1, oH, oW),
+                        go * (wx * wy).view(N, 1, oH, oW),
+                        torch.zeros_like(go),
+                    )
+                    grad_input = torch.index_put(
+                        grad_input,
+                        (N_idx, C_idx, bcast_idx(cy, cond), bcast_idx(cx, cond)),
+                        contrib,
+                        True,
+                    )
+                if output_mask[1]:
+                    val = gather(cx, cy, cond)
+                    gix = gix + (go * val * (sx * wy).view(N, 1, oH, oW)).sum(1)
+                    giy = giy + (go * val * (wx * sy).view(N, 1, oH, oW)).sum(1)
+        if output_mask[1]:
+            grad_grid = torch.stack([gix * gix_mul, giy * giy_mul], dim=-1)
+        return grad_input, grad_grid
+
+    # interpolation_mode == 2, bicubic
+    ix = _grid_unnormalize(x, iW, align_corners)
+    iy = _grid_unnormalize(y, iH, align_corners)
+    ix0 = ix.floor()
+    iy0 = iy.floor()
+    tx = ix - ix0
+    ty = iy - iy0
+    wx = _grid_cubic_weights(tx)
+    wy = _grid_cubic_weights(ty)
+    dwx = _grid_cubic_weight_grads(tx)
+    dwy = _grid_cubic_weight_grads(ty)
+    gtx = torch.zeros(N, oH, oW, device=device, dtype=input.dtype)
+    gty = torch.zeros_like(gtx)
+    for i in range(4):
+        for j in range(4):
+            cx = _grid_compute_coordinates(ix0 + (i - 1), iW, padding_mode, align_corners)
+            cy = _grid_compute_coordinates(iy0 + (j - 1), iH, padding_mode, align_corners)
+            cond = (cx >= 0) & (cx < iW) & (cy >= 0) & (cy < iH)
+            if output_mask[0]:
+                w = (wx[i] * wy[j]).view(N, 1, oH, oW)
+                contrib = torch.where(cond.view(N, 1, oH, oW), go * w, torch.zeros_like(go))
+                grad_input = torch.index_put(
+                    grad_input,
+                    (N_idx, C_idx, bcast_idx(cy, cond), bcast_idx(cx, cond)),
+                    contrib,
+                    True,
+                )
+            if output_mask[1]:
+                val = gather(cx, cy, cond)
+                gtx = gtx + (go * val * (dwx[i] * wy[j]).view(N, 1, oH, oW)).sum(1)
+                gty = gty + (go * val * (wx[i] * dwy[j]).view(N, 1, oH, oW)).sum(1)
+    if output_mask[1]:
+        grad_grid = torch.stack(
+            [gtx * _grid_unnorm_mul(iW, align_corners), gty * _grid_unnorm_mul(iH, align_corners)],
+            dim=-1,
+        )
+    return grad_input, grad_grid
+
+
+@register_decomposition([aten.grid_sampler_2d_backward.default])
+def grid_sampler_2d_backward_decomp(
+    grad_output, input, grid, interpolation_mode, padding_mode, align_corners, output_mask
+):
+    """Compute two-dimensional grid-sampler input and grid gradients.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the sampled output.
+        input (torch.Tensor): Forward input of shape ``(N, C, H, W)``.
+        grid (torch.Tensor): Forward normalized sampling grid.
+        interpolation_mode (int): Nearest, bilinear, or bicubic mode identifier.
+        padding_mode (int): Zero, border, or reflection padding identifier.
+        align_corners (bool): Whether normalized endpoints map to input corners.
+        output_mask (Sequence[bool]): Requested input and grid gradients.
+
+    Returns:
+        tuple[torch.Tensor | None, torch.Tensor | None]: Input and grid gradients, each
+            ``None`` when its output-mask entry is false.
+    """
+    return _grid_sampler_2d_backward_impl(
+        grad_output, input, grid, interpolation_mode, padding_mode, align_corners, output_mask
+    )
+
+
+@register_decomposition([aten.grid_sampler_2d_backward.out])
+def grid_sampler_2d_backward_out_decomp(
+    grad_output,
+    input,
+    grid,
+    interpolation_mode,
+    padding_mode,
+    align_corners,
+    output_mask,
+    *,
+    out0,
+    out1,
+):
+    """Write two-dimensional grid-sampler gradients into output tensors.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the sampled output.
+        input (torch.Tensor): Forward input of shape ``(N, C, H, W)``.
+        grid (torch.Tensor): Forward normalized sampling grid.
+        interpolation_mode (int): Nearest, bilinear, or bicubic mode identifier.
+        padding_mode (int): Zero, border, or reflection padding identifier.
+        align_corners (bool): Whether normalized endpoints map to input corners.
+        output_mask (Sequence[bool]): Requested input and grid gradients.
+        out0 (torch.Tensor): Input-gradient destination.
+        out1 (torch.Tensor): Grid-gradient destination.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: ``out0`` and ``out1`` after copying requested
+            gradients; an unrequested destination is returned unchanged.
+    """
+    grad_input, grad_grid = _grid_sampler_2d_backward_impl(
+        grad_output, input, grid, interpolation_mode, padding_mode, align_corners, output_mask
+    )
+    if grad_input is not None:
+        out0.copy_(grad_input)
+    if grad_grid is not None:
+        out1.copy_(grad_grid)
+    return out0, out1
+
+
+def _grid_sampler_3d_backward_impl(
+    grad_output, input, grid, interpolation_mode, padding_mode, align_corners, output_mask
+):
+    """Analytic adjoint of the 3D grid sampler forward.
+
+    Trilinear uses 8 corners (grads gix/giy/giz); nearest gives a zero grad_grid.
+    aten does not define bicubic for 3D, so only modes 0 and 1 are handled.
+    """
+    N, C, iD, iH, iW = input.shape
+    _, oD, oH, oW, _ = grid.shape
+    device = input.device
+    x = grid[..., 0]
+    y = grid[..., 1]
+    z = grid[..., 2]
+    go = grad_output
+    M = oD * oH * oW
+    input_flat = input.reshape(N * C, iD * iH * iW)
+
+    grad_input_flat = input.new_zeros(N * C, iD * iH * iW) if output_mask[0] else None
+    grad_grid = None
+
+    def lin_index(cx, cy, cz, cond):
+        # [N*C, oD*oH*oW] linear spatial index for a 2D gather or scatter_add.
+        # The index has no channel axis, so neuronx-cc avoids the 5D scatter
+        # that triggers a compiler assertion. Out-of-bounds corners map to 0.
+        """Build flattened valid voxel indices for each channel.
+
+        Args:
+            cx (torch.Tensor): Width coordinates.
+            cy (torch.Tensor): Height coordinates.
+            cz (torch.Tensor): Depth coordinates.
+            cond (torch.Tensor): In-bounds mask.
+
+        Returns:
+            torch.Tensor: Int64 indices shaped ``(N * C, oD * oH * oW)`` with invalid entries
+                mapped to zero.
+        """
+        cz_ = torch.where(cond, cz.to(torch.int64), 0)
+        cy_ = torch.where(cond, cy.to(torch.int64), 0)
+        cx_ = torch.where(cond, cx.to(torch.int64), 0)
+        lin = cz_ * (iH * iW) + cy_ * iW + cx_
+        return lin.view(N, 1, M).expand(N, C, M).reshape(N * C, M)
+
+    def gather(cx, cy, cz, cond):
+        """Gather input values at valid three-dimensional coordinates.
+
+        Args:
+            cx (torch.Tensor): Width coordinates.
+            cy (torch.Tensor): Height coordinates.
+            cz (torch.Tensor): Depth coordinates.
+            cond (torch.Tensor): In-bounds mask.
+
+        Returns:
+            torch.Tensor: Gathered values with out-of-bounds positions zeroed.
+        """
+        val = torch.gather(input_flat, 1, lin_index(cx, cy, cz, cond)).reshape(N, C, oD, oH, oW)
+        return torch.where(cond.view(N, 1, oD, oH, oW), val, torch.zeros_like(val))
+
+    if interpolation_mode == 1:  # nearest
+        ix, _ = _grid_source_index_and_grad(x, iW, padding_mode, align_corners)
+        iy, _ = _grid_source_index_and_grad(y, iH, padding_mode, align_corners)
+        iz, _ = _grid_source_index_and_grad(z, iD, padding_mode, align_corners)
+        cx = ix.round()
+        cy = iy.round()
+        cz = iz.round()
+        cond = (cx >= 0) & (cx < iW) & (cy >= 0) & (cy < iH) & (cz >= 0) & (cz < iD)
+        if output_mask[0]:
+            contrib = torch.where(cond.view(N, 1, oD, oH, oW), go, torch.zeros_like(go))
+            grad_input_flat = torch.scatter_add(
+                grad_input_flat, 1, lin_index(cx, cy, cz, cond), contrib.reshape(N * C, M)
+            )
+        if output_mask[1]:
+            grad_grid = grid.new_zeros(grid.shape)
+        grad_input = grad_input_flat.reshape(N, C, iD, iH, iW) if output_mask[0] else None
+        return grad_input, grad_grid
+
+    # interpolation_mode == 0, trilinear
+    ix, gix_mul = _grid_source_index_and_grad(x, iW, padding_mode, align_corners)
+    iy, giy_mul = _grid_source_index_and_grad(y, iH, padding_mode, align_corners)
+    iz, giz_mul = _grid_source_index_and_grad(z, iD, padding_mode, align_corners)
+    ix0 = ix.floor()
+    iy0 = iy.floor()
+    iz0 = iz.floor()
+    fx = ix - ix0
+    fy = iy - iy0
+    fz = iz - iz0
+    gix = torch.zeros(N, oD, oH, oW, device=device, dtype=input.dtype)
+    giy = torch.zeros_like(gix)
+    giz = torch.zeros_like(gix)
+    for bx in (0, 1):
+        for by in (0, 1):
+            for bz in (0, 1):
+                cx = ix0 + bx
+                cy = iy0 + by
+                cz = iz0 + bz
+                wx = (1 - fx) if bx == 0 else fx
+                wy = (1 - fy) if by == 0 else fy
+                wz = (1 - fz) if bz == 0 else fz
+                sx = -1.0 if bx == 0 else 1.0
+                sy = -1.0 if by == 0 else 1.0
+                sz = -1.0 if bz == 0 else 1.0
+                cond = (cx >= 0) & (cx < iW) & (cy >= 0) & (cy < iH) & (cz >= 0) & (cz < iD)
+                if output_mask[0]:
+                    contrib = torch.where(
+                        cond.view(N, 1, oD, oH, oW),
+                        go * (wx * wy * wz).view(N, 1, oD, oH, oW),
+                        torch.zeros_like(go),
+                    )
+                    grad_input_flat = torch.scatter_add(
+                        grad_input_flat, 1, lin_index(cx, cy, cz, cond), contrib.reshape(N * C, M)
+                    )
+                if output_mask[1]:
+                    val = gather(cx, cy, cz, cond)
+                    gix = gix + (go * val * (sx * wy * wz).view(N, 1, oD, oH, oW)).sum(1)
+                    giy = giy + (go * val * (wx * sy * wz).view(N, 1, oD, oH, oW)).sum(1)
+                    giz = giz + (go * val * (wx * wy * sz).view(N, 1, oD, oH, oW)).sum(1)
+    grad_input = grad_input_flat.reshape(N, C, iD, iH, iW) if output_mask[0] else None
+    if output_mask[1]:
+        grad_grid = torch.stack([gix * gix_mul, giy * giy_mul, giz * giz_mul], dim=-1)
+    return grad_input, grad_grid
+
+
+@register_decomposition([aten.grid_sampler_3d_backward.default])
+def grid_sampler_3d_backward_decomp(
+    grad_output, input, grid, interpolation_mode, padding_mode, align_corners, output_mask
+):
+    """Compute three-dimensional grid-sampler input and grid gradients.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the sampled output.
+        input (torch.Tensor): Forward input of shape ``(N, C, D, H, W)``.
+        grid (torch.Tensor): Forward normalized sampling grid.
+        interpolation_mode (int): Nearest or trilinear mode identifier.
+        padding_mode (int): Zero, border, or reflection padding identifier.
+        align_corners (bool): Whether normalized endpoints map to input corners.
+        output_mask (Sequence[bool]): Requested input and grid gradients.
+
+    Returns:
+        tuple[torch.Tensor | None, torch.Tensor | None]: Input and grid gradients, each
+            ``None`` when its output-mask entry is false.
+    """
+    return _grid_sampler_3d_backward_impl(
+        grad_output, input, grid, interpolation_mode, padding_mode, align_corners, output_mask
+    )
+
+
+@register_decomposition([aten.grid_sampler_3d_backward.out])
+def grid_sampler_3d_backward_out_decomp(
+    grad_output,
+    input,
+    grid,
+    interpolation_mode,
+    padding_mode,
+    align_corners,
+    output_mask,
+    *,
+    out0,
+    out1,
+):
+    """Write three-dimensional grid-sampler gradients into output tensors.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the sampled output.
+        input (torch.Tensor): Forward input of shape ``(N, C, D, H, W)``.
+        grid (torch.Tensor): Forward normalized sampling grid.
+        interpolation_mode (int): Nearest or trilinear mode identifier.
+        padding_mode (int): Zero, border, or reflection padding identifier.
+        align_corners (bool): Whether normalized endpoints map to input corners.
+        output_mask (Sequence[bool]): Requested input and grid gradients.
+        out0 (torch.Tensor): Input-gradient destination.
+        out1 (torch.Tensor): Grid-gradient destination.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: ``out0`` and ``out1`` after copying requested
+            gradients; an unrequested destination is returned unchanged.
+    """
+    grad_input, grad_grid = _grid_sampler_3d_backward_impl(
+        grad_output, input, grid, interpolation_mode, padding_mode, align_corners, output_mask
+    )
+    if grad_input is not None:
+        out0.copy_(grad_input)
+    if grad_grid is not None:
+        out1.copy_(grad_grid)
+    return out0, out1
 
 
 # ── _embedding_bag — bag-reduce embeddings by offsets ──────────────────
@@ -7134,6 +10468,23 @@ def _embedding_bag_out_decomp(
 # without touching the ``.default`` path (which is already supported).
 @register_decomposition([aten.multilabel_margin_loss_forward.output])
 def multilabel_margin_loss_forward_output_decomp(input, target, reduction, *, output, is_target):
+    """Write multilabel margin-loss results into their destination tensors.
+
+    Args:
+        input (torch.Tensor): Loss input tensor.
+        target (torch.Tensor): Multilabel target tensor.
+        reduction (int): Loss reduction mode.
+        output (torch.Tensor): Destination for the loss result.
+        is_target (torch.Tensor): Destination for the target-membership mask.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: The mutated ``output`` and ``is_target``
+            destination tensors.
+
+    Note:
+        The default decomposition creates ``is_target`` in the input dtype. This
+        wrapper casts it to the destination dtype before the copy.
+    """
     z, ist = aten.multilabel_margin_loss_forward.default(input, target, reduction)
     output.copy_(z)
     is_target.copy_(ist.to(is_target.dtype))
@@ -7178,13 +10529,43 @@ def _put_impl(self, index, source, accumulate=False):
 
 @register_decomposition([aten.put.default])
 def put_decomp(self, index, source, accumulate=False):
-    """Functional ``put`` — write source into a flat-indexed copy of self."""
+    """Write source values into a flat-indexed functional copy.
+
+    Args:
+        self (torch.Tensor): Input tensor to copy.
+        index (torch.Tensor): Flat destination indices converted to int64.
+        source (torch.Tensor): Flattened values converted to the input dtype.
+        accumulate (bool, optional): Whether to add source values to current destinations
+            instead of replacing them. Defaults to ``False``.
+
+    Returns:
+        torch.Tensor: Updated tensor with the original shape.
+
+    Note:
+        Repeated indices are summed when ``accumulate`` is true; when false, the
+        winning source value is undefined.
+    """
     return _put_impl(self, index, source, accumulate)
 
 
 @register_decomposition([aten.put_.default])
 def put_inplace_decomp(self, index, source, accumulate=False):
-    """In-place ``put_`` — same math, then copy_ back onto self."""
+    """Write source values into a tensor in place through the functional helper.
+
+    Args:
+        self (torch.Tensor): Tensor to mutate.
+        index (torch.Tensor): Flat destination indices converted to int64.
+        source (torch.Tensor): Flattened values converted to the input dtype.
+        accumulate (bool, optional): Whether to add source values to current destinations
+            instead of replacing them. Defaults to ``False``.
+
+    Returns:
+        torch.Tensor: The mutated ``self`` tensor.
+
+    Note:
+        Repeated indices are summed when ``accumulate`` is true; when false, the
+        winning source value is undefined.
+    """
     self.copy_(_put_impl(self, index, source, accumulate))
     return self
 
@@ -7523,13 +10904,17 @@ for _op, _decomp_fn in (
 
 
 def get_decomposition_table(decompose_all: bool = False) -> dict:
-    """Get the decomposition table for the Neuron backend.
+    """Get the base decomposition table for the Neuron backend.
 
     Args:
-        decompose_all (bool): Unused, kept for API compatibility.
+        decompose_all (bool, optional): Unused compatibility argument. Defaults to ``False``.
 
     Returns:
-        dict: Mapping of ATen ops to their decomposition functions.
+        dict: Shared mapping from ATen operators to decomposition functions.
+
+    Note:
+        The returned object is ``neuron_decompositions`` itself; mutating it changes
+        the process-wide registration table.
     """
     return neuron_decompositions
 
@@ -7627,11 +11012,21 @@ def _lu_diagonal(lu):
 
 @register_decomposition([aten._linalg_det.default, aten._linalg_det.result])
 def linalg_det_decomposition(a):
-    """_linalg_det via LU: det = sign(pivots) * prod(diag(U)).
+    """Decompose ``_linalg_det`` for nonempty nonsingular real matrices.
 
-    aten._linalg_det returns (result, LU, pivots). We return det plus the LU
-    factors and a placeholder pivots tensor (the det value is what consumers
-    use; downstream rarely reads the synthetic pivots).
+    Args:
+        a (torch.Tensor): Nonempty nonsingular real square matrix or batch of such matrices.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Determinants, packed LU factors, and
+            one-based int32 pivot vectors.
+
+    Raises:
+        RuntimeError: If ``a`` is complex or its matrix dimension is zero.
+
+    Note:
+        Partial pivoting uses a static loop, and the determinant product is evaluated in the
+        log domain. Zero pivots are unguarded and can propagate NaNs.
     """
     lu, sign, pivots = _lu_factor_unrolled(a)
     diag = _lu_diagonal(lu)
@@ -7646,8 +11041,22 @@ def linalg_det_decomposition(a):
 
 @register_decomposition([aten._linalg_slogdet.default, aten._linalg_slogdet.sign])
 def linalg_slogdet_decomposition(a):
-    """_linalg_slogdet via LU: sign = sign(pivots)*prod(sign(diag(U))),
-    logabsdet = sum(log|diag(U)|). Returns (sign, logabsdet, LU, pivots)."""
+    """Decompose ``_linalg_slogdet`` for nonempty nonsingular real matrices.
+
+    Args:
+        a (torch.Tensor): Nonempty nonsingular real square matrix or batch of such matrices.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: Determinant signs, log
+            absolute determinants, packed LU factors, and one-based int32 pivot vectors.
+
+    Raises:
+        RuntimeError: If ``a`` is complex or its matrix dimension is zero.
+
+    Note:
+        Partial pivoting uses a static loop. The sign includes row swaps and diagonal signs.
+        Zero pivots are unguarded and can propagate NaNs.
+    """
     lu, sign, pivots = _lu_factor_unrolled(a)
     diag = _lu_diagonal(lu)
     sign_out = sign * torch.prod(torch.sign(diag), dim=-1)
@@ -7656,20 +11065,17 @@ def linalg_slogdet_decomposition(a):
 
 
 def get_compile_decomposition_table() -> dict:
-    """Decomposition table for torch.compile (adds compile-only decompositions).
+    """Get the decomposition table used by the Dynamo backend during compilation.
 
-    During torch.compile, AOT autograd traces the joint forward+backward graph.
-    Ops registered on PrivateUse1 (neuron kernels) would do nested make_fx inside
-    AOT autograd's make_fx, causing FunctionalTensor/ProxyTensor mode conflicts.
-    By adding these ops to the decomposition table, AOT autograd decomposes them
-    into standard ops during tracing, avoiding the nesting issue entirely.
+    Returns:
+        dict: Base Neuron decompositions plus compile-only loss decompositions.
 
-    These decompositions are intentionally NOT in the base neuron_decompositions
-    table. In the eager path, cross_entropy_loss goes through the optimized chunked
-    kernel (_ce_chunked_fwd_inner) which is memory-efficient at O(N * chunk_size).
-    The naive log_softmax + nll_loss decomposition here is O(N * V) but is fine for
-    torch.compile since the neuron backend compiles the full graph. Keeping these
-    in the compile-only table preserves the eager path's optimized implementation.
+    Note:
+        The compile-only entries decompose ``nll_loss_forward`` and
+        ``cross_entropy_loss`` during AOT autograd tracing, avoiding nested FX
+        tracing. Cross entropy returns ``NotImplemented`` for nonzero label smoothing.
+        Its decomposed path materializes ``O(N * V)`` data, while eager execution
+        retains the chunked ``O(N * chunk_size)`` kernel.
     """
     compile_decomps = get_decompositions(
         [

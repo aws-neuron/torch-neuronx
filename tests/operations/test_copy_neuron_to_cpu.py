@@ -1,5 +1,4 @@
 import gc
-import os
 
 import pytest
 import torch
@@ -343,17 +342,12 @@ class TestToCpuNonBlocking:
 class TestConjBitNeuronToCpu:
     """Neuron→CPU copy must preserve conjugate and negative view semantics."""
 
-    @pytest.mark.parametrize("cpp_dispatch", [False, True], ids=["python_dispatch", "cpp_dispatch"])
-    def test_copy_conj_to_cpu(self, cpp_dispatch):
-        os.environ["TORCH_NEURONX_CPP_DISPATCH"] = "1" if cpp_dispatch else "0"
-        try:
-            t = torch.tensor([1.0 + 2.0j, 3.0 - 4.0j], dtype=torch.complex64, device="neuron")
-            dst = torch.empty(2, dtype=torch.complex64)
-            dst.copy_(t.conj())
-            expected = torch.tensor([1.0 - 2.0j, 3.0 + 4.0j], dtype=torch.complex64)
-            torch.testing.assert_close(dst, expected)
-        finally:
-            os.environ.pop("TORCH_NEURONX_CPP_DISPATCH", None)
+    def test_copy_conj_to_cpu(self):
+        t = torch.tensor([1.0 + 2.0j, 3.0 - 4.0j], dtype=torch.complex64, device="neuron")
+        dst = torch.empty(2, dtype=torch.complex64)
+        dst.copy_(t.conj())
+        expected = torch.tensor([1.0 - 2.0j, 3.0 + 4.0j], dtype=torch.complex64)
+        torch.testing.assert_close(dst, expected)
 
     def test_to_cpu_conj(self):
         t = torch.randn(16, dtype=torch.complex64)

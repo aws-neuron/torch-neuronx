@@ -733,8 +733,19 @@ LogicalResult ConvertAtenOp<AtenGatherOp>::matchAndRewrite(
   RankedTensorType toConcatIndexType =
       RankedTensorType::get(toConcatIndexShapeVec, indexElemType);
 
+  SmallVector<int64_t> batchingDims;
+  SmallVector<int64_t> collapsedDims;
+  SmallVector<int64_t> startIndexMap;
   SmallVector<Value> toConcat;
   for (int64_t i = 0; i < inputType.getRank(); ++i) {
+    if (i != dim && !inputType.isDynamicDim(i) &&
+        !indexType.isDynamicDim(i) &&
+        inputType.getDimSize(i) == indexType.getDimSize(i)) {
+      batchingDims.push_back(i);
+      continue;
+    }
+    collapsedDims.push_back(i);
+    startIndexMap.push_back(i);
     if (i == dim) {
       toConcat.push_back(stablehlo::DynamicReshapeOp::create(
           rewriter, loc, toConcatIndexType, index, toConcatIndexShape));
@@ -749,19 +760,12 @@ LogicalResult ConvertAtenOp<AtenGatherOp>::matchAndRewrite(
   SmallVector<int64_t> sliceSizes(inputType.getRank(), 1);
 
   int64_t indexVecDim = inputType.getRank();
-  SmallVector<int64_t> collapsedDims;
-  SmallVector<int64_t> startIndexMap;
-  for (int64_t i = 0; i < inputType.getRank(); ++i) {
-    collapsedDims.push_back(i);
-    startIndexMap.push_back(i);
-  }
-
   auto dimsAttr = stablehlo::GatherDimensionNumbersAttr::get(
       rewriter.getContext(),
       /*offsetDims=*/{},
       /*collapsedSliceDims=*/collapsedDims,
-      /*operandBatchingDims=*/{},
-      /*startIndicesBatchingDims=*/{},
+      /*operandBatchingDims=*/batchingDims,
+      /*startIndicesBatchingDims=*/batchingDims,
       /*startIndexMap=*/startIndexMap,
       /*indexVecDim=*/indexVecDim);
 

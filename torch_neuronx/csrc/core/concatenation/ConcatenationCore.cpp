@@ -85,8 +85,11 @@ int ConcatenationCore::ProcessExistingOperation(
 int ConcatenationCore::ProcessInvalidatedConcatenation(
     IrNode* ir_node, IrConcatResult& ir_concat_result,
     std::list<at::neuron::OperationContext*>& op_context_results) {
-  if (invalidated_cache_keys_.find(ir_node->cache_key) == invalidated_cache_keys_.end()) {
-    return -1;  // Not invalidated - caller should try other processing
+  {
+    std::lock_guard<std::mutex> lock(invalidated_cache_mutex_);
+    if (invalidated_cache_keys_.find(ir_node->cache_key) == invalidated_cache_keys_.end()) {
+      return -1;  // Not invalidated - caller should try other processing
+    }
   }
 
   // Get the original operations that would have been concatenated
@@ -301,23 +304,6 @@ ConcatenationResult ConcatenationCore::ProcessBufferedOperationsImpl(
       auto hint_node = std::make_unique<DeallocHintNode>(op->kernel_execution->GetSrcPtrs()[0]);
       mixed_ir_nodes.push_back(hint_node.get());
       ir_nodes_owned.push_back(std::move(hint_node));
-      continue;
-    }
-    if (kt == at::neuron::KernelTypeEnum::kHint) {
-      auto* hint = dynamic_cast<at::neuron::HintDirectKernelExecution*>(op->kernel_execution.get());
-      if (hint &&
-          hint->GetHintType() == at::neuron::HintDirectKernelExecution::HintType::kDeallocation) {
-        // Create DeallocHintNode
-        auto hint_node = std::make_unique<DeallocHintNode>(hint->GetPtr());
-        mixed_ir_nodes.push_back(hint_node.get());
-        ir_nodes_owned.push_back(std::move(hint_node));
-      } else if (hint && hint->GetHintType() ==
-                             at::neuron::HintDirectKernelExecution::HintType::kAllocation) {
-        // Create AllocHintNode - signals address (re)allocation to clear from pruned set
-        auto hint_node = std::make_unique<AllocHintNode>(hint->GetPtr());
-        mixed_ir_nodes.push_back(hint_node.get());
-        ir_nodes_owned.push_back(std::move(hint_node));
-      }
       continue;
     }
     // Create IR node from HLO operation
@@ -637,6 +623,7 @@ std::unique_ptr<ConcatenationCore> ConcatenationCoreFactory::CreateInstance(
 void ConcatenationCore::InvalidateCacheEntry(const std::string& key) {
   TORCH_NEURONX_COUNTER("Concatenation.CacheInvalidations", 1);
   TORCH_NEURONX_INFO("[CONCATENATION CORE] Cache entry invalidated", "cache_key:", key);
+  std::lock_guard<std::mutex> lock(invalidated_cache_mutex_);
   invalidated_cache_keys_.insert(key);
 }
 

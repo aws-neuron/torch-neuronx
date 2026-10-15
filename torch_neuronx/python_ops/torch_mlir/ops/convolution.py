@@ -137,6 +137,26 @@ def _set_convolution_output_strides(lowering_result, logical_args, logical_kwarg
 def torch_convolution(
     input, weight, bias, stride, padding, dilation, transposed, output_padding, groups
 ):
+    """Prepare a convolution for Torch-MLIR lowering.
+
+    Args:
+        input (torch.Tensor): Input activation tensor.
+        weight (torch.Tensor): Convolution weight tensor.
+        bias (torch.Tensor | None): Bias tensor, or ``None``.
+        stride (Sequence[int]): Stride for each spatial dimension.
+        padding (Sequence[int]): Padding for each spatial dimension.
+        dilation (Sequence[int]): Dilation for each spatial dimension.
+        transposed (bool): Select transposed convolution when ``True``.
+        output_padding (Sequence[int]): Additional transposed-convolution output padding.
+        groups (int): Number of input channel groups.
+
+    Returns:
+        tuple[Callable, tuple, dict]: Convolution callable, normalized arguments, and an
+            empty keyword dictionary.
+
+    Raises:
+        RuntimeError: If dtypes, dimensions, groups, or spatial parameters are invalid.
+    """
     num_spatial_dims = weight.ndim - 2
     padding = _expand_param_if_needed(padding, num_spatial_dims)
     stride = _expand_param_if_needed(stride, num_spatial_dims)
@@ -148,6 +168,22 @@ def torch_convolution(
     )
 
     def conv_kernel(inp, wgt, bias, stride, padding, dilation, transposed, output_padding, groups):
+        """Execute the selected dimensional convolution.
+
+        Args:
+            inp (torch.Tensor): Input activation tensor.
+            wgt (torch.Tensor): Convolution weight tensor.
+            bias (torch.Tensor | None): Bias tensor, or ``None``.
+            stride (Sequence[int]): Stride for each spatial dimension.
+            padding (Sequence[int]): Padding for each spatial dimension.
+            dilation (Sequence[int]): Dilation for each spatial dimension.
+            transposed (bool): Select transposed convolution when ``True``.
+            output_padding (Sequence[int]): Additional transposed-convolution output padding.
+            groups (int): Number of input channel groups.
+
+        Returns:
+            torch.Tensor: Convolution result.
+        """
         if transposed:
             if inp.dim() == 3:
                 return torch.nn.functional.conv_transpose1d(
@@ -191,6 +227,26 @@ def torch_convolution_backward_overrideable(
     output_mask,
     **kwargs,
 ):
+    """Compute convolution gradients with the ATen backward operation.
+
+    Args:
+        grad_output (torch.Tensor): Gradient of the convolution output.
+        input (torch.Tensor): Forward input tensor.
+        weight (torch.Tensor): Forward weight tensor.
+        bias_sizes (Sequence[int] | None): Shape of the bias gradient, or ``None``.
+        stride (Sequence[int]): Forward convolution stride.
+        padding (Sequence[int]): Forward convolution padding.
+        dilation (Sequence[int]): Forward convolution dilation.
+        transposed (bool): Whether the forward convolution was transposed.
+        output_padding (Sequence[int]): Forward transposed-convolution output padding.
+        groups (int): Number of input channel groups.
+        output_mask (Sequence[bool]): Select gradients to compute.
+        **kwargs (Any): Additional ignored lowering arguments.
+
+    Returns:
+        tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]: Input,
+            weight, and bias gradients; masked entries are ``None``.
+    """
     return torch.ops.aten.convolution_backward(
         grad_output,
         input,

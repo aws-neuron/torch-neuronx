@@ -2,7 +2,7 @@ from .base import Operation
 
 
 class NativeMultiHeadAttnSuffixOp(Operation):
-    """Native multi-head attention suffix operation for output projection"""
+    """Provide head-layout merging and output projection for native attention."""
 
     def _setup_implementations(self):
         """Setup available implementations"""
@@ -14,5 +14,9 @@ class NativeMultiHeadAttnSuffixOp(Operation):
 
     @property
     def op_name(self) -> str:
-        """Return the operation name"""
+        """Return the registered operation name.
+
+        Returns:
+            str: ``"native_multi_head_attn_suffix"``.
+        """
         return "native_multi_head_attn_suffix"

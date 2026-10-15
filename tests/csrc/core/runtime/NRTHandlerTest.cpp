@@ -20,6 +20,7 @@ using ::testing::_;
 using ::testing::DoAll;
 using ::testing::Return;
 using ::testing::SetArgPointee;
+using ::testing::Truly;
 
 class NRTHandlerTest : public ::testing::Test {
  protected:
@@ -72,6 +73,32 @@ TEST_F(NRTHandlerTest, ExecutionConfigConstruction) {
   NRTHandler::ExecutionConfig config2(2, 4);
   EXPECT_EQ(config2.device_id, 2);
   EXPECT_EQ(config2.num_cores, 4);
+}
+
+TEST_F(NRTHandlerTest, ScheduleTensorCastTranslatesOperands) {
+  nrt_tensor_t* fake_src = reinterpret_cast<nrt_tensor_t*>(0x1234);
+  nrt_tensor_t* fake_dst = reinterpret_cast<nrt_tensor_t*>(0x5678);
+  NRTHandler::TensorCastOperand src{fake_src, 3, c10::ScalarType::Float};
+  NRTHandler::TensorCastOperand dst{fake_dst, 7, c10::ScalarType::BFloat16};
+  nrta_seq_t expected_seq = 789;
+  NRT_STATUS ret = NRT_SUCCESS;
+
+  EXPECT_CALL(*MockNRT::GetInstance(),
+              nrta_tensor_cast(Truly([fake_src](const nrt_compute_tensor_t* arg) {
+                                 return arg != nullptr && arg->tensor == fake_src &&
+                                        arg->offset_elem == 3 && arg->dtype == NRT_DTYPE_FLOAT32;
+                               }),
+                               Truly([fake_dst](const nrt_compute_tensor_t* arg) {
+                                 return arg != nullptr && arg->tensor == fake_dst &&
+                                        arg->offset_elem == 7 && arg->dtype == NRT_DTYPE_BFLOAT16;
+                               }),
+                               128, 1, 2, &ret, _))
+      .WillOnce(DoAll(SetArgPointee<6>(expected_seq), Return(NRT_SUCCESS)));
+
+  nrta_seq_t result_seq;
+  NRT_STATUS status = NRTHandler::ScheduleTensorCast(src, dst, 128, 1, 2, &ret, &result_seq);
+  EXPECT_EQ(status, NRT_SUCCESS);
+  EXPECT_EQ(result_seq, expected_seq);
 }
 
 TEST_F(NRTHandlerTest, PlainKernelUsesPlainModelLoader) {

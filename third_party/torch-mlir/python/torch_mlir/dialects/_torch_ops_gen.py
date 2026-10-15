@@ -6458,6 +6458,34 @@ def aten_diagonal_scatter(result, self_, src, offset, dim1, dim2, *, loc=None, i
   return AtenDiagonalScatterOp(result=result, self_=self_, src=src, offset=offset, dim1=dim1, dim2=dim2, loc=loc, ip=ip).result
 
 @_ods_cext.register_operation(_Dialect)
+class AtenDigammaOp(_ods_ir.OpView):
+  OPERATION_NAME = "torch.aten.digamma"
+
+  _ODS_REGIONS = (0, True)
+
+  def __init__(self, result, self_, *, loc=None, ip=None):
+    operands = []
+    attributes = {}
+    regions = None
+    operands.append(self_)
+    _ods_context = _ods_get_default_loc_context(loc)
+    results = []
+    results.append(result)
+    _ods_successors = None
+    super().__init__(self.OPERATION_NAME, self._ODS_REGIONS, self._ODS_OPERAND_SEGMENTS, self._ODS_RESULT_SEGMENTS, attributes=attributes, results=results, operands=operands, successors=_ods_successors, regions=regions, loc=loc, ip=ip)
+
+  @builtins.property
+  def self_(self) -> _ods_ir.Value:
+    return self.operation.operands[0]
+
+  @builtins.property
+  def result(self) -> _ods_ir.OpResult:
+    return self.operation.results[0]
+
+def aten_digamma(result, self_, *, loc=None, ip=None) -> _ods_ir.OpResult:
+  return AtenDigammaOp(result=result, self_=self_, loc=loc, ip=ip).result
+
+@_ods_cext.register_operation(_Dialect)
 class AtenDimOp(_ods_ir.OpView):
   OPERATION_NAME = "torch.aten.dim"
 
@@ -7857,6 +7885,34 @@ class AtenErf_Op(_ods_ir.OpView):
 
 def aten_erf_(result, self_, *, loc=None, ip=None) -> _ods_ir.OpResult:
   return AtenErf_Op(result=result, self_=self_, loc=loc, ip=ip).result
+
+@_ods_cext.register_operation(_Dialect)
+class AtenErfcOp(_ods_ir.OpView):
+  OPERATION_NAME = "torch.aten.erfc"
+
+  _ODS_REGIONS = (0, True)
+
+  def __init__(self, result, self_, *, loc=None, ip=None):
+    operands = []
+    attributes = {}
+    regions = None
+    operands.append(self_)
+    _ods_context = _ods_get_default_loc_context(loc)
+    results = []
+    results.append(result)
+    _ods_successors = None
+    super().__init__(self.OPERATION_NAME, self._ODS_REGIONS, self._ODS_OPERAND_SEGMENTS, self._ODS_RESULT_SEGMENTS, attributes=attributes, results=results, operands=operands, successors=_ods_successors, regions=regions, loc=loc, ip=ip)
+
+  @builtins.property
+  def self_(self) -> _ods_ir.Value:
+    return self.operation.operands[0]
+
+  @builtins.property
+  def result(self) -> _ods_ir.OpResult:
+    return self.operation.results[0]
+
+def aten_erfc(result, self_, *, loc=None, ip=None) -> _ods_ir.OpResult:
+  return AtenErfcOp(result=result, self_=self_, loc=loc, ip=ip).result
 
 @_ods_cext.register_operation(_Dialect)
 class AtenErfinvOp(_ods_ir.OpView):
@@ -12498,6 +12554,34 @@ def aten_lerp__Tensor(result, self_, end, weight, *, loc=None, ip=None) -> _ods_
   return AtenLerp_TensorOp(result=result, self_=self_, end=end, weight=weight, loc=loc, ip=ip).result
 
 @_ods_cext.register_operation(_Dialect)
+class AtenLgammaOp(_ods_ir.OpView):
+  OPERATION_NAME = "torch.aten.lgamma"
+
+  _ODS_REGIONS = (0, True)
+
+  def __init__(self, result, self_, *, loc=None, ip=None):
+    operands = []
+    attributes = {}
+    regions = None
+    operands.append(self_)
+    _ods_context = _ods_get_default_loc_context(loc)
+    results = []
+    results.append(result)
+    _ods_successors = None
+    super().__init__(self.OPERATION_NAME, self._ODS_REGIONS, self._ODS_OPERAND_SEGMENTS, self._ODS_RESULT_SEGMENTS, attributes=attributes, results=results, operands=operands, successors=_ods_successors, regions=regions, loc=loc, ip=ip)
+
+  @builtins.property
+  def self_(self) -> _ods_ir.Value:
+    return self.operation.operands[0]
+
+  @builtins.property
+  def result(self) -> _ods_ir.OpResult:
+    return self.operation.results[0]
+
+def aten_lgamma(result, self_, *, loc=None, ip=None) -> _ods_ir.OpResult:
+  return AtenLgammaOp(result=result, self_=self_, loc=loc, ip=ip).result
+
+@_ods_cext.register_operation(_Dialect)
 class AtenLiftFreshCopyOp(_ods_ir.OpView):
   OPERATION_NAME = "torch.aten.lift_fresh_copy"
 
@@ -17103,6 +17187,39 @@ def aten_new_zeros(result, self_, size, dtype, layout, device, pin_memory, *, lo
   return AtenNewZerosOp(result=result, self_=self_, size=size, dtype=dtype, layout=layout, device=device, pin_memory=pin_memory, loc=loc, ip=ip).result
 
 @_ods_cext.register_operation(_Dialect)
+class AtenNextafterOp(_ods_ir.OpView):
+  OPERATION_NAME = "torch.aten.nextafter"
+
+  _ODS_REGIONS = (0, True)
+
+  def __init__(self, result, self_, other, *, loc=None, ip=None):
+    operands = []
+    attributes = {}
+    regions = None
+    operands.append(self_)
+    operands.append(other)
+    _ods_context = _ods_get_default_loc_context(loc)
+    results = []
+    results.append(result)
+    _ods_successors = None
+    super().__init__(self.OPERATION_NAME, self._ODS_REGIONS, self._ODS_OPERAND_SEGMENTS, self._ODS_RESULT_SEGMENTS, attributes=attributes, results=results, operands=operands, successors=_ods_successors, regions=regions, loc=loc, ip=ip)
+
+  @builtins.property
+  def self_(self) -> _ods_ir.Value:
+    return self.operation.operands[0]
+
+  @builtins.property
+  def other(self) -> _ods_ir.Value:
+    return self.operation.operands[1]
+
+  @builtins.property
+  def result(self) -> _ods_ir.OpResult:
+    return self.operation.results[0]
+
+def aten_nextafter(result, self_, other, *, loc=None, ip=None) -> _ods_ir.OpResult:
+  return AtenNextafterOp(result=result, self_=self_, other=other, loc=loc, ip=ip).result
+
+@_ods_cext.register_operation(_Dialect)
 class AtenNllLoss2dBackwardOp(_ods_ir.OpView):
   OPERATION_NAME = "torch.aten.nll_loss2d_backward"
 
@@ -18051,6 +18168,37 @@ def aten_pow_int_float(a, b, *, results=None, loc=None, ip=None) -> _ods_ir.OpRe
   return AtenPowIntFloatOp(a=a, b=b, results=results, loc=loc, ip=ip).result
 
 @_ods_cext.register_operation(_Dialect)
+class AtenPowIntOp(_ods_ir.OpView):
+  OPERATION_NAME = "torch.aten.pow.int"
+
+  _ODS_REGIONS = (0, True)
+
+  def __init__(self, a, b, *, results=None, loc=None, ip=None):
+    operands = []
+    attributes = {}
+    regions = None
+    operands.append(a)
+    operands.append(b)
+    _ods_context = _ods_get_default_loc_context(loc)
+    _ods_successors = None
+    super().__init__(self.OPERATION_NAME, self._ODS_REGIONS, self._ODS_OPERAND_SEGMENTS, self._ODS_RESULT_SEGMENTS, attributes=attributes, results=results, operands=operands, successors=_ods_successors, regions=regions, loc=loc, ip=ip)
+
+  @builtins.property
+  def a(self) -> _ods_ir.Value:
+    return self.operation.operands[0]
+
+  @builtins.property
+  def b(self) -> _ods_ir.Value:
+    return self.operation.operands[1]
+
+  @builtins.property
+  def result(self) -> _ods_ir.OpResult:
+    return self.operation.results[0]
+
+def aten_pow_int(a, b, *, results=None, loc=None, ip=None) -> _ods_ir.OpResult:
+  return AtenPowIntOp(a=a, b=b, results=results, loc=loc, ip=ip).result
+
+@_ods_cext.register_operation(_Dialect)
 class AtenPowScalarOp(_ods_ir.OpView):
   OPERATION_NAME = "torch.aten.pow.Scalar"
 
@@ -18263,8 +18411,13 @@ class AtenQuantizeMxOp(_ods_ir.OpView):
   r"""
   Performs MX quantization along a specified dimension, dividing the input
   into blocks and computing per-block scale factors. Returns the quantized
-  data as packed uint32 (4 FP8 values per element, quantization dimension
-  divided by 4) and the scale factors in F8E8M0FNU format.
+  data as FP8 (E5M2 or E4M3FN) with the same shape as the input and the
+  scale factors in F8E8M0FNU format (quantization dim divided by block_size).
+  
+  The downstream Neuron backend is responsible for any target-specific
+  repacking (e.g. bitcasting groups of FP8 values into wider integer
+  types) required at the hardware boundary; producers emit the FP8 result
+  as-is.
   
   Maps to `aten::quantize_mx(Tensor self, int dim, int block_size,
   ScalarType dtype, int scale_calculation_mode) -> (Tensor, Tensor)`.
@@ -21918,6 +22071,67 @@ def aten_special_expm1(result, self_, *, loc=None, ip=None) -> _ods_ir.OpResult:
   return AtenSpecialExpm1Op(result=result, self_=self_, loc=loc, ip=ip).result
 
 @_ods_cext.register_operation(_Dialect)
+class AtenSpecial_i1eOp(_ods_ir.OpView):
+  OPERATION_NAME = "torch.aten.special_i1e"
+
+  _ODS_REGIONS = (0, True)
+
+  def __init__(self, result, self_, *, loc=None, ip=None):
+    operands = []
+    attributes = {}
+    regions = None
+    operands.append(self_)
+    _ods_context = _ods_get_default_loc_context(loc)
+    results = []
+    results.append(result)
+    _ods_successors = None
+    super().__init__(self.OPERATION_NAME, self._ODS_REGIONS, self._ODS_OPERAND_SEGMENTS, self._ODS_RESULT_SEGMENTS, attributes=attributes, results=results, operands=operands, successors=_ods_successors, regions=regions, loc=loc, ip=ip)
+
+  @builtins.property
+  def self_(self) -> _ods_ir.Value:
+    return self.operation.operands[0]
+
+  @builtins.property
+  def result(self) -> _ods_ir.OpResult:
+    return self.operation.results[0]
+
+def aten_special_i1e(result, self_, *, loc=None, ip=None) -> _ods_ir.OpResult:
+  return AtenSpecial_i1eOp(result=result, self_=self_, loc=loc, ip=ip).result
+
+@_ods_cext.register_operation(_Dialect)
+class AtenSpecial_zetaOp(_ods_ir.OpView):
+  OPERATION_NAME = "torch.aten.special_zeta"
+
+  _ODS_REGIONS = (0, True)
+
+  def __init__(self, result, self_, other, *, loc=None, ip=None):
+    operands = []
+    attributes = {}
+    regions = None
+    operands.append(self_)
+    operands.append(other)
+    _ods_context = _ods_get_default_loc_context(loc)
+    results = []
+    results.append(result)
+    _ods_successors = None
+    super().__init__(self.OPERATION_NAME, self._ODS_REGIONS, self._ODS_OPERAND_SEGMENTS, self._ODS_RESULT_SEGMENTS, attributes=attributes, results=results, operands=operands, successors=_ods_successors, regions=regions, loc=loc, ip=ip)
+
+  @builtins.property
+  def self_(self) -> _ods_ir.Value:
+    return self.operation.operands[0]
+
+  @builtins.property
+  def other(self) -> _ods_ir.Value:
+    return self.operation.operands[1]
+
+  @builtins.property
+  def result(self) -> _ods_ir.OpResult:
+    return self.operation.results[0]
+
+def aten_special_zeta(result, self_, other, *, loc=None, ip=None) -> _ods_ir.OpResult:
+  return AtenSpecial_zetaOp(result=result, self_=self_, other=other, loc=loc, ip=ip).result
+
+@_ods_cext.register_operation(_Dialect)
 class AtenSplitCopyTensorOp(_ods_ir.OpView):
   OPERATION_NAME = "torch.aten.split_copy.Tensor"
 
@@ -24302,6 +24516,39 @@ class AtenTriu_Op(_ods_ir.OpView):
 
 def aten_triu_(result, self_, diagonal, *, loc=None, ip=None) -> _ods_ir.OpResult:
   return AtenTriu_Op(result=result, self_=self_, diagonal=diagonal, loc=loc, ip=ip).result
+
+@_ods_cext.register_operation(_Dialect)
+class AtenTrueDivideTensorOp(_ods_ir.OpView):
+  OPERATION_NAME = "torch.aten.true_divide.Tensor"
+
+  _ODS_REGIONS = (0, True)
+
+  def __init__(self, result, self_, other, *, loc=None, ip=None):
+    operands = []
+    attributes = {}
+    regions = None
+    operands.append(self_)
+    operands.append(other)
+    _ods_context = _ods_get_default_loc_context(loc)
+    results = []
+    results.append(result)
+    _ods_successors = None
+    super().__init__(self.OPERATION_NAME, self._ODS_REGIONS, self._ODS_OPERAND_SEGMENTS, self._ODS_RESULT_SEGMENTS, attributes=attributes, results=results, operands=operands, successors=_ods_successors, regions=regions, loc=loc, ip=ip)
+
+  @builtins.property
+  def self_(self) -> _ods_ir.Value:
+    return self.operation.operands[0]
+
+  @builtins.property
+  def other(self) -> _ods_ir.Value:
+    return self.operation.operands[1]
+
+  @builtins.property
+  def result(self) -> _ods_ir.OpResult:
+    return self.operation.results[0]
+
+def aten_true_divide_Tensor(result, self_, other, *, loc=None, ip=None) -> _ods_ir.OpResult:
+  return AtenTrueDivideTensorOp(result=result, self_=self_, other=other, loc=loc, ip=ip).result
 
 @_ods_cext.register_operation(_Dialect)
 class AtenTruncOp(_ods_ir.OpView):
@@ -28390,6 +28637,39 @@ def aten___rshift___Scalar(result, self_, other, *, loc=None, ip=None) -> _ods_i
   return Aten__Rshift__ScalarOp(result=result, self_=self_, other=other, loc=loc, ip=ip).result
 
 @_ods_cext.register_operation(_Dialect)
+class Aten__Rshift__TensorOp(_ods_ir.OpView):
+  OPERATION_NAME = "torch.aten.__rshift__.Tensor"
+
+  _ODS_REGIONS = (0, True)
+
+  def __init__(self, result, self_, other, *, loc=None, ip=None):
+    operands = []
+    attributes = {}
+    regions = None
+    operands.append(self_)
+    operands.append(other)
+    _ods_context = _ods_get_default_loc_context(loc)
+    results = []
+    results.append(result)
+    _ods_successors = None
+    super().__init__(self.OPERATION_NAME, self._ODS_REGIONS, self._ODS_OPERAND_SEGMENTS, self._ODS_RESULT_SEGMENTS, attributes=attributes, results=results, operands=operands, successors=_ods_successors, regions=regions, loc=loc, ip=ip)
+
+  @builtins.property
+  def self_(self) -> _ods_ir.Value:
+    return self.operation.operands[0]
+
+  @builtins.property
+  def other(self) -> _ods_ir.Value:
+    return self.operation.operands[1]
+
+  @builtins.property
+  def result(self) -> _ods_ir.OpResult:
+    return self.operation.results[0]
+
+def aten___rshift___Tensor(result, self_, other, *, loc=None, ip=None) -> _ods_ir.OpResult:
+  return Aten__Rshift__TensorOp(result=result, self_=self_, other=other, loc=loc, ip=ip).result
+
+@_ods_cext.register_operation(_Dialect)
 class AttrOp(_ods_ir.OpView):
   r"""
   This op declaratively specifies that torch.nn.Module's of the parent
@@ -28806,8 +29086,8 @@ class ConstantNumberOp(_ods_ir.OpView):
     _ods_context = _ods_get_default_loc_context(loc)
     attributes["value"] = (value if (
     isinstance(value, _ods_ir.Attribute) or
-    not _ods_ir.AttrBuilder.contains('anonymous_559')) else
-      _ods_ir.AttrBuilder.get('anonymous_559')(value, context=_ods_context))
+    not _ods_ir.AttrBuilder.contains('anonymous_561')) else
+      _ods_ir.AttrBuilder.get('anonymous_561')(value, context=_ods_context))
     _ods_successors = None
     super().__init__(self.OPERATION_NAME, self._ODS_REGIONS, self._ODS_OPERAND_SEGMENTS, self._ODS_RESULT_SEGMENTS, attributes=attributes, results=results, operands=operands, successors=_ods_successors, regions=regions, loc=loc, ip=ip)
 

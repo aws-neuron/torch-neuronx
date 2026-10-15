@@ -54,10 +54,11 @@ _state = _NUMAState()
 
 
 class AffinityMode(str, Enum):
-    """NUMA CPU affinity strategies.
+    """Select a NUMA CPU-affinity strategy.
 
-    Mirrors :class:`torch.numa.binding.AffinityMode` from PyTorch 2.11+,
-    adapted for Neuron devices.
+    Note:
+        This subset adapts ``torch.numa.binding.AffinityMode`` from PyTorch 2.11 or
+        later. ``NODE`` binds all CPUs on the NUMA node containing the Neuron device.
     """
 
     NODE = "node"
@@ -228,17 +229,16 @@ def _pin_all_threads(cpulist: list[int]) -> int:
 
 
 def pin_to_numa(visible_core: int | None = None) -> None:
-    """Pin all threads to NUMA-local CPUs for this rank's Neuron device.
-
-    Uses ``AffinityMode.NODE`` strategy — identical to
-    :func:`torch.numa.binding._node_get_logical_cpus_to_bind_to` but resolves
-    the NUMA node from ``neuron-ls`` instead of CUDA PCI properties.
+    """Pin all process threads to CPUs local to a rank's Neuron device.
 
     Args:
-        visible_core: Visible NeuronCore index. If ``None``, reads from
-            ``NEURON_RT_VISIBLE_CORES``.
+        visible_core (int, optional): Visible NeuronCore index. Defaults to
+            ``None``, which resolves the first value in ``NEURON_RT_VISIBLE_CORES``.
 
-    Controlled by ``NEURON_NUMA_PIN`` (default: on).
+    Note:
+        ``NEURON_NUMA_PIN=0`` disables pinning. The operation is process-wide and
+        idempotent. It binds to the CPU-affinity list reported for the resolved
+        device and returns without pinning when topology is unavailable.
     """
     if not _is_enabled("NEURON_NUMA_PIN"):
         logger.debug("NUMA pinning disabled (NEURON_NUMA_PIN=0)")
@@ -271,7 +271,12 @@ def pin_to_numa(visible_core: int | None = None) -> None:
 
 
 def get_numa_status() -> dict:
-    """Return diagnostic information about current NUMA optimization state."""
+    """Return diagnostic information about the current NUMA optimization state.
+
+    Returns:
+        dict: Values for ``numa_pin_enabled``, ``numa_pinned``,
+            ``current_affinity``, ``topology_available``, and ``num_devices``.
+    """
     topo = _discover_topology()
     current_affinity = sorted(os.sched_getaffinity(0))
     with _lock:
@@ -291,15 +296,16 @@ def get_numa_status() -> dict:
 
 
 def numa_launch_main() -> None:
-    """Entry point for ``neuron-numa-launch``.
+    """Launch Python with NUMA-local binding for ``LOCAL_RANK``.
 
-    Wraps ``python`` with ``numactl --membind --cpunodebind`` for the correct
-    NUMA node based on ``LOCAL_RANK``.  Used with ``torchrun --no-python``.
+    Raises:
+        ValueError: If ``LOCAL_RANK`` is not an integer.
+        OSError: If replacing the current process fails.
 
-    Usage::
-
-        torchrun --no-python --nproc_per_node 64 ... \\
-            neuron-numa-launch ./train.py --args
+    Note:
+        This console entry point binds CPU and memory for ``torchrun --no-python``.
+        It falls back to unbound Python when ``LOCAL_RANK``, ``numactl``, or device
+        topology is unavailable.
     """
     import shutil
     import sys

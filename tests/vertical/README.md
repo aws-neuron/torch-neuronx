@@ -477,11 +477,11 @@ location has no default because the bucket moves. Pass it with
 
 ```sh
 # From S3 (needs a read-only profile for the bucket):
-python tests/vertical/tools/refresh_cache_key_shapes.py \
+python tests/vertical/internal/refresh_cache_key_shapes.py \
     --bucket <bucket> --prefix <prefix> --profile <aws-profile>
 
 # From a local folder of *_cache_keys.txt files:
-python tests/vertical/tools/refresh_cache_key_shapes.py --from-dir <dir>
+python tests/vertical/internal/refresh_cache_key_shapes.py --from-dir <dir>
 ```
 
 Review the diff and commit the regenerated file.

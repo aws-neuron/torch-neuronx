@@ -13,15 +13,16 @@ import nki.language as nl
 
 @nki.jit()
 def gather_kernel(source, indices, num_m_tiles):
-    """
-    Gather rows by index: output[i, :] = source[indices[i], :]
+    """Gather source rows into a runtime-sized output prefix.
 
     Args:
-        source: [T, H] bf16 on HBM — full token buffer
-        indices: [T, 1] int32 on HBM — token indices (first num_tokens valid)
-        num_m_tiles: [1, 1] int32 — number of 128-row output tiles
+        source (tensor): Full ``[T, H]`` token buffer in HBM.
+        indices (tensor): Int32 ``[T, 1]`` source-row indices in HBM.
+        num_m_tiles (tensor): Int32 ``[1, 1]`` count of 128-row output tiles.
+
     Returns:
-        output: [T, H] bf16 on HBM (first num_tokens rows valid)
+        tensor: ``[T, H]`` HBM tensor whose first ``128 * num_m_tiles`` rows contain
+            gathered values; remaining rows are uninitialized.
     """
     T, H = source.shape  # noqa: N806
 
@@ -53,6 +54,11 @@ def gather_kernel(source, indices, num_m_tiles):
 
     def body(_i):
         # Load 128 indices for this tile
+        """Gather one dynamic output row-tile iteration.
+
+        Args:
+            _i (int): Ignored loop index; ``out_row_offset`` tracks the output position.
+        """
         idx_tile = nl.ndarray((tile_size_m, 1), nl.int32, nl.sbuf)
         nisa.dma_copy(
             dst=idx_tile[0:tile_size_m, 0:1],

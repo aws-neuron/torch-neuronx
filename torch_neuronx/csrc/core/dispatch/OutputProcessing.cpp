@@ -1,5 +1,7 @@
 #include "torch_neuronx/csrc/core/dispatch/OutputProcessing.h"
 
+#include <algorithm>
+
 #include "torch_neuronx/csrc/core/NeuronLogging.h"
 #include "torch_neuronx/csrc/core/NeuronOpsApi.h"
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
@@ -71,12 +73,14 @@ std::vector<torch::Tensor> AllocateExecutionOutputs(
 
         const auto& ospec = entry.output_specs[ret_idx];  // physical (what the NEFF writes)
 
-        if (out_tensor.scalar_type() == ospec.dtype) {
-          // Direct reuse: the out='s dtype matches the execution buffer, so it
-          // can serve as the NEFF output directly. Resize to the spec shape if
-          // needed (here physical == logical, so this is the ordinary out=
-          // resize contract).
-          if (out_tensor.sizes().vec() != ospec.shape) {
+        bool needs_resize = out_tensor.sizes().vec() != ospec.shape;
+        if (out_tensor.scalar_type() == ospec.dtype &&
+            (out_tensor.is_contiguous() || !needs_resize)) {
+          // A resize flattens a strided view and drops its stride. Do not bind a
+          // non-contiguous out= that needs a resize; let it fall through to a
+          // fresh buffer (Step 3), so CopyBackToOriginal scatters it back. A
+          // non-contiguous out= that keeps its shape stays bound for the epilogue.
+          if (needs_resize) {
             TORCH_NEURONX_DISPATCH_DEBUG("[AllocateExecutionOutputs] resizing out tensor",
                                          " arg_idx=", arg_idx);
             ResizeOutputWithWarning(out_tensor, ospec.shape);
@@ -117,39 +121,62 @@ std::vector<torch::Tensor> AllocateExecutionOutputs(
         break;
       }
     }
+  }
 
-    // 2b: TensorList out args (e.g. split_with_sizes_copy.out where out is Tensor[])
-    // These have void return but the arg is aliased as write.
-    bool any_out_filled = false;
-    for (size_t i = 0; i < num_outputs; ++i) {
-      if (outputs[i].defined()) {
-        any_out_filled = true;
-        break;
-      }
-    }
-    if (!any_out_filled) {
-      for (size_t arg_idx = 0; arg_idx < schema_args.size() && arg_idx < args.size(); ++arg_idx) {
-        const auto& arg_alias = schema_args[arg_idx].alias_info();
-        if (!arg_alias || !arg_alias->isWrite()) continue;
-        if (!args[arg_idx].isTensorList()) continue;
+  // ── Step 2b: a write-aliased Tensor[] argument supplies the output buffers ──
+  // For ops whose N destinations are the elements of a write-aliased Tensor[]:
+  // split_with_sizes_copy.out, and in-place ops that write somewhere other than
+  // an input (_foreach_copy_ copies src into self, so donation has nothing to
+  // alias). Only fills slots Step 1 left undefined, so ops that donate all of
+  // their outputs — foreach_mul_, add_ — are unaffected.
+  //
+  // Only the FIRST write-aliased Tensor[] is considered. That matters for the
+  // fused optimizers, where grads is also marked (b!) but must never be written:
+  // params comes first, so the loop breaks before reaching grads.
+  //
+  // `outputs` is indexed by execution output, while the argument list is indexed
+  // by original output. Those differ whenever the graph dropped an output, which
+  // happens when a zero-numel input is returned unchanged and so appears as a
+  // placeholder (see capture_backend). kept_output_indices carries the mapping,
+  // the same way Step 1 and ReconstructOutputs use it.
+  const bool needs_buffers = std::any_of(outputs.begin(), outputs.end(),
+                                         [](const torch::Tensor& t) { return !t.defined(); });
+  if (needs_buffers) {
+    const auto& schema_args = schema.arguments();
+    for (size_t arg_idx = 0; arg_idx < schema_args.size() && arg_idx < args.size(); ++arg_idx) {
+      const auto& arg_alias = schema_args[arg_idx].alias_info();
+      if (!arg_alias || !arg_alias->isWrite()) continue;
+      if (!args[arg_idx].isTensorList()) continue;
 
-        auto tensor_list = args[arg_idx].toTensorList();
-        for (size_t i = 0; i < tensor_list.size() && i < num_outputs; ++i) {
-          at::Tensor out_tensor = tensor_list[i];
-          if (!out_tensor.defined()) continue;
+      auto tensor_list = args[arg_idx].toTensorList();
+      const auto& kept = entry.kept_output_indices;
+      for (size_t exec_idx = 0; exec_idx < num_outputs; ++exec_idx) {
+        if (outputs[exec_idx].defined()) continue;  // keep what Step 1 donated
 
-          const auto& ospec = entry.output_specs[i];
-          if (out_tensor.sizes().vec() != ospec.shape) {
-            ResizeOutputWithWarning(out_tensor, ospec.shape);
-          }
-          if (out_tensor.scalar_type() == ospec.dtype && out_tensor.is_contiguous()) {
-            outputs[i] = out_tensor;
-            TORCH_NEURONX_DISPATCH_DEBUG("[AllocateExecutionOutputs] using TensorList out[", i,
-                                         "] from arg[", arg_idx, "]");
-          }
+        size_t orig_idx = exec_idx;
+        if (!kept.empty()) {
+          if (exec_idx >= kept.size() || kept[exec_idx] < 0) continue;
+          orig_idx = static_cast<size_t>(kept[exec_idx]);
         }
-        break;
+        if (orig_idx >= tensor_list.size()) continue;
+
+        at::Tensor out_tensor = tensor_list[orig_idx];
+        if (!out_tensor.defined()) continue;
+
+        // Dtype and contiguity first: resizing a tensor we then decline to use
+        // would mutate the caller's storage for nothing (Step 2a orders it the
+        // same way).
+        const auto& ospec = entry.output_specs[exec_idx];
+        if (out_tensor.scalar_type() != ospec.dtype || !out_tensor.is_contiguous()) continue;
+        if (out_tensor.sizes().vec() != ospec.shape) {
+          ResizeOutputWithWarning(out_tensor, ospec.shape);
+        }
+        outputs[exec_idx] = out_tensor;
+        TORCH_NEURONX_DISPATCH_DEBUG("[AllocateExecutionOutputs] using TensorList out[", orig_idx,
+                                     "] from write-aliased arg[", arg_idx, "] for exec output[",
+                                     exec_idx, "]");
       }
+      break;
     }
   }
 
@@ -195,8 +222,15 @@ std::vector<torch::Tensor> AllocateExecutionOutputs(
                     required_storage, " but physical buffer has ", phys_tensor.numel(),
                     " elements");
 
-        // Create as_strided view: logical shape + target strides over physical buffer
-        outputs[i] = phys_tensor.as_strided(spec.shape, target);
+        // Create as_strided view: logical shape + target strides over physical buffer.
+        // Exclude ADInplaceOrView so the output has no view metadata. A prim
+        // reaches this code below Autograd only, and the ADInplaceOrView kernel
+        // would then mark the output as a view. The upstream python_ref tests
+        // compare _is_view() between the prim path and the direct path.
+        {
+          at::AutoDispatchBelowADInplaceOrView guard;
+          outputs[i] = phys_tensor.as_strided(spec.shape, target);
+        }
 
         TORCH_NEURONX_DISPATCH_DEBUG("[AllocateExecutionOutputs] target_strides allocation",
                                      " output_idx=", i, " logical_shape=", spec.shape,

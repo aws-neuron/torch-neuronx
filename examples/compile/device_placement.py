@@ -12,11 +12,21 @@ import torch
 
 @torch.compile(backend="neuron", dynamic=False)
 def multiply(x, y):
+    """Multiply two tensors through the Dynamo backend.
+
+    Args:
+        x (torch.Tensor): First input tensor.
+        y (torch.Tensor): Second input tensor.
+
+    Returns:
+        torch.Tensor: Element-wise product on the Neuron device.
+    """
     return x * y
 
 
 def main():
     # CPU tensors are automatically moved to Neuron
+    """Demonstrate compiled execution with CPU and Neuron device inputs."""
     x_cpu = torch.randn(4)
     y_cpu = torch.randn(4)
     result = multiply(x_cpu, y_cpu)

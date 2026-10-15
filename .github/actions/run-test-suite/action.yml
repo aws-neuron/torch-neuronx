@@ -3,7 +3,7 @@ description: Run a test command, copy outputs, and upload artifacts.
 
 inputs:
   test-command:
-    description: The test command to run (e.g., "./tools/run-test-parallel tests/distributed")
+    description: The test command to run (e.g., "python3 tests/pytorch_tests_native/runner/run_upstream_tests.py --node dist-unit-tests")
     required: true
   artifact-name:
     description: Name for the uploaded artifact

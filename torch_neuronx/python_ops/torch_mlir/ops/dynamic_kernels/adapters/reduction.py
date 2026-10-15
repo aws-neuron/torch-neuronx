@@ -85,6 +85,7 @@ def _reshape_sum_output(outputs, original_args):
 
 
 def register():
+    """Register the dynamic free-dimension sum adapter."""
     register_dynamic_nki(
         "sum",
         DynamicNkiEntry(

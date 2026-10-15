@@ -553,6 +553,83 @@ TEST_F(LazyTransformationManagerTest, ThreeDimensionalTensor_Transpose) {
       << "Should contain dot_general operation";
 }
 
+//============================================================================
+// ComputeInputDedupMap: one slot per (storage base, base offset, shape)
+//============================================================================
+//
+// The prologue decomposes each input before dedup runs, so the context offset is
+// the selected prologue base offset (0 for a slice from the storage start, the
+// view offset for an anchored view). ComputeInputDedupMap keys on (storage base,
+// base offset, shape). The offset is a key field, so inputs with different bases
+// get different keys and separate slots. See PR #2100 review.
+
+// Build a context with the fields that ComputeInputDedupMap reads.
+at::neuron::TensorContext DedupCtx(const std::vector<int64_t>& shape, size_t storage_offset,
+                                   size_t element_size) {
+  size_t numel = 1;
+  for (auto d : shape) numel *= static_cast<size_t>(d);
+  return at::neuron::TensorContext{numel, numel * element_size, element_size,
+                                   shape, storage_offset,       c10::TensorOptions()};
+}
+
+TEST(ComputeInputDedupMapTest, MixedBaseOffsetsGetSeparateSlots) {
+  // One view anchors at offset 100, the other decomposes to a base at offset 0.
+  // They share the storage base pointer but need different bases, so they must
+  // not share a slot.
+  void* storage_base = reinterpret_cast<void*>(0x1000);
+  std::vector<void*> ptrs{storage_base, storage_base};
+  std::vector<at::neuron::TensorContext> ctxs{DedupCtx({40, 36}, 100, 4), DedupCtx({44, 36}, 0, 4)};
+
+  auto [dedup_map, deduped_count] = ComputeInputDedupMap(ptrs, ctxs);
+
+  EXPECT_EQ(deduped_count, 2u);
+  EXPECT_EQ(dedup_map, (std::vector<size_t>{0, 1}));
+}
+
+TEST(ComputeInputDedupMapTest, DifferentStorageDoesNotCollide) {
+  // Two tensors in different storage allocations. The old key subtracted
+  // offset * element_size from the pointer. For float inputs, {0x1000, off=0}
+  // and {0x2000, off=1024} both gave 0x1000 and collapsed to one slot. The
+  // raw pointer is a key field, so they now stay in separate slots.
+  std::vector<void*> ptrs{reinterpret_cast<void*>(0x1000), reinterpret_cast<void*>(0x2000)};
+  std::vector<at::neuron::TensorContext> ctxs{DedupCtx({40, 36}, 0, 4),
+                                              DedupCtx({40, 36}, 1024, 4)};
+
+  auto [dedup_map, deduped_count] = ComputeInputDedupMap(ptrs, ctxs);
+
+  EXPECT_EQ(deduped_count, 2u);
+  EXPECT_EQ(dedup_map, (std::vector<size_t>{0, 1}));
+}
+
+TEST(ComputeInputDedupMapTest, RepeatedAnchoredViewSharesOneSlot) {
+  // The same anchored view used twice has the same base, offset, and shape.
+  // Dedup collapses it to one slot.
+  void* storage_base = reinterpret_cast<void*>(0x1000);
+  std::vector<void*> ptrs{storage_base, storage_base};
+  std::vector<at::neuron::TensorContext> ctxs{DedupCtx({40, 36}, 100, 4),
+                                              DedupCtx({40, 36}, 100, 4)};
+
+  auto [dedup_map, deduped_count] = ComputeInputDedupMap(ptrs, ctxs);
+
+  EXPECT_EQ(deduped_count, 1u);
+  EXPECT_EQ(dedup_map, (std::vector<size_t>{0, 0}));
+}
+
+TEST(ComputeInputDedupMapTest, SameShapeDifferentOffsetGetSeparateSlots) {
+  // Two anchored views into one storage with the same shape but different
+  // offsets. The offset is a separate key field, so different offsets give
+  // different keys and separate slots.
+  void* storage_base = reinterpret_cast<void*>(0x1000);
+  std::vector<void*> ptrs{storage_base, storage_base};
+  std::vector<at::neuron::TensorContext> ctxs{DedupCtx({40, 36}, 100, 4),
+                                              DedupCtx({40, 36}, 137, 4)};
+
+  auto [dedup_map, deduped_count] = ComputeInputDedupMap(ptrs, ctxs);
+
+  EXPECT_EQ(deduped_count, 2u);
+  EXPECT_EQ(dedup_map, (std::vector<size_t>{0, 1}));
+}
+
 }  // namespace
 }  // namespace lazy
 }  // namespace c10_neuron

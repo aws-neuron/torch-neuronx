@@ -38,10 +38,21 @@ _original_allclose = torch.allclose
 
 
 def _cross_device_allclose(input, other, rtol=1e-05, atol=1e-08, equal_nan=False):
-    """Patch torch.allclose to handle cross-device comparison (neuron vs cpu)"""
-    if input.device != other.device:
-        other = other.to(input.device)
-    return _original_allclose(input, other, rtol=rtol, atol=atol, equal_nan=equal_nan)
+    """Patch torch.allclose to handle cross-device comparison (neuron vs cpu).
+
+    The body runs under ``DisableTorchFunction`` for the same reason as
+    ``_cross_device_equal`` below. ``test_meta.py`` keys its
+    ``meta_function_expected_failures`` table by function identity at import
+    time, which happens after this patch. The table therefore holds this shim,
+    but the meta crossref mode intercepts the original builtin. The lookup
+    misses the entry, so the mode runs the meta comparison and fails:
+    ``allclose`` calls ``item()``, and ``aten::_local_scalar_dense`` has no
+    meta kernel. Hide the inner call to keep the expected-failure semantics.
+    """
+    with torch._C.DisableTorchFunction():
+        if input.device != other.device:
+            other = other.to(input.device)
+        return _original_allclose(input, other, rtol=rtol, atol=atol, equal_nan=equal_nan)
 
 
 _original_equal = torch.equal
@@ -86,12 +97,57 @@ def _cross_device_assert_equal(self, x, y, *args, **kwargs):
     return _original_assert_equal(self, x, y, *args, **kwargs)
 
 
+_original_gradcheck = _common_utils.gradcheck
+_original_gradgradcheck = _common_utils.gradgradcheck
+
+# Capture the upstream defaults before override_gradcheck_defaults() replaces them.
+_UPSTREAM_GRADCHECK_DEFAULTS = {
+    "eps": _common_utils.GRADCHECK_DEFAULT_EPS,
+    "atol": _common_utils.GRADCHECK_DEFAULT_ATOL,
+    "rtol": _common_utils.GRADCHECK_DEFAULT_RTOL,
+}
+
+
+def _has_neuron_input(inputs) -> bool:
+    """True when any tensor in a nested gradcheck input is on a Neuron device."""
+    stack = [inputs]
+    while stack:
+        obj = stack.pop()
+        if isinstance(obj, torch.Tensor):
+            if obj.device.type == "neuron":
+                return True
+        elif isinstance(obj, dict):
+            stack.extend(obj.values())
+        elif isinstance(obj, list | tuple | set):
+            stack.extend(obj)
+    return False
+
+
+def _dtype_aware_gradcheck(original):
+    """Keep the upstream gradcheck defaults for a check that no Neuron tensor reaches.
+
+    ``override_gradcheck_defaults`` widens eps and atol for the whole session. A
+    test that runs only on the CPU keeps true float64 precision and does not need
+    the wider values. The wider eps also breaks such a test: it perturbs an input
+    far enough to leave the valid range. For example, gradcheck of a
+    differentiable Adam moves beta2 from 0.999 to 1.0, and Adam then rejects it.
+    """
+
+    def wrapper(fn, inputs, *args, **kwargs):
+        if not _has_neuron_input(inputs):
+            for key, value in _UPSTREAM_GRADCHECK_DEFAULTS.items():
+                if kwargs.get(key) is None:
+                    kwargs[key] = value
+        return original(fn, inputs, *args, **kwargs)
+
+    return wrapper
+
+
 def override_gradcheck_defaults():
     """Relax gradcheck tolerances for Neuron's float32 precision.
 
     Neuron autocasts float64 to float32, so PyTorch's float64-tuned
-    defaults don't apply. Values align with ``_apply_gradcheck_patches``
-    in ``tests/pytorch_tests/utils.py``:
+    defaults don't apply. Use the historical Neuron values:
 
       eps=1e-3   — For central-difference gradcheck the optimal step
                    is eps_opt = (3*u)^(1/3) where u is machine epsilon.
@@ -107,10 +163,15 @@ def override_gradcheck_defaults():
     Also forces ``TEST_WITH_SLOW_GRADCHECK=False`` as a safety net in
     case ``PYTORCH_TEST_WITH_SLOW_GRADCHECK=1`` leaks in from the
     environment.
+
+    Installs ``_dtype_aware_gradcheck`` so a CPU-only check keeps the
+    upstream values.
     """
     _common_utils.GRADCHECK_DEFAULT_EPS = 1e-3
     _common_utils.GRADCHECK_DEFAULT_ATOL = _FLOAT32_GRAD_NOISE_FLOOR
     _common_utils.TEST_WITH_SLOW_GRADCHECK = False
+    _common_utils.gradcheck = _dtype_aware_gradcheck(_original_gradcheck)
+    _common_utils.gradgradcheck = _dtype_aware_gradcheck(_original_gradgradcheck)
 
 
 def override_split_backward_grad_tolerances():

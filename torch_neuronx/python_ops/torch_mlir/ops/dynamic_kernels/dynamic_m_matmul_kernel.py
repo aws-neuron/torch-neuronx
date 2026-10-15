@@ -18,6 +18,18 @@ from .adapter_utils import mm_block_size_n
 
 
 def div_ceil(n, d):
+    """Calculate a ceiling quotient for a nonnegative dividend and positive divisor.
+
+    Args:
+        n (int): Nonnegative dividend.
+        d (int): Positive divisor.
+
+    Returns:
+        int: Smallest integer greater than or equal to ``n / d``.
+
+    Raises:
+        ZeroDivisionError: If ``d`` is zero.
+    """
     return (n + d - 1) // d
 
 
@@ -31,10 +43,22 @@ def static_matmul_block(
     block_local_tiles,
     tiles_this_k,
 ):
-    """One m-tile across the k-tiles + n-tiles of one n-block. block_local_tiles =
-    [(local_n_offset, n_width)] per n-tile; k_widths_in_block[tk] = contraction width
-    of k-tile tk (128, or < 128 for the final ragged k-tile); tiles_this_k = valid
-    k-tiles in this (maybe partial) k-block; psum_tiles allocated by the caller in-body."""
+    """Accumulate one matrix-multiplication block into a result tile.
+
+    Args:
+        lhsT_stripes_in_block (sequence): Transposed left-hand K stripes.
+        rhs_stripes_in_block (sequence): Right-hand K stripes.
+        result_accum (tensor): Result tile updated in place.
+        psum_tiles (sequence): Caller-allocated partial-sum scratch tiles overwritten
+            during accumulation.
+        tile_size_m (int): Number of rows in the M tile.
+        k_widths_in_block (sequence): Contraction widths for each K tile.
+        block_local_tiles (sequence): ``(local_n_offset, n_width)`` pairs.
+        tiles_this_k (int): Valid K tiles in the possibly partial K block.
+
+    Note:
+        The final K tile may have a contraction width smaller than 128.
+    """
     for tn in range(len(block_local_tiles)):
         n_local = block_local_tiles[tn][0]
         n_width = block_local_tiles[tn][1]
@@ -63,9 +87,25 @@ def static_matmul_block(
 
 @nki.jit()
 def dynamic_m_matmul_kernel(lhs, rhs, num_m_tiles):
-    """lhs[m_static,K] @ rhs[K,N] -> res[m_static,N]. num_m_tiles [1,1] int32 = number of
-    128-row m-tiles. K,N any positive size (ragged final k-tile / n-tile); N divisible
-    by num_programs (LNC shard)."""
+    """Multiply matrices with a runtime-dynamic row dimension.
+
+    Args:
+        lhs (tensor): Left operand with shape ``[m_static, K]``.
+        rhs (tensor): Right operand with shape ``[K, N]``.
+        num_m_tiles (tensor): Int32 ``[1, 1]`` count of 128-row M tiles.
+
+    Returns:
+        tensor: Product with shape ``[m_static, N]`` and the left operand dtype.
+
+    Raises:
+        AssertionError: If K dimensions differ or N is not divisible by the program count.
+
+    Note:
+        K may be any positive size; N may be any positive size divisible by the
+        program count. Final K and per-program N tiles may be ragged.
+        Operands are loaded into bfloat16 scratch and accumulated in float32.
+        Only the first ``128 * num_m_tiles`` rows are written.
+    """
     m_static, k_max = lhs.shape
     k_max_, n_max = rhs.shape
     assert k_max == k_max_
@@ -178,6 +218,11 @@ def dynamic_m_matmul_kernel(lhs, rhs, num_m_tiles):
 
         def body(_i):
             # PSUM + result_accum in-body, fresh per iteration (NCC_IBIR092 / live-range).
+            """Multiply one dynamic M-tile iteration.
+
+            Args:
+                _i (int): Loop iteration placeholder, which is not read directly.
+            """
             temp_transposes = []
             for _ in range(tiles_in_block_k):
                 temp_transposes.append(nl.ndarray((tile_size_k, tile_size_m), nl.bfloat16, nl.psum))

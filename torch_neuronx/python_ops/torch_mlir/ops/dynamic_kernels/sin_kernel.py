@@ -28,14 +28,18 @@ _INV_TWO_PI = 1.0 / (2.0 * math.pi)
 
 @nki.jit()
 def sin_kernel(input_tensor, num_m_tiles):
-    """
-    Sin activation with range reduction: output = sin(input), any input range.
+    """Compute sine over dynamic row tiles with range reduction.
 
     Args:
-        input_tensor: [m_static, hidden] on HBM
-        num_m_tiles: [1, 1] int32 — number of 128-row tiles to process
+        input_tensor (nki.language.ndarray): Input with shape ``[m_static, hidden]``.
+        num_m_tiles (nki.language.ndarray): Number of 128-row tiles to process.
+
     Returns:
-        output: [m_static, hidden] on HBM
+        nki.language.ndarray: Static-shaped sine values in the input dtype.
+
+    Note:
+        Range reduction is computed in fp32 before applying ``nl.sin``. Rows after
+        the requested tiles are not initialized.
     """
     m_static, hidden = input_tensor.shape
 
@@ -65,6 +69,11 @@ def sin_kernel(input_tensor, num_m_tiles):
     nisa.memset(m_tile_start, 0.0)
 
     def body(_i):
+        """Compute range-reduced sine for one 128-row tile.
+
+        Args:
+            _i (int): Dynamic loop iteration index, accepted but unused.
+        """
         for seg in range(len(h_starts)):
             h_start = h_starts[seg]
             h_width = h_widths[seg]

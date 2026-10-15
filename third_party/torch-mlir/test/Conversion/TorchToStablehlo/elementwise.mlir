@@ -628,13 +628,44 @@ func.func @torch.aten.div.Tensor_mode$trunc(%arg0: !torch.vtensor<[?,?,?,?],f32>
 
 // CHECK-LABEL:  func.func @torch.aten.div.Tensor_mode$floor(
 // CHECK-SAME:         %[[ARG0:.*]]: !torch.vtensor<[?,?,?,?],f32>, %[[ARG1:.*]]: !torch.vtensor<[?,?,?,?],f32>) -> !torch.vtensor<[?,?,?,?],f32> {
-// CHECK-DAG:     %[[T0:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[?,?,?,?],f32> -> tensor<?x?x?x?xf32>
-// CHECK-DAG:     %[[T1:.*]] = torch_c.to_builtin_tensor %[[ARG1]] : !torch.vtensor<[?,?,?,?],f32> -> tensor<?x?x?x?xf32>
-// CHECK:         %[[STR:.*]] = torch.constant.str "floor"
-// CHECK:         %[[T2:.*]] = chlo.broadcast_divide %[[T0]], %[[T1]] : (tensor<?x?x?x?xf32>, tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
-// CHECK:         %[[T3:.*]] = stablehlo.floor %[[T2]] : tensor<?x?x?x?xf32>
-// CHECK:         %[[T4:.*]] = torch_c.from_builtin_tensor %[[T3]] : tensor<?x?x?x?xf32> -> !torch.vtensor<[?,?,?,?],f32>
-// CHECK:         return %[[T4]] : !torch.vtensor<[?,?,?,?],f32>
+// CHECK-DAG:     %[[T0:.*]] = torch_c.to_builtin_tensor %[[ARG1]] : !torch.vtensor<[?,?,?,?],f32> -> tensor<?x?x?x?xf32>
+// CHECK-DAG:     %[[T1:.*]] = torch_c.to_builtin_tensor %[[ARG0]] : !torch.vtensor<[?,?,?,?],f32> -> tensor<?x?x?x?xf32>
+// CHECK:         %[[MOD:.*]] = chlo.broadcast_remainder %[[T1]], %[[T0]] : (tensor<?x?x?x?xf32>, tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
+// CHECK:         %[[NUM:.*]] = chlo.broadcast_subtract %[[T1]], %[[MOD]] : (tensor<?x?x?x?xf32>, tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
+// CHECK:         %[[DIV:.*]] = chlo.broadcast_divide %[[NUM]], %[[T0]] : (tensor<?x?x?x?xf32>, tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
+// CHECK:         %[[ZERO:.*]] = "chlo.constant_like"(%[[DIV]]) <{value = 0.000000e+00 : f32}> : (tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
+// CHECK:         %[[ONE:.*]] = "chlo.constant_like"(%[[DIV]]) <{value = 1.000000e+00 : f32}> : (tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
+// CHECK:         %[[C23:.*]] = "chlo.constant_like"(%[[DIV]]) <{value = 0x4B800000 : f32}> : (tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
+// CHECK:         %[[AX:.*]] = stablehlo.abs %[[T1]] : tensor<?x?x?x?xf32>
+// CHECK:         %[[RX:.*]] = chlo.broadcast_compare %[[AX]], %[[C23]] {comparison_direction = #chlo<comparison_direction LT>} : (tensor<?x?x?x?xf32>, tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xi1>
+// CHECK:         %[[AY:.*]] = stablehlo.abs %[[T0]] : tensor<?x?x?x?xf32>
+// CHECK:         %[[RY:.*]] = chlo.broadcast_compare %[[AY]], %[[C23]] {comparison_direction = #chlo<comparison_direction LT>} : (tensor<?x?x?x?xf32>, tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xi1>
+// CHECK:         %[[AQ:.*]] = stablehlo.abs %[[DIV]] : tensor<?x?x?x?xf32>
+// CHECK:         %[[RQ:.*]] = chlo.broadcast_compare %[[AQ]], %[[C23]] {comparison_direction = #chlo<comparison_direction LT>} : (tensor<?x?x?x?xf32>, tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xi1>
+// CHECK:         %[[AND1:.*]] = stablehlo.and %[[RX]], %[[RY]] : tensor<?x?x?x?xi1>
+// CHECK:         %[[SAFE:.*]] = stablehlo.and %[[AND1]], %[[RQ]] : tensor<?x?x?x?xi1>
+// CHECK:         %[[C22:.*]] = "chlo.constant_like"(%[[DIV]]) <{value = 0x4B000000 : f32}> : (tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
+// CHECK:         %[[DS:.*]] = stablehlo.select %[[SAFE]], %[[DIV]], %[[ZERO]] : tensor<?x?x?x?xi1>, tensor<?x?x?x?xf32>
+// CHECK:         %[[RND:.*]] = stablehlo.round_nearest_even %[[DS]] : tensor<?x?x?x?xf32>
+// CHECK:         %[[ADS:.*]] = stablehlo.abs %[[DS]] : tensor<?x?x?x?xf32>
+// CHECK:         %[[BIG:.*]] = chlo.broadcast_compare %[[ADS]], %[[C22]] {comparison_direction = #chlo<comparison_direction GE>} : (tensor<?x?x?x?xf32>, tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xi1>
+// CHECK:         %[[G1:.*]] = stablehlo.select %[[BIG]], %[[DS]], %[[RND]] : tensor<?x?x?x?xi1>, tensor<?x?x?x?xf32>
+// CHECK:         %[[ISNAN:.*]] = chlo.broadcast_compare %[[DS]], %[[DS]] {comparison_direction = #chlo<comparison_direction NE>} : (tensor<?x?x?x?xf32>, tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xi1>
+// CHECK:         %[[Q:.*]] = stablehlo.select %[[ISNAN]], %[[DS]], %[[G1]] : tensor<?x?x?x?xi1>, tensor<?x?x?x?xf32>
+// CHECK:         %[[PROD:.*]] = chlo.broadcast_multiply %[[MOD]], %[[T0]] : (tensor<?x?x?x?xf32>, tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
+// CHECK:         %[[ADJ:.*]] = chlo.broadcast_compare %[[PROD]], %[[ZERO]] {comparison_direction = #chlo<comparison_direction LT>} : (tensor<?x?x?x?xf32>, tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xi1>
+// CHECK:         %[[DN:.*]] = stablehlo.subtract %[[Q]], %[[ONE]] : tensor<?x?x?x?xf32>
+// CHECK:         %[[EXACT:.*]] = stablehlo.select %[[ADJ]], %[[DN]], %[[Q]] : tensor<?x?x?x?xi1>, tensor<?x?x?x?xf32>
+// CHECK:         %[[NQ:.*]] = chlo.broadcast_divide %[[T1]], %[[T0]] : (tensor<?x?x?x?xf32>, tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xf32>
+// CHECK:         %[[FL:.*]] = stablehlo.floor %[[NQ]] : tensor<?x?x?x?xf32>
+// CHECK:         %[[ANQ:.*]] = stablehlo.abs %[[NQ]] : tensor<?x?x?x?xf32>
+// CHECK:         %[[NBIG:.*]] = chlo.broadcast_compare %[[ANQ]], %[[C22]] {comparison_direction = #chlo<comparison_direction GE>} : (tensor<?x?x?x?xf32>, tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xi1>
+// CHECK:         %[[NG1:.*]] = stablehlo.select %[[NBIG]], %[[NQ]], %[[FL]] : tensor<?x?x?x?xi1>, tensor<?x?x?x?xf32>
+// CHECK:         %[[NNAN:.*]] = chlo.broadcast_compare %[[NQ]], %[[NQ]] {comparison_direction = #chlo<comparison_direction NE>} : (tensor<?x?x?x?xf32>, tensor<?x?x?x?xf32>) -> tensor<?x?x?x?xi1>
+// CHECK:         %[[NAIVE:.*]] = stablehlo.select %[[NNAN]], %[[NQ]], %[[NG1]] : tensor<?x?x?x?xi1>, tensor<?x?x?x?xf32>
+// CHECK:         %[[OUT:.*]] = stablehlo.select %[[SAFE]], %[[EXACT]], %[[NAIVE]] : tensor<?x?x?x?xi1>, tensor<?x?x?x?xf32>
+// CHECK:         %[[RES:.*]] = torch_c.from_builtin_tensor %[[OUT]] : tensor<?x?x?x?xf32> -> !torch.vtensor<[?,?,?,?],f32>
+// CHECK:         return %[[RES]] : !torch.vtensor<[?,?,?,?],f32>
 func.func @torch.aten.div.Tensor_mode$floor(%arg0: !torch.vtensor<[?,?,?,?],f32>, %arg1: !torch.vtensor<[?,?,?,?],f32>) -> !torch.vtensor<[?,?,?,?],f32> {
   %str = torch.constant.str "floor"
   %0 = torch.aten.div.Tensor_mode %arg0, %arg1, %str : !torch.vtensor<[?,?,?,?],f32>, !torch.vtensor<[?,?,?,?],f32>, !torch.str -> !torch.vtensor<[?,?,?,?],f32>

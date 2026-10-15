@@ -46,6 +46,123 @@ class TestFusedAdamW:
                         msg=f"State '{key}' mismatch",
                     )
 
+    @pytest.mark.parametrize("skip_expert", [False, True], ids=["equal-counters", "skipped-expert"])
+    def test_fused_adamw_per_parameter_steps(self, skip_expert, record_property):
+        """Bias corrections use each active parameter's runtime counter."""
+        import json
+        from unittest.mock import patch
+
+        from torch_neuronx.python_ops.torch_mlir.ops import optimizer as optimizer_ops
+
+        if not optimizer_ops._has_nki_adam_kernels:
+            pytest.skip("Requires the NKI fused AdamW implementation")
+
+        shapes = [(128,), (128, 2)]
+        params_cpu = [
+            torch.linspace(-0.02, 0.02, torch.Size(shape).numel()).reshape(shape).requires_grad_()
+            for shape in shapes
+        ]
+        params_neuron = [p.detach().clone().to("neuron").requires_grad_() for p in params_cpu]
+        optimizer_cpu = torch.optim.AdamW(params_cpu, lr=4e-4, fused=True)
+        optimizer_neuron = torch.optim.AdamW(params_neuron, lr=4e-4, fused=True)
+        expert_activity = (False, True, False, True) if skip_expert else (True,) * 4
+        expected_steps = [0, 0]
+        parameter_checks = []
+        full_group_lowering_count = None
+
+        with (
+            patch.object(
+                optimizer_ops,
+                "_make_adam_compute_fn",
+                wraps=optimizer_ops._make_adam_compute_fn,
+            ) as make_compute_fn,
+            patch.object(torch, "_fused_adamw_", wraps=torch._fused_adamw_) as fused_call,
+        ):
+            for step, expert_active in enumerate(expert_activity, start=1):
+                active = (True, expert_active)
+                for i, (cpu_param, neuron_param) in enumerate(
+                    zip(params_cpu, params_neuron, strict=True)
+                ):
+                    grad = torch.linspace(0.1, 0.2, cpu_param.numel()).reshape(cpu_param.shape)
+                    grad = grad * (1.0 + 0.1 * step)
+                    cpu_param.grad = grad if active[i] else None
+                    neuron_param.grad = grad.to("neuron") if active[i] else None
+                    expected_steps[i] += int(active[i])
+
+                optimizer_cpu.step()
+                with track_neuron_ops():
+                    optimizer_neuron.step()
+                    assert_op_runs_on_neuron("_fused_adamw_")
+
+                # The last fused call is Neuron's: verify its actual grouped counters.
+                grouped_params = fused_call.call_args.args[0]
+                grouped_steps = [t.cpu().item() for t in fused_call.call_args.args[5]]
+                assert all(p.device.type == "neuron" for p in grouped_params)
+                assert len(grouped_params) == sum(active)
+                assert grouped_steps == [
+                    n for n, used in zip(expected_steps, active, strict=True) if used
+                ]
+
+                self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+                own_steps = []
+                max_parameter_errors = []
+                moment_errors = []
+                for i, (cpu_param, neuron_param) in enumerate(
+                    zip(params_cpu, params_neuron, strict=True)
+                ):
+                    cpu_state = optimizer_cpu.state.get(cpu_param, {})
+                    neuron_state = optimizer_neuron.state.get(neuron_param, {})
+                    if expected_steps[i] == 0:
+                        assert not cpu_state and not neuron_state
+                        own_steps.append(None)
+                    else:
+                        assert cpu_state["step"].item() == expected_steps[i]
+                        assert neuron_state["step"].cpu().item() == expected_steps[i]
+                        own_steps.append(expected_steps[i])
+                    moment_errors.append(
+                        {
+                            key: (neuron_state[key].cpu() - cpu_state[key]).abs().max().item()
+                            for key in ("exp_avg", "exp_avg_sq")
+                            if key in cpu_state
+                        }
+                    )
+                    expected = cpu_param.detach().clone()
+                    actual = neuron_param.detach().cpu().clone()
+                    max_parameter_errors.append((actual - expected).abs().max().item())
+                    parameter_checks.append((step, i, actual, expected))
+
+                if expert_active:
+                    if full_group_lowering_count is None:
+                        full_group_lowering_count = make_compute_fn.call_count
+                    else:
+                        assert (
+                            make_compute_fn.call_count == full_group_lowering_count
+                        ), "Counter values changed without changing two-parameter metadata"
+
+                record_property(
+                    f"step_{step}",
+                    json.dumps(
+                        {
+                            "active": active,
+                            "grouped_steps": grouped_steps,
+                            "own_steps": own_steps,
+                            "parameter_max_abs": max_parameter_errors,
+                            "moment_max_abs": moment_errors,
+                            "lowering_calls": make_compute_fn.call_count,
+                        }
+                    ),
+                )
+
+        # Check every update after completing skip/resume and cache-reuse coverage.
+        for step, i, actual, expected in parameter_checks:
+            torch.testing.assert_close(
+                actual,
+                expected,
+                rtol=1e-5,
+                atol=1e-6,
+                msg=f"Parameter {i} after update {step} used the wrong bias correction",
+            )
+
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
     def test_fused_adamw_basic(self, dtype):
         """Test AdamW fused accuracy against CPU."""

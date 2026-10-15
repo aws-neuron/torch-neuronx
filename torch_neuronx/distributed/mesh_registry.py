@@ -196,24 +196,23 @@ def _apply_mesh_registry_patch() -> None:
 
 
 def get_all_replica_groups(pg_name: str) -> list[list[int]]:
-    """
-    Get all replica groups for a process group.
-
-    For mesh-based and captured raw PGs, returns pre-computed full groups.
-    A resolvable incomplete group warns and falls back to its local ranks;
-    an entirely unresolvable group name raises.
+    """Return replica groups for a process-group name.
 
     Args:
-        pg_name: Process group identifier (e.g., "mesh_tp", "mesh_fsdp")
+        pg_name (str): Process-group identifier.
 
     Returns:
-        List of replica groups, each a list of rank IDs.
-        For SPMD, all ranks return identical groups.
+        list[list[int]]: Complete registered groups, or the resolved local ranks
+        when the registry is disabled or incomplete. Registered groups are
+        defensive copies and are identical on every rank during SPMD compilation.
 
-    Example:
-        # 2D mesh (4, 2) with FSDP outer, TP inner
-        get_all_replica_groups("mesh_tp")   # [[0,1], [2,3], [4,5], [6,7]]
-        get_all_replica_groups("mesh_fsdp") # [[0,2,4,6], [1,3,5,7]]
+    Raises:
+        RuntimeError: If the process-group name cannot be resolved.
+
+    Note:
+        ``TORCH_NEURONX_SPMD_DISABLE=1`` bypasses the registry. An incomplete
+        group logs an error and falls back to local ranks, which violates the
+        SPMD identical-replica-groups invariant and may produce wrong collectives.
     """
     # TORCH_NEURONX_SPMD_DISABLE: bypass the registry and fall back to per-rank resolution.
     # Checked at read time (not hook time) so the registry is still populated,
@@ -249,6 +248,10 @@ def get_all_replica_groups(pg_name: str) -> list[list[int]]:
 
 
 def clear_mesh_registry() -> None:
-    """Clear the mesh registry. Useful for testing."""
+    """Clear registered and pending process-group topology.
+
+    Note:
+        Use this to reset process-wide registry state between tests.
+    """
     _MESH_REGISTRY.clear()
     _RAW_PENDING.clear()

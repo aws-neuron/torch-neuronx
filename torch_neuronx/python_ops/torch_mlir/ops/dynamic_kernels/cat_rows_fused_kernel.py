@@ -55,7 +55,14 @@ def _kernel_source(k: int, name: str) -> str:
 
 
 def cat_rows_fused_kernel(k: int):
-    """The fused kernel for arity ``k``, built once per k."""
+    """Return the cached fused row-concatenation kernel for an arity.
+
+    Args:
+        k (int): Number of single-row source tensors accepted by the kernel.
+
+    Returns:
+        Callable: Generated NKI kernel that concatenates the sources in argument order.
+    """
     kern = _KERNEL_CACHE.get(k)
     if kern is None:
         name = f"cat_rows_fused_kernel_k{k}"

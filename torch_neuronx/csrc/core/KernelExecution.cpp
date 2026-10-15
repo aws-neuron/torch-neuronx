@@ -282,10 +282,9 @@ NeffDirectKernelExecution::NeffDirectKernelExecution(
                                  c10::DeviceType::PrivateUse1>(
           graph_name, std::move(input_refs), std::move(output_refs), input_contexts,
           output_contexts, device_id),
-      // Match CompileOnlyKernelExecution's persistent-key derivation so the on-disk
-      // lookup performed by CompilationCache::CheckCacheAndCoordinateWork finds the
-      // NEFF written by the compile path (torch.compile → compile_graph) or an
-      // external put_neff_cache under the same base cache key.
+      // No IR here, so this kernel cannot compute the content-addressed persistent key.
+      // Keep CompileOnlyKernelExecution's compiler config, and let CompilationCache
+      // resolve the key from the hint that the compile step recorded.
       CompilableKernelExecution(
           CompilationCacheKey(cache_key, CompileOnlyKernelExecution::GetCompileAdditionalArgs(),
                               CompileOnlyKernelExecution::GetCompileOptimizationLevel(),
@@ -408,25 +407,13 @@ void CollectiveDirectKernelExecution::PrepareImpl() const {
                       "device_id=", GetDeviceId(), "rank=", my_rank_, "cc_ctx=", cc_ctx_);
 }
 
-void CollectiveDirectKernelExecution::Prepare() const {
-  if (c10_neuron::NeuronCachingAllocator::IsLazyAllocEnabled()) {
-    return;
-  }
-  PrepareImpl();
-}
-
 bool CollectiveDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
                                                c10::StreamId stream_id) const {
   TORCH_NEURONX_DEBUG("CollectiveDirectKernelExecution::Schedule()",
                       "collective_type=", static_cast<int>(collective_type_));
 
-  if (c10_neuron::NeuronCachingAllocator::IsLazyAllocEnabled()) {
-    PrepareImpl();
-  } else {
-    // Check that Prepare() was called (cc_ctx_ should be set)
-    EXECUTION_RUNTIME_CHECK(cc_ctx_ != nullptr,
-                            "CollectiveDirectKernelExecution::Schedule() called before Prepare()");
-  }
+  // Tensors are only guaranteed bound once the worker has run kAlloc.
+  PrepareImpl();
 
   int queue = nrt::GetHardwareQueue(NRTA_XU_COLLECTIVES, stream_id);
   NRT_STATUS status = nrt::CollectivesSchedule(&cc_ctx_, queue, nrt_status, sequence_id);
@@ -438,14 +425,6 @@ bool CollectiveDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::Sequ
   return true;
 }
 
-HintDirectKernelExecution::HintDirectKernelExecution(const std::string& op_name, void* ptr,
-                                                     size_t size_bytes, int device_id,
-                                                     HintType hint_type)
-    : NeuronKernelExecution(op_name, device_id),
-      ptr_(ptr),
-      size_bytes_(size_bytes),
-      hint_type_(hint_type) {}
-
 AllocDirectKernelExecution::AllocDirectKernelExecution(const std::string& op_name,
                                                        TensorDataRef dst_ref, size_t size_bytes,
                                                        int device_id)
@@ -453,7 +432,7 @@ AllocDirectKernelExecution::AllocDirectKernelExecution(const std::string& op_nam
                                  c10::DeviceType::PrivateUse1>(op_name, {}, {std::move(dst_ref)},
                                                                device_id),
       size_bytes_(size_bytes),
-      event_op_(op_name + "::event", NeuronEvent(),
+      event_op_(op_name + "::event", std::make_shared<EventImpl>(),
                 EventDirectKernelExecution::EventAction::kSignal, device_id) {}
 
 bool AllocDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
@@ -480,7 +459,7 @@ DeallocDirectKernelExecution::DeallocDirectKernelExecution(const std::string& op
                                  c10::DeviceType::PrivateUse1>(op_name, {std::move(src_ref)}, {},
                                                                device_id),
       size_bytes_(size_bytes),
-      event_op_(op_name + "::event", NeuronEvent(),
+      event_op_(op_name + "::event", std::make_shared<EventImpl>(),
                 EventDirectKernelExecution::EventAction::kSignal, device_id) {}
 
 bool DeallocDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
@@ -520,6 +499,46 @@ bool CopyDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId
     std::string error_msg =
         "Failed to schedule async tensor copy. Status: " + std::to_string(status);
     throw torch_neuronx::ExecutionRuntimeException(error_msg, status);
+  }
+  return true;
+}
+
+CastDirectKernelExecution::CastDirectKernelExecution(
+    const std::string& op_name, TensorDataRef src_ref, TensorDataRef dst_ref,
+    uint64_t src_offset_elements, uint64_t dst_offset_elements, c10::ScalarType src_dtype,
+    c10::ScalarType dst_dtype, uint64_t num_elements, int device_id)
+    : NeuronKernelExecutionTyped<KernelTypeEnum::kCast, c10::DeviceType::PrivateUse1,
+                                 c10::DeviceType::PrivateUse1>(op_name, {std::move(src_ref)},
+                                                               {std::move(dst_ref)}, device_id),
+      src_offset_elements_(src_offset_elements),
+      dst_offset_elements_(dst_offset_elements),
+      src_dtype_(src_dtype),
+      dst_dtype_(dst_dtype),
+      num_elements_(num_elements) {}
+
+bool CastDirectKernelExecution::ValidateImpl() const { return num_elements_ > 0; }
+
+bool CastDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
+                                         c10::StreamId stream_id) const {
+  const NRTHandler::TensorCastOperand src{
+      GetSrcDataPtrs()[0],
+      src_offset_elements_,
+      src_dtype_,
+  };
+  const NRTHandler::TensorCastOperand dst{
+      GetDstDataPtrs()[0],
+      dst_offset_elements_,
+      dst_dtype_,
+  };
+
+  int lnc_idx = c10_neuron::get_vnc_id(device_id_);
+  EXECUTION_RUNTIME_CHECK(lnc_idx >= 0, "Invalid lnc_idx ", lnc_idx, " for device_id ", device_id_);
+  int queue = nrt::GetHardwareQueue(NRTA_XU_TENSOR_OP, stream_id);
+  NRT_STATUS status = NRTHandler::ScheduleTensorCast(src, dst, num_elements_, lnc_idx, queue,
+                                                     nrt_status, sequence_id);
+  if (status != NRT_SUCCESS) {
+    throw torch_neuronx::ExecutionRuntimeException(
+        "Failed to schedule async tensor cast. Status: " + std::to_string(status), status);
   }
   return true;
 }
@@ -599,10 +618,15 @@ bool ReadDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId
 EventDirectKernelExecution::EventDirectKernelExecution(const std::string& op_name,
                                                        const NeuronEvent& event, EventAction action,
                                                        int device_id)
+    : EventDirectKernelExecution(op_name, event.get_impl(), action, device_id) {}
+
+EventDirectKernelExecution::EventDirectKernelExecution(const std::string& op_name,
+                                                       std::shared_ptr<EventImpl> event,
+                                                       EventAction action, int device_id)
     : NeuronKernelExecution(op_name, device_id),
-      event_(event),
+      event_(std::move(event)),
       action_(action),
-      signal_stream_impl_(event.recorded_stream_impl()) {}
+      signal_stream_impl_(event_->recorded_stream_impl.load(std::memory_order_relaxed)) {}
 
 bool EventDirectKernelExecution::ValidateImpl() const {
   // Event primitives don't require inputs/outputs
@@ -613,7 +637,7 @@ bool EventDirectKernelExecution::IsReady() const {
   if (action_ == EventAction::kSignal) {
     return true;
   }
-  return event_.query();
+  return event_->query();
 }
 
 bool EventDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceId* sequence_id,
@@ -624,7 +648,7 @@ bool EventDirectKernelExecution::Schedule(NRT_STATUS* nrt_status, nrt::SequenceI
     EXECUTION_RUNTIME_CHECK(IsReady(), "Event not ready for wait");
     return false;
   }
-  event_.complete_event();
+  event_->complete_event();
   return false;
 }
 

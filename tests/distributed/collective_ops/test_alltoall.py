@@ -320,6 +320,41 @@ def run_partial_group_alltoall_test(rank, world_size, kwargs):
         pass
 
 
+def run_strided_group_alltoall_test(rank, world_size, kwargs):
+    """Every rank runs alltoall in its own strided group.
+
+    The groups partition the world: rank i joins the ranks i + k * stride. The runtime needs
+    every rank to load the collective. On trn2 a group that spans two chips fails in the
+    replica-group validation when another rank stays idle.
+    """
+    stride = kwargs["stride"]
+    groups = [list(range(i, world_size, stride)) for i in range(stride)]
+    # dist.new_group is collective. Every rank must create every group.
+    process_groups = [dist.new_group(g) for g in groups]
+    group_ranks = groups[rank % stride]
+    # On trn2 a cross-chip pair needs a chunk of 4*k elements. The runtime asserts otherwise.
+    chunk = 8
+
+    input_tensor_list = [
+        torch.full((chunk,), rank * 10 + i + 1, dtype=torch.float32).to("neuron")
+        for i in range(len(group_ranks))
+    ]
+    output_tensor_list = [
+        torch.zeros(chunk, dtype=torch.float32).to("neuron") for _ in range(len(group_ranks))
+    ]
+
+    dist.all_to_all(output_tensor_list, input_tensor_list, group=process_groups[rank % stride])
+
+    rank_idx_in_group = group_ranks.index(rank)
+    for src_idx, src_rank in enumerate(group_ranks):
+        expected_value = src_rank * 10 + rank_idx_in_group + 1
+        expected_tensor = torch.full((chunk,), expected_value, dtype=torch.float32)
+        assert torch.allclose(output_tensor_list[src_idx].cpu(), expected_tensor), (
+            f"Rank {rank}: Expected {expected_tensor} from rank {src_rank}, "
+            f"got {output_tensor_list[src_idx].cpu()}"
+        )
+
+
 def run_5gb_tensor_test(rank, world_size, kwargs):
     """Test alltoall with 5GB tensor (~1.25 billion float32 elements)."""
     tensor_size = 1250000000  # ~5GB for float32
@@ -448,8 +483,9 @@ class TestAllToAll(BaseCollectiveOpTest):
         self.distributed_tester.run_test(run_5gb_tensor_test)
 
 
+@pytest.mark.neuron_cores(8)
 class TestAllToAllWorldSize8(BaseCollectiveOpTest):
-    """Test cases for alltoall with partial groups in world size 16 (hardware supported)."""
+    """Test cases for alltoall with partial groups in world size 8 (hardware supported)."""
 
     @property
     def world_size(self) -> int:
@@ -474,25 +510,36 @@ class TestAllToAllWorldSize8(BaseCollectiveOpTest):
             partial_group=partial_group,
         )
 
-    @pytest.mark.parametrize(
-        "group_config",
-        [
-            {
-                "partial_group": [0, 2, 4, 6],
-            },
-            {
-                "partial_group": [2, 3, 4, 5],
-            },
-        ],
+    @pytest.mark.parametrize("partial_group", [[1, 3]])
+    def test_alltoall_partial_group_unaligned_start(self, partial_group):
+        """Groups whose start rank is not a multiple of the group size still work.
+
+        NeuronBackend::alltoall used to reject these up front. Which groups the device
+        interconnect can form an alltoall over is a topology property that a start-rank
+        rule cannot express: it excluded these working groups while still admitting
+        [0, 2, 4, 6], which the runtime rejects (see below), so the check was removed and
+        the runtime is now the only arbiter.
+        """
+        self.distributed_tester.run_test(
+            run_partial_group_alltoall_test,
+            partial_group=partial_group,
+        )
+
+    def test_alltoall_strided_group(self):
+        """Pairs of rank i and rank i + 4 across two chips.
+
+        On trn2 the fabric links rank i to rank i + 4 only. The pair works only when every
+        rank in the world takes part in some group, so all four pairs run at once.
+        """
+        self.distributed_tester.run_test(run_strided_group_alltoall_test, stride=4)
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="the device interconnect cannot form an alltoall over these groups; the "
+        "runtime rejects them with 'NRT model scheduling failed'",
     )
-    @assert_raises(
-        RuntimeError,
-        match=r".*replica group start ranks must be multiples of world size.*",
-    )
-    def test_alltoall_partial_group_supported_fail_cases(self, group_config):
-        partial_group = group_config["partial_group"]
-        lnc = group_config.get("NEURON_LOGICAL_NC_CONFIG", "2")
-        os.environ["NEURON_LOGICAL_NC_CONFIG"] = lnc
+    @pytest.mark.parametrize("partial_group", [[0, 2, 4, 6], [2, 3, 4, 5]])
+    def test_alltoall_partial_group_unsupported_topology(self, partial_group):
         self.distributed_tester.run_test(
             run_partial_group_alltoall_test,
             partial_group=partial_group,

@@ -36,9 +36,22 @@ logger = logging.getLogger(__name__)
 
 
 class DTensorRedistributeOptimization(NeuronFXPass):
-    """Optimize DTensor redistribution patterns to eliminate stablehlo.gather ops."""
+    """Replace redundant DTensor redistribution indexing with view or slice operations.
+
+    Args:
+        state (NeuronFXPassState, optional): Shared state used for pass artifact dumping.
+            Defaults to ``None``.
+    """
 
     def call(self, graph_module: GraphModule) -> PassResult:
+        """Optimize supported DTensor redistribution patterns.
+
+        Args:
+            graph_module (GraphModule): FX graph module optimized in place.
+
+        Returns:
+            PassResult: The same graph module and whether a redistribution pattern changed.
+        """
         modified = _optimize_cat_patterns(graph_module) | _optimize_clone_pattern(graph_module)
         return PassResult(graph_module, modified)
 

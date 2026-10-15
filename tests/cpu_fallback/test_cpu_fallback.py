@@ -184,8 +184,10 @@ class TestCpuFallback:
         "TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1;",
     )
     @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
-    def test_complex_dtype_fallback(self, dtype):
-        """Test that complex dtypes fall back to CPU"""
+    def test_complex_dtype_fallback(self, dtype, monkeypatch):
+        """Test that complex dtypes fall back to CPU when decomposition is disabled."""
+        monkeypatch.setenv("TORCH_NEURONX_COMPLEX_DECOMPOSE", "0")
+
         x = torch.randn(3, 4, dtype=dtype)
         x_neuron = x.to("neuron")
 
@@ -258,7 +260,7 @@ class TestCpuFallbackAsync:
 
     def test_cpufallback_basic(self):
         """Test callBoxed path with scalar argument: mul."""
-        x = torch.randn(2, 3, device="neuron")
+        x = torch.randn(2, 3).to("neuron")
 
         with track_neuron_ops():
             result = torch.mul(x, 2.5)
@@ -273,7 +275,7 @@ class TestCpuFallbackAsync:
 
     def test_static_arg_single_int(self):
         """Test CPU fallback with single int static arg: index_select(x, dim, index)."""
-        x = torch.randn(3, 4, device="neuron")
+        x = torch.randn(3, 4).to("neuron")
         index = torch.tensor([0, 2], dtype=torch.int64, device="neuron")
 
         with track_neuron_ops():
@@ -284,7 +286,7 @@ class TestCpuFallbackAsync:
 
     def test_static_arg_tuple_string_float(self):
         """Test CPU fallback with tuple, string and float as static arg: pad(x, pad, mode, value)"""
-        x = torch.randn(2, 3, device="neuron")
+        x = torch.randn(2, 3).to("neuron")
 
         with track_neuron_ops():
             result = torch.nn.functional.pad(x, (1, 1), mode="constant", value=2.0)
@@ -297,7 +299,7 @@ class TestCpuFallbackAsync:
 
     def test_static_arg_bool(self):
         """Test CPU fallback with bool as static args: triu with diagonal."""
-        m = torch.randn(4, 4, device="neuron")
+        m = torch.randn(4, 4).to("neuron")
 
         with track_neuron_ops():
             # diagonal=1 is int static arg, but tests bool path in conversion
@@ -308,8 +310,8 @@ class TestCpuFallbackAsync:
 
     def test_static_arg_multiple_tuples(self):
         """Test CPU fallback with multiple tuples static args: conv2d."""
-        input_tensor = torch.randn(1, 3, 5, 5, device="neuron")
-        weight = torch.randn(6, 3, 3, 3, device="neuron")
+        input_tensor = torch.randn(1, 3, 5, 5).to("neuron")
+        weight = torch.randn(6, 3, 3, 3).to("neuron")
 
         with track_neuron_ops():
             result = torch.nn.functional.conv2d(
@@ -321,8 +323,8 @@ class TestCpuFallbackAsync:
 
     def test_static_arg_stack(self):
         """Test CPU fallback with list of input tensors: stack(tensors, dim)."""
-        t1 = torch.randn(2, 3, device="neuron")
-        t2 = torch.randn(2, 3, device="neuron")
+        t1 = torch.randn(2, 3).to("neuron")
+        t2 = torch.randn(2, 3).to("neuron")
 
         with track_neuron_ops():
             result = torch.stack([t1, t2], dim=1)
@@ -332,7 +334,7 @@ class TestCpuFallbackAsync:
 
     def test_static_arg_tensor_inplace(self):
         """Test CPU fallback with tensor static arg in-place op: fill_(x, fill_value)."""
-        x = torch.randn(2, 3, device="neuron")
+        x = torch.randn(2, 3).to("neuron")
         fill_value = torch.tensor(5.0, device="neuron")
 
         with track_neuron_ops():
@@ -344,7 +346,7 @@ class TestCpuFallbackAsync:
 
     def test_static_arg_scalar_inplace(self):
         """Test CPU fallback with tensor static arg in-place op: fill_(x, fill_value)."""
-        x = torch.randn(2, 3, device="neuron")
+        x = torch.randn(2, 3).to("neuron")
         fill_value = 5.0
 
         with track_neuron_ops():
@@ -356,7 +358,7 @@ class TestCpuFallbackAsync:
 
     def test_nonzero_offset_src(self):
         """Test CPU fallback with non-zero storage offset src tensor."""
-        base = torch.randn(4, 6, device="neuron")
+        base = torch.randn(4, 6).to("neuron")
         x = base[1:3, :]
         index = torch.tensor([0, 2], dtype=torch.int64, device="neuron")
 
@@ -370,7 +372,7 @@ class TestCpuFallbackAsync:
 
     def test_nonzero_offset_dst(self):
         """Test CPU fallback with non-zero storage offset dst tensor."""
-        base = torch.randn(4, 6, device="neuron")
+        base = torch.randn(4, 6).to("neuron")
         expected_base = base.to("cpu").clone()
         view = base[2:4, :]
 

@@ -68,23 +68,21 @@ def _placeholder_outputs(output_specs: list, device) -> list:
 
 
 def build_compile_only_handle(gm: torch.fx.GraphModule, lowering, artifact):
-    """Build the boxed callable the neuron backend returns in compile-only mode.
-
-    The callable produces the graph's declared outputs without executing the
-    graph or touching a device, and attaches the compiled ``artifact`` (NEFF
-    handle) and the flat inputs to the first tensor output so a caller-owned
-    runtime can execute the NEFF.
+    """Build a boxed callable for Dynamo backend compile-only mode.
 
     Args:
-        gm: the pre-lowering graph module (unused for output specs; kept for the
-            call signature). Output specs come from ``lowering.io_spec``, which
-            describes the NEFF outputs the real executor produces.
-        lowering: the shared ``_lower_fx_to_neff`` result; supplies the NEFF
-            io_spec and ``pass_mutations``, the ordered per-pass IO
-            mutations that restore the original output signature (None
-            re-insertion, script-object pass-throughs, etc.).
-        artifact: the ``CompilationArtifact`` handle to attach for caller-driven
+        gm (torch.fx.GraphModule): Pre-lowering graph accepted for backend signature
+            compatibility and otherwise unused.
+        lowering (object): Lowering result containing the graph, cache key, and mutations.
+        artifact (CompilationArtifact): Submitted compilation artifact for caller-driven
             execution.
+
+    Returns:
+        Callable: Boxed callable that synthesizes the graph's declared outputs.
+
+    Note:
+        The callable does not execute the graph. It attaches ``artifact`` and the flat
+        inputs to the first tensor output for use by a caller-owned runtime.
     """
     logger.warning(
         "Compile-only mode: NEFF compiling (cache_key=%s); returning placeholder "
@@ -98,6 +96,14 @@ def build_compile_only_handle(gm: torch.fx.GraphModule, lowering, artifact):
     pass_mutations = lowering.pass_mutations
 
     def handle(inputs):
+        """Return placeholder outputs carrying the compiled artifact and inputs.
+
+        Args:
+            inputs (Iterable): Flat inputs used to select a device and restore outputs.
+
+        Returns:
+            tuple: Declared outputs after applying the lowering pass mutations.
+        """
         flat_inputs = list(inputs)
         device = next((t.device for t in flat_inputs if isinstance(t, torch.Tensor)), "meta")
         outputs = _placeholder_outputs(output_specs, device)

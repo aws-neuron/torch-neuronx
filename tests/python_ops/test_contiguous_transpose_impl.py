@@ -1,19 +1,13 @@
 """Tests ensuring transpose-based contiguous path is used when applicable."""
 
-import os
-from unittest.mock import patch
-
 import pytest
 import torch
 
 import torch_neuronx
 from tests.utils.neuron_test_utils import (
     assert_op_runs_on_neuron,
-    get_cache_size,
     track_neuron_ops,
 )
-
-_CPP_DISPATCH = os.environ.get("TORCH_NEURONX_CPP_DISPATCH", "1") == "1"
 
 
 @pytest.mark.usefixtures("enable_metrics_for_class")
@@ -68,113 +62,6 @@ class TestContiguousTranspose:
             assert torch.allclose(result_2.cpu(), expected_2)
 
             assert_op_runs_on_neuron("aten::contiguous")
-
-    # ── Original tests: monkeypatch _get_kernel, only work without C++ dispatch ──
-
-    @pytest.mark.skipif(
-        _CPP_DISPATCH,
-        reason="Monkepatching _get_kernel returns a plain "
-        "function that lacks lower/infer_output_dtypes needed by C++ dispatch",
-    )
-    def test_contiguous_transpose_uses_mlir_kernel(self, monkeypatch):
-        """Transpose case should use the transpose kernel (MLIR), not the generic copy."""
-        from torch_neuronx.python_ops import contiguous as contiguous_mod
-        from torch_neuronx.python_ops.contiguous_transpose import ContiguousTransposeMLIRImpl
-
-        transpose_called = {"count": 0}
-        generic_called = {"count": 0}
-
-        impl_class = ContiguousTransposeMLIRImpl
-        orig_get_kernel = impl_class._get_kernel
-
-        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
-            k = orig_get_kernel(self)
-
-            def wrapper(*args, **kwargs):
-                transpose_called["count"] += 1
-                return k(*args, **kwargs)
-
-            return wrapper
-
-        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
-
-        orig_generic = contiguous_mod.contiguous_generic_kernel
-
-        def wrapped_generic(*args, **kwargs):
-            generic_called["count"] += 1
-            return orig_generic(*args, **kwargs)
-
-        monkeypatch.setattr(
-            contiguous_mod, "contiguous_generic_kernel", wrapped_generic, raising=True
-        )
-
-        # Execute
-        x = torch.randn(128, 256, device="neuron")
-        y_view = x.transpose(0, 1)
-        y = y_view.contiguous()
-
-        assert y.is_contiguous()
-        assert y.shape == (256, 128)
-        assert torch.allclose(y, y_view)
-
-        # Validate paths taken
-        assert transpose_called["count"] >= 1, "Expected MLIR transpose kernel to be invoked"
-        assert generic_called["count"] == 0, "Generic fallback should not be used for transpose"
-
-    @pytest.mark.skipif(
-        _CPP_DISPATCH,
-        reason="Monkepatching _get_kernel returns a plain "
-        "function that lacks lower/infer_output_dtypes needed by C++ dispatch",
-    )
-    def test_contiguous_non_permutation_uses_generic(self, monkeypatch):
-        """Non-permutation view should use generic path, NOT MLIR transpose kernel"""
-        from torch_neuronx.python_ops import contiguous as contiguous_mod
-        from torch_neuronx.python_ops.contiguous_transpose import ContiguousTransposeMLIRImpl
-
-        transpose_called = {"count": 0}
-        generic_called = {"count": 0}
-
-        impl_class = ContiguousTransposeMLIRImpl
-        orig_get_kernel = impl_class._get_kernel
-
-        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
-            k = orig_get_kernel(self)
-
-            def wrapper(*args, **kwargs):
-                transpose_called["count"] += 1
-                return k(*args, **kwargs)
-
-            return wrapper
-
-        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
-
-        orig_generic = contiguous_mod.contiguous_generic_kernel
-
-        def wrapped_generic(*args, **kwargs):
-            generic_called["count"] += 1
-            return orig_generic(*args, **kwargs)
-
-        monkeypatch.setattr(
-            contiguous_mod, "contiguous_generic_kernel", wrapped_generic, raising=True
-        )
-
-        # Execute: strided slice is not a pure permutation
-        x_cpu = torch.arange(24, dtype=torch.float32).reshape(4, 6)
-        x = x_cpu.to("neuron")
-        y = x[:, ::2]
-        assert not y.is_contiguous()
-
-        z = y.contiguous()
-        assert z.is_contiguous()
-        assert torch.allclose(z, y)
-
-        # Validate paths taken
-        assert (
-            transpose_called["count"] == 0
-        ), "MLIR transpose kernel should not be used for non-permutation"
-        assert generic_called["count"] >= 1, "Generic fallback should handle non-permutation views"
-
-    # ── Remaining tests: no monkeypatching, work with both paths ──
 
     def test_contiguous_transpose_2d_and_autograd(self):
         """2D transpose path should preserve values and gradients."""
@@ -242,66 +129,3 @@ class TestContiguousTranspose:
         yg = xg.permute(*perm0).contiguous()
         yg.sum().backward()
         assert xg.grad is not None and torch.allclose(xg.grad.cpu(), torch.ones_like(xg).cpu())
-
-    @pytest.mark.skipif(
-        _CPP_DISPATCH,
-        reason="Monkepatching _get_kernel returns a plain "
-        "function that lacks lower/infer_output_dtypes needed by C++ dispatch",
-    )
-    def test_incorrect_fallback_to_generic_kernel(self, monkeypatch):
-        """Test incorrect fallback to generic kernel"""
-        from torch_neuronx.python_ops.contiguous_transpose import ContiguousTransposeMLIRImpl
-
-        compile_called = {"count": 0}
-
-        impl_class = ContiguousTransposeMLIRImpl
-        orig_get_kernel = impl_class._get_kernel
-
-        def wrapped_get_kernel(self, orig_get_kernel=orig_get_kernel):
-            kernel = orig_get_kernel(self)
-
-            def wrapper(*args, **kwargs):
-                orig_cache_size = get_cache_size()
-                result = kernel(*args, **kwargs)
-                updated_cache_size = get_cache_size()
-                if updated_cache_size > orig_cache_size:
-                    compile_called["count"] += 1
-                return result
-
-            return wrapper
-
-        monkeypatch.setattr(impl_class, "_get_kernel", wrapped_get_kernel, raising=True)
-
-        def mock_contiguous_generic_kernel(
-            src, dst, shape, src_strides, dst_strides, src_storage_offset=0
-        ):
-            """Mock that returns corrupted output to detect generic kernel was used"""
-            dst.cpu().zero_()  # Fill with zeros instead of correct values
-            return dst
-
-        with patch(
-            "torch_neuronx.python_ops.contiguous.contiguous_generic_kernel",
-            side_effect=mock_contiguous_generic_kernel,
-        ):
-            base_tensor = torch.arange(
-                1 * 2048 * 32 * 128, dtype=torch.bfloat16, device="neuron"
-            ).reshape(1, 2048, 32, 128)
-
-            # Step 1: Cache the first permutation
-            view_1 = base_tensor.permute(0, 2, 3, 1)
-            compile_called["count"] = 0
-            view_1.contiguous()
-            assert (
-                compile_called["count"] == 1
-            ), f"Expected 1 compilation, got {compile_called['count']}"
-
-            # Step 2: This should compile a new neff and successfully execute
-            view_2 = base_tensor.permute(0, 2, 1, 3)
-            compile_called["count"] = 0
-            result_2 = view_2.contiguous()
-            assert (
-                compile_called["count"] == 1
-            ), f"Expected 1 compilation, got {compile_called['count']}"
-
-            expected_2 = base_tensor.cpu().permute(0, 2, 1, 3).contiguous()
-            assert torch.allclose(result_2.cpu(), expected_2)

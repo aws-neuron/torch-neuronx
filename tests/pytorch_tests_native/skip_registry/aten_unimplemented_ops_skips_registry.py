@@ -30,7 +30,7 @@ SKIP_GROUPS: list[SkipGroup] = [
     # igamma/c), secondary activations (hardshrink, hardswish,
     # hardtanh, leaky_relu, mish, selu, elu, glu, softshrink, rrelu,
     # relu6, prelu), rounding/floor (floor, nan_to_num, fmod),
-    # log/exp variants (expm1, log10/1p/2, logaddexp, logaddexp2),
+    # log/exp variants (log10/1p/2, logaddexp),
     # bitwise/integer-only (gcd, lcm, hash_tensor), and misc (copysign,
     # fmax, fmin, heaviside, hypot, nextafter, angle, isin, sinc,
     # addbmm, max_unpool2d/3d, kl_div, pairwise_distance, ormqr,
@@ -52,27 +52,14 @@ SKIP_GROUPS: list[SkipGroup] = [
             "*_copysign__neuron*",
             "*_digamma_neuron*",
             "*_digamma__neuron*",
-            "*_elu_neuron*",
-            "*_elu_backward_neuron*",
             "*_erfc_neuron*",
             "*_erfc__neuron*",
-            "*_expm1_neuron*",
             "*_floor_divide__neuron*",
             "*_fmax_neuron*",
             "*_fmin_neuron*",
             "*_fmod_neuron*",
             "*_gcd_neuron*",
             "*_gcd__neuron*",
-            "*_glu_neuron*",
-            "*_glu_backward_neuron*",
-            "*_hardshrink_neuron*",
-            "*_hardshrink_backward_neuron*",
-            "*_hardswish_neuron*",
-            "*_hardswish__neuron*",
-            "*_hardswish_backward_neuron*",
-            "*_hardtanh_neuron*",
-            "*_hardtanh__neuron*",
-            "*_hardtanh_backward_neuron*",
             "*_hash_tensor_neuron*",
             "*_heaviside_neuron*",
             "*_heaviside__neuron*",
@@ -85,7 +72,6 @@ SKIP_GROUPS: list[SkipGroup] = [
             "*_igamma__neuron*",
             "*_igammac_neuron*",
             "*_igammac__neuron*",
-            "*_isin_neuron*",
             "*_kl_div_neuron*",
             "*_lcm_neuron*",
             "*_lcm__neuron*",
@@ -96,11 +82,8 @@ SKIP_GROUPS: list[SkipGroup] = [
             "*_log1p_neuron*",
             "*_log2_neuron*",
             "*_logaddexp_neuron*",
-            "*_logaddexp2_neuron*",
             "*_max_unpool2d_neuron*",
             "*_max_unpool3d_neuron*",
-            "*_mish_neuron*",
-            "*_mish__neuron*",
             "*_multilabel_margin_loss_forward_neuron*",
             "*_mvlgamma_neuron*",
             "*_nan_to_num_neuron*",
@@ -110,15 +93,12 @@ SKIP_GROUPS: list[SkipGroup] = [
             "*_ormqr_neuron*",
             "*_pairwise_distance_neuron*",
             "*_polygamma_neuron*",
-            "*_relu6_neuron*",
             "*_rrelu_neuron*",
             "*_rrelu__neuron*",
             "*_rrelu_with_noise_neuron*",
             "*_rrelu_with_noise__neuron*",
             "*_rrelu_with_noise_backward_neuron*",
             "*_rrelu_with_noise_functional_neuron*",
-            "*_selu_neuron*",
-            "*_selu__neuron*",
             "*_sinc_neuron*",
             "*_smooth_l1_loss_backward_neuron*",
             "*_softshrink_neuron*",
@@ -127,7 +107,10 @@ SKIP_GROUPS: list[SkipGroup] = [
             "*_special_bessel_j1_neuron*",
             "*_special_entr_neuron*",
             "*_special_erfc_neuron*",
-            "*_special_erfcx_neuron*",
+            "*_special_erfcx_neuron_int*",
+            "*_special_erfcx_neuron_uint*",
+            "*_special_erfcx_neuron_bool*",
+            "*_special_erfcx_neuron_float64*",
             "*_special_gammainc_neuron*",
             "*_special_gammaincc_neuron*",
             "*_special_i0e_neuron*",
@@ -143,7 +126,7 @@ SKIP_GROUPS: list[SkipGroup] = [
         match_target="test_method",
     ),
     # ═══════════════════════════════════════════════════════════════
-    # NN ops not natively lowered on Neuron (33 ops).
+    # NN ops not natively lowered on Neuron (32 ops).
     # ═══════════════════════════════════════════════════════════════
     # Includes pooling variants (avg_pool1d/2d/3d + backward,
     # max_pool*_with_indices + backward, adaptive_max_pool2d/3d +
@@ -154,7 +137,7 @@ SKIP_GROUPS: list[SkipGroup] = [
     # native_batch_norm), loss functions (binary_cross_entropy[_backward],
     # huber_loss, smooth_l1_loss, soft_margin_loss, multi_margin_loss,
     # nll_loss2d_forward/backward), the upsample variants still without a
-    # lowering (upsample_trilinear3d and the anti-aliased _upsample_bilinear2d_aa
+    # lowering (the anti-aliased _upsample_bilinear2d_aa
     # / _upsample_bicubic2d_aa pair with their backwards), and prelu family
     # (prelu, _prelu_kernel,
     # _prelu_kernel_backward).
@@ -198,7 +181,6 @@ SKIP_GROUPS: list[SkipGroup] = [
             "*_prelu_neuron*",
             "*_smooth_l1_loss_neuron*",
             "*_soft_margin_loss_neuron*",
-            "*_upsample_trilinear3d_neuron*",
         ],
         match_target="test_method",
     ),
@@ -271,13 +253,12 @@ SKIP_GROUPS: list[SkipGroup] = [
         match_target="test_method",
     ),
     # ═══════════════════════════════════════════════════════════════
-    # Reduction ops not natively lowered on Neuron (10 ops).
+    # Reduction ops not natively lowered on Neuron (6 ops).
     # ═══════════════════════════════════════════════════════════════
-    # Includes index-returning reductions (argmax, argmin, aminmax,
-    # _aminmax), and special reduction helpers (_cummax_helper,
-    # _cummin_helper, _logcumsumexp, nansum, bincount, renorm).
+    # Includes index-returning reductions (aminmax, _aminmax), and
+    # special reduction helpers (_logcumsumexp, nansum, bincount, renorm).
     # Core reductions ARE supported natively: sum, mean, amax, amin, all,
-    # any, cumsum.
+    # any, cumsum, cummax, cummin, argmax, argmin.
     SkipGroup(
         reason=(
             "Reduction ops not natively lowered on Neuron — bounce"
@@ -285,12 +266,8 @@ SKIP_GROUPS: list[SkipGroup] = [
         ),
         patterns=[
             "*__aminmax_neuron*",
-            "*__cummax_helper_neuron*",
-            "*__cummin_helper_neuron*",
             "*__logcumsumexp_neuron*",
             "*_aminmax_neuron*",
-            "*_argmax_neuron*",
-            "*_argmin_neuron*",
             "*_bincount_neuron*",
             "*_nansum_neuron*",
             "*_renorm_neuron*",

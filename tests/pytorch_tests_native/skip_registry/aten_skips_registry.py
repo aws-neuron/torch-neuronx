@@ -5,6 +5,33 @@ from tests.pytorch_tests_native.skip_registry import xfail_tests as x
 SKIP_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=(
+            "[Compiler Bug] Neuron min/max/clamp drop NaN. min/max/clamp -- and"
+            " the reductions (amax/amin), clamp-based activations"
+            " (hardsigmoid/celu/hardtanh/relu6), and losses (margin_ranking_loss/"
+            "hinge_embedding_loss) that decompose to them -- follow IEEE-754"
+            " maxNum: a NaN operand is dropped and the non-NaN operand / clamp"
+            " bound is returned instead of propagating NaN. StableHLO requires"
+            " NaN propagation, so the fix is a spec-conformant NaN-propagating"
+            " stablehlo.min/max in the compiler, which would clear all of these"
+            " at once (eager + compile). Tracked as unsupported for now."
+        ),
+        tests=x.MINMAX_CLAMP_NAN_PROPAGATION,
+    ),
+    SkipGroup(
+        reason=(
+            "[platform.float64] float64 is not natively supported on Neuron (64-bit types"
+            " are computed on a 32-bit datapath), so float64 floor_divide/remainder/div-floor"
+            " leave a residual that exceeds test_decomp's strict DecompCrossRefMode tolerance."
+        ),
+        tests=[
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_div_floor_rounding_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_floor_divide_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_remainder_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_quick_div_floor_rounding_neuron_float64",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "Neuron does the index bounds check on-device (async), like CUDA/XPU,"
             " so an out-of-bounds fancy index does not raise a synchronous"
             " IndexError at the op call. The upstream test already skips CUDA/XPU"
@@ -25,9 +52,70 @@ SKIP_GROUPS: list[SkipGroup] = [
             " their backward pass produces complex intermediates"
             " (aten::_linalg_solve_ex) that Neuron cannot execute natively."
         ),
-        patterns=["*cdouble*", "*cfloat*", "*chalf*", "*complex*", "*fft_*"],
+        # ``_fft_r2c`` (rfft) now lowers natively, so it is unskipped. Keep the
+        # other FFT variants skipped: c2c, c2r, rfft2, and rfftn are not lowered.
+        patterns=[
+            "*cdouble*",
+            "*cfloat*",
+            "*chalf*",
+            "*complex*",
+            "*fft_fft*",
+            "*fft_ifft*",
+            "*fft_hfft*",
+            "*fft_ihfft*",
+            "*fft_irfft*",
+            "*fft_rfft2*",
+            "*fft_rfftn*",
+        ],
         match_target="test_method",
         tests=s.ATEN_COMPLEX_DTYPE_UNSUPPORTED,
+    ),
+    SkipGroup(
+        reason=(
+            "uint16, uint32 and uint64 are not supported on Neuron hardware."
+            " Tensor creation already raises 'Unsupported ScalarType', and the"
+            " dispatcher cast policy has no target for them: unlike int64 they"
+            " cannot fold to int32 without changing the value range."
+        ),
+        tests=[
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_unique_neuron_uint16",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_unique_neuron_uint32",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_unique_neuron_uint64",
+            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_unique_neuron_uint16",
+            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_unique_neuron_uint32",
+            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_unique_neuron_uint64",
+            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_unique_neuron_uint16",
+            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_unique_neuron_uint32",
+            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_unique_neuron_uint64",
+            "test_meta.py::TestMetaNEURON::test_meta_outplace_unique_neuron_uint16",
+            "test_meta.py::TestMetaNEURON::test_meta_outplace_unique_neuron_uint32",
+            "test_meta.py::TestMetaNEURON::test_meta_outplace_unique_neuron_uint64",
+            "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_cat_out_fast_path_dim0_dim1_neuron_uint16",
+            "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_cat_out_fast_path_dim0_dim1_neuron_uint32",
+            "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_cat_out_fast_path_dim0_dim1_neuron_uint64",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_item_neuron_uint16",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_item_neuron_uint32",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_item_neuron_uint64",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "float8_e4m3fnuz and float8_e5m2fnuz are AMD ROCm-specific float8"
+            " variants. Neuron implements the OCP float8 types, so tensor"
+            " creation raises 'Unsupported ScalarType' for these two."
+        ),
+        tests=[
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_eye_neuron_float8_e4m3fnuz",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_eye_neuron_float8_e5m2fnuz",
+            "test_decomp.py::TestDecompNEURON::test_quick_eye_neuron_float8_e4m3fnuz",
+            "test_decomp.py::TestDecompNEURON::test_quick_eye_neuron_float8_e5m2fnuz",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_eye_neuron_float8_e4m3fnuz",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_eye_neuron_float8_e5m2fnuz",
+            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_eye_neuron_float8_e4m3fnuz",
+            "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_eye_neuron_float8_e5m2fnuz",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_item_neuron_float8_e4m3fnuz",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_item_neuron_float8_e5m2fnuz",
+        ],
     ),
     SkipGroup(
         reason="CUDA graphs are not supported on Neuron hardware",
@@ -141,6 +229,12 @@ SKIP_GROUPS: list[SkipGroup] = [
             "TestSparseMaskedReductionsNEURON",
             "TestSparseNEURON",
             "TestSparseUnaryUfuncsNEURON",
+            # to_sparse builds a sparse result, so the real op raises before the
+            # meta comparison starts: aten::_sparse_coo_tensor_with_dims_and_tensors
+            # has no kernel for the Sparseneuron backend.
+            "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_to_sparse_neuron_*",
+            "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_to_sparse_neuron_*",
+            "test_meta.py::TestMetaNEURON::test_meta_outplace_to_sparse_neuron_*",
         ],
     ),
     SkipGroup(
@@ -182,8 +276,8 @@ SKIP_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "int64→int32 downcast overflow: test values exceed int32 range,"
-            " producing wrong results due to two's complement truncation"
+            "int64->int32 downcast overflow: test values exceed int32 range."
+            " Neuron wraps with two's complement or raises a conversion error"
         ),
         tests=s.ATEN_INT64_OVERFLOW,
     ),
@@ -259,14 +353,32 @@ SKIP_GROUPS: list[SkipGroup] = [
             " when complex intermediate tensors flow through aten::stack,"
             " aten::abs, or aten::contiguous."
         ),
+        tests=s.COMPLEX_OUTPUT_OPS,
+    ),
+    SkipGroup(
+        reason=(
+            "aten::_fft_r2c (rfft) runs natively on Neuron for the common cases."
+            " These rfft variants still fail. Each needs a feature that Neuron"
+            " does not have yet: complex-to-complex FFT (aten::_fft_c2c) for the"
+            " noncontiguous-samples and variant-consistency checks, the rfft"
+            " backward in the fake crossref and gradient checks, and the decomp"
+            " crossref; the .out compile path; the"
+            " OpInfo declared dtype set; and more than one Neuron device."
+        ),
         tests=[
-            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_batch_vs_slicing__refs__conversions_polar_neuron_float32",
-            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_batch_vs_slicing__refs__conversions_polar_neuron_float64",
-            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_batch_vs_slicing_polar_neuron_float32",
-            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_batch_vs_slicing_polar_neuron_float64",
-            "test_decomp.py::TestDecompNEURON::test_comprehensive_linalg_eig_neuron_float32",
-            "test_decomp.py::TestDecompNEURON::test_comprehensive_linalg_eig_neuron_float64",
-            "test_ops.py::TestCommonNEURON::test_out_linalg_eig_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_dtypes_fft_rfft_neuron",
+            "test_ops.py::TestCommonNEURON::test_multiple_devices_fft_rfft_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_multiple_devices_fft_rfft_neuron_int64",
+            "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_fft_rfft_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_out_fft_rfft_neuron_float32",
+            "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_fft_rfft_neuron_float32",
+            "test_ops.py::TestFakeTensorNEURON::test_fake_crossref_backward_amp_fft_rfft_neuron_float32",
+            "test_ops.py::TestFakeTensorNEURON::test_fake_crossref_backward_no_amp_fft_rfft_neuron_float32",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_fft_rfft_neuron_float32",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_fft_rfft_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_fft_rfft_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_fft_rfft_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_fft_rfft_neuron_float64",
         ],
     ),
     SkipGroup(
@@ -339,7 +451,7 @@ SKIP_GROUPS: list[SkipGroup] = [
     ),
     SkipGroup(
         reason=(
-            "Upstream OpInfo for zeros/ones/full declares"
+            "Upstream OpInfo for zeros/ones/full/eye declares"
             " @expectedFailure for test_out_warning because CPU/CUDA do not"
             " fire the 'Resized a non-empty tensor but did not warn about it'"
             " UserWarning. Neuron correctly fires the warning, so the test"
@@ -353,7 +465,19 @@ SKIP_GROUPS: list[SkipGroup] = [
             "test_ops.py::TestCommonNEURON::test_out_warning_zeros_neuron",
             "test_ops.py::TestCommonNEURON::test_out_warning_ones_neuron",
             "test_ops.py::TestCommonNEURON::test_out_warning_full_neuron",
+            "test_ops.py::TestCommonNEURON::test_out_warning_eye_neuron",
         ],
+    ),
+    SkipGroup(
+        reason=(
+            "Upstream OpInfo declares @expectedFailure for test_compare_cpu"
+            " on these ops (linalg.lu family and special polynomials)."
+            " Neuron correctly computes the result, so the test passes —"
+            " but pytest reports 'Unexpected success' as a failure."
+            " PT 2.14 widened test_compare_cpu from @onlyCUDA to"
+            " @onlyAccelerator, exposing this on Neuron for the first time."
+        ),
+        tests=s.ATEN_COMPARE_CPU_UNEXPECTED_SUCCESS,
     ),
     SkipGroup(
         reason=(
@@ -422,6 +546,267 @@ SKIP_GROUPS: list[SkipGroup] = [
             "test_reductions.py::TestReductionsNEURON::test_dim_ndim_limit_masked_mean_neuron",
             "test_reductions.py::TestReductionsNEURON::test_dim_ndim_limit_masked_std_neuron",
             "test_reductions.py::TestReductionsNEURON::test_dim_ndim_limit_masked_var_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[platform.float64 + on-device RNG] float64 is not natively supported on Neuron "
+            "(64-bit tensors run on a 32-bit datapath), and the on-device RNG draws "
+            "different inputs than the CPU-RNG reference, so these fp64 gradcheck/reduction/"
+            "comparison tests exceed tolerance. Skipped as a platform limitation (not an op bug). "
+        ),
+        tests=[
+            "test_foreach.py::TestForeachNEURON::test_autodiff__foreach_lgamma_outplace_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_linalg_lu_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_linalg_lu_factor_ex_neuron_float64",
+            "test_tensor_creation_ops.py::TestTensorCreationNEURON::test_random_default_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_quick_core_backward_logaddexp2_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_quick_logaddexp2_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_nn_functional_hardtanh_neuron_float64",
+            "test_reductions.py::TestReductionsNEURON::test_ref_large_input_1D__refs_sum_neuron_float64",
+            "test_reductions.py::TestReductionsNEURON::test_ref_large_input_1D_masked_sum_neuron_float64",
+            "test_reductions.py::TestReductionsNEURON::test_ref_large_input_1D_sum_neuron_float64",
+            "nn/test_init.py::TestNNInitDeviceTypeNEURON::test_trunc_normal_all_dtypes_dims_1_float64_neuron_float64",
+            "nn/test_init.py::TestNNInitDeviceTypeNEURON::test_trunc_normal_all_dtypes_dims_2_float64_neuron_float64",
+            "nn/test_init.py::TestNNInitDeviceTypeNEURON::test_trunc_normal_unique_values_float64_min_unique_5000_neuron_float64",
+            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_div_rounding_numpy_neuron_float64",
+            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_reference_numerics_extremal_values__refs_remainder_neuron_float64",
+            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_reference_numerics_extremal_values_floor_divide_neuron_float64",
+            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_reference_numerics_extremal_values_remainder_neuron_float64",
+            "test_binary_ufuncs.py::TestBinaryUfuncs*NEURON::test_reference_numerics_large_values_floor_divide_neuron_float64",
+            "test_binary_ufuncs.py::TestBinaryUfuncsDeviceNEURON::test_reference_numerics_floor_divide_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_addmm_decomposed_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_addmm_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_baddbmm_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_constant_pad_nd_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_native_layer_norm_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_layer_norm_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_pad_constant_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_rms_norm_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_softmin_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_softmin_with_dtype_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_quick_addmm_decomposed_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_quick_addmm_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_quick_baddbmm_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_quick_constant_pad_nd_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_quick_mv_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_quick_nn_functional_pad_constant_neuron_float64",
+            "test_decomp.py::TestDecompNEURON::test_quick_vdot_neuron_float64",
+            "test_linalg.py::TestLinalgNEURON::test_linalg_lu_solve_neuron_float64",
+            "test_modules.py::TestModuleNEURON::test_grad_nn_BCEWithLogitsLoss_neuron_float64",
+            "test_modules.py::TestModuleNEURON::test_grad_nn_GaussianNLLLoss_neuron_float64",
+            "test_modules.py::TestModuleNEURON::test_grad_nn_HuberLoss_neuron_float64",
+            "test_modules.py::TestModuleNEURON::test_grad_nn_LeakyReLU_neuron_float64",
+            "test_modules.py::TestModuleNEURON::test_grad_nn_NLLLoss_neuron_float64",
+            "test_modules.py::TestModuleNEURON::test_grad_nn_PReLU_neuron_float64",
+            "test_modules.py::TestModuleNEURON::test_grad_nn_SmoothL1Loss_neuron_float64",
+            "test_modules.py::TestModuleNEURON::test_gradgrad_nn_AvgPool2d_neuron_float64",
+            "test_modules.py::TestModuleNEURON::test_gradgrad_nn_BatchNorm1d_eval_mode_neuron_float64",
+            "test_modules.py::TestModuleNEURON::test_gradgrad_nn_BatchNorm3d_eval_mode_neuron_float64",
+            "test_modules.py::TestModuleNEURON::test_gradgrad_nn_GaussianNLLLoss_neuron_float64",
+            "test_modules.py::TestModuleNEURON::test_gradgrad_nn_PoissonNLLLoss_neuron_float64",
+            "test_modules.py::TestModuleNEURON::test_gradgrad_nn_RNN_eval_mode_neuron_float64",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_constant_pad_nd_neuron_float64",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_floor_divide_neuron_float64",
+            "test_ops.py::TestCommonNEURON::test_python_ref__refs_linalg_vector_norm_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad___getitem___neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad___rmul___neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_acos_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_addcmul_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_cholesky_solve_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_clamp_max_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_clamp_min_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_clamp_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_frexp_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_kron_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_linalg_eigh_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_linalg_tensorsolve_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_linalg_vector_norm_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_lu_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_max_binary_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_maximum_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_min_binary_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_minimum_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_mul_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_nn_functional_max_pool3d_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_nn_functional_threshold_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_remainder_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_scatter_reduce_amax_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_scatter_reduce_amin_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_svd_lowrank_neuron_float64",
+            "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_nn_functional_interpolate_trilinear_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad___getitem___neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad__native_batch_norm_legit_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad__upsample_bilinear2d_aa_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_addmm_decomposed_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_addmm_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_addmv_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_clamp_max_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_clamp_min_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_dist_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_dot_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_frexp_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_inner_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_linalg_solve_triangular_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_linalg_tensorsolve_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_linalg_vector_norm_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_lu_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_masked_std_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_masked_var_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_matrix_exp_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_mode_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_native_layer_norm_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_nn_functional_batch_norm_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_nn_functional_binary_cross_entropy_with_logits_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_nn_functional_grid_sample_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_nn_functional_interpolate_trilinear_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_nn_functional_threshold_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_norm_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_scatter_reduce_amax_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_scatter_reduce_amin_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_trapezoid_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_trapz_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad___getitem___neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad__native_batch_norm_legit_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_cholesky_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_clamp_max_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_clamp_min_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_clamp_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_corrcoef_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_cumprod_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_div_no_rounding_mode_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_frexp_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_index_reduce_amax_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_index_reduce_amin_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_lerp_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_linalg_cholesky_ex_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_linalg_cholesky_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_masked_var_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_matrix_exp_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_max_binary_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_max_reduction_no_dim_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_maximum_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_min_binary_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_min_reduction_no_dim_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_minimum_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_batch_norm_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_grid_sample_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_interpolate_trilinear_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_layer_norm_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_threshold_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_unfold_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_pca_lowrank_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_scatter_reduce_amax_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_scatter_reduce_amin_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_std_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_triangular_solve_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_true_divide_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_addmm_decomposed_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_addmm_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_clamp_max_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_clamp_min_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_mul_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_nn_functional_threshold_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_polygamma_polygamma_n_0_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_scatter_reduce_amax_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_scatter_reduce_amin_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_grad_tan_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_clamp_max_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_clamp_min_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_clamp_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_index_reduce_amax_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_index_reduce_amin_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_mul_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_nn_functional_threshold_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_polygamma_polygamma_n_0_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_remainder_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_scatter_reduce_amax_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_scatter_reduce_amin_neuron_float64",
+            "test_ops_gradients.py::TestBwdGradientsNEURON::test_inplace_gradgrad_tan_neuron_float64",
+            "test_reductions.py::TestReductionsNEURON::test_histc_min_max_corner_cases_neuron_float64",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_diff_neuron_float64",
+            "test_torch.py::TestTorchDeviceTypeNEURON::test_diff_noncontig_neuron_float64",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_tan_neuron_float64",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal__refs_trunc_neuron_float64",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_tan_neuron_float64",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_extremal_trunc_neuron_float64",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large__refs_ceil_neuron_float64",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large__refs_trunc_neuron_float64",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_ceil_neuron_float64",
+            "test_unary_ufuncs.py::TestUnaryUfuncsNEURON::test_reference_numerics_large_trunc_neuron_float64",
+        ],
+    ),
+    SkipGroup(
+        reason="Tests use torch.compile with a non-Neuron backend (eager/inductor/aot_eager)",
+        tests=s.ATEN_NON_NEURON_COMPILE_BACKEND,
+    ),
+    SkipGroup(
+        reason="Assumes torch is linked with CUDA — not applicable on Neuron",
+        tests=[
+            "FakeTensorOperatorInvariants::test_fake_gpu_no_init",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][platform.float64] float64 gradgrad tests added in PT 2.14."
+            " Neuron does not support native float64; the float64->float32"
+            " precision loss causes gradcheck failures. xfail (not skip)"
+            " so a future float64 story would xpass and flag it."
+        ),
+        tests=[
+            "test_autograd.py::TestAutogradDeviceTypeNEURON::test_cdist_gradgrad_neuron_float64",
+            "test_autograd.py::TestAutogradDeviceTypeNEURON::test_pdist_gradgrad_neuron_float64",
+            # test_pdist_neuron uses torch.double internally; gradcheck fails
+            # due to float64→float32 precision loss (same root cause)
+            "test_nn.py::TestNNDeviceTypeNEURON::test_pdist_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Neuron registers ops without schemas (schemaless boxed dispatch)."
+            " test_find_dangling_impls expects all registered ops to have a schema."
+        ),
+        tests=[
+            "TestDispatch::test_find_dangling_impls",
+            "TestDispatch::test_find_dangling_impls_ext",
+        ],
+    ),
+    SkipGroup(
+        reason="Requires z3-solver package (not installed on Neuron hosts)",
+        tests=[
+            "TestSymbolicTracing::test_constant_specialization",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][platform.float64] New NEURON device-type test instantiations added"
+            " in PT 2.14. Neuron does not support native float64; the"
+            " float64->float32 precision loss causes accuracy mismatches,"
+            " Jacobian failures, or compilation errors. xfail (not skip)"
+            " so a future float64 story would xpass and flag it."
+        ),
+        tests=s.ATEN_PLATFORM_FLOAT64_NEW_INSTANTIATIONS,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14][platform.float64] New NEURON device-type test instantiations added"
+            " in PT 2.14 iter2. Neuron does not support native float64; the"
+            " float64->float32 precision loss causes accuracy mismatches,"
+            " Jacobian failures, ComplexDouble cast errors, or compilation"
+            " errors. xfail (not skip) so a future float64 story would xpass."
+        ),
+        tests=s.ATEN_PLATFORM_FLOAT64_NEW_INSTANTIATIONS_ITER2,
+    ),
+    SkipGroup(
+        reason=(
+            "float8_e4m3fnuz and float8_e5m2fnuz are AMD ROCm-specific float8"
+            " variants not supported on Neuron hardware. Unlike the standard OCP"
+            " float8 formats (e4m3fn, e5m2), these fnuz variants use a different"
+            " NaN/zero encoding and are not a Neuron roadmap item."
+        ),
+        patterns=[
+            "*float8_e4m3fnuz*",
+            "*float8_e5m2fnuz*",
         ],
     ),
 ]

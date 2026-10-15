@@ -14,6 +14,7 @@
 #include "torch_neuronx/csrc/core/NeuronTensorImpl.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/LazyTransformationManager.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/OperationTransformations.h"
+#include "torch_neuronx/csrc/core/lazy_materialization/TransformationRegistry.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/TransformationTypes.h"
 
 using namespace torch_neuronx::testing;
@@ -44,6 +45,18 @@ void ExtractInputPtrsAndContexts(const std::vector<at::Tensor>& inputs,
   input_contexts.clear();
   for (const auto& t : inputs) {
     input_ptrs.push_back(t.data_ptr());
+    input_contexts.push_back(at::neuron::TensorContext::FromTensor(t));
+  }
+}
+
+// Build dedup inputs the way PrepareKernelTensors does at runtime: the pointer is
+// the storage base, not the element pointer. See NeuronBindings.cpp.
+void ExtractBaseContexts(const std::vector<at::Tensor>& bases, std::vector<void*>& input_ptrs,
+                         std::vector<at::neuron::TensorContext>& input_contexts) {
+  input_ptrs.clear();
+  input_contexts.clear();
+  for (const auto& t : bases) {
+    input_ptrs.push_back(const_cast<void*>(t.storage().data()));
     input_contexts.push_back(at::neuron::TensorContext::FromTensor(t));
   }
 }
@@ -827,16 +840,15 @@ TEST_F(OperationPrologueTest, ThreeIndependentTransformationChains) {
 //============================================================================
 
 TEST_F(OperationPrologueTest, Dedup_AllSameStorage) {
-  // 4 slice views from one [16,64] tensor → should dedup to 1 input
+  // 4 column slices of one [16,64] tensor. Each column slice is non-contiguous, so
+  // the prologue decomposes it to the SAME base ([16,64] at storage offset 0) plus a
+  // SLICE. Production runs dedup on these decomposed base contexts (see
+  // ProcessInputTransformations), so all 4 share (storage base, offset 0, [16,64])
+  // and dedup to 1 input slot. The 4 distinct SLICE chains still emit 4 outputs.
   auto base = CreateNeuronTensor({16, 64}, c10::ScalarType::Float);
-  std::vector<int64_t> view_shape = {16, 16};
 
-  auto v0 = CreateNeuronView(base, view_shape, 0);
-  auto v1 = CreateNeuronView(base, view_shape, 16);
-  auto v2 = CreateNeuronView(base, view_shape, 32);
-  auto v3 = CreateNeuronView(base, view_shape, 48);
-
-  std::vector<at::Tensor> inputs = {v0, v1, v2, v3};
+  // Dedup sees the decomposed base context for every slice, not the view.
+  std::vector<at::Tensor> inputs = {base, base, base, base};
   std::vector<void*> input_ptrs;
   std::vector<at::neuron::TensorContext> input_contexts;
   ExtractInputPtrsAndContexts(inputs, input_ptrs, input_contexts);
@@ -870,17 +882,14 @@ TEST_F(OperationPrologueTest, Dedup_AllSameStorage) {
 }
 
 TEST_F(OperationPrologueTest, Dedup_InterleavedTwoTensors) {
-  // a0, b0, a1, b1 from two different tensors → should dedup to 2 inputs
+  // a0, b0, a1, b1: column slices of two different tensors. Each slice decomposes to
+  // its own base ([16,64] at offset 0). Dedup sees these base contexts, so the two
+  // storages give 2 slots with map [0,1,0,1].
   auto baseA = CreateNeuronTensor({16, 64}, c10::ScalarType::Float);
   auto baseB = CreateNeuronTensor({16, 64}, c10::ScalarType::Float);
-  std::vector<int64_t> view_shape = {16, 16};
 
-  auto a0 = CreateNeuronView(baseA, view_shape, 0);
-  auto b0 = CreateNeuronView(baseB, view_shape, 0);
-  auto a1 = CreateNeuronView(baseA, view_shape, 16);
-  auto b1 = CreateNeuronView(baseB, view_shape, 16);
-
-  std::vector<at::Tensor> inputs = {a0, b0, a1, b1};
+  // Dedup sees the decomposed base context for every slice, not the view.
+  std::vector<at::Tensor> inputs = {baseA, baseB, baseA, baseB};
   std::vector<void*> input_ptrs;
   std::vector<at::neuron::TensorContext> input_contexts;
   ExtractInputPtrsAndContexts(inputs, input_ptrs, input_contexts);
@@ -940,16 +949,14 @@ TEST_F(OperationPrologueTest, Dedup_NoSharedStorage) {
 }
 
 TEST_F(OperationPrologueTest, Dedup_MixedSharedAndIndependent) {
-  // other, a0, a1, a2 — 1 independent + 3 from same storage → dedup to 2
+  // other + 3 column slices of one tensor. The contiguous `other` stays as-is; each
+  // column slice decomposes to the same base ([16,64] at offset 0). Dedup sees these
+  // base contexts, so the result is 2 slots with map [0,1,1,1].
   auto base = CreateNeuronTensor({16, 64}, c10::ScalarType::Float);
   auto other = CreateNeuronTensor({16, 16}, c10::ScalarType::Float);
-  std::vector<int64_t> view_shape = {16, 16};
 
-  auto a0 = CreateNeuronView(base, view_shape, 0);
-  auto a1 = CreateNeuronView(base, view_shape, 16);
-  auto a2 = CreateNeuronView(base, view_shape, 32);
-
-  std::vector<at::Tensor> inputs = {other, a0, a1, a2};
+  // Dedup sees the decomposed base context for every slice, not the view.
+  std::vector<at::Tensor> inputs = {other, base, base, base};
   std::vector<void*> input_ptrs;
   std::vector<at::neuron::TensorContext> input_contexts;
   ExtractInputPtrsAndContexts(inputs, input_ptrs, input_contexts);
@@ -977,6 +984,64 @@ TEST_F(OperationPrologueTest, Dedup_MixedSharedAndIndependent) {
   EXPECT_EQ(result.input_dedup_map[3], 1);  // a2 → slot 1
   EXPECT_EQ(CountMlirFuncArgs(result.prologue_mlir_str), 2) << "MLIR should have 2 %args. Got:\n"
                                                             << result.prologue_mlir_str;
+}
+
+// End-to-end: drive the REAL decomposition, then dedup on its output. The tests
+// above hand-build the base contexts. These run the full runtime path instead:
+// a non-contiguous view -> TryCreateAnyTransformation -> processed_input (base)
+// -> ComputeInputDedupMap. This checks the decomposition and the dedup together,
+// so the base contexts are the ones the runtime really produces, not a model.
+TEST_F(OperationPrologueTest, Dedup_EndToEnd_SharedStorageColumnSlices) {
+  auto x = at::arange(16 * 64, at::TensorOptions().dtype(c10::ScalarType::Float)).reshape({16, 64});
+  std::vector<at::Tensor> views = {x.slice(1, 0, 16), x.slice(1, 16, 32), x.slice(1, 32, 48),
+                                   x.slice(1, 48, 64)};
+
+  auto& registry = TransformationRegistry::Get();
+  std::vector<at::Tensor> bases;
+  for (size_t i = 0; i < views.size(); ++i) {
+    ASSERT_FALSE(views[i].is_contiguous());
+    auto tr = registry.TryCreateAnyTransformation(views[i], "aten::cat", i);
+    ASSERT_TRUE(tr.has_value()) << "column slice " << i << " must decompose";
+    bases.push_back(tr->processed_input);
+  }
+
+  std::vector<void*> input_ptrs;
+  std::vector<at::neuron::TensorContext> input_contexts;
+  ExtractBaseContexts(bases, input_ptrs, input_contexts);
+
+  std::vector<size_t> dedup_map;
+  size_t deduped_count = 0;
+  ComputeDedup(input_ptrs, input_contexts, dedup_map, deduped_count);
+
+  EXPECT_EQ(deduped_count, 1u) << "4 column slices of one storage share one base";
+  EXPECT_EQ(dedup_map, (std::vector<size_t>{0, 0, 0, 0}));
+}
+
+TEST_F(OperationPrologueTest, Dedup_EndToEnd_TwoStorages) {
+  auto opts = at::TensorOptions().dtype(c10::ScalarType::Float);
+  auto xA = at::arange(16 * 64, opts).reshape({16, 64});
+  auto xB = at::arange(16 * 64, opts).reshape({16, 64});
+  std::vector<at::Tensor> views = {xA.slice(1, 0, 16), xB.slice(1, 0, 16), xA.slice(1, 16, 32),
+                                   xB.slice(1, 16, 32)};
+
+  auto& registry = TransformationRegistry::Get();
+  std::vector<at::Tensor> bases;
+  for (size_t i = 0; i < views.size(); ++i) {
+    auto tr = registry.TryCreateAnyTransformation(views[i], "aten::cat", i);
+    ASSERT_TRUE(tr.has_value()) << "column slice " << i << " must decompose";
+    bases.push_back(tr->processed_input);
+  }
+
+  std::vector<void*> input_ptrs;
+  std::vector<at::neuron::TensorContext> input_contexts;
+  ExtractBaseContexts(bases, input_ptrs, input_contexts);
+
+  std::vector<size_t> dedup_map;
+  size_t deduped_count = 0;
+  ComputeDedup(input_ptrs, input_contexts, dedup_map, deduped_count);
+
+  EXPECT_EQ(deduped_count, 2u) << "two storages give two bases";
+  EXPECT_EQ(dedup_map, (std::vector<size_t>{0, 1, 0, 1}));
 }
 
 TEST_F(OperationPrologueTest, Dedup_SharedStorageDifferentShapes) {

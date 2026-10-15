@@ -94,6 +94,7 @@ def _reshape_mm_output(outputs, original_args):
 
 
 def register():
+    """Register the dynamic-row matrix multiplication adapter."""
     register_dynamic_nki(
         "mm",
         DynamicNkiEntry(

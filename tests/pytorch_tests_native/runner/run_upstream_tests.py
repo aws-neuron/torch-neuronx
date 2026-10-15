@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import shlex
 import shutil
@@ -48,21 +49,29 @@ from pathlib import Path
 
 
 # Anchor path: the workspace root is the repository directory containing
-# tests/, .github/, etc. Computed by walking up from this file (which lives at
+# tests/, tools/, etc. Computed by walking up from this file (which lives at
 # tests/pytorch_tests_native/runner/run_upstream_tests.py) until we find a
-# distinguishing marker — the .github/ directory. This is more robust than
-# counting Path.parent levels, which silently breaks if the file moves.
+# distinguishing marker: the repository's pyproject.toml together with either the
+# torch_neuronx package source or the .github/ directory. This is more robust than counting
+# Path.parent levels, which silently breaks if the file moves. The source tree and the
+# public skills tree carry torch_neuronx/; the wheel-test image installs torch_neuronx and
+# keeps no source copy, but it still has .github/.
 def _find_workspace_root() -> Path:
-    """Walk up from this file until we hit the repo root (identified by .github/).
+    """Walk up to the repo root: pyproject.toml plus torch_neuronx/ or .github/.
 
-    Falls back to a fixed number of parents only if the marker isn't found,
-    so the function can't return arbitrarily high in the filesystem.
+    Raises RuntimeError if no parent contains the marker, so the function cannot
+    return an arbitrarily high directory in the filesystem.
     """
     here = Path(__file__).resolve()
     for parent in here.parents:
-        if (parent / ".github").is_dir():
+        if (parent / "pyproject.toml").is_file() and (
+            (parent / "torch_neuronx" / "__init__.py").is_file() or (parent / ".github").is_dir()
+        ):
             return parent
-    raise RuntimeError(f"Could not locate workspace root from {here} — no parent contains .github/")
+    raise RuntimeError(
+        f"Could not locate workspace root from {here}: no parent contains "
+        "pyproject.toml with torch_neuronx/ or .github/"
+    )
 
 
 WORKSPACE_ROOT = _find_workspace_root()
@@ -71,9 +80,11 @@ WORKSPACE_ROOT = _find_workspace_root()
 # (e.g. ``--ignore=tests/pytorch_tests_native/test/...``) and as the prefix
 # for items expanded into pytest targets.
 TEST_ROOT = "tests/pytorch_tests_native/test"
+CONFIG_DIR = WORKSPACE_ROOT / "tests" / "pytorch_tests_native"
 
 
-_INTREE_TEST_PATHS = ["tests/pytorch_tests_native/neuron_compile_ops/"]
+def _is_repo_path(path: str) -> bool:
+    return path == "tests" or path.startswith("tests/")
 
 
 def _resolve_item_path(path: str) -> str:
@@ -82,7 +93,7 @@ def _resolve_item_path(path: str) -> str:
     the cloned upstream TEST_ROOT."""
     if path == "torch_test_root_files":
         return TEST_ROOT
-    elif any(path.startswith(p) for p in _INTREE_TEST_PATHS):
+    elif _is_repo_path(path):
         return path
     else:
         return f"{TEST_ROOT}/{path}"
@@ -93,7 +104,13 @@ DEFAULT_NUM_WORKERS = 64
 DEFAULT_NUM_WORKERS_RETRY = 4
 DEFAULT_TEST_TIMEOUT = 800
 DEFAULT_CLASS_TIMEOUT = 7200
+# Wall-clock budget for the retry pass, not a per-test ceiling. Both passes keep
+# the DEFAULT_TEST_TIMEOUT ceiling that build_pytest_argv injects.
 DEFAULT_RETRY_TIMEOUT = 1800
+# Low on purpose: the tests marked needs_process_isolation use a lot of device memory.
+ISOLATED_NUM_WORKERS = 4
+# pytest exit code when no test is selected.
+NO_TESTS_COLLECTED = 5
 POST_PROCESSING_BUFFER = 1200  # seconds reserved for HUD + CSV conversion
 
 # Exit codes that mean wall-clock budget was exceeded. The pytest cache is
@@ -109,11 +126,13 @@ def derive_safe_name(items: Sequence[str], shard_id: int | None) -> str:
     """Build the artifact filename stem from items + shard.
 
     First item drives the stem; if there are more, append ``_and_N_more``.
-    Slashes collapse to underscores; trailing ``.py`` is stripped.
+    Slashes collapse to underscores; the ``.py`` suffix is dropped. A pytest
+    node id (``file.py::Class``) keeps only its path; the ``::`` selector is
+    dropped so the filename has no colon.
     """
     if not items:
         raise ValueError("items must be non-empty")
-    stem = items[0].replace("/", "_").removesuffix(".py")
+    stem = items[0].split("::", 1)[0].replace("/", "_").removesuffix(".py")
     if len(items) > 1:
         stem = f"{stem}_and_{len(items)}_more"
     if shard_id is not None:
@@ -121,10 +140,7 @@ def derive_safe_name(items: Sequence[str], shard_id: int | None) -> str:
     return stem
 
 
-def derive_report_paths(
-    output_dir: Path, items: Sequence[str], shard_id: int | None
-) -> dict[str, Path]:
-    safe = derive_safe_name(items, shard_id)
+def derive_report_paths(output_dir: Path, safe: str) -> dict[str, Path]:
     return {
         "report": output_dir / f"test_results_{safe}.json",
         "html": output_dir / f"{safe}.html",
@@ -145,8 +161,8 @@ def _final_exit_code(exit_code: int, soft_fail: bool) -> int:
     """Final process exit code.
 
     Advisory (``--soft-fail``) suites always return 0 regardless of test outcome:
-    they still run and upload results for the dashboard/aggregator, but must never
-    fail the CI job. Non-soft_fail suites keep their real exit code.
+    they cannot fail the CI job. The workflow excludes configured soft-fail suites
+    from aggregate reports. Other suites keep their real exit code.
     """
     return 0 if soft_fail else exit_code
 
@@ -180,6 +196,16 @@ def needs_process_isolation_flag(items: Sequence[str]) -> bool:
     return any(item.startswith("distributed") for item in items)
 
 
+def describe_test_timeout(args: argparse.Namespace) -> str:
+    """Report the per-test timeout that ``build_pytest_argv`` injects.
+
+    A ``--forked`` suite gets no ``--timeout``, so a number would be wrong.
+    """
+    if needs_process_isolation_flag(args.items):
+        return "none (--forked)"
+    return f"{args.test_timeout}s"
+
+
 def build_pytest_argv(
     args: argparse.Namespace,
     paths: dict[str, Path],
@@ -209,10 +235,10 @@ def build_pytest_argv(
         "--continue-on-collection-errors",
         "-v",
     ]
-    if needs_process_isolation_flag(args.items):
-        argv.append("--forked")
-    else:
-        argv.append(f"--timeout={args.test_timeout}")
+    forked = args.forked if args.forked is not None else needs_process_isolation_flag(args.items)
+    argv.append("--forked" if forked else f"--timeout={args.test_timeout}")
+    if args.marker:
+        argv.extend(["-m", args.marker])
     if args.shard_id is not None and args.num_shards is not None:
         argv.extend([f"--shard-id={args.shard_id}", f"--num-shards={args.num_shards}"])
     for ign in args.ignore:
@@ -371,6 +397,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
+  run_upstream_tests.py --config internal_test_distribution_config.json --node aten-unit-tests
   run_upstream_tests.py test_ops.py
   run_upstream_tests.py --shard-id 0 --num-shards 4 test_ops.py
   run_upstream_tests.py --ignore distributed/fsdp distributed
@@ -386,8 +413,7 @@ Examples:
     parser.add_argument(
         "--soft-fail",
         action="store_true",
-        help="Advisory suite: run and upload results, but always exit 0 so a "
-        "failure does not block CI (run-but-don't-block).",
+        help="Return 0 for an advisory suite. The distribution config controls reporting.",
     )
     parser.add_argument(
         "--download-neff-cache",
@@ -402,13 +428,25 @@ Examples:
         action="store_true",
         help="After the run, upload the local NEFF cache back to the shared store. "
         "Only effective with --download-neff-cache AND on the main branch. Set by "
-        "the nightly seeding run; readers (merge-queue, dep-guard) leave it off.",
+        "main Nightly and main Dependency Guard. PR and Merge Queue runs leave it off.",
     )
-    parser.add_argument("items", nargs="+")
+    parser.add_argument(
+        "--config",
+        default="internal_test_distribution_config.json",
+        help="The distribution config in tests/pytorch_tests_native that --node reads.",
+    )
+    parser.add_argument(
+        "--node",
+        help="Run the config entries that have this node id, one after the other.",
+    )
+    parser.add_argument("items", nargs="*")
+    parser.set_defaults(forked=None, marker=None, env={}, allow_empty=False)
     args = parser.parse_args(argv)
+    if bool(args.node) == bool(args.items):
+        parser.error("Give the test items or --node, but not both.")
 
     # Env vars override the defaults — preserved from the bash script for
-    # GitHub Actions / internal-compute workflow compatibility.
+    # GitHub Actions and CI runner workflow compatibility.
     args.num_workers = int(os.environ.get("NUM_WORKERS", DEFAULT_NUM_WORKERS))
     args.num_workers_retry = int(os.environ.get("NUM_WORKERS_RETRY", DEFAULT_NUM_WORKERS_RETRY))
     args.test_timeout = int(os.environ.get("TEST_TIMEOUT", DEFAULT_TEST_TIMEOUT))
@@ -426,6 +464,49 @@ Examples:
 # ---------------------------------------------------------------------------
 # Top-level orchestration helpers (named functions, not inline subprocesses)
 # ---------------------------------------------------------------------------
+def node_runs(args: argparse.Namespace) -> list[argparse.Namespace]:
+    """Return one pytest run for each config entry of ``args.node``.
+
+    An entry can set ``forked``, ``env`` (a None value unsets the variable), and
+    ``isolated_pass``. ``isolated_pass`` runs the tests marked needs_process_isolation
+    in a second, forked run. See "Process isolation" in docs/AI-testing.md.
+    """
+    from distribution_config import expand_distribution_config
+
+    with open(CONFIG_DIR / args.config) as f:
+        entries = expand_distribution_config(json.load(f))
+    entries = [entry for entry in entries if entry.get("node") == args.node]
+    if not entries:
+        raise SystemExit(f"Node {args.node!r} is not in {args.config}. Use a node id from it.")
+    runs: list[argparse.Namespace] = []
+    for entry in entries:
+        run = argparse.Namespace(**vars(args))
+        run.items = entry["items"]
+        run.ignore = entry["ignore"]
+        run.shard_id = entry["shard_id"]
+        run.num_shards = entry["num_shards"]
+        run.forked = entry.get("forked")
+        run.marker = entry.get("marker")
+        run.env = entry.get("env", {})
+        if entry["num_workers"] is not None:
+            run.num_workers = entry["num_workers"]
+        run.name = derive_safe_name(run.items, run.shard_id)
+        if any(r.name == run.name for r in runs):
+            run.name += f"_{len(runs)}"
+        runs.append(run)
+        if entry.get("isolated_pass"):
+            run.forked = False
+            run.marker = "not needs_process_isolation"
+            isolated = argparse.Namespace(**vars(run))
+            isolated.forked = True
+            isolated.marker = "needs_process_isolation"
+            isolated.num_workers = ISOLATED_NUM_WORKERS
+            isolated.name += "_isolated"
+            isolated.allow_empty = True
+            runs.append(isolated)
+    return runs
+
+
 def clone_upstream_tests(branch: str) -> None:
     """Clone upstream PyTorch tests at the given branch. Non-fatal on failure.
 
@@ -496,9 +577,9 @@ def print_run_summary(args: argparse.Namespace) -> None:
             f"(total: {args.total_timeout}s, buffer: {POST_PROCESSING_BUFFER}s)"
         )
     print("=== PyTorch Test Runner ===")
-    print(f"Items to run: {' '.join(args.items)}")
+    print(f"Items to run: {args.node or ' '.join(args.items)}")
     print(f"Workers: {args.num_workers}")
-    print(f"Item timeout: {args.class_timeout}s, Test timeout: {args.test_timeout}s")
+    print(f"Item timeout: {args.class_timeout}s, Test timeout: {describe_test_timeout(args)}")
     print(f"Output: {args.output_dir}")
     if args.shard_id is not None and args.num_shards is not None:
         print(f"Sharding: shard {args.shard_id} of {args.num_shards}")
@@ -506,11 +587,13 @@ def print_run_summary(args: argparse.Namespace) -> None:
 
 
 def print_retry_header(args: argparse.Namespace, rpaths: dict[str, Path]) -> None:
-    """Print the retry-pass banner."""
-    print(
-        f"\n=== Retrying failed tests (single pass, {args.num_workers_retry} workers, "
-        f"timeout {args.retry_timeout}s) ==="
-    )
+    """Print the retry-pass banner.
+
+    Name both timeouts. A bare "timeout" is ambiguous, and the per-test ceiling
+    is the one that fails a slow test.
+    """
+    print(f"\n=== Retrying failed tests (single pass, {args.num_workers_retry} workers) ===")
+    print(f"Pass budget: {args.retry_timeout}s, Test timeout: {describe_test_timeout(args)}")
     print("Retry reports:")
     print(f"  json: {rpaths['report']}")
     print(f"  html: {rpaths['html']}")
@@ -530,41 +613,18 @@ def print_completion_summary(items: Sequence[str], exit_code: int) -> None:
 # ---------------------------------------------------------------------------
 # Top-level orchestration (linear, mirroring the bash script)
 # ---------------------------------------------------------------------------
-def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-
-    # Chdir to the workspace root before any file ops. Every relative path
-    # below (args.output_dir, --json-report-file, pytest test targets,
-    # generate_hud.py, convert_reports.py) depends on it. The bash script
-    # did `cd "$BASE_PATH"`; this is the Python equivalent.
-    os.chdir(WORKSPACE_ROOT)
-
+def run_items(args: argparse.Namespace, shim: Path) -> int:
+    """Run one pytest pass over ``args.items``, retry its failures, and write its summary."""
+    # A test can delete the output dir. Thus make it again before each run.
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("TEST_RUN_TIMESTAMP", time.strftime("%Y%m%d_%H%M%S"))
+    pytest_env = preload_env(shim)
+    for name, value in args.env.items():
+        if value is None:
+            pytest_env.pop(name, None)
+        else:
+            pytest_env[name] = value
 
-    clone_upstream_tests(args.pytorch_fork_branch)
-    print_run_summary(args)
-
-    # Persistent NEFF cache: hydrate from the shared S3 store to local NVMe before
-    # any compile happens, so the run reads warm entries instead of recompiling.
-    # hydrate() sets the cache env vars for the pytest children below. Fail-open —
-    # a miss or S3 error just means a cold compile. The job name (same stem as the
-    # report artifacts) scopes the S3 prefix, unique per matrix node across the
-    # full suite (not just the smoke set).
-    cache = None
-    if args.download_neff_cache:
-        # Late import: sibling runner module, resolved via the runner dir on
-        # sys.path at runtime (mirrors step_summary / job_metadata below).
-        from persistent_cache import PersistentNeffCache
-
-        cache = PersistentNeffCache(derive_safe_name(args.items, args.shard_id))
-        cache.hydrate()
-
-    # Build the env-lock LD_PRELOAD shim once; both the main pass and the
-    # retry pass preload it. See the "env-lock LD_PRELOAD shim" section.
-    pytest_env = preload_env(build_env_lock_shim())
-
-    paths = derive_report_paths(args.output_dir, args.items, args.shard_id)
+    paths = derive_report_paths(args.output_dir, args.name)
     print(f"=== Running: {' '.join(args.items)} ===")
     main_cmd = build_pytest_argv(args, paths, num_workers=args.num_workers)
     exit_code, timed_out = run_with_timeout(
@@ -573,16 +633,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if timed_out or exit_code in TIMEOUT_EXIT_CODES:
         print(f"WARNING: Hit timeout after {args.class_timeout}s (exit code: {exit_code})")
+    if exit_code == NO_TESTS_COLLECTED and args.allow_empty:
+        print("=== No tests selected ===")
+        return 0
 
     # Single retry pass for failed tests — mirrors the bash retry block.
     # See the bash comment block for the worker-crash flakiness rationale.
     if not timed_out and should_retry(exit_code):
         rpaths = retry_paths(paths)
         print_retry_header(args, rpaths)
+        # A run with 0 or 1 workers needs all of the devices, so the retry uses no more workers.
         retry_cmd = build_pytest_argv(
             args,
             rpaths,
-            num_workers=args.num_workers_retry,
+            num_workers=min(args.num_workers_retry, args.num_workers),
             extra=["--last-failed", "--last-failed-no-failures=none"],
         )
         retry_exit, _ = run_with_timeout(
@@ -601,12 +665,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print_completion_summary(args.items, exit_code)
 
-    # Post-process: HUD NDJSON + per-class CSVs + per-node GH step summary.
-    # All non-fatal so a failure in a post-processing step doesn't mask the
-    # real test exit code.
-    generate_hud_results(args.output_dir)
-    convert_pytest_reports_to_csv(args.output_dir)
-
     # Per-node GitHub Actions step summary. If the retry pass produced a
     # report file, pass it so the markdown reflects post-retry final state.
     # Lazy import so the runner stays importable when convert_reports'
@@ -620,6 +678,58 @@ def main(argv: Sequence[str] | None = None) -> int:
         retry_report if retry_report.exists() else None,
         output_dir=args.output_dir,
     )
+    return exit_code
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    # Chdir to the workspace root before any file ops. Every relative path
+    # below (args.output_dir, --json-report-file, pytest test targets,
+    # generate_hud.py, convert_reports.py) depends on it. The bash script
+    # did `cd "$BASE_PATH"`; this is the Python equivalent.
+    os.chdir(WORKSPACE_ROOT)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    (args.output_dir / "step_summary.md").unlink(missing_ok=True)
+    os.environ.setdefault("TEST_RUN_TIMESTAMP", time.strftime("%Y%m%d_%H%M%S"))
+
+    if args.node:
+        runs = node_runs(args)
+    else:
+        args.name = derive_safe_name(args.items, args.shard_id)
+        runs = [args]
+    if not all(_is_repo_path(item) for run in runs for item in run.items):
+        clone_upstream_tests(args.pytorch_fork_branch)
+    print_run_summary(args)
+
+    # Persistent NEFF cache: hydrate from the shared S3 store to local NVMe before
+    # any compile happens, so the run reads warm entries instead of recompiling.
+    # hydrate() sets the cache env vars for the pytest children below. Fail-open:
+    # a miss or S3 error just means a cold compile. The job name (the node id, or
+    # the same stem as the report artifacts) scopes the S3 prefix, unique per
+    # matrix node across the full suite (not just the smoke set).
+    cache = None
+    if args.download_neff_cache:
+        # Late import: sibling runner module, resolved via the runner dir on
+        # sys.path at runtime (mirrors step_summary / job_metadata below).
+        from persistent_cache import PersistentNeffCache
+
+        cache = PersistentNeffCache(args.node or args.name)
+        cache.hydrate()
+
+    # Build the env-lock LD_PRELOAD shim once; each pass preloads it. See the
+    # "env-lock LD_PRELOAD shim" section.
+    shim = build_env_lock_shim()
+    exit_code = 0
+    for run in runs:
+        exit_code = run_items(run, shim) or exit_code
+
+    # Post-process: HUD NDJSON + per-class CSVs. All non-fatal so a failure in a
+    # post-processing step doesn't mask the real test exit code.
+    if not args.node:
+        generate_hud_results(args.output_dir)
+    convert_pytest_reports_to_csv(args.output_dir)
 
     # Capture the environment versions this node ran against (torch, neuronx-cc,
     # dkms, collectives, runtime-lib, ...) into a sidecar the aggregator folds

@@ -101,7 +101,11 @@ def _layout_change_needed(src: torch.Tensor | int | float | bool, dst: torch.Ten
 
 @neuron_op("aten::copy_", disable_dtype_autocast=True, priority=50)
 class CopyNeuronImpl(OperationImplementation):
-    """Implements aten::copy_ for the Neuron backend."""
+    """Implement ``aten::copy_`` transfers involving a Neuron device.
+
+    Note:
+        A successful execution updates the destination tensor in place and returns it.
+    """
 
     def can_handle(
         self,
@@ -113,6 +117,19 @@ class CopyNeuronImpl(OperationImplementation):
         **kwargs,
     ) -> bool:
         # Handle scalar src -> Neuron dst
+        """Check whether a copy operation involves a Neuron device.
+
+        Args:
+            self_tensor (torch.Tensor): Destination tensor.
+            src (torch.Tensor | int | float | bool): Source tensor or supported scalar value.
+            non_blocking (bool, optional): Accepted but not inspected. Defaults to ``False``.
+            out (torch.Tensor, optional): Accepted but not inspected. Defaults to ``None``.
+            **kwargs (Any): Additional dispatcher arguments accepted but not inspected.
+
+        Returns:
+            bool: ``True`` for a supported scalar source copied to a Neuron destination
+                or a tensor copy where either operand is on a Neuron device.
+        """
         if isinstance(src, (int | float | bool)) and isinstance(self_tensor, torch.Tensor):
             return self_tensor.device.type == "neuron"
 

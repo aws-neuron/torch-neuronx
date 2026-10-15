@@ -1,15 +1,54 @@
 import os
 import posixpath
 import re
+import runpy
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+import setuptools
 from setuptools import Extension, find_namespace_packages, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
+# pyproject.toml declares license = "Apache-2.0" (a PEP 639 license expression), which needs
+# setuptools 77.0.3 or later. Fail early with a clear message instead of a schema error.
+_MIN_SETUPTOOLS = (77, 0, 3)
+if tuple(int(p) for p in re.findall(r"\d+", setuptools.__version__)[:3]) < _MIN_SETUPTOOLS:
+    raise RuntimeError(
+        f"setuptools {setuptools.__version__} is too old. Install setuptools>=77.0.3: "
+        'uv pip install "setuptools>=77.0.3"'
+    )
+
 PACKAGE_NAME = "torch_neuronx"
+
+# Prevent an installed backend from loading during the build.
+os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+
+
+def _get_pytorch_version():
+    """Get the PyTorch version that this wheel uses."""
+    selected_version = os.environ.get("TORCH_NEURONX_BUILD_PYTORCH_VERSION")
+    try:
+        import torch
+
+        installed_version = torch.__version__.split("+", 1)[0]
+    except ImportError:
+        installed_version = None
+
+    version = selected_version or installed_version
+    if not version:
+        raise RuntimeError("PyTorch is not installed. Install PyTorch before the build.")
+
+    if not re.fullmatch(r"\d+\.\d+\.\d+(?:[a-z0-9.]*)?", version):
+        raise ValueError(f"PyTorch version {version!r} is invalid. Use a PEP 440 version.")
+
+    if selected_version and installed_version and selected_version != installed_version:
+        raise RuntimeError(
+            f"Selected PyTorch {selected_version} does not match installed PyTorch "
+            f"{installed_version}. Install the selected version."
+        )
+    return version
 
 
 def _get_git_sha():
@@ -64,7 +103,7 @@ def _is_release_branch():
     return branch.startswith("release")
 
 
-def _get_version():
+def _get_version(pytorch_version):
     """Build version string per versioning scheme.
 
     Format: {TORCH_MAJOR}.{TORCH_MINOR}.{NEURON_MAJOR}.{NEURON_MINOR}.{BUILD}+{suffix}
@@ -72,30 +111,42 @@ def _get_version():
     Mainline: 2.13.3.0.4527+8e870898.dev
     Release:  2.13.3.0.4527+8e870898
     """
-    version_info = {}
-    with open(Path(__file__).parent / "torch_neuronx" / "_version.py") as f:
-        exec(f.read(), version_info)
+    version_info = runpy.run_path(Path(__file__).parent / "torch_neuronx" / "_version.py")
+    neuron_version = version_info["NEURON_VERSION"]
+    if not re.fullmatch(r"\d+\.\d+", neuron_version):
+        raise ValueError(
+            f"Neuron version {neuron_version!r} is invalid. Use a major.minor version."
+        )
 
-    parts = version_info["__version__"].split(".")
-    parts[4] = _get_build_counter()
+    torch_parts = pytorch_version.split(".")
+    neuron_parts = neuron_version.split(".")
+    version_prefix = ".".join([*torch_parts[:2], *neuron_parts])
 
     sha = _get_git_sha() or "unknown"
     suffix = sha if _is_release_branch() else f"{sha}.dev"
 
-    return f"{'.'.join(parts)}+{suffix}"
+    return f"{version_prefix}.{_get_build_counter()}+{suffix}"
 
 
-version = _get_version()
-
-# Disable autoload for builds
-os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+pytorch_version = _get_pytorch_version()
+version = _get_version(pytorch_version)
 
 ROOT_DIR = Path(__file__).absolute().parent
 CSRC_DIR = ROOT_DIR / "torch_neuronx/csrc"
 
 
 def generate_build_config(is_release):
-    """Update build configuration file with build-time IS_RELEASE_BUILD value."""
+    """Write the build type into the build configuration file.
+
+    Args:
+        is_release (bool): Whether to write the ``RELEASE`` build type instead of ``DEV``.
+
+    Raises:
+        OSError: If the configuration file cannot be read or overwritten.
+
+    Note:
+        This function overwrites the file and prints its updated content.
+    """
     config_path = ROOT_DIR / "torch_neuronx" / "_build_config.py"
 
     # Read the template
@@ -113,7 +164,11 @@ def generate_build_config(is_release):
 
 
 def is_ninja_available():
-    """Check if Ninja build system is available."""
+    """Check whether the Ninja executable is available.
+
+    Returns:
+        bool: ``True`` when ``ninja --version`` succeeds, otherwise ``False``.
+    """
     try:
         subprocess.check_output(["ninja", "--version"], stderr=subprocess.DEVNULL)
         return True
@@ -122,7 +177,14 @@ def is_ninja_available():
 
 
 class BuildTimer:
-    """Utility class for timing build operations."""
+    """Measure and report elapsed time for a build operation.
+
+    Args:
+        operation_name (str): Name included in timing messages.
+
+    Note:
+        The context manager reports failures but does not suppress exceptions.
+    """
 
     def __init__(self, operation_name):
         self.operation_name = operation_name
@@ -144,9 +206,17 @@ class BuildTimer:
 
 
 class BuildPyCommand(build_ext):
-    """Custom build command to compile proto files."""
+    """Generate Python modules from bundled protocol buffer definitions."""
 
     def fix_import(self, file_path):
+        """Rewrite the XLA import in a generated protocol buffer module.
+
+        Args:
+            file_path (str or Path): Generated Python module to modify in place.
+
+        Raises:
+            OSError: If the module cannot be read or overwritten.
+        """
         with open(file_path) as f:
             content = f.read()
 
@@ -157,6 +227,12 @@ class BuildPyCommand(build_ext):
             f.write(content)
 
     def run(self):
+        """Generate bundled protocol buffer modules and repair their imports.
+
+        Raises:
+            OSError: If the compiler cannot start or generated output cannot be accessed.
+            RuntimeError: If protocol buffer compilation returns a nonzero status.
+        """
         builder_path = "torch_neuronx/protos"
         # Compile proto files
         proto_files = [
@@ -208,7 +284,14 @@ if is_building:
             import shutil
 
             class BazelExtension(Extension):
-                """A C/C++ extension that is defined as a Bazel BUILD target."""
+                """Represent a C/C++ extension defined by a Bazel target.
+
+                Args:
+                    bazel_target (str): Bazel label containing one package path and target name.
+
+                Raises:
+                    ValueError: If ``bazel_target`` cannot be split into path and target components.
+                """
 
                 def __init__(self, bazel_target):
                     self.bazel_target = bazel_target
@@ -223,9 +306,17 @@ if is_building:
                     Extension.__init__(self, ext_name, sources=[])
 
             class BuildBazelExtension(build_ext):
-                """A command that runs Bazel to build a C/C++ extension."""
+                """Build C/C++ extensions with Bazel."""
 
                 def run(self):
+                    """Generate protocol buffers and run the Bazel extension build.
+
+                    Raises:
+                        OSError: If the protocol compiler or generated output cannot be accessed.
+                        subprocess.CalledProcessError: If the Bazel version probe exits
+                            unsuccessfully.
+                        RuntimeError: If protocol compilation fails or Bazel is unavailable.
+                    """
                     with BuildTimer("Bazel Extension Build"):
                         # First run proto compilation
                         self.run_command("generate_proto")
@@ -280,11 +371,19 @@ if is_building:
                         ) from e
 
                 def build_extension(self, ext: Extension) -> None:
-                    """
-                    This method is called by setuptools to build a single extension.
-                    We override it to implement our custom Bazel build logic.
-                    """
+                    """Build an extension, delegating non-Bazel extensions to setuptools.
 
+                    Args:
+                        ext (Extension): Extension definition to build and install.
+
+                    Returns:
+                        None: This method returns after building or delegating the extension.
+
+                    Raises:
+                        OSError: If build metadata or extension files cannot be read or written.
+                        RuntimeError: If Bazel output is missing, cannot be replaced, or
+                            fails RPATH repair.
+                    """
                     if not isinstance(ext, BazelExtension):
                         # If it's not our custom extension type, let setuptools handle it.
                         super().build_extension(ext)
@@ -363,6 +462,14 @@ if is_building:
                     # Override build_ext 'get_ext_filename' to get original shared library name
                     # without python ABI suffix.
                     # Equivalent to PyTorch BuildExtension's 'no_python_abi_suffix=True'
+                    """Remove the Python ABI component from an extension filename.
+
+                    Args:
+                        fullname (str): Fully qualified extension name.
+
+                    Returns:
+                        str: Platform extension filename without a Python ABI suffix.
+                    """
                     ext_filename = super().get_ext_filename(fullname)
                     # The parts will be e.g. ["my_extension", "cpython-37m-x86_64-linux-gnu", "so"].
                     ext_filename_parts = ext_filename.split(".")
@@ -387,15 +494,26 @@ if is_building:
             print("Using CMake Build for C++ Extension")
 
             class CMakeExtension(Extension):
-                """A CMake extension module"""
+                """Represent an extension built by CMake.
+
+                Args:
+                    name (str): Fully qualified extension module name.
+                """
 
                 def __init__(self, name):
                     Extension.__init__(self, name, sources=[])
 
             class BuildCMakeExtension(build_ext):
-                """A command that runs CMake to build a C/C++ extension."""
+                """Build C/C++ extensions with CMake."""
 
                 def run(self):
+                    """Generate protocol buffers and run the CMake extension build.
+
+                    Raises:
+                        OSError: If the protocol compiler or generated output cannot be accessed.
+                        subprocess.CalledProcessError: If a CMake command exits unsuccessfully.
+                        RuntimeError: If protocol compilation fails or CMake is unavailable.
+                    """
                     with BuildTimer("CMake Extension Build"):
                         # First run proto compilation
                         self.run_command("generate_proto")
@@ -409,6 +527,18 @@ if is_building:
                         build_ext.run(self)
 
                 def build_extension(self, ext):
+                    """Build an extension, delegating non-CMake extensions to setuptools.
+
+                    Args:
+                        ext (Extension): Extension definition to configure and build.
+
+                    Returns:
+                        None: This method returns after building or delegating the extension.
+
+                    Raises:
+                        OSError: If a required build directory cannot be created.
+                        subprocess.CalledProcessError: If CMake configuration or compilation fails.
+                    """
                     if not isinstance(ext, CMakeExtension):
                         return super().build_extension(ext)
 
@@ -474,6 +604,14 @@ if is_building:
                     # Override build_ext 'get_ext_filename' to get original shared library name
                     # without python ABI suffix.
                     # Equivalent to PyTorch BuildExtension's 'no_python_abi_suffix=True'
+                    """Remove the Python ABI component from an extension filename.
+
+                    Args:
+                        fullname (str): Fully qualified extension name.
+
+                    Returns:
+                        str: Platform extension filename without a Python ABI suffix.
+                    """
                     ext_filename = super().get_ext_filename(fullname)
                     # The parts will be e.g. ["my_extension", "cpython-37m-x86_64-linux-gnu", "so"].
                     ext_filename_parts = ext_filename.split(".")
@@ -492,7 +630,15 @@ if is_building:
             from torch.utils.cpp_extension import BuildExtension, CppExtension
 
             class CustomBuildExt(BuildExtension):
+                """Build a PyTorch C++ extension after generating protocol buffer modules."""
+
                 def run(self):
+                    """Generate protocol buffers, then run the PyTorch extension build.
+
+                    Raises:
+                        OSError: If the protocol compiler or generated output cannot be accessed.
+                        RuntimeError: If protocol buffer compilation returns a nonzero status.
+                    """
                     with BuildTimer("PyTorch C++ Extension Build"):
                         self.run_command("generate_proto")
                         BuildExtension.run(self)
@@ -549,6 +695,14 @@ else:
     ext_modules = []
     cmdclass = {}
 
+install_requires = [
+    f"torch=={pytorch_version}",
+    "numpy<2; python_version < '3.12'",
+    "numpy>=2; python_version >= '3.12'",
+    "grpcio-tools",
+    "wheel",
+]
+
 setup(
     name=PACKAGE_NAME,
     version=version,
@@ -566,5 +720,6 @@ setup(
     ext_modules=ext_modules,
     python_requires=">=3.10",
     cmdclass=cmdclass,
-    license_files=["LICENSE", "third_party/torch-mlir/LICENSE"],
+    license_files=["LICENSE", "NOTICE", "third_party/torch-mlir/LICENSE"],
+    install_requires=install_requires,
 )

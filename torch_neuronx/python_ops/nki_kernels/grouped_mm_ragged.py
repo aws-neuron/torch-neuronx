@@ -21,9 +21,21 @@ _OUT_SLACK = 128
 def grouped_mm_ragged_2d_3d_nki(
     a: torch.Tensor, b: torch.Tensor, offs: torch.Tensor
 ) -> torch.Tensor:
-    """Ragged grouped matmul: a (r, d1), b (g, d1, d2), offs (g,) -> (r, d2).
+    """Run ragged 2D-by-3D grouped matrix multiplication through NKI.
 
-    `offs` may be arbitrary -- no alignment requirement, no padding.
+    Args:
+        a (torch.Tensor): Token matrix with shape ``(R, D1)``.
+        b (torch.Tensor): Expert matrices with shape ``(E, D1, D2)``.
+        offs (torch.Tensor): Arbitrary cumulative expert end offsets.
+
+    Returns:
+        torch.Tensor: Result with shape ``(R + 128, D2)`` including spare tail rows.
+
+    Raises:
+        AssertionError: If ``D2`` is not divisible by the launch program count.
+
+    Note:
+        Callers must trim the final 128 rows; offsets require no alignment or padding.
     """
     # Returns r + _OUT_SLACK rows. The caller must slice: slicing inside the @nki_op
     # would make its shape inference under-allocate what the kernel writes.
@@ -33,9 +45,21 @@ def grouped_mm_ragged_2d_3d_nki(
 def grouped_mm_ragged_2d_2d_nki(
     a: torch.Tensor, b: torch.Tensor, offs: torch.Tensor
 ) -> torch.Tensor:
-    """Ragged grouped matmul: a (d1, t), b (t, d2), offs (g,) -> (g, d1, d2).
+    """Run ragged 2D-by-2D grouped matrix multiplication through NKI.
 
-    `offs` may be arbitrary -- no alignment requirement, no padding.
+    Args:
+        a (torch.Tensor): Left operand with shape ``(D1, T)``.
+        b (torch.Tensor): Right operand with shape ``(T, D2)``.
+        offs (torch.Tensor): Arbitrary cumulative expert end offsets.
+
+    Returns:
+        torch.Tensor: Per-expert result with shape ``(E, D1, D2)``.
+
+    Raises:
+        AssertionError: If ``D2`` is not divisible by the launch program count.
+
+    Note:
+        Offsets require no alignment or padding.
     """
     return wrap_nki(grouped_mm_ragged_2d_2d)[_grid()](a, b, offs)
 
@@ -44,6 +68,22 @@ def grouped_mm_ragged_2d_2d_nki(
 def grouped_mm_ragged_2d_3d_op(
     a: torch.Tensor, b: torch.Tensor, offs: torch.Tensor
 ) -> torch.Tensor:
+    """Expose ragged 2D-by-3D grouped multiplication as an NKI op.
+
+    Args:
+        a (torch.Tensor): Token matrix with shape ``(R, D1)``.
+        b (torch.Tensor): Expert matrices with shape ``(E, D1, D2)``.
+        offs (torch.Tensor): Arbitrary cumulative expert end offsets.
+
+    Returns:
+        torch.Tensor: Result with shape ``(R + 128, D2)`` including spare tail rows.
+
+    Raises:
+        AssertionError: If ``D2`` is not divisible by the launch program count.
+
+    Note:
+        Callers must trim the final 128 rows.
+    """
     return grouped_mm_ragged_2d_3d_nki(a, b, offs)
 
 
@@ -51,4 +91,20 @@ def grouped_mm_ragged_2d_3d_op(
 def grouped_mm_ragged_2d_2d_op(
     a: torch.Tensor, b: torch.Tensor, offs: torch.Tensor
 ) -> torch.Tensor:
+    """Expose ragged 2D-by-2D grouped multiplication as an NKI op.
+
+    Args:
+        a (torch.Tensor): Left operand with shape ``(D1, T)``.
+        b (torch.Tensor): Right operand with shape ``(T, D2)``.
+        offs (torch.Tensor): Arbitrary cumulative expert end offsets.
+
+    Returns:
+        torch.Tensor: Per-expert result with shape ``(E, D1, D2)``.
+
+    Raises:
+        AssertionError: If ``D2`` is not divisible by the launch program count.
+
+    Note:
+        Offsets require no alignment or padding.
+    """
     return grouped_mm_ragged_2d_2d_nki(a, b, offs)

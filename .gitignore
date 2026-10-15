@@ -66,20 +66,11 @@ global_metric_store.json
 file.neff
 .torch_neuronx/
 
-# Agent scratch directory — pytorch-upstream-test-debugger skill writes
-# per-bug RCA workspaces (notes, baseline/verify reports, PR body drafts,
-# verify_failing.sh, completion.json) under agent_artifacts/<slug>/.
-# Must never be committed — see
-# .kiro/skills/pytorch-upstream-test-debugger/SKILL.md under
-# "Artifacts and file I/O".
-agent_artifacts/
-
 # Ignore python files generated from proto
 torch_neuronx/protos/*.py
 torch_neuronx/protos/xla/*.py
 
-# Ignore the pytorch test directory
-tests/pytorch_tests/test/
+# Ignore generated upstream PyTorch test files.
 tests/pytorch_tests_native/torch/
 tests/pytorch_tests_native/test/
 
@@ -89,10 +80,12 @@ uv.lock
 .clangd
 build
 
-# Claude Code config — .claude/skills, .claude/agents, and the shared
-# .claude/settings.json (team permission policy) are tracked. Only per-user
-# overrides live in the gitignored settings.local.json.
-.claude/settings.local.json
+# Agent skills live only in .external/skills (public) and .internal/skills (private).
+# Agent client folders are local-only; see .internal/README.md to set them up.
+.claude/
+.kiro/
+.agents/
+.codex/
 
-# Agent scratch space (temporary scripts, experiments)
+# Agent scratch directory - skills write temporary evidence under agent_space/.
 agent_space/

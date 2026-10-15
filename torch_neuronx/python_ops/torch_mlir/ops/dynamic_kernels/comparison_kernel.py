@@ -23,12 +23,33 @@ def _cmp_tensor(dst, in_tiles, aux, h_width):
 
 
 def make_comparison_kernel(cmp_op):
-    """``cmp_op`` is default-bound, not captured: NKI can't resolve closure free variables."""
+    """Build a runtime-scalar comparison kernel for an NKI operation.
+
+    Args:
+        cmp_op (object): NKI scalar comparison operation.
+
+    Returns:
+        Callable: JIT-decorated comparison kernel.
+
+    Note:
+        The operation is default-bound because NKI cannot resolve closure free variables.
+    """
 
     @nki.jit()
     def comparison_kernel(input_tensor, threshold, ctrl, cmp_op=cmp_op):
-        """[m_static, hidden] HBM traced at 128 rows, run at any M >= 128. threshold: [128, 1]
-        fp32 replication of the scalar. ctrl: [[full tiles], [tail row = M - 128]]."""
+        """Compare a runtime-sized tensor with a replicated scalar threshold.
+
+        Args:
+            input_tensor (nl.NkiTensor): Input traced as ``[128, hidden]`` and run for any
+                ``M >= 128``.
+            threshold (nl.NkiTensor): ``[128, 1]`` fp32 replication of the runtime scalar.
+            ctrl (nl.NkiTensor): Full-tile count and ``M - 128`` tail-row controls.
+            cmp_op (object, optional): Default-bound NKI scalar comparison operation. Defaults to
+                the factory's ``cmp_op``.
+
+        Returns:
+            nl.NkiTensor: Boolean comparison mask with the input shape.
+        """
         m_static, hidden = input_tensor.shape
         h_starts, h_widths = free_dim_tiles(hidden, input_tensor.dtype)
 
@@ -56,12 +77,33 @@ def make_comparison_kernel(cmp_op):
 
 
 def make_binary_mask_kernel(cmp_op):
-    """The ``.Tensor`` overload: a second full-width operand instead of the threshold column.
-    Also serves logical_and on float operands."""
+    """Build a full-width binary mask kernel for an NKI operation.
+
+    Args:
+        cmp_op (object): NKI tensor comparison or logical operation.
+
+    Returns:
+        Callable: JIT-decorated binary mask kernel.
+
+    Note:
+        The tensor overload accepts a second full-width operand and also serves logical-and
+        on floating-point inputs.
+    """
 
     @nki.jit()
     def binary_mask_kernel(input_a, input_b, ctrl, cmp_op=cmp_op):
-        """Two [m_static, hidden] operands of one dtype, traced at 128 rows, run at any M."""
+        """Apply a binary mask operation to runtime-sized full-width tensors.
+
+        Args:
+            input_a (nl.NkiTensor): First input traced as ``[128, hidden]``.
+            input_b (nl.NkiTensor): Same-shape, same-dtype second input.
+            ctrl (nl.NkiTensor): Full-tile count and ``M - 128`` tail-row controls.
+            cmp_op (object, optional): Default-bound NKI tensor operation. Defaults to the
+                factory's ``cmp_op``.
+
+        Returns:
+            nl.NkiTensor: Boolean mask with the input shape.
+        """
         m_static, hidden = input_a.shape
         h_starts, h_widths = free_dim_tiles(hidden, input_a.dtype)
 

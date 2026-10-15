@@ -8,19 +8,26 @@ import torch_neuronx._C as _C
 def contiguous_generic_kernel(
     src, dst, shape, src_strides, dst_strides, src_storage_offset=0, non_blocking=False
 ):
-    """
-    Generic element-wise copy kernel using CPU fallback.
-
-    This implementation copies the tensor to CPU, performs the strided access
-    operation there (where it's efficient), and copies back to device.
+    """Copy an arbitrary strided tensor through a CPU fallback.
 
     Args:
-        src: Source tensor (1D view of full storage)
-        dst: Destination tensor (1D view, contiguous)
-        shape: Original tensor shape
-        src_strides: Source strides
-        dst_strides: Destination strides (should be contiguous)
-        src_storage_offset: Storage offset for the source tensor
+        src (torch.Tensor): One-dimensional view of the complete source storage.
+        dst (torch.Tensor): Contiguous destination tensor on a Neuron device.
+        shape (Sequence[int]): Logical source shape.
+        src_strides (Sequence[int]): Logical source strides.
+        dst_strides (Sequence[int]): Destination strides retained for interface compatibility.
+        src_storage_offset (int, optional): Source storage offset. Defaults to ``0``.
+        non_blocking (bool, optional): Allow asynchronous raw copies. Defaults to ``False``.
+
+    Returns:
+        torch.Tensor: The supplied ``dst`` after scheduling the contiguous copy back.
+
+    Raises:
+        RuntimeError: If native copy device, layout, size, or bounds validation fails.
+
+    Note:
+        This CPU fallback mutates ``dst``. With ``non_blocking=True``, its final
+        CPU-to-Neuron device copy may still be pending when the function returns.
     """
     # Report this as a CPU fallback — the contiguous op was supposed to run on
     # device but no NKI kernel could handle this stride pattern.

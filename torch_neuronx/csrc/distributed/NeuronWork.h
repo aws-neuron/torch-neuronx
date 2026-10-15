@@ -278,9 +278,9 @@ class NeuronWork : public c10d::Work {
   void abort();
 
   /**
-   * Get the end event for external synchronization.
+   * Get the current completion record for external synchronization.
    */
-  const at::neuron::NeuronEvent& getEndEvent() const { return end_event_; }
+  at::neuron::NeuronEvent getEndEvent() const { return end_event_.capture(); }
 
   /**
    * Get the stream this work is associated with.

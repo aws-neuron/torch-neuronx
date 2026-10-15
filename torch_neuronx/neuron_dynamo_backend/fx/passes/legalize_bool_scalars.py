@@ -35,9 +35,22 @@ _ARITHMETIC_OPS = {
 
 
 class LegalizeBoolScalars(NeuronFXPass):
-    """Replace True/False scalar args with 1/0 in arithmetic ops."""
+    """Replace positional Boolean scalars with integers in arithmetic operations.
+
+    Args:
+        state (NeuronFXPassState, optional): Shared FX-pass state used for artifact dumping.
+            Defaults to ``None``.
+    """
 
     def call(self, gm: torch.fx.GraphModule) -> PassResult:
+        """Legalize positional Boolean scalar arguments in an FX graph.
+
+        Args:
+            gm (torch.fx.GraphModule): FX graph module to update.
+
+        Returns:
+            PassResult: Graph module and whether any Boolean argument changed.
+        """
         graph = gm.graph
         modified = False
 

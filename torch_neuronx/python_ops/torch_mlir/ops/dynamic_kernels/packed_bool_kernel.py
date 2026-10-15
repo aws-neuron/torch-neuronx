@@ -22,12 +22,35 @@ def _packed_binary(dst, in_tiles, aux, h_width):
 
 
 def make_packed_bool_kernel(alu_op):
-    """``alu_op`` must be a bitwise op (it acts per byte) and is default-bound, not captured:
-    NKI can't resolve closure free variables."""
+    """Build a Boolean-mask kernel from a bitwise ALU operation.
+
+    Args:
+        alu_op (object): NKI bitwise ALU operation applied independently to packed bytes.
+
+    Returns:
+        Callable: JIT-compiled packed Boolean kernel.
+
+    Note:
+        The operation is default-bound because NKI cannot resolve closure free variables.
+    """
 
     @nki.jit()
     def packed_bool_kernel(input_a, input_b, ctrl, alu_op=alu_op):
-        """Two [m_static, hidden] int16 HBM operands -- bool[m_static, 2*hidden] views."""
+        """Apply a bitwise operation to int16-packed Boolean masks.
+
+        Args:
+            input_a (tensor): First ``[m_static, hidden]`` int16 HBM view.
+            input_b (tensor): Second ``[m_static, hidden]`` int16 HBM view.
+            ctrl (tensor): Full-tile count and backward-aligned tail row.
+            alu_op (object, optional): Default-bound NKI bitwise ALU operation. Defaults to
+                the operation supplied to ``make_packed_bool_kernel``.
+
+        Returns:
+            tensor: Packed int16 result representing ``bool[m_static, 2 * hidden]``.
+
+        Note:
+            Bitwise operations act independently on the two packed Boolean bytes.
+        """
         m_static, hidden = input_a.shape
         h_starts, h_widths = free_dim_tiles(hidden, input_a.dtype)
 

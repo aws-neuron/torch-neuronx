@@ -10,6 +10,7 @@
 
 #include "torch_neuronx/csrc/core/allocator/NeuronCachingAllocator.h"
 #include "torch_neuronx/csrc/core/allocator/NeuronSegmentAllocator.h"
+#include "torch_neuronx/csrc/core/allocator/ScalarDeviceMemoryCache.h"
 
 namespace at::neuron {
 
@@ -159,13 +160,13 @@ class NeuronResourceManager {
   // Returns: Reference to the global resource semaphore
   ResourceSemaphore& GetResourceSemaphore();
 
-  // Get the segment pool for a specific device (lazy alloc path).
+  // Get the segment pool for a specific device.
   // Returns: Reference to the device's NeuronSegmentPool
   c10_neuron::NeuronSegmentPool& GetSegmentPool(int device);
 
-  // Get the tensor pool for a specific device (host alloc path).
-  // Returns: Reference to the device's NrtTensorPool
-  c10_neuron::NrtTensorPool& GetTensorPool(int device);
+  // Get the scalar device memory cache for a specific device.
+  // Returns: Reference to the device's ScalarDeviceMemoryCache
+  c10_neuron::ScalarDeviceMemoryCache& GetScalarCache(int device);
 
  private:
   // Private constructor for singleton pattern
@@ -184,7 +185,7 @@ class NeuronResourceManager {
   mutable std::mutex mutex_;
 
   std::vector<std::unique_ptr<c10_neuron::NeuronSegmentPool>> segment_pools_;
-  std::vector<std::unique_ptr<c10_neuron::NrtTensorPool>> tensor_pools_;
+  std::vector<std::unique_ptr<c10_neuron::ScalarDeviceMemoryCache>> scalar_caches_;
   std::unique_ptr<CompilationCache> compilation_cache_;
   std::unique_ptr<ModelHandleCache> model_handle_cache_;
   std::unique_ptr<OperationExecutionEngine> operation_execution_engine_;

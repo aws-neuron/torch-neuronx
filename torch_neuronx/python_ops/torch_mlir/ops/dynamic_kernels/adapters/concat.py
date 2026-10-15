@@ -259,6 +259,7 @@ def _reshape_cat_output(outputs, original_args):
 
 
 def register():
+    """Register the dynamic column and row concatenation adapter."""
     register_dynamic_nki(
         "cat",
         DynamicNkiEntry(

@@ -14,11 +14,23 @@ _REDUCE_OP_MAP = {
 
 
 def all_gather_into_tensor_out(input, group_size, group_name, out):
-    """
-    Custom implementation as Torch code registers _allgather_base_ as C10d OP in ops.cpp
-    and then it requires to have getBackend method supported on the process group object.
-    NeuronPG does not have this method implemented, hence we provide this custom
-    implementation here.
+    """Gather rank tensors into a caller-provided output tensor.
+
+    Args:
+        input (torch.Tensor): Local tensor to gather from this rank.
+        group_size (int): Collective rank count, accepted for schema compatibility.
+        group_name (str): Name used to resolve the process group.
+        out (torch.Tensor): Destination for rank-ordered gathered tensors.
+
+    Returns:
+        torch.Tensor: The supplied ``out`` tensor after launching the gather.
+
+    Raises:
+        RuntimeError: If native process-group device or shape validation fails.
+
+    Note:
+        Calls ``_allgather_base`` directly because ``NeuronPG`` lacks ``getBackend``,
+        which the standard Torch implementation requires.
     """
     group = _resolve_process_group(group_name)
     opts = torch._C._distributed_c10d.AllgatherOptions()
@@ -29,11 +41,23 @@ def all_gather_into_tensor_out(input, group_size, group_name, out):
 
 
 def all_gather_into_tensor(input, group_size, group_name):
-    """Neuron implementation of _c10d_functional::all_gather_into_tensor.
+    """Gather rank tensors into a new rank-ordered tensor.
 
-    Uses asyncOp=false to avoid the CompositeExplicitAutograd fallback retaining
-    tensor references in NeuronWork's Future. Functional collective callers
-    obtain results via the returned tensor and wait_tensor, not future.value().
+    Args:
+        input (torch.Tensor): Local tensor to gather from this rank.
+        group_size (int): Number of ranks contributing tensors.
+        group_name (str): Name used to resolve the process group.
+
+    Returns:
+        torch.Tensor: Gathered tensor with leading size ``input.shape[0] * group_size``.
+
+    Raises:
+        RuntimeError: If native process-group device or shape validation fails.
+
+    Note:
+        Uses ``asyncOp=False`` to avoid the CompositeExplicitAutograd fallback retaining
+        tensor references in ``NeuronWork``'s future. Callers use the returned tensor and
+        ``wait_tensor`` rather than ``future.value()``.
     """
     group = _resolve_process_group(group_name)
     output = input.new_empty(input.shape[0] * group_size, *input.shape[1:])
@@ -47,11 +71,24 @@ def all_gather_into_tensor(input, group_size, group_name):
 
 
 def reduce_scatter_tensor(input, reduce_op, group_size, group_name):
-    """Neuron implementation of _c10d_functional::reduce_scatter_tensor.
+    """Reduce rank tensors and scatter the leading dimension.
 
-    Uses asyncOp=false to avoid the CompositeExplicitAutograd fallback retaining
-    tensor references in NeuronWork's Future. Functional collective callers
-    obtain results via the returned tensor and wait_tensor, not future.value().
+    Args:
+        input (torch.Tensor): Tensor whose leading dimension contains all rank shards.
+        reduce_op (str): Reduction key looked up in ``_REDUCE_OP_MAP``.
+        group_size (int): Number of output shards along the leading dimension.
+        group_name (str): Name used to resolve the process group.
+
+    Returns:
+        torch.Tensor: Reduced local shard with leading size ``input.shape[0] // group_size``.
+
+    Raises:
+        KeyError: If ``reduce_op`` is absent from ``_REDUCE_OP_MAP``.
+        RuntimeError: If native process-group validation or submission fails.
+
+    Note:
+        Uses ``asyncOp=False`` to avoid retaining tensor references in ``NeuronWork``'s
+        future; callers synchronize through the returned tensor and ``wait_tensor``.
     """
     group = _resolve_process_group(group_name)
     output = input.new_empty(input.shape[0] // group_size, *input.shape[1:])
@@ -66,7 +103,25 @@ def reduce_scatter_tensor(input, reduce_op, group_size, group_name):
 
 
 def reduce_scatter_tensor_coalesced(inputs, reduce_op, group_size, group_name):
-    """Neuron implementation of _c10d_functional::reduce_scatter_tensor_coalesced."""
+    """Reduce and scatter multiple tensors in one collective.
+
+    Args:
+        inputs (list[torch.Tensor]): Tensors containing all rank shards on dimension zero.
+        reduce_op (str): Reduction key looked up in ``_REDUCE_OP_MAP``.
+        group_size (int): Number of output shards along dimension zero.
+        group_name (str): Name used to resolve the process group.
+
+    Returns:
+        list[torch.Tensor]: Reduced local shards with leading dimensions divided by
+        ``group_size``.
+
+    Raises:
+        KeyError: If ``reduce_op`` is absent from ``_REDUCE_OP_MAP``.
+        RuntimeError: If native process-group validation or submission fails.
+
+    Note:
+        Runs with ``asyncOp=False`` and registers the collective work for every output.
+    """
     group = _resolve_process_group(group_name)
     outputs = [t.new_empty(t.shape[0] // group_size, *t.shape[1:]) for t in inputs]
 
@@ -81,12 +136,24 @@ def reduce_scatter_tensor_coalesced(inputs, reduce_op, group_size, group_name):
 
 
 def all_reduce(input, reduce_op, group_name):
-    """Neuron implementation of _c10d_functional::all_reduce.
+    """Reduce a cloned tensor across the resolved process group.
 
-    The CompositeExplicitAutograd fallback clones the input and does an in-place
-    allreduce on the clone, but the resulting Work/Future lifecycle doesn't
-    synchronize correctly with torch_neuronx.synchronize(), causing one rank to
-    hang. This PrivateUse1 dispatch avoids that path entirely.
+    Args:
+        input (torch.Tensor): Tensor to clone and reduce without modification.
+        reduce_op (str): Reduction key looked up in ``_REDUCE_OP_MAP``.
+        group_name (str): Name used to resolve the process group.
+
+    Returns:
+        torch.Tensor: Contiguous reduced clone registered with the collective work.
+
+    Raises:
+        KeyError: If ``reduce_op`` is absent from ``_REDUCE_OP_MAP``.
+        RuntimeError: If native process-group validation or submission fails.
+
+    Note:
+        Uses ``asyncOp=False`` and bypasses the CompositeExplicitAutograd fallback,
+        whose Work/Future lifecycle can fail to synchronize with
+        ``torch_neuronx.synchronize()`` and hang a rank.
     """
     output = input.clone(memory_format=torch.contiguous_format)
     group = _resolve_process_group(group_name)
@@ -101,10 +168,23 @@ def all_reduce(input, reduce_op, group_name):
 
 
 def all_reduce_coalesced(inputs, reduce_op, group_name):
-    """Neuron implementation of _c10d_functional::all_reduce_coalesced.
+    """Reduce cloned tensors together across the resolved process group.
 
-    Inputs are left unmodified; returns reduced clones. Same asyncOp=False
-    rationale as all_reduce.
+    Args:
+        inputs (list[torch.Tensor]): Tensors to clone and reduce without modification.
+        reduce_op (str): Reduction key looked up in ``_REDUCE_OP_MAP``.
+        group_name (str): Name used to resolve the process group.
+
+    Returns:
+        list[torch.Tensor]: Contiguous reduced clones of ``inputs``.
+
+    Raises:
+        KeyError: If ``reduce_op`` is absent from ``_REDUCE_OP_MAP``.
+        RuntimeError: If native process-group validation or submission fails.
+
+    Note:
+        Uses ``asyncOp=False`` for the same Work/Future synchronization rationale as
+        ``all_reduce`` and registers the returned work against each original input.
     """
     outputs = [t.clone(memory_format=torch.contiguous_format) for t in inputs]
     group = _resolve_process_group(group_name)
@@ -120,6 +200,12 @@ def all_reduce_coalesced(inputs, reduce_op, group_name):
 
 
 def register_neuron_collectives():
+    """Register Neuron functional collective implementations.
+
+    Note:
+        Installs process-wide ``PrivateUse1`` implementations for gather,
+        reduce-scatter, and all-reduce functional operators.
+    """
     torch.library.impl(
         "_c10d_functional::all_gather_into_tensor_out", "PrivateUse1", all_gather_into_tensor_out
     )

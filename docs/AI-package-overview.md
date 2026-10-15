@@ -4,70 +4,80 @@
 `'neuron'` device via PyTorch's `PrivateUse1` mechanism. For the elevator
 pitch and usage, see `README.md` (authoritative). Two execution paths:
 
-1. **Eager mode** — `tensor.to('neuron')` routes individual ATen ops
+1. **Eager mode** - `tensor.to('neuron')` routes individual ATen ops
    through a C++ dispatcher and per-op implementations.
-2. **`torch.compile` mode** — `torch.compile(model, backend="neuron")`
+2. **`torch.compile` mode** - `torch.compile(model, backend="neuron")`
    compiles whole FX graphs to NEFF via a StableHLO pipeline and executes
    them through the Neuron Runtime (NRT).
 
-> **Navigation → codegraph.** For the import-time boot sequence, the
-> per-op eager dispatch path, or the `torch.compile` pipeline as source,
-> ask codegraph:
-> `codegraph_explore "torch_neuronx __init__ _autoload neuron_backend NeuronDispatcher dispatch"`.
-> This doc is the **subsystem index + the two cross-cutting invariants** —
-> the part no single source file states.
+> **Source navigation.** Run this command from the repository root:
+>
+> `rg -n '_autoload|neuron_backend|NeuronDispatcher|dispatch' pyproject.toml torch_neuronx`
+>
+> If `rg` is unavailable, use `git grep -n -E` with the same pattern and paths.
 
 ## How it's wired into PyTorch (contract)
 
-Two `pyproject.toml` entry points register the package automatically:
-`torch.backends` → `torch_neuronx:_autoload` (registers the `'neuron'`
-device) and `torch_dynamo_backends` → `neuron_backend`. On import,
-`torch_neuronx/__init__.py` loads `_C`, renames the `PrivateUse1` backend
-to `"neuron"`, registers `torch.neuron.*`, registers Python op impls, and
-sets env-var defaults. Order matters — `_C` device registration precedes
-everything. (Boot sequence as source: codegraph the symbols above.)
+`pyproject.toml` declares `torch.backends` -> `torch_neuronx:_autoload` and
+`torch_dynamo_backends` ->
+`torch_neuronx.neuron_dynamo_backend.backend:neuron_backend`.
+
+`torch_neuronx/__init__.py` first prepares the bundled torch-mlir path, imports
+PyTorch, and sets environment defaults. It then imports `_C`, registers the
+device and profiler, initializes the C++ int64 policy, and disables Dynamo
+tracing for `_C` callables. Next it imports the Python submodules and public
+APIs. If no other backend owns `PrivateUse1`, it renames the backend, registers
+`torch.neuron`, generates convenience methods, and later registers Python
+operations. Read the file for the guarded patch registrations that follow.
 
 ## Subsystem index (routing)
 
 | Subsystem | Path | Doc |
 |---|---|---|
-| User-facing Python API (device, streams, memory, metrics, profiler, NKI HOPs) | `torch_neuronx/*.py` | `AI-runtime-api.md` |
-| `torch.compile` backend — FX → StableHLO → NEFF, FX passes, MegaCache | `torch_neuronx/neuron_dynamo_backend/` | `AI-dynamo-backend.md` |
-| Eager-mode op impls (MLIR/NKI), `@neuron_op`, cast policy | `torch_neuronx/python_ops/` | `AI-python-ops.md` |
-| C++ `_C` extension: dispatcher, allocators, cache, streams, profiler | `torch_neuronx/csrc/` | `AI-csrc.md` |
-| `"neuron"` c10d backend, collectives, DTensor sharding | `torch_neuronx/distributed/` + `csrc/distributed/` | `AI-distributed.md` |
-| NEFF cache, `neuronx-cc` wrapper | `torch_neuronx/kernels/` | `AI-compilation-kernels.md` |
-| Tests | `tests/` | `AI-testing.md` |
-| Examples | `examples/` | `AI-examples.md` |
-| Build system (Bazel primary, CMake fallback), vendored torch-mlir | `bazel/`, `BUILD.bazel`, `third_party/torch-mlir/` | `AI-build-infra.md` |
+| User-facing Python API (device, streams, memory, metrics, profiler, NKI HOPs) | `torch_neuronx/` | `docs/AI-runtime-api.md` |
+| Environment and bug-report collection | `torch_neuronx/collect_env.py` | `docs/AI-runtime-api.md` |
+| `torch.compile` backend - FX -> StableHLO -> NEFF, FX passes, MegaCache | `torch_neuronx/neuron_dynamo_backend/` | `docs/AI-dynamo-backend.md` |
+| Eager-mode op impls (MLIR/NKI), `@neuron_op`, cast policy | `torch_neuronx/python_ops/` | `docs/AI-python-ops.md` |
+| C++ `_C` extension: dispatcher, allocators, cache, streams, profiler | `torch_neuronx/csrc/` | `docs/AI-csrc.md` |
+| C++ compilation and persistent NEFF caches | `torch_neuronx/csrc/core/compilation/` + `torch_neuronx/csrc/core/cache/` | `docs/AI-compilation-kernels.md` |
+| Python kernel base plus legacy and test-only compiler wrapper | `torch_neuronx/kernels/` | `docs/AI-compilation-kernels.md` |
+| `"neuron"` c10d backend, collectives, DTensor sharding | `torch_neuronx/distributed/` + `torch_neuronx/csrc/distributed/` | `docs/AI-distributed.md` |
+| Tests | `tests/` | `docs/AI-testing.md` |
+| Examples | `examples/` | `docs/AI-examples.md` |
+| Build system (Bazel primary, CMake fallback), vendored torch-mlir | `bazel/`, `BUILD.bazel`, `third_party/torch-mlir/` | `docs/AI-build-infra.md` |
 
 ## Two cross-cutting invariants
 
 These anchor behavior across every subsystem; for the detailed behavior
 and accuracy caveats, see `README.md` Limitations (authoritative).
 
-- **Neuron computes on 32-bit types.** `float64`/`uint64` are down-cast on
-  entry, re-widened on exit. `int64` defaults to **packed mode**
-  (`TORCH_NEURONX_INT64_MODE=packed`): kept losslessly on device as `int32`
-  lane-pairs, with only arithmetic on the low 32 bits. The dynamo
-  `Executor` path still down-casts via `view()`/`.to()`. Authoritative:
-  `docs/packed_int64_design.md`; rules in `python_ops/cast_policy.py` +
-  `int64_policy.py`.
-- **Only contiguous tensors execute on-device.** Non-contiguous inputs are
-  materialized via the `contiguous_*` op family (`python_ops/contiguous*.py`)
-  or, for eager copies, `csrc/utils/CopyUtils.cpp`.
+- **64-bit handling differs by execution path.** Eager `float64` operations
+  autocast to `float32`. Eager `int64` defaults to `native`, a per-op cascade:
+  supported ops run as S64, non-native `DOWNCAST` ops use the packed int32 view
+  and low 32 bits, and unsupported ops use CPU fallback. `packed` is an
+  explicit mode that forces int64 operations through the packed view. The
+  Dynamo `Executor` downcasts `int64`/`uint64` with `view()` and `float64` with
+  `.to()`, then restores requested output dtypes.
+  `torch_neuronx/int64_policy.py` is authoritative for the current default and
+  per-op routing. `docs/packed_int64_design.md` is design background that
+  predates the `native` default.
+- **Contiguity is checked at kernel boundaries, with explicit layout support.**
+  Prepared kernel tensors reject non-contiguous layouts by default, but callers
+  that account for those layouts can set `allow_non_contiguous`. Eager dispatch
+  can handle supported non-contiguous inputs with lazy-materialization
+  prologues. See `docs/AI-csrc.md` for lazy materialization.
 
 ## Where to start
 
 | Question | Start here |
 |---|---|
-| "Why is my model slow to compile?" | `AI-dynamo-backend.md` + `NEURON_CC_FLAGS` |
-| "How do I add support for a new ATen op?" | `AI-python-ops.md` + `docs/new_op.md` |
-| "Why does my tensor get copied to CPU?" | `AI-python-ops.md` (cast policy) + `AI-csrc.md` (CPUFallbackExecutor) |
-| "How do I debug a failed NEFF compile?" | `AI-build-infra.md` + `TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS` |
-| "How are collectives implemented?" | `AI-distributed.md` |
+| "Why is my model slow to compile?" | `docs/AI-dynamo-backend.md` + `NEURON_CC_FLAGS` |
+| "How do I add support for a new ATen op?" | `docs/AI-python-ops.md` + `docs/cpp_dispatch_onboarding_guide.md` |
+| "Why does my tensor get copied to CPU?" | `docs/AI-python-ops.md` (cast policy) + `docs/AI-csrc.md` (CPUFallbackExecutor) |
+| "How do I debug a failed NEFF compile?" | `docs/AI-build-infra.md` + `TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS` |
+| "How are collectives implemented?" | `docs/AI-distributed.md` |
 
 ## Authoritative human docs (cite, don't restate)
 
-- Build/test quickstart → `README.md`, `CONTRIBUTING.md`, `BAZEL_BUILD.md`.
-- Env-var reference → `docs/environment_variables.md`.
+- Build/test quickstart -> `README.md`, `CONTRIBUTING.md`, `BAZEL_BUILD.md`.
+- Env-var reference -> `docs/environment_variables.md`.

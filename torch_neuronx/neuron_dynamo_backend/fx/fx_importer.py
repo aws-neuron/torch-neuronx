@@ -12,9 +12,13 @@ ATEN_HIERARCHY_ENV_VAR = "TORCH_NEURONX_ATEN_HIERARCHY"
 
 
 def enable_aten_hierarchy() -> bool:
-    """Whether to append an aten-op leaf to each node's hierarchy string.
+    """Report whether node hierarchy strings include an ATen operation leaf.
 
-    Off by default -- see ``_get_hierarchy_string`` for why this is opt-in
+    Returns:
+        bool: ``True`` when ``TORCH_NEURONX_ATEN_HIERARCHY`` is enabled.
+
+    Note:
+        The setting is disabled by default and read from the process environment.
     """
     return bool(_getenv_bool(ATEN_HIERARCHY_ENV_VAR, False))
 
@@ -65,14 +69,30 @@ def _get_hierarchy_string(node: torch.fx.Node) -> str | None:
 
 
 class NeuronContextCache(ContextCache):
-    """Neuron custom context cache."""
+    """Track hierarchy-aware source locations during FX import.
+
+    Args:
+        *args: Positional arguments forwarded to ``ContextCache``.
+        **kwargs: Keyword arguments forwarded to ``ContextCache``.
+    """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.has_hierarchy = False
 
     def get_node_location(self, node: torch.fx.Node) -> Location | None:
-        """Get location with hierarchy string fused with source location."""
+        """Fuse an FX node hierarchy with its source location.
+
+        Args:
+            node (torch.fx.Node): FX node whose import location is requested.
+
+        Returns:
+            Location | None: Fused hierarchy and source location, either location
+            alone, or ``None`` when neither is available.
+
+        Note:
+            Finding a hierarchy sets ``has_hierarchy`` on this cache.
+        """
         source_loc = super().get_node_location(node)
         hierarchy = _get_hierarchy_string(node)
 
@@ -89,13 +109,16 @@ class NeuronContextCache(ContextCache):
 
 
 class NeuronFxImporter(FxImporter):
-    """Neuron custom FxImporter.
-
-    Central extension point for torch-mlir FxImporter customizations.
-    Add new parameters here for future hooks.
+    """Import FX graphs through the Neuron-customized torch-MLIR context.
 
     Args:
-        hooks: Optional FxImporterHooks for custom import behavior.
+        hooks (FxImporterHooks | None, optional): Hooks for custom import behavior.
+            Defaults to ``None``.
+        **kwargs: Additional keyword arguments forwarded to ``FxImporter``.
+
+    Note:
+        This class is the central extension point for Neuron FX importer
+        customizations and installs ``NeuronContextCache``.
     """
 
     def __init__(self, *, hooks: FxImporterHooks | None = None, **kwargs):
@@ -107,5 +130,9 @@ class NeuronFxImporter(FxImporter):
 
     @property
     def has_hierarchy(self) -> bool:
-        """Returns True if any node had hierarchy metadata during import."""
+        """Report whether any imported node produced hierarchy metadata.
+
+        Returns:
+            bool: ``True`` after importing at least one hierarchy-aware node.
+        """
         return self._cc.has_hierarchy

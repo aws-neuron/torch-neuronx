@@ -93,6 +93,15 @@ class NeuronCachingAllocatorTest : public ::testing::Test {
         .Times(AnyNumber())
         .WillRepeatedly(DoAll(SetArgPointee<3>(UINT64_MAX), Return(NRT_SUCCESS)));
 
+    // nrta_tensor_write: the scalar cache miss path submits a kWrite for the
+    // value. Set the async-status out-param (arg 6) to NRT_SUCCESS so the op's
+    // completion status isn't the fail-closed NRT_FAILURE default, and a nonzero
+    // sequence out-param (arg 7) to match how the other async NRT ops are mocked.
+    EXPECT_CALL(*MockNRT::GetInstance(), nrta_tensor_write(_, _, _, _, _, _, _, _))
+        .Times(AnyNumber())
+        .WillRepeatedly(
+            DoAll(SetArgPointee<6>(NRT_SUCCESS), SetArgPointee<7>(1u), Return(NRT_SUCCESS)));
+
     // Initialize the execution engine (needed for lazy alloc SubmitOperationContext)
     at::neuron::NeuronResourceManager::Instance();
   }
@@ -277,12 +286,6 @@ TEST_F(NeuronCachingAllocatorTest, GetSegmentPoolReturnsSameInstanceForSameDevic
   EXPECT_EQ(&pool1, &pool2);
 }
 
-TEST_F(NeuronCachingAllocatorTest, GetTensorPoolReturnsSameInstanceForSameDevice) {
-  auto& pool1 = c10_neuron::GetTensorPool(0);
-  auto& pool2 = c10_neuron::GetTensorPool(0);
-  EXPECT_EQ(&pool1, &pool2);
-}
-
 TEST_F(NeuronCachingAllocatorTest, EmptyCacheDoesNotCrash) {
   EXPECT_NO_THROW(NeuronCachingAllocator::emptyCache());
 }
@@ -323,4 +326,83 @@ TEST_F(NeuronCachingAllocatorTest, FullLifecycleAllocFindRecordDestroy) {
 
   // findTensor should return nullptr (removed from registry)
   EXPECT_EQ(NeuronCachingAllocator::findTensor(ptr), nullptr);
+}
+
+TEST_F(NeuronCachingAllocatorTest, CachedScalarTensorIsResolvableByFindTensor) {
+  int32_t val = 7;
+  auto t =
+      NeuronCachingAllocator::createCachedScalarTensor(&val, sizeof(val), c10::ScalarType::Int, 0);
+  ASSERT_TRUE(t.has_value());
+  void* ptr = t->data_ptr();
+  ASSERT_NE(ptr, nullptr);
+
+  syncDevice();
+
+  nrt_tensor_t* handle = NeuronCachingAllocator::findTensor(ptr);
+  EXPECT_NE(handle, nullptr);
+
+  // The storage context resolves to the same handle.
+  void* ctx = t->storage().data_ptr().get_context();
+  EXPECT_EQ(NeuronCachingAllocator::getTensorFromContext(ctx), handle);
+}
+
+TEST_F(NeuronCachingAllocatorTest, IdenticalScalarsShareVAAndSlice) {
+  int32_t val = 123;
+  auto a =
+      NeuronCachingAllocator::createCachedScalarTensor(&val, sizeof(val), c10::ScalarType::Int, 0);
+  auto b =
+      NeuronCachingAllocator::createCachedScalarTensor(&val, sizeof(val), c10::ScalarType::Int, 0);
+  ASSERT_TRUE(a.has_value() && b.has_value());
+
+  syncDevice();
+
+  // Identical bit patterns dedup to one shared placeholder VA (the second call
+  // is a cache hit that submits no new op) and resolve to the same slice.
+  EXPECT_EQ(a->data_ptr(), b->data_ptr());
+  EXPECT_EQ(NeuronCachingAllocator::findTensor(a->data_ptr()),
+            NeuronCachingAllocator::findTensor(b->data_ptr()));
+}
+
+TEST_F(NeuronCachingAllocatorTest, ScalarEntrySurvivesTensorDestructionUntilEmptyCache) {
+  int32_t val = 55;
+  void* ptr = nullptr;
+  {
+    auto t = NeuronCachingAllocator::createCachedScalarTensor(&val, sizeof(val),
+                                                              c10::ScalarType::Int, 0);
+    ASSERT_TRUE(t.has_value());
+    ptr = t->data_ptr();
+    syncDevice();
+    EXPECT_NE(NeuronCachingAllocator::findTensor(ptr), nullptr);
+  }
+  // The scalar entry is permanent (no-op deleter, shared across tensors), so
+  // destroying the tensor must not free it.
+  syncDevice();
+  EXPECT_NE(NeuronCachingAllocator::findTensor(ptr), nullptr);
+
+  // Only emptyCache tears it down.
+  NeuronCachingAllocator::emptyCache();
+  EXPECT_EQ(NeuronCachingAllocator::findTensor(ptr), nullptr);
+}
+
+TEST_F(NeuronCachingAllocatorTest, DistinctScalarsResolveToDistinctSlices) {
+  int32_t v1 = 1, v2 = 2;
+  auto a =
+      NeuronCachingAllocator::createCachedScalarTensor(&v1, sizeof(v1), c10::ScalarType::Int, 0);
+  auto b =
+      NeuronCachingAllocator::createCachedScalarTensor(&v2, sizeof(v2), c10::ScalarType::Int, 0);
+  ASSERT_TRUE(a.has_value() && b.has_value());
+
+  syncDevice();
+
+  EXPECT_NE(a->data_ptr(), b->data_ptr());
+  EXPECT_NE(NeuronCachingAllocator::findTensor(a->data_ptr()),
+            NeuronCachingAllocator::findTensor(b->data_ptr()));
+}
+
+TEST_F(NeuronCachingAllocatorTest, OversizedScalarReturnsNullopt) {
+  // Larger than kSlotSize (16 bytes) — not a real scalar; must fall back.
+  char buf[32] = {};
+  auto t =
+      NeuronCachingAllocator::createCachedScalarTensor(buf, sizeof(buf), c10::ScalarType::Float, 0);
+  EXPECT_FALSE(t.has_value());
 }

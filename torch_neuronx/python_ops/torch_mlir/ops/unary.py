@@ -67,6 +67,15 @@ _LN2_HI, _LN2_LO = _cody_waite_split(math.log(2.0), 2)
 # past 1. Measured at x=1: Taylor 8.0e-08, exp 1.0e-07.
 _SINH_TAYLOR_LIMIT = 1.0
 
+# expm1 near 0: exp(x) - 1 cancels; below this |x| use the Taylor series. Above
+# it the reduced exp is accurate. Both stay under the fp32 tolerance at 0.35.
+_EXPM1_TAYLOR_LIMIT = 0.35
+
+# expm1 large negative: below this x, exp(x) is 0 to float precision, so
+# expm1(x) = -1. Saturate here to skip the range reduction, which returns nan for
+# very negative x (2**k underflows to 0 and exp(r) is non-finite).
+_EXPM1_NEG_SATURATE = -40.0
+
 
 def _exp_reduced(x, exp_bias=0):
     """Accurate exp(x) * 2**exp_bias, sidestepping the hardware exp unit.
@@ -108,11 +117,51 @@ def _exp_reduced(x, exp_bias=0):
     return poly * torch.pow(2.0, k + exp_bias)
 
 
-@register_aten(["aten::abs", "aten::abs.out"])
-def torch_abs(x, out=None):
-    """StableHlo.abs does not support unsigned dtype
+def _validate_float_promoting_out(x, *args, out=None, **kwargs):
+    """Reject an out= tensor whose dtype can't hold the float result.
 
-    Reference: https://openxla.org/stablehlo/spec#abs_uint8_decomp
+    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
+    dispatch path skips (it would otherwise silently cast the result into out).
+    These ops promote integer/bool inputs to the default float dtype, so the
+    expected out dtype is the input dtype only when it is already floating.
+    """
+    # Unwrap tuple out= (e.g. max.dim returns (values, indices)); check values only.
+    out_tensor = out[0] if isinstance(out, tuple | list) else out
+    if out_tensor is None or not isinstance(out_tensor, torch.Tensor):
+        return
+    # Only check when the input is floating-point: the result is float, and an
+    # integer out= cannot hold it. For integer/bool inputs the result dtype is
+    # also integer (or stays bool), so any integer out= is acceptable.
+    if not x.is_floating_point():
+        return
+    if out_tensor.is_floating_point():
+        return
+    expected = x.dtype
+    raise RuntimeError(
+        f"Expected out tensor to have dtype {expected}, " f"but got {out_tensor.dtype} instead"
+    )
+
+
+@register_aten(
+    ["aten::abs", "aten::abs.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
+def torch_abs(x, out=None):
+    """Compute the elementwise absolute value.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Absolute values with negative floating-point zero normalized.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+
+    Note:
+        Returns the input tensor itself for unsigned 8-bit data because StableHLO
+        absolute value does not support that dtype.
     """
     if x.dtype == torch.uint8:
         return x
@@ -122,59 +171,127 @@ def torch_abs(x, out=None):
     return result
 
 
-@register_aten(["aten::neg", "aten::neg.out"])
+@register_aten(
+    ["aten::neg", "aten::neg.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_neg(x, out=None):
+    # neuronx-cc fails to compile an int32 negate that feeds the transpose
+    # epilogue alone (contiguous input, permuted output). A subtraction from
+    # zero compiles, gives the same result, and measures faster than negate
+    # for int32. Other dtypes compile with negate.
+    """Negate each input element.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise negated values.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+    """
+    if x.dtype == torch.int32:
+        return 0 - x
     return torch.neg(x)
 
 
-@register_aten(["aten::sqrt", "aten::sqrt.out"])
+@register_aten(
+    ["aten::sqrt", "aten::sqrt.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_sqrt(x, out=None):
-    """Square root."""
+    """Compute the elementwise square root.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise square roots.
+    """
     return torch.sqrt(x)
 
 
-@register_aten(["aten::rsqrt", "aten::rsqrt.out"])
+@register_aten(
+    ["aten::rsqrt", "aten::rsqrt.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_rsqrt(x, out=None):
+    """Compute the reciprocal square root of each element.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise reciprocal square roots.
+    """
     return torch.rsqrt(x)
 
 
-@register_aten(["aten::cos", "aten::cos.out"])
+@register_aten(
+    ["aten::cos", "aten::cos.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_cos(x, out=None):
+    """Compute the cosine of each element.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise cosine values.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+    """
     return torch.cos(x)
 
 
-@register_aten(["aten::sin", "aten::sin.out"])
+@register_aten(
+    ["aten::sin", "aten::sin.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_sin(x, out=None):
-    return torch.sin(x)
+    """Compute the sine of each element.
 
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
 
-def _validate_float_promoting_out(x, out=None):
-    """Reject an out= tensor whose dtype can't hold the float result.
+    Returns:
+        torch.Tensor: Elementwise sine values.
 
-    Mirrors PyTorch's structured-kernel unsafe-cast guard, which the Neuron
-    dispatch path skips (it would otherwise silently cast the result into out).
-    These ops promote integer/bool inputs to the default float dtype, so the
-    expected out dtype is the input dtype only when it is already floating.
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
     """
-    expected = x.dtype if x.is_floating_point() else torch.get_default_dtype()
-    if out is not None and out.dtype != expected:
-        raise RuntimeError(
-            f"Expected out tensor to have dtype {expected}, but got {out.dtype} instead"
-        )
+    return torch.sin(x)
 
 
 @register_aten(
     ["aten::cosh", "aten::cosh.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_cosh(x, out=None):
-    """Hyperbolic cosine as (e**x + e**-x)/2 over the reduced exp.
+    """Compute the hyperbolic cosine of each element.
 
-    Measured max rel error 1.1e-07 in fp32 vs 9.3e-06 for the hardware cosh.
-    fp16/bf16 keep the hardware op: the polynomial's multiply-adds accumulate
-    more error in an 8-11 bit mantissa (1.5e-02 bf16) than the single op does.
-    Non-finite inputs also defer to it, since the reduction turns -inf into nan.
+    Args:
+        x (torch.Tensor): Input tensor, promoted to the default float dtype if needed.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise hyperbolic cosine values.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+
+    Note:
+        Finite ``torch.float32`` and ``torch.float64`` inputs use the reduced exponential formula
+        ``(exp(x) + exp(-x)) / 2``. ``torch.float16``, ``torch.bfloat16``, and non-finite inputs use
+        the hardware operation to avoid polynomial error or invalid reduction.
     """
     if not x.is_floating_point():
         x = x.to(torch.get_default_dtype())
@@ -190,16 +307,25 @@ def torch_cosh(x, out=None):
 
 @register_aten(
     ["aten::sinh", "aten::sinh.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_sinh(x, out=None):
-    """Hyperbolic sine: Taylor near 0, else (e**x - e**-x)/2 over the reduced exp.
+    """Compute the hyperbolic sine of each element.
 
-    The exp form cancels catastrophically as x approaches 0 (4.6e-02 at 1e-6),
-    so small inputs use the series instead. Measured max rel error 1.0e-07 in
-    fp32 vs 1.7e-05 for the hardware sinh. fp16/bf16 and non-finite inputs keep
-    the hardware op, for the reasons in torch_cosh.
+    Args:
+        x (torch.Tensor): Input tensor, promoted to the default float dtype if needed.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise hyperbolic sine values.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+
+    Note:
+        Finite ``torch.float32`` and ``torch.float64`` inputs use a Taylor series for ``abs(x) < 1``
+        and the reduced formula ``(exp(x) - exp(-x)) / 2`` otherwise, avoiding near-zero
+        cancellation. ``torch.float16``, ``torch.bfloat16``, and non-finite inputs use hardware.
     """
     if not x.is_floating_point():
         x = x.to(torch.get_default_dtype())
@@ -217,17 +343,25 @@ def torch_sinh(x, out=None):
 
 @register_aten(
     ["aten::tan", "aten::tan.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_tan(x, out=None):
-    """Tangent with the argument reduced into (-pi/2, pi/2) first.
+    """Compute the tangent after Cody-Waite argument reduction.
 
-    The hardware reduces x mod pi in single precision, so error grows with |x|:
-    8.1e-02 over [-pi, pi] and 4.2e-01 over [1e3, 1e5]. Reducing first keeps it
-    at 3.3e-06 / 4.6e-04. The reduction runs in fp32 (upcasting fp16/bf16) so
-    the split-pi subtraction stays exact; casting back matches torch's own fp16
-    tan on every measured sample.
+    Args:
+        x (torch.Tensor): Input tensor, promoted to the default float dtype if needed.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise tangent values in the promoted input dtype.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+
+    Note:
+        ``torch.float16`` and ``torch.bfloat16`` inputs are reduced modulo pi in
+        ``torch.float32`` using a three-part pi split and are cast back afterward;
+        ``torch.float32`` and ``torch.float64`` inputs retain their dtype.
     """
     if not x.is_floating_point():
         x = x.to(torch.get_default_dtype())
@@ -240,99 +374,336 @@ def torch_tan(x, out=None):
 
 @register_aten(
     ["aten::acos", "aten::acos.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_acos(x, out=None):
-    """Inverse cosine (arccos) — elementwise transcendental."""
+    """Compute the inverse cosine of each element.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise inverse cosine values.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+    """
     return torch.acos(x)
 
 
 @register_aten(
     ["aten::acosh", "aten::acosh.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_acosh(x, out=None):
-    """Inverse hyperbolic cosine — elementwise transcendental."""
+    """Compute the inverse hyperbolic cosine of each element.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise inverse hyperbolic cosine values.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+    """
     return torch.acosh(x)
 
 
 @register_aten(
     ["aten::asin", "aten::asin.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_asin(x, out=None):
-    """Inverse sine (arcsin) — elementwise transcendental."""
+    """Compute the inverse sine of each element.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise inverse sine values.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+    """
     return torch.asin(x)
 
 
 @register_aten(
     ["aten::asinh", "aten::asinh.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_asinh(x, out=None):
-    """Inverse hyperbolic sine — elementwise transcendental."""
+    """Compute the inverse hyperbolic sine of each element.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise inverse hyperbolic sine values.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+    """
     return torch.asinh(x)
 
 
 @register_aten(
     ["aten::atan", "aten::atan.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_atan(x, out=None):
-    """Inverse tangent (arctan) — elementwise transcendental."""
+    """Compute the inverse tangent of each element.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise inverse tangent values.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+    """
     return torch.atan(x)
 
 
 @register_aten(
     ["aten::atanh", "aten::atanh.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_atanh(x, out=None):
-    """Inverse hyperbolic tangent — elementwise transcendental."""
+    """Compute the inverse hyperbolic tangent of each element.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise inverse hyperbolic tangent values.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+    """
     return torch.atanh(x)
 
 
-@register_aten(["aten::exp", "aten::exp.out"])
+@register_aten(
+    ["aten::exp", "aten::exp.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_exp(x, out=None):
+    """Compute the exponential of each element.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise exponential values.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+    """
     return torch.exp(x)
 
 
-@register_aten(["aten::log", "aten::log.out"])
+def _expm1_accurate(x):
+    """exp(x) - 1 over the accurate reduced exp; Taylor near zero.
+
+    The hardware exp has ~1e-05 relative error, so exp(x) - 1 misses the fp32
+    tolerance. Use the range-reduced exp instead (see _exp_reduced, ~7e-08).
+    Near zero exp(x) - 1 cancels catastrophically, so small inputs use the
+    Taylor series expm1(x) = x + x**2/2! + x**3/3! + ... instead.
+
+    This helper calls no torch.expm1, so the torch.compile decomposition that
+    reuses it (expm1_decomp in decompositions.py) does not recurse. Both paths
+    share this one implementation. Compute fp16/bf16 in float32 for accuracy.
+    """
+    # Integer and bool inputs promote to the default float dtype, matching CPU.
+    if not x.is_floating_point():
+        x = x.to(torch.get_default_dtype())
+    orig_dtype = x.dtype
+    if orig_dtype in (torch.float16, torch.bfloat16):
+        x = x.float()
+    large = _exp_reduced(x) - 1.0
+    series = x * (
+        1.0 + x * (0.5 + x * (1 / 6 + x * (1 / 24 + x * (1 / 120 + x * (1 / 720 + x / 5040)))))
+    )
+    computed = torch.where(x.abs() < _EXPM1_TAYLOR_LIMIT, series, large)
+    # Large negative x: exp(x) is 0 to float precision, so expm1(x) = -1. Saturate
+    # before the range reduction reaches it: for very negative x, 2**k underflows
+    # to 0 while the corrupted reduced argument makes exp(r) non-finite, so
+    # _exp_reduced returns 0 * inf = nan. -40 is far above that (exp(-40)~4e-18,
+    # negligible for every float dtype) and far below the underflow region.
+    computed = torch.where(x < _EXPM1_NEG_SATURATE, torch.full_like(x, -1.0), computed)
+    # Non-finite inputs: expm1(+inf)=+inf, expm1(-inf)=-1, expm1(nan)=nan. A
+    # finite overflow already yields +inf through 2**k, and nan propagates.
+    computed = torch.where(x == float("-inf"), torch.full_like(x, -1.0), computed)
+    computed = torch.where(x == float("inf"), torch.full_like(x, float("inf")), computed)
+    # A nan input must stay nan. On Neuron the large-negative `<` compare above can
+    # read a nan as true, so the saturate can turn nan into -1. Restore nan last.
+    computed = torch.where(torch.isnan(x), x, computed)
+    if orig_dtype in (torch.float16, torch.bfloat16):
+        computed = computed.to(orig_dtype)
+    return computed
+
+
+@register_aten(
+    ["aten::expm1", "aten::expm1.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
+def torch_expm1(x, out=None):
+    """Compute one less than the exponential of each element.
+
+    Args:
+        x (torch.Tensor): Input tensor, promoted to the default float dtype if needed.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise values of ``exp(x) - 1``.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+
+    Note:
+        Uses the shared range-reduced decomposition, a Taylor series near zero, and negative
+        saturation. Float16 and bfloat16 inputs are computed in float32 and cast back.
+    """
+    # Call the aten op so make_fx reuses the registered expm1 decomposition
+    # (expm1_decomp -> _expm1_accurate); both paths share the one helper.
+    return torch.ops.aten.expm1(x)
+
+
+def _validate_expm1_inplace(self):
+    """Reject an integer or bool in-place expm1_.
+
+    expm1 promotes an integer input to float, but the in-place variant must
+    store the result back into self. The Neuron dispatch path skips PyTorch's
+    structured-kernel guard, so check here. CPU raises the same error.
+    """
+    if not self.is_floating_point():
+        expected = torch.get_default_dtype()
+        raise RuntimeError(
+            f"result type {expected} can't be cast to the desired output type {self.dtype}"
+        )
+
+
+@register_aten(["aten::expm1_"], validate_static_inputs=_validate_expm1_inplace)
+def torch_expm1_(self):
+    """Compute the registered in-place exponential-minus-one operation.
+
+    Args:
+        self (torch.Tensor): Floating-point tensor updated by the registered operation.
+
+    Returns:
+        torch.Tensor: The mutated ``self`` tensor.
+
+    Raises:
+        RuntimeError: If ``self`` has a Boolean or integer dtype.
+
+    Note:
+        Uses the same range-reduced implementation as ``torch_expm1``.
+    """
+    # Same as torch_expm1: call the aten op so make_fx reuses the registered
+    # expm1 decomposition. The in-place path writes the result back into self.
+    return torch.ops.aten.expm1(self)
+
+
+@register_aten(
+    ["aten::log", "aten::log.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_log(x, out=None):
+    """Compute the natural logarithm of each element.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise natural logarithms.
+    """
     return torch.log(x)
 
 
 @register_aten(["aten::log2", "aten::log2.out", "aten::log2_"])
 def torch_log2(x, out=None):
-    """Base-2 logarithm — elementwise."""
+    """Compute the base-2 logarithm of each element.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise base-2 logarithms.
+
+    Note:
+        The registered ``log2_`` variant updates ``x`` in place.
+    """
     return torch.log2(x)
 
 
 @register_aten(["aten::log10", "aten::log10.out", "aten::log10_"])
 def torch_log10(x, out=None):
-    """Base-10 logarithm — elementwise."""
+    """Compute the base-10 logarithm of each element.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise base-10 logarithms.
+
+    Note:
+        The registered ``log10_`` variant updates ``x`` in place.
+    """
     return torch.log10(x)
 
 
 @register_aten(["aten::log1p", "aten::log1p.out", "aten::log1p_"])
 def torch_log1p(x, out=None):
-    """Natural logarithm of (1 + x) — elementwise."""
+    """Compute the natural logarithm of one plus each element.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise values of ``log(1 + x)``; integer and Boolean inputs
+            use the default floating-point dtype.
+
+    Note:
+        Computes ``torch.float16`` and ``torch.bfloat16`` inputs in
+        ``torch.float32`` before casting back to match CPU semantics. The registered
+        ``log1p_`` variant updates ``x`` in place.
+    """
     # Upcast to float32 for reduced-precision types to match CPU semantics.
     if x.dtype in (torch.float16, torch.bfloat16):
         return torch.log1p(x.float()).to(x.dtype)
     return torch.log1p(x)
 
 
-@register_aten(["aten::erf", "aten::erf.out"])
+@register_aten(
+    ["aten::erf", "aten::erf.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_erf(x, out=None):
     # Cast non-floating-point inputs (e.g. bool, int) to float,
     # matching PyTorch CPU behavior where erf promotes to float.
+    """Compute the error function of each element.
+
+    Args:
+        x (torch.Tensor): Input tensor, promoted to ``torch.float32`` if non-floating-point.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise error-function values with NaNs preserved.
+    """
     if not x.is_floating_point():
         x = x.to(torch.float32)
     # Handle NaN case: erf(NaN) should return NaN
@@ -340,10 +711,23 @@ def torch_erf(x, out=None):
     return torch.where(torch.isnan(x), x, result)
 
 
-@register_aten(["aten::erfinv", "aten::erfinv.out"])
+@register_aten(
+    ["aten::erfinv", "aten::erfinv.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_erfinv(y, out=None):
     # Cast non-floating-point inputs (e.g. bool, int) to float,
     # matching PyTorch CPU behavior where erfinv promotes to float.
+    """Approximate the inverse error function elementwise.
+
+    Args:
+        y (torch.Tensor): Input tensor, promoted to ``torch.float32`` if non-floating-point.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Piecewise rational approximations, with NaN outside
+        ``[-1, 1]`` and signed infinity at the endpoints.
+    """
     if not y.is_floating_point():
         y = y.to(torch.float32)
 
@@ -374,8 +758,23 @@ def torch_erfinv(y, out=None):
     return result
 
 
-@register_aten(["aten::ceil", "aten::ceil.out"])
+@register_aten(
+    ["aten::ceil", "aten::ceil.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_ceil(self, out=None):
+    """Compute the ceiling of each element.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise ceiling values.
+
+    Raises:
+        RuntimeError: If ``self`` is floating-point and ``out`` has a non-floating-point dtype.
+    """
     return torch.ceil(self)
 
 
@@ -388,6 +787,8 @@ def _validate_floor(self, out=None):
     so out must have the same dtype as the input. The message is spelled like
     CPU (e.g. 'Long', not 'torch.int64').
     """
+    if isinstance(self, torch.Tensor) and self.dtype is torch.bool:
+        raise RuntimeError("\"floor\" not implemented for 'Bool'")
     if out is not None and out.dtype != self.dtype:
         raise RuntimeError(
             f"Found dtype {aten_scalar_type_name(out.dtype)} but expected "
@@ -397,19 +798,27 @@ def _validate_floor(self, out=None):
 
 @register_aten(
     ["aten::floor", "aten::floor.out", "aten::floor_"],
-    output_params=("out",),
     validate_static_inputs=_validate_floor,
 )
 def torch_floor(self, out=None):
-    """Floor — elementwise, identity on non-floating-point dtypes.
+    """Compute the floor of each element.
 
-    Two input classes bypass the HLO floor and pass through unchanged (floor is
-    the identity on both):
-      - |x| >= 2^23: float32 has no fractional bits, so the value is already an
-        integer; the HLO lowering otherwise loses precision (clamps to int32).
-      - nan: neuronx-cc's floor returns 2^31 for nan instead of nan. floor(nan)
-        is nan, so we restore it with an isnan mask. (inf/-inf are already handled
-        correctly by the 2^23 branch, since |inf| >= 2^23.)
+    Args:
+        self (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise floors, or ``self`` itself for supported integer data.
+
+    Raises:
+        RuntimeError: If ``self`` is Boolean or ``out`` has a different dtype from
+            ``self``.
+
+    Note:
+        Passes through every value with ``abs(x) >= 2**23`` to avoid StableHLO
+        clamping on the ``torch.float32`` path. Restores NaNs because neuronx-cc floor otherwise
+        returns ``2**31``; infinities are handled by the large-value branch. The
+        registered ``floor_`` variant updates ``self`` in place.
     """
     if not self.is_floating_point():
         return self
@@ -419,92 +828,243 @@ def torch_floor(self, out=None):
     return torch.where(torch.isnan(self), self, result)
 
 
-@register_aten(["aten::trunc", "aten::trunc.out"])
+@register_aten(
+    ["aten::trunc", "aten::trunc.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_trunc(x, out=None):
+    """Truncate each element toward zero.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise truncated values.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+    """
     return torch.trunc(x)
 
 
-@register_aten(["aten::sign", "aten::sign.out"])
+@register_aten(
+    ["aten::sign", "aten::sign.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_sign(x, out=None):
+    """Compute the sign of each element.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise signs.
+    """
     return torch.sign(x)
 
 
 @register_aten(
     ["aten::angle", "aten::angle.out"],
-    output_params=("out",),
     validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_angle(x, out=None):
-    """Phase angle of a real input.
+    """Compute the phase angle of each real input element.
 
-    torch-mlir has no StableHLO legalization for aten::angle, so it is decomposed
-    into where/isnan (0 for x >= 0, pi for x < 0, nan for nan) by
-    ``angle_decomp`` in neuron_dynamo_backend/decompositions.py. That decomposition
-    table is applied on both the eager (make_fx) and torch.compile paths, so this
-    handler just calls torch.angle and lets the shared decomposition lower it.
+    Args:
+        x (torch.Tensor): Real input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise phase angles; real inputs yield zero for nonnegative values,
+            pi for negative values, and NaN for NaN inputs.
+
+    Raises:
+        RuntimeError: If ``x`` is floating-point and ``out`` has a non-floating-point dtype.
+
+    Note:
+        Torch-MLIR lacks StableHLO legalization for ``aten::angle``. The shared
+        ``angle_decomp`` decomposition handles eager ``make_fx`` and
+        ``torch.compile`` paths before this handler lowers ``torch.angle``.
     """
     return torch.angle(x)
 
 
-@register_aten(["aten::reciprocal", "aten::reciprocal_", "aten::reciprocal.out"])
+@register_aten(
+    ["aten::reciprocal", "aten::reciprocal_", "aten::reciprocal.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_reciprocal(a, out=None):
-    """Elementwise reciprocal (1/x).
+    """Compute the reciprocal of each element.
 
-    reciprocal promotes integer/bool inputs to the default floating-point dtype
-    (matching PyTorch's type-promotion semantics). The torch-mlir StableHLO
-    lowering of ``AtenReciprocalOp`` only legalizes floating-point operands
-    ("only floating-point datatype legalization supported for AtenReciprocalOp"),
-    so cast integer/bool inputs up front instead of emitting an illegal integer
-    reciprocal. This is what makes integer ``__rdiv__`` / ``__rtruediv__``
-    (``1 / int_tensor``) lower correctly.
+    Args:
+        a (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise reciprocals.
+
+    Raises:
+        RuntimeError: If ``a`` is floating-point and ``out`` has a non-floating-point dtype.
+
+    Note:
+        Promotes integer and Boolean inputs to the default float dtype because the
+        Torch-MLIR StableHLO lowering accepts only floating-point reciprocal
+        operands. This also supports integer ``__rdiv__`` and ``__rtruediv__``.
+        The registered ``reciprocal_`` variant updates ``a`` in place.
     """
     if not a.is_floating_point() and not a.is_complex():
         a = a.to(torch.get_default_dtype())
     return torch.reciprocal(a)
 
 
-@register_aten(["aten::exp2", "aten::exp2.out"])
+@register_aten(
+    ["aten::exp2", "aten::exp2.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_exp2(self, out=None):
+    """Compute two raised to each input element.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise base-2 exponentials.
+
+    Raises:
+        RuntimeError: If ``self`` is floating-point and ``out`` has a non-floating-point dtype.
+    """
     return torch.ops.aten.exp2(self)
 
 
 @register_aten(["aten::exp2_"])
 def torch_exp2_(self):
+    """Compute the registered in-place base-2 exponential.
+
+    Args:
+        self (torch.Tensor): Input tensor updated by the registered operation.
+
+    Returns:
+        torch.Tensor: The mutated ``self`` tensor.
+    """
     return torch.ops.aten.exp2(self)
 
 
 @register_aten(
     ["aten::frac", "aten::frac.out", "aten::frac_"],
-    validate_static_inputs=validate_float_only_dtype,
+    validate_static_inputs=lambda *args, **kw: (
+        validate_float_only_dtype(*args, **kw),
+        _validate_float_promoting_out(*args, **kw),
+    ),
 )
 def torch_frac(self, out=None):
+    """Compute the fractional portion of each element.
+
+    Args:
+        self (torch.Tensor): Floating-point input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Fractional portions of the input values.
+
+    Raises:
+        RuntimeError: If ``self`` has a Boolean or integer dtype, or floating-point
+            ``self`` is paired with a non-floating-point ``out``.
+
+    Note:
+        The registered ``frac_`` variant updates ``self`` in place.
+    """
     return torch.ops.aten.frac(self)
 
 
 @register_aten(
     ["aten::round", "aten::round.out", "aten::round_"],
-    validate_static_inputs=validate_round_dtype,
+    validate_static_inputs=lambda *args, **kw: (
+        validate_round_dtype(*args, **kw),
+        _validate_float_promoting_out(*args, **kw),
+    ),
 )
 def torch_round(self, out=None):
+    """Round each element to the nearest integer value.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise rounded values.
+
+    Raises:
+        RuntimeError: If ``self`` has Boolean dtype, or floating-point ``self`` is
+            paired with a non-floating-point ``out``.
+
+    Note:
+        The registered ``round_`` variant updates ``self`` in place.
+    """
     return torch.ops.aten.round(self)
 
 
 @register_aten(
     ["aten::round.decimals", "aten::round.decimals_out", "aten::round_.decimals"],
     static_argnames=("decimals",),
-    validate_static_inputs=validate_float_only_dtype,
+    validate_static_inputs=lambda *args, **kw: (
+        validate_float_only_dtype(*args, **kw),
+        _validate_float_promoting_out(*args, **kw),
+    ),
 )
 def torch_round_decimals(self, decimals, out=None):
+    """Round each element to a fixed number of decimal places.
+
+    Args:
+        self (torch.Tensor): Floating-point input tensor.
+        decimals (int): Number of decimal places to retain.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise rounded values.
+
+    Raises:
+        RuntimeError: If ``self`` has a Boolean or integer dtype, or floating-point
+            ``self`` is paired with a non-floating-point ``out``.
+
+    Note:
+        The registered ``round_.decimals`` variant updates ``self`` in place.
+    """
     return torch.ops.aten.round(self, decimals=decimals)
 
 
-@register_aten(["aten::logit", "aten::logit.out"], static_argnames=("eps",))
+@register_aten(
+    ["aten::logit", "aten::logit.out"],
+    static_argnames=("eps",),
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_logit(self, eps=None, out=None):
+    """Compute the logit of each element.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        eps (float, optional): Clamping epsilon. Defaults to ``None``.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise logit values.
+    """
     return torch.ops.aten.logit(self, eps)
 
 
 @register_aten(["aten::logit_"], static_argnames=("eps",))
 def torch_logit_(self, eps=None):
+    """Compute the registered in-place logit.
+
+    Args:
+        self (torch.Tensor): Input tensor updated by the registered operation.
+        eps (float, optional): Clamping epsilon. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: The mutated ``self`` tensor.
+    """
     return torch.ops.aten.logit(self, eps)
 
 
@@ -514,9 +1074,32 @@ def torch_logit_(self, eps=None):
     static_argnames=("eps",),
 )
 def torch_logit_backward(grad_output, self, eps=None, grad_input=None):
+    """Compute the gradient of the logit operation.
+
+    Args:
+        grad_output (torch.Tensor): Upstream gradient tensor.
+        self (torch.Tensor): Forward input tensor.
+        eps (float, optional): Forward clamping epsilon. Defaults to ``None``.
+        grad_input (torch.Tensor, optional): Gradient destination. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Gradient with respect to ``self``.
+    """
     return torch.ops.aten.logit_backward.default(grad_output, self, eps)
 
 
-@register_aten(["aten::special_i1e", "aten::special_i1e.out"])
+@register_aten(
+    ["aten::special_i1e", "aten::special_i1e.out"],
+    validate_static_inputs=_validate_float_promoting_out,
+)
 def torch_special_i1e(self, out=None):
+    """Compute the exponentially scaled modified Bessel function I1.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        out (torch.Tensor, optional): Destination tensor. Defaults to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise exponentially scaled modified Bessel values.
+    """
     return torch.ops.aten.special_i1e(self)

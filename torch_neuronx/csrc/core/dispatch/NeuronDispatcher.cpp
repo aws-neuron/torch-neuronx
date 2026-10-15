@@ -10,9 +10,12 @@
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
 
+#include <algorithm>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <sstream>
+#include <vector>
 
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/KernelExecution.h"
@@ -29,8 +32,10 @@
 #include "torch_neuronx/csrc/core/dispatch/OutputProcessing.h"
 #include "torch_neuronx/csrc/core/dispatch/ParseLoweringResult.h"
 #include "torch_neuronx/csrc/core/dispatch/PreprocessArgs.h"
+#include "torch_neuronx/csrc/core/dispatch/StructuralComplexOps.h"
 #include "torch_neuronx/csrc/core/lazy_materialization/Transformations.h"
 #include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
+#include "torch_neuronx/csrc/core/streams/StreamConfig.h"
 #include "torch_neuronx/csrc/core/utils/CopyUtils.h"
 #include "torch_neuronx/csrc/core/utils/DtypeCastVec.h"
 #include "torch_neuronx/csrc/core/utils/HostChain.h"
@@ -133,6 +138,9 @@ void NeuronDispatcher::RegisterOp(const std::string& op_name, py::object python_
   static const std::unordered_set<std::string> kToCopyOps = {
       "_to_copy",
   };
+  static const std::unordered_set<std::string> kForeachCopyOps = {
+      "_foreach_copy_",
+  };
   static const std::unordered_set<std::string> kContiguousOps = {
       "contiguous",
   };
@@ -178,6 +186,12 @@ void NeuronDispatcher::RegisterOp(const std::string& op_name, py::object python_
     lib.impl(op_name.c_str(),
              torch::CppFunction::makeFromBoxedFunctor(std::make_unique<BoxedDispatchFunctor>(
                  reg, &NeuronDispatcher::DispatchToCopyImpl)));
+  } else if (kForeachCopyOps.count(bare_name)) {
+    TORCH_NEURONX_DISPATCH_DEBUG(
+        "[NeuronDispatcher::RegisterOp] registered DispatchForeachCopy handler", " op=", op_name);
+    lib.impl(op_name.c_str(),
+             torch::CppFunction::makeFromBoxedFunctor(std::make_unique<BoxedDispatchFunctor>(
+                 reg, &NeuronDispatcher::DispatchForeachCopyImpl)));
   } else if (kContiguousOps.count(bare_name)) {
     TORCH_NEURONX_DISPATCH_DEBUG(
         "[NeuronDispatcher::RegisterOp] registered DispatchContiguous handler", " op=", op_name);
@@ -267,6 +281,9 @@ void NeuronDispatcher::DispatchScalarTensor(const c10::OperatorHandle& op,
   auto cpu_tensor = at::scalar_tensor(scalar, opts);
 
   // Copy CPU → Neuron (non-blocking to allow overlap with other work)
+  // Scalar device cache not used - this result goes to the
+  // caller, who can write it in place. This would corrupt the shared slot and
+  // every later scalar of that value.
   auto neuron_tensor = cpu_tensor.to(target_device, /*non_blocking=*/true);
 
   // Log for op tracking so test framework sees the op as executed.
@@ -393,10 +410,21 @@ static bool CanUseDirectNeuronToCPUCopy(const at::Tensor& logical_src,
 
 /// Dtype supported by the MLIR aten::copy_ lowering (excludes Bool).
 static bool IsCopyMlirDtypeSupported(c10::ScalarType dt) {
-  // Int64 copies use the NRT direct path (memcpy), not MLIR lowering — the
-  // MLIR copy lowering doesn't support int64 (true regardless of Int64Mode).
-  if (dt == c10::ScalarType::Long) return false;
+  // IsSupportedDtype() accepts Long when int64 reaches the compiler as S64
+  // (native / native_strict) or when packed int64 is on. The copy lowering
+  // carries int64 in those modes, so Long needs no special case here. See
+  // IsCopyMlirPairSupported() for the one pair the lowering cannot carry.
   return IsSupportedDtype(dt) && !c10::isComplexType(dt);
+}
+
+/// Dtype pair the MLIR aten::copy_ lowering can carry. int64 to or from a float
+/// needs all 64 bits, and the device convert keeps the low word only, so that
+/// pair stays on the CPU bounce.
+static bool IsCopyMlirPairSupported(c10::ScalarType src_dt, c10::ScalarType dst_dt) {
+  if (!IsCopyMlirDtypeSupported(src_dt) || !IsCopyMlirDtypeSupported(dst_dt)) return false;
+  if (src_dt == c10::ScalarType::Long && c10::isFloatingType(dst_dt)) return false;
+  if (dst_dt == c10::ScalarType::Long && c10::isFloatingType(src_dt)) return false;
+  return true;
 }
 
 /// Dtype supported by the MLIR aten::_to_copy lowering.
@@ -415,11 +443,7 @@ static bool IsToCopyMlirDtypeSupported(c10::ScalarType dt) {
 /// Mirrors Python can_handle() guard: `not (is_host_cc_enabled() and
 /// current_stream() != default_stream())`.
 static bool IsNonDefaultStreamWithHostCC(c10::DeviceIndex device_index) {
-  static const bool host_cc_enabled = [] {
-    const char* env = std::getenv("TORCH_NEURONX_ENABLE_HOST_CC");
-    return env != nullptr && std::string(env) == "1";
-  }();
-  if (!host_cc_enabled) return false;
+  if (!at::neuron::config::IsHostCCEnabled()) return false;
   auto current = at::neuron::getCurrentNeuronStream(device_index);
   auto default_s = at::neuron::getDefaultNeuronStream(device_index);
   return current != default_s;
@@ -546,6 +570,28 @@ static bool TryComplexNeuronToNeuronCopy(const at::Tensor& src, at::Tensor& dst)
   // a non-contiguous dst.
   dst_real.copy_(src_real);
   return true;
+}
+
+static bool IsNrtTensorCastEligible(const at::Tensor& src, c10::ScalarType dst_dtype,
+                                    c10::DeviceIndex dst_device, bool is_non_default_hostcc) {
+  return is_non_default_hostcc && src.scalar_type() != dst_dtype &&
+         torch_neuronx::utils::is_nrt_tensor_cast_supported(src.scalar_type(), dst_dtype) &&
+         src.device().index() == dst_device && !src.is_neg() && !src.is_conj();
+}
+
+static bool CanUseNrtTensorCast(const at::Tensor& src, const at::Tensor& dst,
+                                bool is_non_default_hostcc) {
+  return IsNrtTensorCastEligible(src, dst.scalar_type(), dst.device().index(),
+                                 is_non_default_hostcc) &&
+         src.numel() == dst.numel() && !dst.is_neg() && !dst.is_conj() && dst.is_contiguous() &&
+         !src.storage().is_alias_of(dst.storage());
+}
+
+static void RunNrtTensorCast(const at::Tensor& src, at::Tensor& dst) {
+  auto src_prepared = src.is_contiguous() ? src
+                                          : torch_neuronx::ops::contiguous_internal(
+                                                src, c10::MemoryFormat::Contiguous);
+  torch_neuronx::utils::cast_neuron_to_neuron(src_prepared, dst);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -687,7 +733,9 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
   //   1. MLIR pipeline    — contiguous dst, supported dtypes, default stream
   //   2. NRT on-device    — non-contiguous dst, same dtype, same shape
   //   2.5. Raw NRT N→N    — same dtype, contiguous src, non-default stream + hostCC
-  //   3. NRT CPU bounce   — everything else
+  //   3. NRT device cast  — supported cross-dtype copies on hostCC streams
+  //   4. kHost fallback   — remaining supported cross-dtype copies
+  //   5. NRT CPU bounce   — everything else
   if (src_is_neuron && dst_is_neuron) {
     // ── 0. Complex: reconcile conj/neg on device instead of on the host ──
     if (src.is_complex() && self_tensor.is_complex() &&
@@ -702,8 +750,7 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
 
     const bool is_non_default_hostcc = IsNonDefaultStreamWithHostCC(self_tensor.device().index());
     bool mlir_can_handle = self_tensor.dim() > 0 && self_tensor.is_contiguous() &&
-                           IsCopyMlirDtypeSupported(src.scalar_type()) &&
-                           IsCopyMlirDtypeSupported(self_tensor.scalar_type()) &&
+                           IsCopyMlirPairSupported(src.scalar_type(), self_tensor.scalar_type()) &&
                            !is_non_default_hostcc;
 
     // ── 1. MLIR lowering pipeline (most optimal) ──
@@ -733,8 +780,7 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
     // ── 2. Non-contiguous dst: on-device stride matching via NRT ──
     if (!self_tensor.is_contiguous()) {
       // Unsupported dtype → CPU bounce (must come before on-device paths)
-      if (!IsCopyMlirDtypeSupported(src.scalar_type()) ||
-          !IsCopyMlirDtypeSupported(self_tensor.scalar_type())) {
+      if (!IsCopyMlirPairSupported(src.scalar_type(), self_tensor.scalar_type())) {
         auto tmp_cpu = CopyNeuronToCPU(src, self_tensor.scalar_type());
         if (needs_broadcast) {
           tmp_cpu = tmp_cpu.expand_as(self_tensor).contiguous();
@@ -807,7 +853,18 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
       return;
     }
 
-    // ── 3a. kHost cross-dtype chain (FSDP-stream + cross-dtype + supported pair) ──
+    // ── 3. Raw NRT cross-dtype cast (non-default stream + hostCC) ──
+    if (!needs_broadcast && CanUseNrtTensorCast(src, self_tensor, is_non_default_hostcc)) {
+      TORCH_NEURONX_DISPATCH_DEBUG(
+          "[DispatchCopy] Neuron→Neuron raw NRT cross-dtype cast", " src_dtype=", src.scalar_type(),
+          " dst_dtype=", self_tensor.scalar_type(), " numel=", src.numel());
+      RunNrtTensorCast(src, self_tensor);
+      logOperationExecuted("aten::copy_");
+      torch::jit::push(*stack, self_tensor);
+      return;
+    }
+
+    // ── 4. kHost cross-dtype fallback ──
     if (!needs_broadcast &&
         CanUseKHostCastChain(src, self_tensor.scalar_type(), self_tensor.device().index(),
                              is_non_default_hostcc)) {
@@ -822,8 +879,8 @@ void NeuronDispatcher::DispatchCopyImpl(const c10::OperatorHandle& op,
       // Fall through on failure (numel==0 etc.)
     }
 
-    // ── 3b. NRT CPU bounce (least optimal) ── when MLIR, raw-NRT, and the kHost
-    // chain all don't apply (unsupported dtype, broadcast, or non-v1 cast pair).
+    // ── 5. NRT CPU bounce (least optimal) ── when MLIR, raw NRT, and the
+    // kHost chain don't apply.
     bool async_write = is_non_default_hostcc;
     TORCH_NEURONX_DISPATCH_DEBUG("[DispatchCopy] Neuron→Neuron NRT CPU bounce",
                                  " async_write=", async_write);
@@ -1019,21 +1076,18 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
         torch::jit::push(*stack, dst);
         return;
       }
-      // Cross-dtype kHost cast chain (FSDP-stream + cross-dtype + supported pair).
-      if (CanUseKHostCastChain(self_tensor, target_dtype, target_device.index(),
-                               is_non_default_hostcc)) {
-        TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] Neuron→Neuron kHost cross-dtype chain",
+      if (IsNrtTensorCastEligible(self_tensor, target_dtype, target_device.index(),
+                                  is_non_default_hostcc)) {
+        TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] Neuron→Neuron raw NRT cross-dtype cast",
                                      " src_dtype=", self_tensor.scalar_type(),
                                      " target_dtype=", target_dtype,
                                      " numel=", self_tensor.numel());
         auto dst = at::empty(self_tensor.sizes(),
                              at::TensorOptions().dtype(target_dtype).device(target_device));
-        if (RunKHostCastChain(self_tensor, dst)) {
-          logOperationExecuted("aten::_to_copy");
-          torch::jit::push(*stack, dst);
-          return;
-        }
-        // Fall through on failure (numel==0).
+        RunNrtTensorCast(self_tensor, dst);
+        logOperationExecuted("aten::_to_copy");
+        torch::jit::push(*stack, dst);
+        return;
       }
       TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] Neuron→Neuron NRT CPU bounce (hostCC async)");
       auto cpu_tmp = CopyNeuronToCPU(self_tensor, target_dtype);
@@ -1065,8 +1119,9 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
                                           *memory_format_opt == c10::MemoryFormat::ChannelsLast3d);
 
     // ===== Phase 1: dtype conversion → `converted` (target_dtype) =====
-    // `converted` is contiguous except for the same-dtype passthrough, which may
-    // keep self's (possibly non-contiguous) layout; Phase 2 fixes the layout.
+    // `converted` can be non-contiguous. The same-dtype passthrough keeps self's
+    // layout, and the MLIR lowering keeps the ATen output layout of a permuted
+    // input. Phase 2 applies the requested memory_format.
     const bool mlir_can_handle = IsToCopyMlirDtypeSupported(self_tensor.scalar_type()) &&
                                  IsToCopyMlirDtypeSupported(target_dtype);
     torch::Tensor converted;
@@ -1113,8 +1168,8 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
       converted = self_tensor;
       converted_contiguous = self_tensor.is_contiguous();
     } else if (mlir_can_handle) {
-      // MLIR _to_copy (contiguous output; it ignores memory_format — Phase 2
-      // applies the requested layout).
+      // MLIR _to_copy. It ignores memory_format and returns the ATen output
+      // layout, so Phase 2 applies the requested layout.
       TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] N2N phase1 MLIR",
                                    " src_dtype=", self_tensor.scalar_type(),
                                    " target_dtype=", target_dtype);
@@ -1139,20 +1194,31 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
     torch::Tensor result;
     if (is_channels_last) {
       result = MakeChannelsLast(converted, *memory_format_opt);
-    } else if (preserve_fmt && !self_tensor.is_contiguous() &&
-               self_tensor.is_non_overlapping_and_dense()) {
-      // Preserve: replay the source's (dense) strides. Reached only with a dtype
-      // change — a same-dtype Preserve is a no-op handled at the top.
-      result =
-          torch::empty_strided(self_tensor.sizes(), self_tensor.strides(), converted.options());
-      if (IsCopyMlirDtypeSupported(result.scalar_type())) {
-        result.copy_(converted);
+    } else if (preserve_fmt && !self_tensor.is_contiguous()) {
+      // Preserve: replay the dim order of the source. Reached only with a dtype
+      // change. The top of the function handles a same-dtype Preserve.
+      //
+      // infer_dense_strides is the ATen rule for Preserve. It gives the strides
+      // of the source when the source is dense. It densifies the dim order when
+      // the source is a strided view of a bigger buffer. A plain replay of the
+      // strides of the source is wrong in the second case.
+      auto preserved = at::infer_dense_strides(self_tensor.sizes(), self_tensor.strides());
+      if (converted.sizes().equals(self_tensor.sizes()) && converted.strides().equals(preserved)) {
+        // Phase 1 already gives this layout for a permuted input. Skip the copy.
+        TORCH_NEURONX_DISPATCH_DEBUG("[DispatchToCopy] N2N phase2 preserve already applied",
+                                     " strides=", converted.strides());
+        result = converted;
       } else {
-        // Unsupported dtype (complex, 8-byte): byte-wise copy — the aten::copy_
-        // redispatch would detour through CopyToNonContiguous / aten::contiguous
-        // (hard error for complex when fallback is restricted; downcast risk
-        // for 8-byte dtypes). See the CPU→Neuron strided branch above.
-        torch_neuronx::utils::nki_copy_strided_neuron_to_neuron(converted, result);
+        result = torch::empty_strided(self_tensor.sizes(), preserved, converted.options());
+        if (IsCopyMlirDtypeSupported(result.scalar_type())) {
+          result.copy_(converted);
+        } else {
+          // Unsupported dtype (complex, 8-byte): byte-wise copy. The aten::copy_
+          // redispatch would detour through CopyToNonContiguous / aten::contiguous
+          // (hard error for complex when fallback is restricted; downcast risk
+          // for 8-byte dtypes). See the CPU to Neuron strided branch above.
+          torch_neuronx::utils::nki_copy_strided_neuron_to_neuron(converted, result);
+        }
       }
     } else if (!converted_contiguous) {
       // contiguous_format requested but `converted` is the non-contiguous
@@ -1181,6 +1247,193 @@ void NeuronDispatcher::DispatchToCopyImpl(const c10::OperatorHandle& op,
   TORCH_CHECK(false, "DispatchToCopy: unhandled case — src_device=", self_tensor.device(),
               " src_dtype=", self_tensor.scalar_type(), " target_device=", target_device,
               " target_dtype=", target_dtype, " non_blocking=", non_blocking);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  aten::_foreach_copy_
+// ═══════════════════════════════════════════════════════════════
+
+/// Dtype the fused list kernel can express.
+///
+/// Wider than IsCopyMlirDtypeSupported, which describes what aten::copy_'s own
+/// lowering handles. The list kernel is a clone or a cast, and the compiler takes
+/// those for the narrow integer types copy_'s specialised path does not. Using
+/// copy_'s predicate here sent uint8 lists pair by pair into copy_'s CPU bounce:
+/// measured at 1167us against 249us for the single kernel, on 20 x 4096 uint8.
+static bool IsForeachCopyKernelDtype(c10::ScalarType dt) {
+  switch (dt) {
+    case c10::ScalarType::Float:
+    case c10::ScalarType::Half:
+    case c10::ScalarType::BFloat16:
+    case c10::ScalarType::Int:
+    case c10::ScalarType::Short:
+    case c10::ScalarType::Char:
+    case c10::ScalarType::Byte:
+    case c10::ScalarType::Bool:
+      return true;
+    case c10::ScalarType::Long:
+      return IsNativeInt64Enabled();
+    default:
+      return false;  // float64, complex, uint16/32/64, and anything new
+  }
+}
+
+/// True when every dst/src pair has the same sizes.
+///
+/// aten::copy_ broadcasts src into dst, so dst's shape wins. Neither of the batch
+/// routes does that: the kernel clones the source, giving it src's shape, and a
+/// coalesced span copies elementwise across the whole buffer. Pairs that differ
+/// in shape therefore have to go one at a time, where copy_ broadcasts properly.
+static bool PairShapesMatch(const c10::List<at::Tensor>& dsts, const c10::List<at::Tensor>& srcs) {
+  if (dsts.size() != srcs.size()) return false;
+  for (size_t i = 0; i < dsts.size(); ++i) {
+    at::Tensor d = dsts[i];
+    at::Tensor s = srcs[i];
+    if (!d.defined() || !s.defined() || d.sizes() != s.sizes()) return false;
+  }
+  return true;
+}
+
+void NeuronDispatcher::DispatchForeachCopyImpl(const c10::OperatorHandle& op,
+                                               c10::DispatchKeySet dispatch_keys,
+                                               torch::jit::Stack* stack,
+                                               const OpRegistration& reg) {
+  // Schema: aten::_foreach_copy_(Tensor(a!)[] self, Tensor[] src,
+  //                              bool non_blocking=False) -> ()
+  //
+  // _foreach_copy_ is a batch of aten::copy_, and one kernel copying every src
+  // into its dst is correct whatever those tensors look like in memory. So the
+  // whole list goes on the ordinary cached path whenever every pair is something
+  // that kernel can express, and pair by pair into aten::copy_ when it is not.
+  //
+  // All of the routing has to happen here, ahead of the cache lookup, because it
+  // turns on things a cached entry cannot carry: the current stream and storage
+  // adjacency are not part of the cache key, and the Python factory that would
+  // otherwise decide runs only on a cache miss, so its decision would be
+  // replayed on calls it never saw.
+  auto schema = op.schema();
+  auto args = torch::jit::pop(*stack, schema.arguments().size());
+
+  auto self_list = args[0].toTensorList();
+  auto src_list = args[1].toTensorList();
+  const size_t n = self_list.size();
+
+  // ATen's own checks, which this handler now gates on their behalf. Without them
+  // an empty call and a length mismatch both succeed quietly where CPU raises.
+  TORCH_CHECK(n > 0, "Tensor list must have at least one tensor.");
+  TORCH_CHECK(n == src_list.size(), "Tensor lists must have the same number of tensors, got ", n,
+              " and ", src_list.size());
+
+  const bool non_blocking = (args.size() > 2 && !args[2].isNone()) ? args[2].toBool() : false;
+
+  // ── Coalesce, when both sides tile one storage ──
+  // Copying dst[i] <- src[i] over lists that are each adjacent 1-D views of one
+  // buffer touches exactly the bytes of the combined span, in order, so the
+  // whole list is one copy. This is the FSDP all-gather copy-in.
+  //
+  // This sits ahead of the stream rule below on purpose, because coalescing wins
+  // on either side of it: on the default stream it is one MLIR kernel instead of
+  // N, and on a non-default stream, where MLIR is gated, it is one DMA instead
+  // of N.
+  //
+  // A second reason this cannot move into the Python factory: as_strided
+  // synthesizes a tensor with no counterpart among the raw arguments, so the
+  // kernel's recorded input indices could not be replayed on a cache hit.
+  if (n > 0 && n == src_list.size()) {
+    at::Tensor dst_flat = CoalesceAdjacentViews(self_list);
+    at::Tensor src_flat = CoalesceAdjacentViews(src_list);
+    // PairShapesMatch is asked last: it walks the list, and by this point both
+    // sides have already tiled, so it only runs when a coalesce is otherwise on.
+    // Equal totals are not enough — dsts of 4+4 and srcs of 2+6 tile the same
+    // span while the pairwise copies would reject the shapes outright.
+    if (dst_flat.defined() && src_flat.defined() && dst_flat.numel() == src_flat.numel() &&
+        !RawNrtCopyOverlaps(src_flat, dst_flat) && PairShapesMatch(self_list, src_list)) {
+      TORCH_NEURONX_DISPATCH_DEBUG("[DispatchForeachCopy] coalesced ", n,
+                                   " pairs into one copy of ", dst_flat.numel(), " elements");
+      dst_flat.copy_(src_flat, non_blocking);
+      logOperationExecuted("aten::_foreach_copy_");
+      return;
+    }
+  }
+
+  // Eligible for the single fused kernel: matching lengths, and every pair a
+  // same-device Neuron pair in a dtype the copy lowering supports.
+  //
+  // A neg or conj tensor is excluded: it carries the sign or conjugation as a
+  // flag rather than in memory, and the compiled kernel reads memory, so it
+  // would copy unnegated values. aten::copy_ materializes the flag on its way
+  // through, which is why those pairs go one at a time below. Shapes must match
+  // for the same reason: the kernel clones the source and so produces src's
+  // shape, where copy_ broadcasts src into dst and dst's shape wins.
+  bool one_kernel = n > 0 && n == src_list.size();
+  for (size_t i = 0; i < n && one_kernel; ++i) {
+    at::Tensor dst = self_list[i];
+    at::Tensor src = src_list[i];
+    one_kernel = dst.defined() && src.defined() && dst.device() == src.device() &&
+                 dst.is_privateuseone() && dst.sizes() == src.sizes() &&
+                 IsForeachCopyKernelDtype(dst.scalar_type()) &&
+                 IsForeachCopyKernelDtype(src.scalar_type()) && !src.is_neg() && !src.is_conj() &&
+                 !dst.is_neg() && !dst.is_conj();
+  }
+  // Aliased lists go pair by pair. ATen copies in list order, so a write can be
+  // seen by a later read: _foreach_copy_([x, y], [y, x]) leaves both holding y. The
+  // fused kernel gets both buffers with no declared aliasing relationship, so the
+  // order of its reads and writes is the compiler's choice and it may swap them
+  // instead. The pair route keeps ATen's ordering.
+  //
+  // A destination may overlap its own source, which is just that pair's copy, but
+  // nothing else. RawNrtCopyOverlaps compares buffer identity before it computes
+  // ranges, so for a list of separate allocations each call here is one pointer
+  // comparison, and a list tiling one buffer is judged on ranges and stays eligible.
+  //
+  // Overlap requires a shared storage, so if every storage below is distinct no pair
+  // can overlap and the walk has nothing to find.
+  bool storages_all_distinct = true;
+  {
+    std::unordered_set<const void*> seen;
+    seen.reserve(2 * n);
+    for (size_t i = 0; i < n && storages_all_distinct; ++i) {
+      for (const at::Tensor& t : {at::Tensor(self_list[i]), at::Tensor(src_list[i])}) {
+        if (!t.defined() || !t.has_storage()) continue;
+        if (!seen.insert(t.storage().data()).second) storages_all_distinct = false;
+      }
+    }
+  }
+  for (size_t i = 0; i < n && one_kernel && !storages_all_distinct; ++i) {
+    at::Tensor dst = self_list[i];
+    for (size_t j = 0; j < n && one_kernel; ++j) {
+      if (i != j && RawNrtCopyOverlaps(dst, at::Tensor(src_list[j]))) one_kernel = false;
+      if (j > i && RawNrtCopyOverlaps(dst, at::Tensor(self_list[j]))) one_kernel = false;
+    }
+  }
+
+  // MLIR must not run on a non-default stream while host collectives are
+  // enabled — the rule aten::copy_ follows.
+  if (one_kernel && IsNonDefaultStreamWithHostCC(at::Tensor(self_list[0]).device().index())) {
+    one_kernel = false;
+  }
+
+  TORCH_NEURONX_DISPATCH_DEBUG("[DispatchForeachCopy] n=", n, " one_kernel=", one_kernel);
+
+  if (one_kernel) {
+    for (auto& arg : args) torch::jit::push(*stack, arg);
+    NeuronDispatcher::DispatchImpl(op, dispatch_keys, stack, reg);
+    return;
+  }
+
+  for (size_t i = 0; i < n; ++i) {
+    at::Tensor dst = self_list[i];
+    at::Tensor src = src_list[i];
+    if (!dst.defined() || !src.defined()) continue;
+    // Empty pairs are deliberately not skipped. DispatchCopyImpl checks
+    // broadcastability *before* its own zero-element short-circuit, so handing the
+    // pair over keeps the error CPU raises for shapes that do not broadcast even
+    // though both sides are empty: a (0,2) dst against a (0,3) src has no elements
+    // either side, yet 3 does not stretch to 2. Any skip written here would have to
+    // repeat that check to stay in parity, so let copy_ own it.
+    dst.copy_(src, non_blocking);
+  }
+  logOperationExecuted("aten::_foreach_copy_");
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1300,8 +1553,12 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
       }
     }
     if (has_wrapped_double && !has_multidim_float) {
-      c10::ScalarType weak_dtype =
-          float_operand_dtype ? *float_operand_dtype : c10::ScalarType::Float;
+      // No float tensor operand: a weak float scalar promotes to the default
+      // dtype (torch.get_default_dtype()), matching CPU. Neuron has no float64,
+      // so a float64 default still materializes as float32.
+      c10::ScalarType neuron_default_st = c10::typeMetaToScalarType(at::get_default_dtype());
+      if (neuron_default_st == c10::ScalarType::Double) neuron_default_st = c10::ScalarType::Float;
+      c10::ScalarType weak_dtype = float_operand_dtype ? *float_operand_dtype : neuron_default_st;
       if (weak_dtype != c10::ScalarType::Double) {
         for (auto& a : args) {
           if (!a.isTensor()) continue;
@@ -1327,10 +1584,14 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
   }
 
   // Complex dtype routing:
-  //   - decomposition enabled: decompose before lowering;
-  //   - decomposition disabled: use verified native lowerings, otherwise fallback.
-  if (HasComplexInput(args)) {
-    if (ShouldUseComplexDecomposition(!reg.lower_func.is_none())) {
+  //   1. use a verified native lowering when one exists;
+  //   2. otherwise try structural/general decomposition;
+  //   3. otherwise raise under strict mode or fall back to CPU.
+  if (HasComplexInput(args) && !HasNativeComplexLowering(lookup_name)) {
+    if (TryDispatchStructuralComplexOp(lookup_name, args, stack, op_name)) {
+      return;
+    }
+    if (ShouldUseComplexDecomposition(lookup_name, !reg.lower_func.is_none())) {
       std::string decomp_cache_key = GenerateCacheKey(lookup_name, schema, args, reg);
       decomp_cache_key += ":complex_decomp";
       DispatchWithCasting(op, dispatch_keys, stack, args, schema, reg, dispatcher, op_name,
@@ -1338,40 +1599,41 @@ void NeuronDispatcher::DispatchImpl(const c10::OperatorHandle& op,
       return;
     }
 
-    if (!HasNativeComplexLowering(lookup_name)) {
-      if (kFallbackOnlyForUnimplemented && HasComplexNonOutputInput(args, schema)) {
-        RaiseComplexFallbackDisabled(op_name);
-      }
-
-      TORCH_NEURONX_DISPATCH_DEBUG(
-          "[NeuronDispatcher::Dispatch] complex input not in allowlist → CPU fallback",
-          " op=", op_name);
-      for (auto& arg : args) {
-        torch::jit::push(*stack, arg);
-      }
-      at::native::cpu_fallback(op, stack);
-      torch_neuronx::markFallbackLogged(op_name);
-      return;
+    if (kFallbackOnlyForUnimplemented && HasComplexNonOutputInput(args, schema)) {
+      RaiseComplexFallbackDisabled(op_name);
     }
+
+    TORCH_NEURONX_DISPATCH_DEBUG(
+        "[NeuronDispatcher::Dispatch] complex input not in allowlist → CPU fallback",
+        " op=", op_name);
+    for (auto& arg : args) {
+      torch::jit::push(*stack, arg);
+    }
+    at::native::cpu_fallback(op, stack);
+    torch_neuronx::markFallbackLogged(op_name);
+    return;
   }
 
-  TORCH_CHECK(
-      !reg.lower_func.is_none(), "NeuronDispatcher: operation '", op_name,
-      "' was registered without a "
-      "lower_func. All ops must have a C++ lowering path when TORCH_NEURONX_CPP_DISPATCH=1.");
+  TORCH_CHECK(!reg.lower_func.is_none(), "NeuronDispatcher: operation '", op_name,
+              "' was registered without a "
+              "lower_func. Every op must have a C++ lowering path.");
 
-  // ── 1. Int64 → CPU fallback ──
+  // ── 1. Strong int64 → CPU fallback ──
   // ShouldCpuFallback returns true when:
   //   - The op is UNSUPPORTED (e.g. matmul/conv on int64 would produce garbage), or
   //   - The active Int64Mode steers this op away from Neuron — namely
   //     native_strict, where any non-native op runs on CPU. (packed and
   //     cpu_bounce never force a whole-op CPU fallback.)
-  // We still require at least one int64 input — when there's no int64 there's
-  // nothing to fall back from.
+  // A wrapped int64 is a weak Python scalar adapter, not a strong int64
+  // operand. Defer it to DispatchWithCasting so Meta can resolve its semantic
+  // dtype first; an unresolved wrapped scalar still takes the later fallback.
   if (ShouldCpuFallback(op_name)) {
     bool has_int64_input = false;
     ForEachTensor(args, [&](const at::Tensor& t) {
-      if (t.scalar_type() == c10::ScalarType::Long) has_int64_input = true;
+      if (t.scalar_type() == c10::ScalarType::Long &&
+          !t.unsafeGetTensorImpl()->is_wrapped_number()) {
+        has_int64_input = true;
+      }
     });
     if (has_int64_input) {
       TORCH_NEURONX_DISPATCH_DEBUG("[NeuronDispatcher::Dispatch] int64 → CPU fallback",
@@ -1474,6 +1736,8 @@ void NeuronDispatcher::DispatchContiguousImpl(const c10::OperatorHandle& op,
     return;
   }
 
+  // Complex default-format contiguous can preserve real/imag pairs through an
+  // interleaved real view. Unsupported complex layouts retain CPU fallback.
   // Complex: `contiguous` is an allocate-and-copy, and TryComplexNeuronToNeuronCopy
   // reconciles the conj/neg bits on device, so route through it instead of the host —
   // this is the op ATen's Conjugate key materializes a non-contiguous conjugated view
@@ -1497,6 +1761,9 @@ void NeuronDispatcher::DispatchContiguousImpl(const c10::OperatorHandle& op,
 
   // Complex dtypes: fall back to CPU
   if (HasComplexInput(args)) {
+    if (TryDispatchStructuralComplexOp(lookup_name, args, stack, op_name)) {
+      return;
+    }
     if (kFallbackOnlyForUnimplemented && HasComplexNonOutputInput(args, schema)) {
       RaiseComplexFallbackDisabled(op_name);
     }
@@ -1631,7 +1898,8 @@ void NeuronDispatcher::DispatchNonzeroImpl(const c10::OperatorHandle& op,
   auto schema = op.schema();
   auto args = torch::jit::pop(*stack, schema.arguments().size());
 
-  // Validate out= dtype if present (nonzero.out requires int64 output)
+  // Validate out= dtype and device if present (nonzero.out requires an int64
+  // output on the same device as the input).
   for (size_t i = 0; i < args.size() && i < schema.arguments().size(); ++i) {
     const auto& alias_info = schema.arguments()[i].alias_info();
     if (alias_info && alias_info->isWrite() && args[i].isTensor()) {
@@ -1640,6 +1908,17 @@ void NeuronDispatcher::DispatchNonzeroImpl(const c10::OperatorHandle& op,
         TORCH_CHECK(false,
                     "nonzero: Expected out tensor to have scalar type Long but got scalar type",
                     c10::toString(out_tensor.scalar_type()));
+      }
+      // ATen rejects an out= on another device. Neuron would otherwise copy the
+      // result across and return it.
+      if (out_tensor.defined() && !args.empty() && args[0].isTensor()) {
+        auto self_tensor = args[0].toTensor();
+        if (self_tensor.defined() && out_tensor.device().type() != self_tensor.device().type()) {
+          TORCH_CHECK(false,
+                      "Expected all tensors to be on the same device, but found at least two "
+                      "devices, ",
+                      self_tensor.device(), " and ", out_tensor.device(), "!");
+        }
       }
     }
   }
@@ -1759,6 +2038,52 @@ void NeuronDispatcher::DispatchNonzeroImpl(const c10::OperatorHandle& op,
                                " result_shape=", result.sizes());
 }
 
+namespace {
+
+// Result sizes for an advanced index that selects nothing, e.g. an all-false
+// boolean mask. The index broadcast replaces the indexed dimensions and the
+// un-indexed ones are kept, so (8, 4) indexed by an all-false (8,) mask is
+// (0, 4), not (0,). Indexed dimensions stay in place when their positions are
+// contiguous and otherwise collapse to the front.
+std::vector<int64_t> ZeroSizeIndexResultSizes(const at::Tensor& self,
+                                              const c10::List<c10::optional<at::Tensor>>& indices) {
+  TORCH_CHECK_INDEX(static_cast<int64_t>(indices.size()) <= self.dim(),
+                    "too many indices for tensor of dimension ", self.dim());
+
+  std::vector<int64_t> broadcast;
+  std::vector<int64_t> indexed_dims;
+  for (size_t i = 0; i < indices.size(); ++i) {
+    const auto index = indices.get(i);
+    if (!index.has_value() || !index->defined()) continue;
+    broadcast =
+        indexed_dims.empty() ? index->sizes().vec() : at::infer_size(broadcast, index->sizes());
+    indexed_dims.push_back(static_cast<int64_t>(i));
+  }
+  TORCH_INTERNAL_ASSERT(!indexed_dims.empty());
+
+  const bool positions_contiguous =
+      indexed_dims.back() - indexed_dims.front() + 1 == static_cast<int64_t>(indexed_dims.size());
+
+  std::vector<int64_t> sizes;
+  if (positions_contiguous) {
+    for (int64_t dim = 0; dim < indexed_dims.front(); ++dim) sizes.push_back(self.size(dim));
+    sizes.insert(sizes.end(), broadcast.begin(), broadcast.end());
+    for (int64_t dim = indexed_dims.back() + 1; dim < self.dim(); ++dim) {
+      sizes.push_back(self.size(dim));
+    }
+  } else {
+    sizes = broadcast;
+    for (int64_t dim = 0; dim < self.dim(); ++dim) {
+      if (std::find(indexed_dims.begin(), indexed_dims.end(), dim) == indexed_dims.end()) {
+        sizes.push_back(self.size(dim));
+      }
+    }
+  }
+  return sizes;
+}
+
+}  // namespace
+
 // ═══════════════════════════════════════════════════════════════
 //  aten::index.Tensor — convert boolean indices to integer indices
 //  BEFORE cache key generation (data-dependent shapes).
@@ -1781,16 +2106,6 @@ void NeuronDispatcher::DispatchIndexImpl(const c10::OperatorHandle& op,
   auto args = torch::jit::pop(*stack, schema.arguments().size());
 
   if (TryHandleEmptyTensors(op, stack, args, schema, op_name, reg)) {
-    return;
-  }
-
-  if (HasComplexInput(args)) {
-    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchIndex] complex dtype → CPU fallback", " op=", op_name);
-    for (auto& arg : args) {
-      torch::jit::push(*stack, arg);
-    }
-    at::native::cpu_fallback(op, stack);
-    torch_neuronx::markFallbackLogged(op_name);
     return;
   }
 
@@ -1826,11 +2141,11 @@ void NeuronDispatcher::DispatchIndexImpl(const c10::OperatorHandle& op,
   // Boolean indices produce data-dependent shapes via nonzero, so this
   // conversion must happen BEFORE cache key generation.
   // Also move CPU indices to Neuron device.
-  auto self_device = args[0].toTensor().device();
+  const auto& self = args[0].toTensor();
+  auto self_device = self.device();
   if (args.size() > 1 && args[1].isList()) {
     auto indices_list = args[1].toListRef();
     c10::List<c10::optional<at::Tensor>> converted;
-    bool has_bool_index = false;
     bool needs_update = false;
 
     for (const auto& elem : indices_list) {
@@ -1839,8 +2154,17 @@ void NeuronDispatcher::DispatchIndexImpl(const c10::OperatorHandle& op,
       } else if (elem.isTensor()) {
         auto idx = elem.toTensor();
         if (idx.defined() && idx.scalar_type() == c10::ScalarType::Bool) {
-          has_bool_index = true;
           needs_update = true;
+          const int64_t start_dim = static_cast<int64_t>(converted.size());
+          TORCH_CHECK_INDEX(start_dim + idx.dim() <= self.dim(),
+                            "too many indices for tensor of dimension ", self.dim());
+          for (const auto j : c10::irange(idx.dim())) {
+            const int64_t src_dim = start_dim + j;
+            TORCH_CHECK_INDEX(idx.size(j) == self.size(src_dim), "The shape of the mask ",
+                              idx.sizes(), " at index ", j,
+                              " does not match the shape of the indexed tensor ", self.sizes(),
+                              " at index ", src_dim);
+          }
           auto nonzero_indices = at::nonzero_numpy(idx);
           for (auto& nz_idx : nonzero_indices) {
             converted.push_back(std::move(nz_idx));
@@ -1873,12 +2197,38 @@ void NeuronDispatcher::DispatchIndexImpl(const c10::OperatorHandle& op,
         }
       }
       if (has_empty_index) {
-        auto self = args[0].toTensor();
-        auto result = torch::empty({0}, self.options());
-        torch::jit::push(*stack, result);
+        auto sizes = ZeroSizeIndexResultSizes(self, converted);
+        torch::jit::push(*stack, torch::empty(sizes, self.options()));
         return;
       }
     }
+  }
+
+  // Keep complex routing after boolean/index normalization so decomposition
+  // receives valid on-device integer indices. Native allowlisted ops bypass
+  // decomposition; non-native ops try structural/general decomposition before
+  // strict error or CPU fallback.
+  if (HasComplexInput(args) && !HasNativeComplexLowering(lookup_name)) {
+    if (TryDispatchStructuralComplexOp(lookup_name, args, stack, op_name)) {
+      return;
+    }
+    if (ShouldUseComplexDecomposition(lookup_name, !reg.lower_func.is_none())) {
+      std::string decomp_cache_key = GenerateCacheKey(lookup_name, schema, args, reg);
+      decomp_cache_key += ":complex_decomp";
+      DispatchWithCasting(op, dispatch_keys, stack, args, schema, reg, dispatcher, op_name,
+                          decomp_cache_key, false, true);
+      return;
+    }
+    if (kFallbackOnlyForUnimplemented && HasComplexNonOutputInput(args, schema)) {
+      RaiseComplexFallbackDisabled(op_name);
+    }
+    TORCH_NEURONX_DISPATCH_DEBUG("[DispatchIndex] complex dtype → CPU fallback", " op=", op_name);
+    torch_neuronx::markFallbackLogged(op_name);
+    for (auto& arg : args) {
+      torch::jit::push(*stack, arg);
+    }
+    at::native::cpu_fallback(op, stack);
+    return;
   }
 
   // ── Dynamic-NKI pre-check ──
@@ -1995,8 +2345,9 @@ SdpaCoreResult NeuronDispatcher::DispatchSdpaCore(const c10::OperatorHandle& op,
 
   // Execute
   auto device = ExtractDevice(args);
-  auto filtered_inputs = FlattenAndFilterInputs(args, schema, entry->kept_input_indices, op_name,
-                                                reg.static_argnums, reg.static_argnames);
+  auto filtered_inputs =
+      FlattenAndFilterInputs(args, schema, entry->kept_input_indices, op_name, reg.static_argnums,
+                             reg.static_argnames, entry->ir_input_count);
 
   auto exec_outputs = AllocateExecutionOutputs(*entry, args, filtered_inputs, device, schema);
 
@@ -2030,6 +2381,55 @@ void NeuronDispatcher::DispatchSdpaFwdImpl(const c10::OperatorHandle& op,
     const auto& debug_mask_arg = (*stack)[stack->size() - num_args + 6];
     if (debug_mask_arg.isBool() && debug_mask_arg.toBool()) {
       TORCH_CHECK(false, "return_debug_mask=True is not supported in Neuron SDPA implementation");
+    }
+  }
+
+  // Reject an explicit mask together with is_causal, as ATen does. Upstream
+  // raises this from _scaled_dot_product_attention_math, so CPU raises whenever
+  // the math backend runs (a float64 query rules out flash). Neuron always runs
+  // its fused kernel, so the check has to live here to keep the same contract.
+  {
+    const auto& schema_args = schema.arguments();
+    const size_t base = stack->size() - num_args;
+    bool has_mask = false;
+    bool is_causal = false;
+    for (size_t i = 0; i < num_args && i < schema_args.size(); ++i) {
+      const auto& name = schema_args[i].name();
+      const auto& slot = (*stack)[base + i];
+      if (name == "attn_bias" || name == "attn_mask") {
+        has_mask = slot.isTensor() && slot.toTensor().defined();
+      } else if (name == "is_causal" && slot.isBool()) {
+        is_causal = slot.toBool();
+      }
+    }
+    TORCH_CHECK(!(has_mask && is_causal),
+                "_scaled_dot_product_attention: Explicit attn_mask should not be set when "
+                "is_causal=True");
+  }
+
+  // Neuron computes SDPA in float32. Every other op reaches float32 through
+  // DowncastArgs, but DispatchSdpaCore skips it ("PreprocessArgs only"), so a
+  // float64 query used to fail the dtype guard below while add/matmul/softmax
+  // accept float64. Downcast the floating tensor operands here and restore the
+  // query dtype on the output, which matches the documented platform policy
+  // that float64 is computed as float32. Every Double tensor slot is rewritten
+  // rather than a fixed index, because the mask/bias position differs between
+  // the flash and efficient-attention overloads.
+  c10::ScalarType sdpa_orig_dtype = c10::ScalarType::Undefined;
+  {
+    const size_t base = stack->size() - num_args;
+    const auto& q_in = (*stack)[base];
+    if (q_in.isTensor() && q_in.toTensor().defined() &&
+        q_in.toTensor().scalar_type() == c10::ScalarType::Double) {
+      sdpa_orig_dtype = c10::ScalarType::Double;
+      for (size_t i = 0; i < num_args; ++i) {
+        auto& slot = (*stack)[base + i];
+        if (!slot.isTensor()) continue;
+        const auto& t = slot.toTensor();
+        if (t.defined() && t.scalar_type() == c10::ScalarType::Double) {
+          slot = c10::IValue(t.to(c10::ScalarType::Float));
+        }
+      }
     }
   }
 
@@ -2090,6 +2490,14 @@ void NeuronDispatcher::DispatchSdpaFwdImpl(const c10::OperatorHandle& op,
         final_outputs[0] = fixed;
       }
     }
+  }
+
+  // Restore the caller's dtype after the float32 compute. This runs after the
+  // stride fixup because alloc_with_matching_layout allocates with the (already
+  // downcast) query dtype, so an earlier upcast would be undone by its copy_.
+  if (sdpa_orig_dtype != c10::ScalarType::Undefined && !final_outputs.empty() &&
+      final_outputs[0].defined()) {
+    final_outputs[0] = final_outputs[0].to(sdpa_orig_dtype);
   }
 
   // Push 9-tuple with SymInt and None slots
@@ -2182,7 +2590,8 @@ std::vector<torch::Tensor> NeuronDispatcher::DispatchCore(
     c10::DispatchKeySet dispatch_keys, torch::jit::Stack* stack, std::vector<c10::IValue>& args,
     const c10::FunctionSchema& schema, const OpRegistration& reg, NeuronDispatcher& dispatcher,
     at::neuron::CPUFallbackContext fallback_ctx, const std::vector<c10::IValue>& original_args,
-    std::shared_ptr<DispatchCacheEntry>* out_entry, bool use_complex_decomposition) {
+    std::shared_ptr<DispatchCacheEntry>* out_entry, bool use_complex_decomposition,
+    const std::vector<c10::IValue>& raw_fallback_args) {
   TORCH_NEURONX_DISPATCH_DEBUG("[DispatchCore] using cache_key", " op=", op_name,
                                " cache_key=", cache_key);
 
@@ -2206,7 +2615,9 @@ std::vector<torch::Tensor> NeuronDispatcher::DispatchCore(
     // Use original (pre-downcast) args for CPU fallback when available,
     // so that dtypes (e.g. int64) are preserved instead of using the
     // downcasted args (e.g. int32) from DowncastArgs.
-    const auto& fallback_args = original_args.empty() ? args : original_args;
+    const auto& fallback_args = !raw_fallback_args.empty()
+                                    ? raw_fallback_args
+                                    : (original_args.empty() ? args : original_args);
     for (const auto& arg : fallback_args) {
       torch::jit::push(*stack, arg);
     }
@@ -2254,8 +2665,9 @@ std::vector<torch::Tensor> NeuronDispatcher::DispatchCore(
 
   auto device = ExtractDevice(args);
 
-  auto filtered_inputs = FlattenAndFilterInputs(args, schema, entry->kept_input_indices, op_name,
-                                                reg.static_argnums, reg.static_argnames);
+  auto filtered_inputs =
+      FlattenAndFilterInputs(args, schema, entry->kept_input_indices, op_name, reg.static_argnums,
+                             reg.static_argnames, entry->ir_input_count);
 
   TORCH_NEURONX_DISPATCH_DEBUG("[DispatchCore] filtered inputs ready", " op=", op_name,
                                " num_filtered_inputs=", filtered_inputs.size());
@@ -2331,19 +2743,39 @@ void NeuronDispatcher::DispatchWithCasting(const c10::OperatorHandle& op,
     // capture mutated types (int64→int32, scalars→tensors) causing type mismatches.
     auto fallback_ctx = BuildCPUFallbackContext(args, schema);
 
-    // ── 2. Snapshot original args before downcast ──
-    // Original args are passed to lower_func on cache miss for dtype inference
-    // at original precision, and used for CPU fallback with original dtypes.
-    // Deep-copy TensorList/GenericList args because DowncastArgs mutates them
-    // in-place via shared intrusive_ptr storage.
-    auto original_args = args;
-    for (size_t i = 0; i < original_args.size(); ++i) {
-      if (original_args[i].isTensorList()) {
-        original_args[i] = c10::IValue(original_args[i].toTensorList().copy());
-      } else if (original_args[i].isList()) {
-        original_args[i] = c10::IValue(original_args[i].toList().copy());
+    // Keep a distinct raw copy for immediate CPU fallback. The semantic args
+    // below may be normalized for lowering, but fallback must reproduce the
+    // exact user call, including wrapped Python-scalar provenance.
+    auto raw_fallback_args = CloneIValueListContainers(args);
+
+    // Resolve only the Meta-proven functional weak-integer route.
+    // The cache key was generated from raw args and distinguishes wrapped
+    // scalars from explicit rank-0 tensors.
+    NormalizeWrappedIntegerScalarViaMeta(op, args, schema, cache_key);
+
+    // Apply whole-op int64 routing after weak wrapped integers have had a
+    // chance to resolve to their Meta-proven narrow dtype. A strong int64
+    // tensor still takes the existing fallback route.
+    if (ShouldCpuFallback(op_name)) {
+      bool has_int64_input = false;
+      ForEachTensor(args, [&](const at::Tensor& t) {
+        if (t.scalar_type() == c10::ScalarType::Long) has_int64_input = true;
+      });
+      if (has_int64_input) {
+        TORCH_NEURONX_DISPATCH_DEBUG("[DispatchWithCasting] int64 → CPU fallback", " op=", op_name);
+        torch_neuronx::markFallbackLogged(op_name);
+        for (const auto& arg : raw_fallback_args) torch::jit::push(*stack, arg);
+        at::native::cpu_fallback(op, stack);
+        return;
       }
     }
+
+    // ── 2. Snapshot semantic original args before Neuron downcast ──
+    // Semantic original args are passed to lower_func on cache miss for dtype
+    // inference at original precision. CPU fallback uses raw_fallback_args.
+    // Deep-copy TensorList/GenericList args because DowncastArgs mutates them
+    // in-place via shared intrusive_ptr storage.
+    auto original_args = CloneIValueListContainers(args);
 
     // ── 3. Downcast args (tensors + dtype kwargs) to supported types ──
     DowncastArgs(args, schema);
@@ -2371,7 +2803,7 @@ void NeuronDispatcher::DispatchWithCasting(const c10::OperatorHandle& op,
     std::shared_ptr<DispatchCacheEntry> cache_entry;
     auto exec_outputs = DispatchCore(op_name, cache_key, op, dispatch_keys, stack, args, schema,
                                      reg, dispatcher, std::move(fallback_ctx), original_args,
-                                     &cache_entry, use_complex_decomposition);
+                                     &cache_entry, use_complex_decomposition, raw_fallback_args);
 
     if (exec_outputs.empty()) {
       // DispatchCore already handled fallback and pushed to stack
@@ -2396,6 +2828,58 @@ void NeuronDispatcher::DispatchWithCasting(const c10::OperatorHandle& op,
     TORCH_NEURONX_DISPATCH_DEBUG("[DispatchWithCasting] Failed EXCEPTION (re-throwing)",
                                  " op=", op_name, " error=", e.what());
     throw;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ApplyAtenOutputLayouts
+// ═══════════════════════════════════════════════════════════════
+//
+// ATen gives an op that has a permuted input an output with the same
+// permutation. A TensorIterator kernel gets this for free, because it
+// allocates its own output while it holds the input strides.
+//
+// The Neuron dispatcher allocates from DispatchCacheEntry::output_specs, which
+// the Python lowering fills with a shape and a dtype only. The ATen rule has no
+// field to live in, so AllocateExecutionOutputs falls back to a contiguous
+// output and the permutation is lost.
+//
+// This function fills output_specs[i].target_strides. AllocateExecutionOutputs
+// then allocates a physical-shape buffer plus an as_strided view, and
+// ProcessOutputTransformations merges the inverse transpose into the MLIR. The
+// NEFF writes the permuted layout directly, so no copy runs.
+//
+// The cache key holds the strides of each non-contiguous input
+// (CacheKeyGenerator::AppendTensor), and Dispatch builds the key before
+// PreprocessArgs makes the inputs contiguous. One cache entry therefore serves
+// one input layout, so the output layout is a property of the entry. One Meta
+// dispatch for each cache miss is enough.
+static void ApplyAtenOutputLayouts(DispatchCacheEntry& entry, const c10::FunctionSchema& schema,
+                                   const std::vector<c10::IValue>& original_args) {
+  if (original_args.empty() || entry.output_specs.empty()) return;
+
+  auto handle = c10::Dispatcher::singleton().findOp(schema.operator_name());
+  if (!handle.has_value()) return;
+
+  auto layouts = AtenOutputLayouts(*handle, schema, original_args);
+
+  // The Meta returns and output_specs disagree for an op that drops or repacks
+  // a return. Keep the contiguous output unless the count and the shape both
+  // agree, so a mismatch can never apply a layout to the wrong output.
+  if (layouts.size() != entry.output_specs.size()) return;
+
+  for (size_t i = 0; i < layouts.size(); ++i) {
+    auto& spec = entry.output_specs[i];
+    if (layouts[i].strides.empty()) continue;
+    if (layouts[i].shape != spec.shape) continue;
+    // A lowering that sets target_strides itself already knows the layout of
+    // its NEFF. Do not overrule it.
+    if (spec.target_strides.has_value()) continue;
+
+    spec.target_strides = layouts[i].strides;
+    TORCH_NEURONX_DISPATCH_DEBUG("[ApplyAtenOutputLayouts] keeping the ATen layout",
+                                 " op=", entry.op_name, " output_idx=", i, " shape=", spec.shape,
+                                 " target_strides=", spec.target_strides.value());
   }
 }
 
@@ -2478,6 +2962,7 @@ std::shared_ptr<DispatchCacheEntry> NeuronDispatcher::GetOrLowerOperation(
     auto entry = ParseLoweringResult(result);
 
     if (entry) {
+      ApplyAtenOutputLayouts(*entry, schema, original_args);
       if (!reg.skip_cache) {
         TORCH_NEURONX_DISPATCH_DEBUG("[GetOrLowerOperation] caching result",
                                      " cache_key=", cache_key, " op_name=", entry->op_name,
@@ -2677,53 +3162,23 @@ static void FlattenScalarListToTensors(const c10::IValue& val, std::vector<torch
   }
 }
 
-// Mirror of Python ``native_int64_guard_allows`` (int64_policy.py). Native S64
-// is safe only when every int64 operand is contiguous and at most one needs
-// broadcasting to the common shape (a native S64 binary op with BOTH operands
-// broadcast — e.g. kron's outer-product mul — hangs the device). Kept in
-// lockstep with the Python guard so the traced graph (fake) and this binding
-// agree on which invocations are packed.
-static bool NativeInt64GuardAllows(const std::vector<torch::Tensor>& tensors) {
-  std::vector<const torch::Tensor*> i64;
-  for (const auto& t : tensors) {
-    if (t.defined() && t.scalar_type() == c10::ScalarType::Long && t.dim() > 0) {
-      i64.push_back(&t);
-    }
-  }
-  if (i64.empty()) return true;
-  for (const auto* t : i64) {
-    if (!t->is_contiguous()) return false;
-  }
-  // Right-aligned broadcast shape.
-  size_t maxdim = 0;
-  for (const auto* t : i64) maxdim = std::max(maxdim, static_cast<size_t>(t->dim()));
-  std::vector<int64_t> common(maxdim, 1);
-  for (const auto* t : i64) {
-    auto sizes = t->sizes();
-    for (size_t k = 0; k < sizes.size(); ++k) {
-      size_t idx = maxdim - sizes.size() + k;
-      if (sizes[k] != 1) common[idx] = sizes[k];
-    }
-  }
-  int broadcast_count = 0;
-  for (const auto* t : i64) {
-    auto sizes = t->sizes();
-    bool differs = (static_cast<size_t>(t->dim()) != maxdim);
-    for (size_t k = 0; !differs && k < sizes.size(); ++k) {
-      if (sizes[k] != common[k]) differs = true;
-    }
-    if (differs) ++broadcast_count;
-  }
-  return broadcast_count < 2;
-}
-
 std::vector<torch::Tensor> NeuronDispatcher::FlattenAndFilterInputs(
     const std::vector<c10::IValue>& args, const c10::FunctionSchema& schema,
     const std::vector<int>& kept_input_indices, const std::string& op_name,
     const std::unordered_set<size_t>& static_argnums,
-    const std::unordered_set<std::string>& static_argnames) {
+    const std::unordered_set<std::string>& static_argnames, int64_t ir_input_count) {
   const auto& schema_args = schema.arguments();
   std::vector<torch::Tensor> flattened;
+  // A zero-input factory NEFF must drop write-aliased args (see the empty
+  // kept_input_indices branch below), so track which flattened tensors they are.
+  std::vector<char> flattened_is_write_aliased;
+  auto mark_write_aliased = [&](size_t schema_idx, size_t before) {
+    flattened_is_write_aliased.resize(flattened.size(), false);
+    const auto& ai = schema_args[schema_idx].alias_info();
+    if (ai != nullptr && ai->isWrite()) {
+      for (size_t k = before; k < flattened.size(); ++k) flattened_is_write_aliased[k] = true;
+    }
+  };
 
   // Determine target device for scalar→tensor conversion (same logic as PreprocessArgs).
   // Also capture the first integer tensor operand's dtype so Scalar[] elements are
@@ -2743,6 +3198,7 @@ std::vector<torch::Tensor> NeuronDispatcher::FlattenAndFilterInputs(
   // Positional (non-kwarg-only) tensor args
   for (size_t i = 0; i < args.size() && i < schema_args.size(); ++i) {
     if (schema_args[i].kwarg_only()) continue;
+    size_t before = flattened.size();
     // A non-static number list (Scalar[]) is a runtime input: the NEFF was lowered
     // with each element as its own 0-dim tensor, so expand it the same way here.
     // A static number list (e.g. normalized_shape int[]) is a compile-time
@@ -2755,44 +3211,44 @@ std::vector<torch::Tensor> NeuronDispatcher::FlattenAndFilterInputs(
       // Extracts real tensors only; for a static number list this adds nothing.
       FlattenTensorsFromIValue(args[i], flattened);
     }
+    mark_write_aliased(i, before);
   }
   // Kwarg-only tensor args
   for (size_t i = 0; i < args.size() && i < schema_args.size(); ++i) {
     if (!schema_args[i].kwarg_only()) continue;
+    size_t before = flattened.size();
     FlattenTensorsFromIValue(args[i], flattened);
+    mark_write_aliased(i, before);
   }
 
-  TORCH_NEURONX_DISPATCH_DEBUG("[FlattenAndFilterInputs] flattened", " op=", op_name,
-                               " num_flattened=", flattened.size(),
-                               " num_kept=", kept_input_indices.size());
+  TORCH_NEURONX_DISPATCH_DEBUG(
+      "[FlattenAndFilterInputs] flattened", " op=", op_name, " num_flattened=", flattened.size(),
+      " num_kept=", kept_input_indices.size(), " ir_input_count=", ir_input_count);
 
-  // Packed int64 graph inputs are kept logical int64 through dispatch (so
-  // host-level shape reads see the correct shape); bind their int32[..., 2]
-  // physical view to the NEFF here. This matches the int32 graph parameter
-  // (the fake input is generated as int32[..., 2]) — the in-graph NKI gather
-  // then extracts the low words. Zero-copy reinterpret.
-  //
-  // A NATIVE op is additionally demoted to the packed view when its int64
-  // operands fail the native-int64 guard (non-contiguous / dual-broadcast) —
-  // native S64 hangs the compiler for those. This MUST match the Python fake
-  // generation (use_packed_int64_view_for_op + native_int64_guard_allows), so
-  // the graph parameters (int32[...,2]) and this binding agree.
-  const bool guard_demotes_to_packed = IsS64Passthrough() &&
-                                       DecideInt64(op_name) == Int64Decision::NATIVE &&
-                                       !NativeInt64GuardAllows(flattened);
-  if (UsePackedInt64ViewForOp(op_name) || guard_demotes_to_packed) {
-    for (auto& t : flattened) {
-      if (t.defined() && t.scalar_type() == c10::ScalarType::Long &&
-          t.device().type() == c10::DeviceType::PrivateUse1 && t.is_contiguous() && t.numel() > 0) {
-        // Empty int64 is kept unpacked (clean int64[0]) to match the fake input
-        // (create_fake_recursive) — a packed (…, 2) view of a 0-element tensor
-        // is elided by the compiler and shifts the inplace output binding.
-        t = torch_neuronx::packed_int64::physical_view(t);
+  if (ir_input_count == 0) {
+    TORCH_CHECK(kept_input_indices.empty(),
+                "[FlattenAndFilterInputs] zero-input IR has kept input indices for op '", op_name,
+                "'");
+    return {};
+  }
+
+  if (kept_input_indices.empty()) {
+    // Empty means the NEFF uses no inputs (a factory op: arange/ones/zeros with
+    // out=). A write-aliased out=/self is an output binding, not a NEFF input.
+    // Keeping it makes a phantom input and trips an NRT arity check. Drop the
+    // write-aliased args; keep any read-only inputs.
+    bool any_write_aliased = false;
+    for (char w : flattened_is_write_aliased) any_write_aliased |= (w != 0);
+    if (!any_write_aliased) return flattened;
+    std::vector<torch::Tensor> read_only;
+    read_only.reserve(flattened.size());
+    for (size_t k = 0; k < flattened.size(); ++k) {
+      if (k >= flattened_is_write_aliased.size() || flattened_is_write_aliased[k] == 0) {
+        read_only.push_back(flattened[k]);
       }
     }
+    return read_only;
   }
-
-  if (kept_input_indices.empty()) return flattened;
 
   std::vector<torch::Tensor> filtered;
   filtered.reserve(kept_input_indices.size());
@@ -2914,7 +3370,7 @@ bool NeuronDispatcher::TryHandleEmptyTensors(
   auto* index_cfg = GetIndexOpConfig(op_name);
 
   if (index_cfg) {
-    // ── Category 1: GetIndexOpConfig ops (scatter, scatter_add, _index_put_impl_) ──
+    // ── Category 1: GetIndexOpConfig ops (scatter, scatter_add, _index_put_impl_, index_fill) ──
     // Check ALL args including lists for empty tensors.
     bool has_empty = false;
     for (const auto& arg : args) {
@@ -3074,7 +3530,7 @@ bool NeuronDispatcher::TryHandleEmptyTensors(
     };
     auto make_zeros = [&](const MetaOutputSpec& spec, size_t output_index) {
       auto cpu_opts = torch::TensorOptions().dtype(spec.dtype).device(c10::kCPU);
-      return apply_target_strides(torch::zeros(spec.shape, cpu_opts).to(device), output_index);
+      return apply_target_strides(torch::zeros(spec.shape, cpu_opts), output_index);
     };
     auto make_empty = [&](const MetaOutputSpec& spec, size_t output_index) {
       auto opts = torch::TensorOptions().dtype(spec.dtype).device(device);
@@ -3082,8 +3538,7 @@ bool NeuronDispatcher::TryHandleEmptyTensors(
     };
     auto make_full = [&](const MetaOutputSpec& spec, size_t output_index, double fill_value) {
       auto cpu_opts = torch::TensorOptions().dtype(spec.dtype).device(c10::kCPU);
-      return apply_target_strides(torch::full(spec.shape, fill_value, cpu_opts).to(device),
-                                  output_index);
+      return apply_target_strides(torch::full(spec.shape, fill_value, cpu_opts), output_index);
     };
 
     // ── 1b. Create output tensors with correct fill values ──
@@ -3219,6 +3674,31 @@ bool NeuronDispatcher::TryHandleEmptyTensors(
         }
       }
 
+    } else if (auto* fill_cfg = GetFillValueConfig(op_name)) {
+      // Fill-value op (constant_pad_nd, linear): fill with configured value.
+      TORCH_NEURONX_DISPATCH_DEBUG("[TryHandleEmpty] fill-value op", " op=", op_name);
+
+      for (size_t i = 0; i < meta_specs.size(); ++i) {
+        const auto& spec = meta_specs[i];
+        if (spec.is_undefined) {
+          outputs.push_back(torch::Tensor());
+        } else if (HasZeroDim(spec.shape)) {
+          outputs.push_back(make_empty(spec, i));
+        } else if (fill_cfg->is_tensor_fill) {
+          auto fill_tensor = ExtractTensorArg(args, schema, fill_cfg->fill_arg);
+          if (fill_tensor.defined()) {
+            outputs.push_back(
+                fill_tensor.to(spec.dtype).expand(spec.shape).contiguous().to(device));
+          } else {
+            outputs.push_back(make_zeros(spec, i));  // bias=None → zeros
+          }
+        } else {
+          double fill_value =
+              ExtractScalarArg(args, schema, fill_cfg->fill_arg, fill_cfg->fill_default).toDouble();
+          outputs.push_back(make_full(spec, i, fill_value));
+        }
+      }
+
     } else {
       // ── General case: create zeros ──
       for (size_t i = 0; i < meta_specs.size(); ++i) {
@@ -3252,6 +3732,16 @@ bool NeuronDispatcher::TryHandleEmptyTensors(
         out_tensor.copy_(outputs[ret_idx]);
         outputs[ret_idx] = out_tensor;
         break;
+      }
+    }
+
+    // make_zeros/make_full build the fabricated fill on host so an out= write
+    // is a single host->device copy (no device-side 0-d copy_ round-trip). Any
+    // output not written into a device out= (functional returns) must still land
+    // on the device before it is returned.
+    for (auto& fabricated : outputs) {
+      if (fabricated.defined() && fabricated.device().is_cpu()) {
+        fabricated = fabricated.to(device);
       }
     }
 

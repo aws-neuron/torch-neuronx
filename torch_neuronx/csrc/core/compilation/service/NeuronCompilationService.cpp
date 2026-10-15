@@ -20,6 +20,7 @@ namespace at::neuron {
 
 namespace {
 constexpr size_t kMaxServiceWorkers = 128;
+constexpr size_t kMaxFailedCompiles = 1024;
 constexpr const char* kServiceWorkersEnv = "NEURON_COMPILE_SERVICE_WORKERS";
 
 size_t ResolveWorkerCount(size_t requested) {
@@ -172,6 +173,7 @@ void NeuronCompilationService::WorkerLoop() {
 
     std::string neff_path;
     std::string error_msg;
+    std::string failed_compile_key;
     try {
       std::ifstream ifs(job->hlo_file_path, std::ios::binary);
       if (ifs) {
@@ -187,31 +189,52 @@ void NeuronCompilationService::WorkerLoop() {
           if (!request_config.additional_args.empty()) request_config.additional_args += " ";
           request_config.additional_args += job->additional_args;
         }
+        failed_compile_key = job->cache_key;
 
-        auto neff_bytes = NeuronCompiler::CompileHloToNeff(hlo_bytes, request_config, job->ir_type,
-                                                           job->op_name, job->cache_key);
-
-        if (!neff_bytes.empty()) {
-          neff_path = job->hlo_file_path + ".neff";
-          std::ofstream ofs(neff_path, std::ios::binary);
-          if (ofs) {
-            ofs.write(reinterpret_cast<const char*>(neff_bytes.data()),
-                      static_cast<std::streamsize>(neff_bytes.size()));
-          } else {
-            neff_path.clear();
-            error_msg = "Failed to write NEFF to temp file";
+        if (!failed_compile_key.empty()) {
+          std::lock_guard<std::mutex> lock(failed_compiles_mutex_);
+          auto cached = failed_compiles_.find(failed_compile_key);
+          if (cached != failed_compiles_.end()) {
+            error_msg = cached->second;
+            TORCH_NEURONX_INFO("Reusing failed compilation for op=", job->op_name,
+                               " cache_key=", job->cache_key);
           }
-        } else {
-          error_msg =
-              "NeuronCompiler::CompileHloToNeff returned empty NEFF for op=" + job->op_name +
-              " cache_key=" + job->cache_key + " ir_type=" + job->ir_type;
-          TORCH_NEURONX_ERROR(error_msg);
+        }
+
+        if (error_msg.empty()) {
+          auto neff_bytes = NeuronCompiler::CompileHloToNeff(
+              hlo_bytes, request_config, job->ir_type, job->op_name, job->cache_key);
+
+          if (!neff_bytes.empty()) {
+            neff_path = job->hlo_file_path + ".neff";
+            std::ofstream ofs(neff_path, std::ios::binary);
+            if (ofs) {
+              ofs.write(reinterpret_cast<const char*>(neff_bytes.data()),
+                        static_cast<std::streamsize>(neff_bytes.size()));
+            } else {
+              neff_path.clear();
+              error_msg = "Failed to write NEFF to temp file";
+            }
+          } else {
+            error_msg =
+                "NeuronCompiler::CompileHloToNeff returned empty NEFF for op=" + job->op_name +
+                " cache_key=" + job->cache_key + " ir_type=" + job->ir_type;
+            TORCH_NEURONX_ERROR(error_msg);
+          }
         }
       } else {
         error_msg = "Failed to read HLO file: " + job->hlo_file_path;
       }
     } catch (const std::exception& e) {
       error_msg = e.what();
+    }
+
+    if (!failed_compile_key.empty() && !error_msg.empty()) {
+      std::lock_guard<std::mutex> lock(failed_compiles_mutex_);
+      if (failed_compiles_.find(failed_compile_key) == failed_compiles_.end()) {
+        if (failed_compiles_.size() >= kMaxFailedCompiles) failed_compiles_.clear();
+        failed_compiles_.emplace(failed_compile_key, error_msg);
+      }
     }
 
     job->result.set_value({neff_path, error_msg});

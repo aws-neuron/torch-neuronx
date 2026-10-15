@@ -132,6 +132,8 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
 
   // Tracking for last scheduled operation (for cross-XU synchronization)
   LastScheduledInfo last_scheduled_info_;
+  // Barriers execute at retirement and are not covered by a device sequence.
+  size_t pending_barrier_count_{0};
 
   // Per-stream completion tracking state for async NRT operations
   XUCompletionState xu_completed_seqs_;
@@ -188,6 +190,7 @@ struct StreamImpl : public std::enable_shared_from_this<StreamImpl> {
   // True iff `op` is a same-stream kWait eligible for run-ahead bypass; the
   // free-HBM headroom check lives in IsRunAheadMemorySafe.
   static bool IsSameStreamWaitBypass(OperationContext* op, const StreamImpl* consumer);
+  nrt::SequenceId GetComputeQueueFence(OperationContext* op) const;
   // True iff free device HBM has enough headroom to safely advance past a
   // same-stream kWait. Disabled => always returns true.
   static bool IsRunAheadMemorySafe(c10::DeviceIndex device_index);

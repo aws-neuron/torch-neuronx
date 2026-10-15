@@ -1,9 +1,4 @@
-"""
-Multi-Stream Collective Operations Tests for Host-CC Feature.
-
-Tests collective operations on non-default streams using NRT host collectives API.
-Environment variable: TORCH_NEURONX_ENABLE_HOST_CC=1 (enabled by tests)
-"""
+"""Multi-stream collective tests for HostCC."""
 
 import os
 
@@ -12,29 +7,47 @@ import torch
 import torch.distributed as dist
 
 import torch_neuronx
-from tests.utils.neuron_test_utils import assert_raises
+from tests.utils.neuron_test_utils import (
+    assert_raises,
+    get_core_start_index,
+    requires_nrt_streams_with_host_cc,
+)
+from torch_neuronx.utils import is_host_cc_enabled
 
+from ..utils import DistributedTester
 from .base_collective_op import BaseCollectiveOpTest
 
 
-# Module-level setup: enable host-cc for all tests in this file
 @pytest.fixture(scope="module", autouse=True)
-def enable_host_cc():
-    """Enable host-cc for all tests in this module."""
-    old_value = os.environ.get("TORCH_NEURONX_ENABLE_HOST_CC")
+def require_host_cc():
+    os.environ["TORCH_NEURONX_ENABLE_STREAMS"] = "1"
     os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = "1"
-    yield
-    # Restore original value
-    if old_value is None:
-        os.environ.pop("TORCH_NEURONX_ENABLE_HOST_CC", None)
-    else:
-        os.environ["TORCH_NEURONX_ENABLE_HOST_CC"] = old_value
 
 
 _DEFAULT_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 2))
 _SMALL_TENSOR_SIZE = 1024
 _MEDIUM_TENSOR_SIZE = 256 * 1024
 _LARGE_TENSOR_SIZE = 4 * 1024 * 1024
+
+
+class FirstStreamTester(DistributedTester):
+    def _worker(self, rank, test_fn, func_args, master_addr, master_port, error_queue):
+        func_args["first_stream"] = torch.neuron.Stream(
+            device=f"neuron:{get_core_start_index() + rank}"
+        )
+        super()._worker(rank, test_fn, func_args, master_addr, master_port, error_queue)
+
+
+def run_first_stream_collective(rank, world_size, kwargs):
+    assert is_host_cc_enabled()
+    stream = kwargs["first_stream"]
+    assert stream != torch_neuronx.default_stream()
+    with torch.neuron.stream(stream):
+        tensor = torch.ones(1024, device="neuron") * (rank + 1)
+        dist.all_reduce(tensor)
+    stream.synchronize()
+    expected = torch.full((1024,), world_size * (world_size + 1) / 2)
+    torch.testing.assert_close(tensor.cpu(), expected)
 
 
 def create_tp_fsdp_groups(rank: int, world_size: int, tp_size: int):
@@ -938,6 +951,14 @@ def run_coalesced_tensor_variants(rank, world_size, kwargs):
 # =============================================================================
 # Test Classes
 # =============================================================================
+
+
+class TestHostCCFirstStream(BaseCollectiveOpTest):
+    @requires_nrt_streams_with_host_cc
+    def test_first_stream_collective(self, process_index):
+        FirstStreamTester(world_size=self.world_size, process_index=process_index).run_test(
+            run_first_stream_collective
+        )
 
 
 class TestMultiStreamBasic(BaseCollectiveOpTest):

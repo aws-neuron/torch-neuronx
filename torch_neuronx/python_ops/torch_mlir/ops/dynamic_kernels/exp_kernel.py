@@ -45,6 +45,11 @@ def _run_exp_loop(
     """
 
     def body(_i):
+        """Process one unrolled exponential loop iteration.
+
+        Args:
+            _i (int): Loop iteration index.
+        """
         for slot in range(1, tiles_per_trip):
             nisa.tensor_scalar(
                 dst=row_start[slot],
@@ -115,14 +120,18 @@ def _run_exp_loop(
 
 @nki.jit()
 def exp_kernel(input_tensor, num_m_tiles):
-    """
-    Exp activation: output = exp(input)
+    """Exponentiate a tensor over a runtime-dynamic row dimension.
 
     Args:
-        input_tensor: [m_static, hidden] bf16 on HBM
-        num_m_tiles: [1, 1] int32 — number of 128-row tiles to process
+        input_tensor (tensor): ``[m_static, hidden]`` HBM input.
+        num_m_tiles (tensor): Int32 ``[1, 1]`` count of 128-row tiles to process.
+
     Returns:
-        output: [m_static, hidden] bf16 on HBM
+        tensor: HBM output with the input shape and dtype.
+
+    Note:
+        Only the first ``128 * num_m_tiles`` rows are written with elementwise
+        exponentials; any remaining capacity rows are unspecified.
     """
     m_static, hidden = input_tensor.shape
 

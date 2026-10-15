@@ -58,6 +58,11 @@ def _run_sub_loop(
     slot_stride = tile_size_m * num_programs
 
     def body(_i):
+        """Subtract one unrolled group of interleaved row tiles.
+
+        Args:
+            _i (int): Dynamic loop iteration index accepted and unused.
+        """
         for slot in range(1, tiles_per_trip):
             nisa.tensor_scalar(
                 dst=row_start[slot],
@@ -144,15 +149,19 @@ def _run_sub_loop(
 
 @nki.jit()
 def sub_kernel(input_a, input_b, num_m_tiles):
-    """
-    Elementwise sub: output = input_a - input_b
+    """Subtract tensors over dynamic row tiles.
 
     Args:
-        input_a: [m_static, hidden] bf16 on HBM
-        input_b: [m_static, hidden] bf16 on HBM
-        num_m_tiles: [1, 1] int32, number of 128-row tiles per program
+        input_a (nki.language.ndarray): Minuend with shape ``[m_static, hidden]``.
+        input_b (nki.language.ndarray): Subtrahend with the same shape.
+        num_m_tiles (nki.language.ndarray): Number of 128-row tiles per program.
+
     Returns:
-        output: [m_static, hidden] bf16 on HBM
+        nki.language.ndarray: Static-shaped ``input_a - input_b`` in the
+        ``input_a`` dtype.
+
+    Note:
+        Rows not covered by the per-program tile count are not initialized.
     """
     m_static, hidden = input_a.shape
 

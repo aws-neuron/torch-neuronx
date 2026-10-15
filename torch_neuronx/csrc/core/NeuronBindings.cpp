@@ -5,6 +5,7 @@
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <pthread.h>
 #include <torch/csrc/Generator.h>
+#include <torch/csrc/autograd/engine.h>
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/extension.h>
@@ -14,6 +15,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
@@ -41,7 +43,7 @@
 #include "torch_neuronx/csrc/core/NeuronGuardImpl.h"
 #include "torch_neuronx/csrc/core/NeuronHooksInterface.h"
 #include "torch_neuronx/csrc/core/NeuronStorageImpl.h"
-#include "torch_neuronx/csrc/core/cache/CompilationCacheKey.h"
+#include "torch_neuronx/csrc/core/cache/CacheUtils.h"
 #include "torch_neuronx/csrc/core/cache/PersistentCacheBackend.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
 #include "torch_neuronx/csrc/core/utils/NeuronExceptions.h"
@@ -166,30 +168,6 @@ InputTransformationResult ProcessInputTransformations(const std::string& op_name
   InputTransformationResult result;
   result.final_inputs.reserve(inputs.size());
   result.kernel_transforms.resize(inputs.size());
-
-  // Native-int64 prologue boundary guard: for an op that packs its int64 inputs
-  // (DOWNCAST / packed mode → the op module represents them as int32[...,2]),
-  // any int64 operand appears *unpacked* (tensor<...xi64>) in a fused prologue's
-  // pass-through signature. Merging that prologue with the op then hits an
-  // i64-vs-i32x2 boundary that cannot be linked (validateDepCompatibility skips
-  // it → empty merged MLIR → "Failed to merge prologue"). This bites ops with a
-  // non-contiguous *non-int64* input plus an int64 operand (e.g.
-  // cross_entropy_loss: non-contiguous float32 input + int64 target). Disable
-  // fusion for such ops so their non-contiguous inputs are materialized instead
-  // (correct, and matches the packed path). Native ops keep S64 in both the
-  // prologue and the op (no boundary), so they are unaffected.
-  if (fuse_transforms && torch_neuronx::dispatch::UsePackedInt64ViewForOp(op_name)) {
-    for (const auto& in : inputs) {
-      if (in.defined() && in.scalar_type() == c10::ScalarType::Long) {
-        TORCH_NEURONX_DEBUG(
-            "Packed-int64 op with int64 operand: disabling prologue fusion to avoid the "
-            "i64/i32x2 merge boundary; non-contiguous inputs are materialized instead",
-            "op=", op_name);
-        fuse_transforms = false;
-        break;
-      }
-    }
-  }
 
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto& input = inputs[i];
@@ -663,6 +641,13 @@ void maybe_lazy_init() {
   // fail fast (not deadlock) if used in a bad-forked child.
   TORCH_CHECK(!c10_neuron::is_in_bad_fork(),
               "Neuron runtime should not be used after fork(); use spawn or num_workers=0.");
+  if (c10_neuron::is_initialized()) {
+    return;
+  }
+  // Serialize first-touch init. Concurrent callers must not run nrt_init() at
+  // the same time. Init once under a lock; later callers see it done.
+  static std::mutex init_mutex;
+  std::lock_guard<std::mutex> lock(init_mutex);
   if (!c10_neuron::is_initialized()) {
     neuron_init();
   }
@@ -936,10 +921,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_python_ops_registered", &torch_neuronx::set_python_ops_registered,
         "Set flag indicating Python operations are registered");
   m.def(
-      "_set_python_contiguous_op",
-      [](py::object op) { torch_neuronx::ops::SetPythonContiguousOp(op.ptr()); },
-      "Set the Python contiguous operation instance");
-
+      "_current_graph_task_keep_graph",
+      []() { return torch::autograd::get_current_graph_task_keep_graph(); },
+      "Return whether the current autograd GraphTask keeps its graph.");
   // Raw NRT memory operations for CPU fallback
   m.def(
       "_nrt_copy_raw_to_cpu",
@@ -1419,15 +1403,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // NeuronDispatcher — C++ dispatch registration
   // ============================================================================
   //
-  // skip_cache: Some ops use a Python preprocessing function (uses_preprocessing=True)
-  // that transforms args before lowering. This preprocessing can read tensor VALUES
-  // (not just shapes/dtypes) to make decisions that affect the lowered graph — e.g.
-  // masked_select computes output size from mask.sum(), native_dropout generates a
-  // random mask, one_hot infers num_classes from torch.max(x). The C++ dispatch cache
-  // key is (op_name, shapes, dtypes, static_args), which cannot capture these
-  // value-dependent differences. Caching would silently replay a stale lowering with
-  // wrong output shapes or constants. skip_cache tells the dispatcher to always call
-  // lower_func on every invocation, bypassing the dispatch cache entirely.
+  // skip_cache: a VALUE_DEPENDENT op reads a tensor value in its preprocessing and puts
+  // what it read into the graph. masked_select takes the output size from mask.sum();
+  // one_hot takes num_classes from torch.max(x). The dispatch cache key is
+  // (op_name, shapes, dtypes, strides, static_args) and holds none of those values, so a
+  // replay returns the wrong shape. skip_cache makes the dispatcher call lower_func on
+  // every invocation. Python derives it from preprocessing=Preprocessing.VALUE_DEPENDENT.
   m.def(
       "_register_neuron_op",
       [](const std::string& op_name, py::object python_wrapper, py::object lower_func,
@@ -1764,9 +1745,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         result["num_alloc_deferred"] = stats.num_alloc_deferred;
         result["num_alloc_drain_retry_ok"] = stats.num_alloc_drain_retry_ok;
         result["num_alloc_drain_retry_fail"] = stats.num_alloc_drain_retry_fail;
+        result["num_scalar_cache_hits"] = stats.num_scalar_cache_hits;
+        result["num_scalar_cache_misses"] = stats.num_scalar_cache_misses;
+        result["scalar_cache_size"] = stats.scalar_cache_size;
         return result;
       },
       "Get memory statistics for a device", py::arg("device_index"));
+
+  m.def(
+      "_nrt_get_memory_usage_breakdown",
+      [](int device_index) -> py::list {
+        py::list result;
+        uint32_t vnc = static_cast<uint32_t>(c10_neuron::get_vnc_id(device_index));
+        auto breakdown = at::neuron::nrt::GetMemoryUsageBreakdown(vnc);
+        for (const auto& entry : breakdown) {
+          result.append(py::make_tuple(py::str(entry.first), py::int_(entry.second)));
+        }
+        return result;
+      },
+      "Get per-category HBM memory usage breakdown", py::arg("device_index"));
 
   m.def(
       "_reset_peak_memory_stats",
@@ -1921,6 +1918,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             // Use absolute timestamp for pytorch.org/memory_viz compatibility
             entry_dict["time_us"] = entry.timestamp_us;
             entry_dict["frames"] = framesToPyList(entry.context);
+            if (entry.trace_id != 0) {
+              entry_dict["trace_id"] = entry.trace_id;
+            }
             if (entry.action == c10_neuron::NeuronMemorySnapshot::TraceAction::OOM) {
               entry_dict["device_free"] = entry.device_free;
             }
@@ -1932,6 +1932,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::dict result;
         result["segments"] = segments;
         result["device_traces"] = device_traces;
+        result["clock_domain_offset_us"] =
+            c10_neuron::NeuronMemorySnapshot::GetClockDomainOffsetUs();
         return result;
       },
       "Capture current memory snapshot");
@@ -2149,13 +2151,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // torch.compile MegaCache: write NEFF to persistent cache.
   m.def(
       "put_neff_cache",
-      [](const std::string& key, py::bytes neff_bytes) -> bool {
-        auto cache_key = at::neuron::CompilationCacheKey(
-            key, at::neuron::CompileOnlyKernelExecution::GetCompileAdditionalArgs(),
-            at::neuron::CompileOnlyKernelExecution::GetCompileOptimizationLevel(),
-            /*hlo_bytes_ptr=*/nullptr, at::neuron::CacheKeySource::TORCH_COMPILE);
-        const std::string* pk = cache_key.GetPersistentKey();
-        if (!pk) return false;
+      [](const std::string& persistent_key, py::bytes neff_bytes,
+         const std::string& base_key) -> bool {
+        if (persistent_key.empty()) return false;
 
         at::neuron::PersistentCacheBackend cache;
 
@@ -2163,33 +2161,40 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         // Copy required: Put() takes const ref, needs owned data
         std::vector<uint8_t> neff_vec(neff_str.begin(), neff_str.end());
 
-        return cache.Put(*pk, neff_vec);
+        if (!cache.Put(persistent_key, neff_vec)) return false;
+
+        // Bind the base key so a later execute_compiled_graph() finds this NEFF. Only a
+        // caller that stages a NEFF without a compile step in this process needs it.
+        if (!base_key.empty()) {
+          at::neuron::NeuronResourceManager::Instance()
+              .GetCompilationCache()
+              .RegisterPersistentKeyHint(base_key, persistent_key);
+        }
+        return true;
       },
-      "Write NEFF to persistent cache, keyed by the base cache key (persistent key derived "
-      "internally to match execute_compiled_graph's lookup)",
-      py::arg("key"), py::arg("neff_bytes"));
+      "Write NEFF to persistent cache under a persistent key from get_neff_info(). A base cache "
+      "key cannot derive that key. Pass base_key to also record base_key -> persistent_key, so a "
+      "later execute_compiled_graph(base_key) finds this NEFF. compile_graph records that pair "
+      "itself, so only a caller that stages a NEFF without compiling needs base_key.",
+      py::arg("persistent_key"), py::arg("neff_bytes"), py::arg("base_key") = "");
 
   // torch.compile MegaCache: read NEFF from persistent cache.
   m.def(
       "get_neff_cache",
-      [](const std::string& key) -> py::object {
-        auto cache_key = at::neuron::CompilationCacheKey(
-            key, at::neuron::CompileOnlyKernelExecution::GetCompileAdditionalArgs(),
-            at::neuron::CompileOnlyKernelExecution::GetCompileOptimizationLevel(),
-            /*hlo_bytes_ptr=*/nullptr, at::neuron::CacheKeySource::TORCH_COMPILE);
-        const std::string* pk = cache_key.GetPersistentKey();
-        if (!pk) return py::none();
+      [](const std::string& persistent_key) -> py::object {
+        if (persistent_key.empty()) return py::none();
 
         at::neuron::PersistentCacheBackend cache;
 
-        auto result = cache.Get(*pk);
+        auto result = cache.Get(persistent_key);
         if (result.has_value()) {
           return py::bytes(reinterpret_cast<const char*>(result->data()), result->size());
         }
         return py::none();
       },
-      "Read NEFF from persistent cache by the base cache key, returns None if not found",
-      py::arg("key"));
+      "Read NEFF from persistent cache by an already-derived persistent key, returns None if not "
+      "found",
+      py::arg("persistent_key"));
 
   // HLO persistent cache: write serialized HLO entry
   m.def(
@@ -2199,18 +2204,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         std::filesystem::path cache_dir = cache_dir_env ? cache_dir_env : "/tmp/hlo_cache";
         at::neuron::PersistentCacheBackend cache(cache_dir, ".bin");
 
-        // Use CompilationCacheKey to compute filesystem-safe persistent key
-        auto cache_key = at::neuron::CompilationCacheKey(key, "", "");
-        const std::string* pk = cache_key.GetPersistentKey();
-        if (!pk) return false;
+        // The HLO cache has no NEFF, so it must not use the content-addressed NEFF key.
+        const std::string pk = at::neuron::cache_utils::HashHloCacheKey(key);
 
-        if (cache.Exists(*pk)) {
+        if (cache.Exists(pk)) {
           return true;
         }
 
         std::string_view data_str = data.cast<std::string_view>();
         std::vector<uint8_t> data_vec(data_str.begin(), data_str.end());
-        return cache.Put(*pk, data_vec);
+        return cache.Put(pk, data_vec);
       },
       "Write serialized HLO cache entry to persistent cache", py::arg("key"), py::arg("data"));
 
@@ -2222,11 +2225,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         std::filesystem::path cache_dir = cache_dir_env ? cache_dir_env : "/tmp/hlo_cache";
         at::neuron::PersistentCacheBackend cache(cache_dir, ".bin");
 
-        auto cache_key = at::neuron::CompilationCacheKey(key, "", "");
-        const std::string* pk = cache_key.GetPersistentKey();
-        if (!pk) return py::none();
+        const std::string pk = at::neuron::cache_utils::HashHloCacheKey(key);
 
-        auto result = cache.Get(*pk);
+        auto result = cache.Get(pk);
         if (result.has_value()) {
           return py::bytes(reinterpret_cast<const char*>(result->data()), result->size());
         }
@@ -2243,13 +2244,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         std::filesystem::path cache_dir = cache_dir_env ? cache_dir_env : "/tmp/hlo_cache";
         at::neuron::PersistentCacheBackend cache(cache_dir, ".bin");
 
-        auto cache_key = at::neuron::CompilationCacheKey(key, "", "");
-        const std::string* pk = cache_key.GetPersistentKey();
-        if (!pk) return false;
-
-        return cache.Exists(*pk);
+        return cache.Exists(at::neuron::cache_utils::HashHloCacheKey(key));
       },
       "Check if HLO cache entry exists", py::arg("key"));
+
+  // HLO cache storage name. Exposed for tests.
+  m.def(
+      "_hash_hlo_cache_key",
+      [](const std::string& key) -> std::string {
+        return at::neuron::cache_utils::HashHloCacheKey(key);
+      },
+      "Return the HLO cache storage name for a frontend key", py::arg("key"));
 
   // torch.compile MegaCache: get NEFF info from in-memory compilation cache
   m.def(
@@ -2279,7 +2284,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     at::neuron::drain_visible_device_streams("module_cleanup:pre");
     try {
       torch_neuronx::dispatch::NeuronDispatcher::Instance().Cleanup();
-      torch_neuronx::ops::SetPythonContiguousOp(nullptr);
       torch_neuronx::distributed::NeuronBackend::Cleanup();
     } catch (const std::exception& e) {
       std::cerr << "Warning: Dispatcher cleanup failed during module cleanup: " << e.what()

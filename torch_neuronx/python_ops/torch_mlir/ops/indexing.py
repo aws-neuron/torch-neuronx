@@ -2,16 +2,24 @@
 
 import torch
 
-from torch_neuronx.dtype_utils import torch_dtype_to_scalar_type_name
+from torch_neuronx.dtype_utils import torch_dtype_to_scalar_type_name, torch_dtype_to_type_meta_name
 from torch_neuronx.python_ops.nki_kernels.bound_check import assert_index_in_bounds
 from torch_neuronx.utils import skip_op_preconditions
 
 from ..operation_registry import Preprocessing, register_aten
 from ..validation import validate_inplace_broadcast
+from .unary import _validate_float_promoting_out
 
 
 def convert_indices(indices):
-    """Convert boolean indices into integer indices."""
+    """Convert index entries to the representation used by Neuron lowering.
+
+    Args:
+        indices (list[torch.Tensor | None]): Index tensors and ``None`` placeholders.
+
+    Returns:
+        tuple: Boolean indices expanded with ``nonzero``; other tensors moved to the Neuron device.
+    """
     integer_indices = []
     for index in indices:
         if index is None:
@@ -24,9 +32,18 @@ def convert_indices(indices):
 
 
 def index_checking(tensor, indices):
-    """Validate index dtypes for index operations. Bounds checking is fused
-    in-graph (see index.py index_fn) to avoid a host sync; an OOB index faults
-    on-device and aten::index's error_handler surfaces the exact exception."""
+    """Reject floating-point tensors used as indices.
+
+    Args:
+        tensor (torch.Tensor): Indexed tensor, retained for callback compatibility.
+        indices (list[torch.Tensor | None]): Index entries to validate.
+
+    Raises:
+        IndexError: If an index tensor has a floating-point dtype.
+
+    Note:
+        Bounds checking runs in-graph to avoid a host synchronization.
+    """
     for _, idx in enumerate(indices):
         if idx is None or idx.dtype == torch.bool:
             continue
@@ -98,6 +115,22 @@ def _index_select_error_handler(ctx):
     error_handler=_index_select_error_handler,
 )
 def torch_index_select(x, dim, index, out=None):
+    """Prepare an index-select operation for shape-only preprocessing.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        dim (int): Dimension to index.
+        index (torch.Tensor): Scalar or one-dimensional integer indices.
+        out (torch.Tensor, optional): Output tensor checked for overlap. Defaults to ``None``.
+
+    Returns:
+        tuple: Compute function, normalized arguments, and empty keyword arguments.
+
+    Raises:
+        IndexError: If ``index`` has invalid rank or contains an out-of-bounds value.
+        RuntimeError: If scalar input receives multiple indices or ``out`` overlaps internally.
+        TypeError: If ``index`` is not ``int32`` or ``int64``.
+    """
     _assert_no_internal_overlap(out)
     if index.dim() == 0:
         index = index.reshape(1)
@@ -114,11 +147,23 @@ def torch_index_select(x, dim, index, out=None):
     # (window [-1, 1)), see _device_bounds_check.
     if not skip_op_preconditions() and x.dim() == 0 and index.numel() > 1:
         raise RuntimeError(
-            f"index_select(): Index to scalar can have only 1 value, "
-            f"got {index.numel()} value(s)"
+            f"index_select(): Index to scalar can have only 1 value, got {index.numel()} value(s)"
         )
 
     def index_select_fn(x, dim, index):
+        """Select indexed values after enforcing bounds in the compiled graph.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            dim (int): Dimension to index.
+            index (torch.Tensor): Integer indices.
+
+        Returns:
+            torch.Tensor: Values selected from ``x``.
+
+        Raises:
+            IndexError: If ``index`` contains an out-of-bounds value.
+        """
         # In-graph bounds check (no host sync): the gather consumes the checked
         # index, so the check survives DCE and faults on an OOB index;
         # _index_select_error_handler then surfaces the exact exception.
@@ -157,6 +202,25 @@ def _validate_index_copy(x, dim, indexes, source, out=None):
     validate_static_inputs=_validate_index_copy,
 )
 def torch_index_copy(x, dim, indexes, source, out=None):
+    """Copy source values into selected indices.
+
+    Args:
+        x (torch.Tensor): Destination tensor.
+        dim (int): Dimension to index.
+        indexes (torch.Tensor): Integer destination indices.
+        source (torch.Tensor): Values to copy.
+        out (torch.Tensor, optional): Output buffer accepted but not forwarded. Defaults to
+            ``None``.
+
+    Returns:
+        torch.Tensor: Copy of ``x`` with selected values replaced.
+
+    Raises:
+        IndexError: If ``dim`` is invalid, an index is out of bounds, or scalar ``source`` is
+            paired with multiple index values.
+        RuntimeError: If ``indexes`` does not have an integer dtype.
+        ValueError: If ``source`` has an incompatible shape.
+    """
     # 0-d tensor: index_copy on a scalar is valid when dim=0, index has
     # exactly one element (value 0), and source is also 0-d.  CPU PyTorch
     # handles this by treating the scalar as a 1-element container.
@@ -173,7 +237,9 @@ def torch_index_copy(x, dim, indexes, source, out=None):
         actual_dim = dim if dim >= 0 else x.dim() + dim
         expected_shape = list(x.shape)
         expected_shape[actual_dim] = indexes.numel()
-        if list(source.shape) != expected_shape:
+        if x.dim() == 1 and source.dim() == 0 and indexes.numel() == 1:
+            source = source.reshape(1)
+        elif list(source.shape) != expected_shape:
             raise ValueError(
                 f"Incompatible shapes for broadcasting: {tuple(source.shape)}"
                 f" and requested shape {tuple(expected_shape)}"
@@ -185,13 +251,133 @@ def torch_index_copy(x, dim, indexes, source, out=None):
     ["aten::index_add", "aten::index_add_", "aten::index_add.out"],
     static_argnums=(1,),
     static_argnames=("alpha",),
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_index_add(x, dim, index, source, alpha=1, out=None):
+    """Add scaled source values at selected indices.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        dim (int): Dimension to index.
+        index (torch.Tensor): Integer destination indices.
+        source (torch.Tensor): Values to add.
+        alpha (Number, optional): Source multiplier. Defaults to ``1``.
+        out (torch.Tensor, optional): Output buffer validated but not forwarded. Defaults to
+            ``None``.
+
+    Returns:
+        torch.Tensor: Indexed addition result.
+
+    Raises:
+        RuntimeError: If floating-point ``x`` has a non-floating-point ``out``.
+    """
     return torch.index_add(x, dim, index, source, alpha=alpha)
 
 
-@register_aten(["aten::gather", "aten::gather.out"], static_argnums=(1,))
+def _validate_index_fill(self, dim, index, value, out=None, **_kwargs):
+    if index.dtype != torch.int64:
+        raise IndexError("index_fill_(): Expected dtype int64 for index.")
+    if isinstance(value, torch.Tensor) and value.dim() != 0:
+        raise RuntimeError(
+            "index_fill_ only supports a 0-dimensional value tensor, but got tensor "
+            f"with {value.dim()} dimension(s)."
+        )
+    value_is_complex = isinstance(value, complex) or (
+        isinstance(value, torch.Tensor) and value.is_complex()
+    )
+    if value_is_complex and not self.is_complex():
+        raise RuntimeError(
+            "index_fill_(): Converting complex Scalar to non-complex type is not supported"
+        )
+
+
+@register_aten(
+    [
+        "aten::index_fill.int_Scalar",
+        "aten::index_fill.int_Tensor",
+        "aten::index_fill.int_Scalar_out",
+        "aten::index_fill.int_Tensor_out",
+        "aten::index_fill_.int_Scalar",
+        "aten::index_fill_.int_Tensor",
+    ],
+    static_argnums=(1,),
+    validate_static_inputs=_validate_index_fill,
+)
+def torch_index_fill(self, dim, index, value, out=None):
+    """Fill selected indices with a scalar value.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        dim (int): Dimension to index.
+        index (torch.Tensor): ``int64`` destination indices.
+        value (Number or torch.Tensor): Scalar fill value.
+        out (torch.Tensor, optional): Output buffer accepted but not forwarded. Defaults to
+            ``None``.
+
+    Returns:
+        torch.Tensor: Filled copy of ``self``.
+
+    Raises:
+        IndexError: If ``index`` is not ``int64``.
+        RuntimeError: If a tensor value is non-scalar or complex for a real input.
+    """
+    # index_copy needs source.dtype == self.dtype; index_fill does not promote.
+    if isinstance(value, torch.Tensor) and value.dtype != self.dtype:
+        value = value.to(self.dtype)
+    return torch.index_fill(self, dim, index, value)
+
+
+def _validate_gather(x, dim, index, *, sparse_grad=False, out=None):
+    """Apply the out= and index-size checks ATen makes before gather runs."""
+    out_tensor = out[0] if isinstance(out, tuple | list) and out else out
+    if isinstance(out_tensor, torch.Tensor) and out_tensor.dtype != x.dtype:
+        expected = torch_dtype_to_type_meta_name(x.dtype) or x.dtype
+        actual = torch_dtype_to_type_meta_name(out_tensor.dtype) or out_tensor.dtype
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {expected}, but got {actual} instead"
+        )
+    if x.dim() > 0 and index.dim() == x.dim():
+        axis = dim % x.dim()
+        for other in range(x.dim()):
+            if other != axis and index.size(other) > x.size(other):
+                raise RuntimeError(
+                    f"Size does not match at dimension {other} expected index "
+                    f"{list(index.shape)} to be no larger than self {list(x.shape)} "
+                    f"apart from dimension {axis}"
+                )
+
+
+@register_aten(
+    ["aten::gather", "aten::gather.out"],
+    static_argnums=(1,),
+    validate_static_inputs=_validate_gather,
+)
 def torch_gather(x, dim, index, *, sparse_grad=False, out=None):
+    """Gather values along one dimension.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        dim (int): Dimension to gather.
+        index (torch.Tensor): Indices of values to gather.
+        sparse_grad (bool, optional): Accepted for schema compatibility. Defaults to ``False``.
+        out (torch.Tensor, optional): Destination populated and returned by registered dispatch;
+            ignored by this function body and not forwarded to ``torch.gather``. Defaults to
+            ``None``.
+
+    Returns:
+        torch.Tensor: Gathered values with scalar ranks normalized to ATen behavior.
+
+    Raises:
+        RuntimeError: If ``out`` has the wrong dtype or non-gather dimensions are too large.
+    """
+    # ATen accepts a 0-dim tensor against a 1-dim counterpart, but the StableHLO
+    # conversion requires index and input to have the same rank ("`index` and
+    # `input` param should have the same rank"). Align the ranks and restore the
+    # ATen result rank afterwards.
+    if x.dim() == 0 and index.dim() == 1:
+        return torch.gather(x.reshape(1), 0, index)
+    if x.dim() == 1 and index.dim() == 0:
+        return torch.gather(x, 0, index.reshape(1)).reshape(())
     return torch.gather(x, dim, index)
 
 
@@ -217,13 +403,46 @@ def _scatter_error_handler(ctx):
     static_argnums=(1,),
     preprocessing=Preprocessing.SHAPE_ONLY,
     error_handler=_scatter_error_handler,
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_scatter_value(x, dim, index, value, out=None):
+    """Prepare scalar-value scatter for shape-only preprocessing.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        dim (int): Dimension to scatter along.
+        index (torch.Tensor): Destination indices.
+        value (Number or torch.Tensor): Value to scatter.
+        out (torch.Tensor, optional): Output buffer forwarded to the compute function. Defaults to
+            ``None``.
+
+    Returns:
+        tuple: Compute function, normalized arguments, and output keyword arguments.
+
+    Raises:
+        RuntimeError: If an index is out of bounds or floating-point ``x`` has a
+            non-floating-point ``out``.
+    """
     # Convert scalar to tensor with matching dtype
     if not isinstance(value, torch.Tensor):
         value = torch.tensor(value, dtype=x.dtype, device=x.device)
 
     def torch_scatter_value_fn(x, dim, index, value, out=None):
+        """Scatter value entries after enforcing bounds in-graph.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            dim (int): Dimension to scatter along.
+            index (torch.Tensor): Destination indices.
+            value (torch.Tensor): Values to scatter.
+            out (torch.Tensor, optional): Accepted but not forwarded. Defaults to ``None``.
+
+        Returns:
+            torch.Tensor: Scatter result.
+
+        Raises:
+            RuntimeError: If ``index`` contains an out-of-bounds value.
+        """
         # In-graph bounds check: scatter consumes the checked index (keeps the
         # check alive through DCE, ordered before the scatter).
         if not skip_op_preconditions():
@@ -252,7 +471,47 @@ def torch_scatter_value(x, dim, index, value, out=None):
     error_handler=_scatter_error_handler,
 )
 def torch_scatter_src(x, dim, index, src, out=None, reduce=None):
+    """Prepare source-tensor scatter for shape-only preprocessing.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        dim (int): Dimension to scatter along.
+        index (torch.Tensor): Destination indices.
+        src (torch.Tensor or Number): Source values.
+        out (torch.Tensor, optional): Output buffer forwarded to the compute function. Defaults to
+            ``None``.
+        reduce (str, optional): ``"add"`` or ``"multiply"`` reduction. Defaults to ``None``.
+
+    Returns:
+        tuple: Compute function, arguments, and output or reduction keyword arguments.
+
+    Raises:
+        RuntimeError: If ``reduce`` is unsupported or an index is out of bounds.
+
+    Note:
+        ``"multiply"`` does not combine duplicate destinations before multiplying by ``x``.
+    """
+
     def torch_scatter_src_fn(x, dim, index, src, out=None, reduce=None):
+        """Scatter source values with optional reduction and in-graph bounds checks.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            dim (int): Dimension to scatter along.
+            index (torch.Tensor): Destination indices.
+            src (torch.Tensor or Number): Source values.
+            out (torch.Tensor, optional): Accepted but not forwarded. Defaults to ``None``.
+            reduce (str, optional): ``"add"`` or ``"multiply"`` reduction. Defaults to ``None``.
+
+        Returns:
+            torch.Tensor: Scatter result.
+
+        Raises:
+            RuntimeError: If ``reduce`` is unsupported or an index is out of bounds.
+
+        Note:
+            ``"multiply"`` does not combine duplicate destinations before multiplying by ``x``.
+        """
         # In-graph bounds check: scatter consumes the checked index.
         if not skip_op_preconditions():
             index = _device_bounds_check(x, dim, index, wrap=True)
@@ -309,9 +568,24 @@ def torch_scatter_src(x, dim, index, src, out=None, reduce=None):
     # Output size is mask.sum().item(), which the raw cache key cannot capture, so
     # re-lower every call and key on the resolved size. That size usually differs
     # per call, so the NEFF recompiles whenever the count changes.
-    relower_every_call=True,
+    validate_static_inputs=_validate_float_promoting_out,
 )
 def torch_masked_select(x, mask, out=None):
+    """Prepare masked selection using a value-dependent output size.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        mask (torch.Tensor): Boolean selection mask broadcastable with ``x``.
+        out (torch.Tensor, optional): Validated output buffer forwarded to the compute function.
+            Defaults to ``None``.
+
+    Returns:
+        tuple: Compute function, arguments including the selected size, and output keywords.
+
+    Raises:
+        RuntimeError: If ``mask`` is not Boolean, the inputs cannot broadcast, or floating-point
+            ``x`` has a non-floating-point ``out``.
+    """
     if mask.dtype != torch.bool:
         raise RuntimeError(
             f"masked_select: expected BoolTensor for mask, but got {mask.dtype} tensor"
@@ -323,6 +597,20 @@ def torch_masked_select(x, mask, out=None):
     size = int(size * broadcast_shape.numel() / mask.shape.numel())
 
     def masked_select_fn(x, mask, size, out=None):
+        """Select broadcast input values at true mask positions.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            mask (torch.Tensor): Boolean selection mask broadcastable with ``x``.
+            size (int): Number of selected output elements.
+            out (torch.Tensor, optional): Accepted but not forwarded. Defaults to ``None``.
+
+        Returns:
+            torch.Tensor: One-dimensional selected values.
+
+        Raises:
+            RuntimeError: If ``x`` and ``mask`` cannot broadcast.
+        """
         broadcast_shape = torch.broadcast_shapes(x.shape, mask.shape)
 
         # A 0-d broadcast shape (both self and mask are scalars) has no
@@ -398,7 +686,95 @@ def _validate_masked_fill_inplace(x, mask, value, out=None, **kwargs):
     validate_static_inputs=_validate_masked_fill_inplace,
 )
 def torch_masked_fill(x, mask, value, out=None):
+    """Fill masked positions with a scalar value.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        mask (torch.Tensor): Boolean mask broadcastable to ``x``.
+        value (Number or torch.Tensor): Scalar fill value.
+        out (torch.Tensor, optional): Output buffer handled by registered dispatch. Defaults to
+            ``None``.
+
+    Returns:
+        torch.Tensor: Mask-filled tensor preserving ``x`` dtype.
+
+    Raises:
+        RuntimeError: If the mask is non-boolean, value is non-scalar, or in-place broadcast expands
+            ``x``.
+    """
     return torch.masked_fill(x, mask, value)
+
+
+def _masked_scatter_true_count(self, mask):
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    if not isinstance(mask, torch.Tensor) or mask.is_meta or isinstance(mask, FakeTensor):
+        return None
+    shape = torch.broadcast_shapes(self.shape, mask.shape)
+    return int(mask.broadcast_to(shape).sum())
+
+
+def _validate_masked_scatter(self, mask, source, out=None, **_kwargs):
+    if isinstance(mask, torch.Tensor) and mask.dtype != torch.bool:
+        raise RuntimeError(
+            f"masked_scatter_ only supports boolean masks, but got mask with dtype {mask.dtype}"
+        )
+    if isinstance(source, torch.Tensor):
+        n_true = _masked_scatter_true_count(self, mask)
+        if n_true is not None and source.numel() < n_true:
+            raise RuntimeError(
+                f"masked_scatter: source has {source.numel()} elements, but the mask "
+                f"needs {n_true}. Provide a source with at least {n_true} elements."
+            )
+
+
+def _validate_masked_scatter_inplace(self, mask, source, out=None, **kwargs):
+    """masked_scatter_: the mask contract plus the no-expanding-destination rule."""
+    _validate_masked_scatter(self, mask, source, out=out, **kwargs)
+    validate_inplace_broadcast(self, mask, **kwargs)
+
+
+@register_aten(
+    ["aten::masked_scatter", "aten::masked_scatter.out"],
+    validate_static_inputs=_validate_masked_scatter,
+)
+@register_aten(
+    ["aten::masked_scatter_"],
+    validate_static_inputs=_validate_masked_scatter_inplace,
+)
+def torch_masked_scatter(self, mask, source, out=None):
+    """Copy source elements into true mask positions.
+
+    Args:
+        self (torch.Tensor): Input tensor.
+        mask (torch.Tensor): Boolean mask broadcastable to ``self``.
+        source (torch.Tensor): Source elements consumed in order.
+        out (torch.Tensor, optional): Output buffer handled by registered dispatch. Defaults to
+            ``None``.
+
+    Returns:
+        torch.Tensor: Masked-scatter result.
+
+    Raises:
+        RuntimeError: If the mask is non-boolean, source is too short, or in-place broadcast expands
+            ``self``.
+    """
+    return torch.ops.aten.masked_scatter(self, mask, source)
+
+
+@register_aten(["aten::masked_scatter_backward"], static_argnums=(2,))
+def torch_masked_scatter_backward(grad_output, mask, sizes):
+    """Compute the masked-scatter source gradient.
+
+    Args:
+        grad_output (torch.Tensor): Gradient with respect to the output.
+        mask (torch.Tensor): Boolean mask used by the forward operation.
+        sizes (list[int]): Shape of the forward source tensor.
+
+    Returns:
+        torch.Tensor: Gradient with respect to the source.
+    """
+    return torch.ops.aten.masked_scatter_backward(grad_output, mask, sizes)
 
 
 # NOTE: where.ScalarOther, where.ScalarSelf, and where.Scalar are NOT registered
@@ -415,8 +791,26 @@ def torch_masked_fill(x, mask, value, out=None):
         "aten::where.self",
         "aten::where.self_out",
     ],
+    validate_static_inputs=lambda condition, x=None, y=None, out=None, **kw: (
+        _validate_float_promoting_out(x if x is not None else condition, out=out)
+    ),
 )
 def torch_where(condition, x=None, y=None, out=None):
+    """Select elements from two tensors according to a condition.
+
+    Args:
+        condition (torch.Tensor): Boolean selection condition.
+        x (torch.Tensor): Values selected where ``condition`` is true.
+        y (torch.Tensor): Values selected where ``condition`` is false.
+        out (torch.Tensor, optional): Validated output buffer accepted but not forwarded. Defaults
+            to ``None``.
+
+    Returns:
+        torch.Tensor: Elementwise selection from ``x`` and ``y``.
+
+    Raises:
+        RuntimeError: If floating-point ``x`` has a non-floating-point ``out``.
+    """
     return torch.where(condition, x, y)
 
 
@@ -439,6 +833,23 @@ def _validate_nonzero_static(
     validate_static_inputs=_validate_nonzero_static,
 )
 def torch_nonzero_static(tensor, size=None, fill_value=-1, out=None, with_count=False, dtype=None):
+    """Return a fixed-size tensor of nonzero coordinates.
+
+    Args:
+        tensor (torch.Tensor): Input tensor.
+        size (int): Required number of coordinate rows.
+        fill_value (int, optional): Padding value. Defaults to ``-1``.
+        out (torch.Tensor, optional): Output tensor used for dtype validation. Defaults to ``None``.
+        with_count (bool, optional): Ignored lowering argument. Defaults to ``False``.
+        dtype (torch.dtype, optional): Requested output dtype used for validation. Defaults to
+            ``None``.
+
+    Returns:
+        torch.Tensor: Fixed-size nonzero coordinates.
+
+    Raises:
+        RuntimeError: If a requested or output dtype is not ``torch.int64``.
+    """
     return torch.nonzero_static(tensor, size=size, fill_value=fill_value)
 
 
@@ -447,6 +858,22 @@ def torch_nonzero_static(tensor, size=None, fill_value=-1, out=None, with_count=
     static_argnums=(1, 2, 3, 4),
 )
 def torch_topk(x, k, dim=-1, largest=True, sorted=True, values=None, indices=None):
+    """Return the largest or smallest ``k`` values and indices.
+
+    Args:
+        x (torch.Tensor): Input tensor.
+        k (int): Number of values to select.
+        dim (int, optional): Selection dimension. Defaults to ``-1``.
+        largest (bool, optional): Select largest values when true. Defaults to ``True``.
+        sorted (bool, optional): Sort selected values when true. Defaults to ``True``.
+        values (torch.Tensor, optional): Value output buffer handled by dispatch. Defaults to
+            ``None``.
+        indices (torch.Tensor, optional): Index output buffer handled by dispatch. Defaults to
+            ``None``.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Selected values and their indices.
+    """
     if x.ndim == 0:
         vals, idxs = torch.topk(x.unsqueeze(0), k, dim=0, largest=largest, sorted=sorted)
         return vals.squeeze(0), idxs.squeeze(0)
@@ -492,7 +919,7 @@ def _bool_mask_true_count(idx):
 
     This count is the only tensor *value* index_put's preprocessing reads. It is
     the length of the integer indices the mask expands into, which the raw cache
-    key cannot see — hence VALUE_DEPENDENT + relower_every_call.
+    key cannot see. That is why the op is VALUE_DEPENDENT.
     """
     if isinstance(idx, torch.Tensor) and idx.dtype == torch.bool:
         return int(idx.sum().item())
@@ -601,26 +1028,34 @@ def _check_index_put_dtype(x, values):
     ["aten::_index_put_impl_"],
     # Matched against the preprocessed kwargs by name, so the synthesized ones count.
     static_argnames=("accumulate", "unsafe", "use_masked_fill", "mask_counts"),
-    preprocessing=Preprocessing.VALUE_DEPENDENT,
-    translate_args_fn=_translate_index_put_args,
     # A boolean mask's True-count is not in the raw cache key, so the dispatch
     # entry must not be replayed.
-    relower_every_call=True,
+    preprocessing=Preprocessing.VALUE_DEPENDENT,
+    translate_args_fn=_translate_index_put_args,
     error_handler=_index_put_error_handler,
 )
 def torch_index_put_impl(x, indices, values, accumulate=False, unsafe=False, out=None):
-    """Torch MLIR implementation of torch._index_put_impl_.
+    """Prepare indexed assignment with value-dependent mask expansion.
 
-    Takes one of three routes, all of which pass ``indices`` through unchanged:
+    Args:
+        x (torch.Tensor): Destination tensor.
+        indices (list[torch.Tensor | None]): Advanced-index entries.
+        values (torch.Tensor): Values assigned at indexed positions.
+        accumulate (bool, optional): Add instead of overwrite when true. Defaults to ``False``.
+        unsafe (bool, optional): Skip floating-point index rejection and index-bounds checks when
+            true. Defaults to ``False``.
+        out (torch.Tensor, optional): Output buffer forwarded to compute. Defaults to ``None``.
 
-    - a single boolean mask with a one-element ``values`` becomes a ``where``
-    - a mask that selects nothing returns ``x``
-    - otherwise the masks expand to integer indices in-graph and ``x`` is scattered into
+    Returns:
+        tuple: Compute function, raw arguments, and static preprocessing keywords.
 
-    ``mask_counts`` carries each mask's True-count, which the expansion needs as a
-    compile-time size.
+    Raises:
+        IndexError: If indices have invalid dtype, rank, shape, or bounds.
+        RuntimeError: If values have incompatible shape or dtype.
+
+    Note:
+        Boolean masks may use a ``where`` fast path or expand to integer indices in-graph.
     """
-
     # Validate index dtypes eagerly (raises before dispatch). The bounds check is
     # fused into _index_put_fn below (in-graph), so an OOB index faults as
     # aten::_index_put_impl_ and its error handler surfaces the exact exception.
@@ -635,7 +1070,16 @@ def torch_index_put_impl(x, indices, values, accumulate=False, unsafe=False, out
                 raise IndexError("tensors used as indices must be long, int, byte or bool tensors")
 
     def can_dispatch_to_masked_fill(x, indices, values):
-        """Check if index_put can be optimized to masked_fill."""
+        """Report whether indexed assignment can use masked fill.
+
+        Args:
+            x (torch.Tensor): Destination tensor.
+            indices (list[torch.Tensor | None]): Advanced-index entries.
+            values (torch.Tensor): Values to assign.
+
+        Returns:
+            bool: ``True`` for one compatible boolean mask and one value in overwrite mode.
+        """
         if values.numel() != 1 or accumulate:
             return False
 
@@ -812,7 +1256,34 @@ def _index_select_backward_error_handler(ctx):
     error_handler=_index_select_backward_error_handler,
 )
 def torch_index_select_backward(grad, input_sizes, dim, index):
+    """Prepare an index-select backward operation for shape-only preprocessing.
+
+    Args:
+        grad (torch.Tensor): Gradient with respect to selected output.
+        input_sizes (list[int]): Forward input shape.
+        dim (int): Selected dimension.
+        index (torch.Tensor): Forward integer indices.
+
+    Returns:
+        tuple: Compute function, raw arguments, and empty keyword arguments.
+
+    Raises:
+        IndexError: If scalar input receives multiple indices.
+        TypeError: If ``index`` is not ``int32`` or ``int64``.
+    """
+
     def index_select_backward_fn(grad, input_sizes, dim, index):
+        """Scatter selected gradients back to the forward input shape.
+
+        Args:
+            grad (torch.Tensor): Gradient with respect to selected output.
+            input_sizes (list[int]): Forward input shape.
+            dim (int): Selected dimension.
+            index (torch.Tensor): Forward integer indices.
+
+        Returns:
+            torch.Tensor: Gradient with shape ``input_sizes``.
+        """
         # 0-d self (input_sizes empty): CPU identity-returns the scalar grad,
         # but only index 0 is valid (CPU rejects negatives). Enforce in-graph
         # (window [0, 1)) and consume the checked index through a gather the
@@ -846,6 +1317,19 @@ def torch_index_select_backward(grad, input_sizes, dim, index):
 
 @register_aten(["aten::slice_backward"], static_argnums=(1, 2, 3, 4, 5))
 def torch_slice_backward(grad_output, input_sizes, dim, start, end, step):
+    """Place a slice gradient into a zero tensor of the input shape.
+
+    Args:
+        grad_output (torch.Tensor): Gradient with respect to the slice output.
+        input_sizes (list[int]): Forward input shape.
+        dim (int): Sliced dimension.
+        start (int): Slice start.
+        end (int): Slice end.
+        step (int): Slice step.
+
+    Returns:
+        torch.Tensor: Gradient with shape ``input_sizes``.
+    """
     grad_input = torch.zeros(input_sizes, dtype=grad_output.dtype, device=grad_output.device)
     indices = [slice(None)] * len(input_sizes)
     indices[dim] = slice(start, end, step)
@@ -855,6 +1339,17 @@ def torch_slice_backward(grad_output, input_sizes, dim, start, end, step):
 
 @register_aten(["aten::select_backward"], static_argnums=(1, 2, 3))
 def torch_select_backward(grad_output, input_sizes, dim, index):
+    """Place a select gradient at its original input position.
+
+    Args:
+        grad_output (torch.Tensor): Gradient with respect to the selected output.
+        input_sizes (list[int]): Forward input shape.
+        dim (int): Selected dimension.
+        index (int): Selected position.
+
+    Returns:
+        torch.Tensor: Zero-padded gradient with shape ``input_sizes``.
+    """
     # Backward of select: place grad_output at position `index` along `dim` in a
     # zero tensor of shape input_sizes, zeros everywhere else. Decompose to
     # unsqueeze + pad so it lowers to stablehlo.pad rather than stablehlo.scatter
@@ -884,10 +1379,25 @@ def torch_select_backward(grad_output, input_sizes, dim, index):
 def torch_searchsorted_tensor(
     sorted_sequence, values, *, out_int32=False, right=False, side=None, sorter=None, out=None
 ):
-    """Decompose searchsorted into comparison + sum.
+    """Find insertion indices with a comparison-and-sum decomposition.
 
-    O(N*M) linear scan that avoids data-dependent control flow.
-    NOTE: Creates an intermediate [..., N, M] tensor; large inputs may cause OOM.
+    Args:
+        sorted_sequence (torch.Tensor): Sorted innermost sequences.
+        values (torch.Tensor): Values whose insertion positions are requested.
+        out_int32 (bool, optional): Return ``int32`` indices when true. Defaults to ``False``.
+        right (bool, optional): Choose the upper bound when true. Defaults to ``False``.
+        side (str, optional): ``"left"`` or ``"right"`` override. Defaults to ``None``.
+        sorter (torch.Tensor, optional): Indices that sort ``sorted_sequence``. Defaults to
+            ``None``.
+        out (torch.Tensor, optional): Output buffer accepted but not forwarded. Defaults to
+            ``None``.
+
+    Returns:
+        torch.Tensor: Insertion indices.
+
+    Note:
+        The linear scan creates an intermediate with shape ``[..., M, N]``, where ``M`` is the
+        number of values and ``N`` is the innermost sorted-sequence length.
     """
     if side is not None:
         right = side == "right"
@@ -910,7 +1420,22 @@ def torch_searchsorted_tensor(
 def torch_searchsorted_scalar(
     sorted_sequence, value, *, out_int32=False, right=False, side=None, sorter=None, out=None
 ):
-    """Scalar variant: wrap scalar as tensor and delegate to tensor version."""
+    """Find the insertion index for a scalar value.
+
+    Args:
+        sorted_sequence (torch.Tensor): Sorted innermost sequences.
+        value (Number): Scalar insertion value.
+        out_int32 (bool, optional): Return ``int32`` indices when true. Defaults to ``False``.
+        right (bool, optional): Choose the upper bound when true. Defaults to ``False``.
+        side (str, optional): ``"left"`` or ``"right"`` override. Defaults to ``None``.
+        sorter (torch.Tensor, optional): Indices that sort ``sorted_sequence``. Defaults to
+            ``None``.
+        out (torch.Tensor, optional): Output buffer accepted but not forwarded. Defaults to
+            ``None``.
+
+    Returns:
+        torch.Tensor: Scalar insertion indices with the temporary value dimension removed.
+    """
     values = (
         torch.as_tensor(value, dtype=sorted_sequence.dtype).reshape(1).to(sorted_sequence.device)
     )

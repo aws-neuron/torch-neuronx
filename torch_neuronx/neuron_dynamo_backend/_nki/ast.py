@@ -5,6 +5,8 @@ from torch.utils._ordered_set import OrderedSet
 
 
 class NKIContext:
+    """Track generated names, buffers, and statements for NKI lowering."""
+
     nameset: OrderedSet[str]
     buffers: dict[str, "NKIArray"]
     code_body: list["NISAOpValue"]
@@ -17,6 +19,11 @@ class NKIContext:
         self.prefix = "{{prefix}}"
 
     def create_name(self):
+        """Create and reserve the next context-prefixed buffer name.
+
+        Returns:
+            str: Newly reserved name.
+        """
         tmp_idx = len(self.nameset)
         name = f"{self.prefix}_{tmp_idx}"
         while name in self.nameset:
@@ -26,6 +33,7 @@ class NKIContext:
         return name
 
     def print_readable(self):
+        """Print generated buffer allocations and statements."""
         print("# Buffer allocations:")
         for bufname in self.buffers:
             print("\t" + self.buffers[bufname].codegen())
@@ -35,6 +43,15 @@ class NKIContext:
 
 
 class NISAOpValue:
+    """Represent a symbolic NISA operation and its optional destination array.
+
+    Args:
+        ctx (NKIContext): Context that owns generated names and statements.
+        op (str): NKI or NISA operation name.
+        meta_tensor (torch.Tensor, optional): Destination metadata. Defaults to ``None``.
+        zero (bool, optional): Emit a zero-initialized destination. Defaults to ``False``.
+    """
+
     dst_arr: Optional["NKIArray"]
     name: str | None  # Name of the dst buffer or immediate value
     args: list["NISAOpValue"]
@@ -53,6 +70,12 @@ class NISAOpValue:
         self.op = op
 
     def allocate_buffer(self, meta_tensor, zero=False):
+        """Create and register a symbolic destination array from tensor metadata.
+
+        Args:
+            meta_tensor (torch.Tensor): Tensor supplying destination shape and dtype.
+            zero (bool, optional): Emit zero initialization. Defaults to ``False``.
+        """
         self.name = self.ctx.create_name()
         self.dst_arr = NKIArray.from_meta(self.ctx, meta_tensor, self.name, zero=zero)
         # zeroing must run inside the code body
@@ -66,6 +89,11 @@ class NISAOpValue:
         return self.name
 
     def codegen(self):
+        """Generate source code for the symbolic operation.
+
+        Returns:
+            str: Custom source when provided; otherwise, the operation call source.
+        """
         if hasattr(self, "_custom_codegen"):
             return self._custom_codegen
         arg_string = ", ".join([f"{arg}" for arg in self.args])
@@ -82,6 +110,17 @@ class NISAOpValue:
 
 
 class NKIArray(NISAOpValue):
+    """Represent an NKI array allocation and its metadata.
+
+    Args:
+        ctx (NKIContext): Context associated with the array.
+        name (str): Generated or template array name.
+        dtype (torch.dtype): Array element dtype.
+        shape (Sequence[int]): Array dimensions.
+        target_buffer (str, optional): Allocation buffer. Defaults to ``"nl.sbuf"``.
+        zero (bool, optional): Generate ``nl.zeros``. Defaults to ``False``.
+    """
+
     dtype: torch.dtype
     shape: tuple[int, ...]
     target_buffer: str
@@ -99,9 +138,25 @@ class NKIArray(NISAOpValue):
 
     @classmethod
     def from_meta(cls, ctx, tensor, name, zero=False):
+        """Create an NKI array from tensor metadata.
+
+        Args:
+            ctx (NKIContext): Context associated with the array.
+            tensor (torch.Tensor): Tensor supplying shape and dtype.
+            name (str): Generated or template array name.
+            zero (bool, optional): Generate a zero-initialized array. Defaults to ``False``.
+
+        Returns:
+            NKIArray: Array with the tensor's shape and dtype.
+        """
         return cls(ctx, name, tensor.dtype, tensor.shape, zero=zero)
 
     def codegen(self):
+        """Generate source code for the NKI array allocation.
+
+        Returns:
+            str: NKI allocation source.
+        """
         nl_dtype = str(self.dtype).replace("torch.", "nl.")
         if self.dtype == torch.bool:
             nl_dtype = "nl.bool_"
@@ -110,6 +165,13 @@ class NKIArray(NISAOpValue):
 
 # Immediate constant value
 class NISAConstant(NISAOpValue):
+    """Represent an immediate constant in generated NISA code.
+
+    Args:
+        ctx (NKIContext): Context associated with the constant.
+        value (Any): Immediate constant value.
+    """
+
     value: Any
 
     def __init__(self, ctx, value):

@@ -1,4 +1,2 @@
-# Version is {TORCH_MAJOR}.{TORCH_MINOR}.{NEURON_MAJOR}.{NEURON_MINOR}.{BUILD}
-# BUILD is overridden by CI via VERSION_BUILD env var.
-# On release branches, NEURON_MINOR is bumped at branch cut.
-__version__ = "2.13.3.0.0"
+# On release branches, bump the Neuron minor version at the branch cut.
+NEURON_VERSION = "3.0"

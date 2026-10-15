@@ -16,6 +16,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class NeuronFXPassState:
+    """Store shared state for Neuron FX passes.
+
+    Args:
+        job (CompilationJob): Compilation job used to save pass artifacts.
+        model_name (str): Model name used when saving artifacts.
+        dumping_enabled (bool): Whether passes save their resulting FX graphs.
+        pass_mutations (list[PassMutations], optional): Recorded pass mutations.
+            Defaults to an empty list.
+        pre_aot_pass_mutations (PassMutations, optional): Mutations recorded before AOT.
+            Defaults to ``None``.
+    """
+
     job: CompilationJob
     model_name: str
     dumping_enabled: bool
@@ -28,7 +40,15 @@ class NeuronFXPassState:
         input_mutations: list[IOMutation] | None = None,
         output_mutations: list[IOMutation] | None = None,
     ) -> None:
-        """Record the input and output mutations emitted by a single FX pass."""
+        """Record input and output mutations emitted by one FX pass.
+
+        Args:
+            pass_name (str): Name of the pass that emitted the mutations.
+            input_mutations (list[IOMutation], optional): Input mutations to record.
+                Defaults to ``None``.
+            output_mutations (list[IOMutation], optional): Output mutations to record.
+                Defaults to ``None``.
+        """
         pm = PassMutations(
             pass_name=pass_name,
             input_mutations=input_mutations or [],
@@ -39,7 +59,11 @@ class NeuronFXPassState:
 
 
 class NeuronFXPass(PassBase):
-    """PassBase subclass that optionally dumps FX artifacts after execution."""
+    """Run an FX pass and optionally save its resulting graph artifact.
+
+    Args:
+        state (NeuronFXPassState, optional): Shared pass state. Defaults to ``None``.
+    """
 
     def __init__(self, state: NeuronFXPassState | None = None):
         super().__init__()

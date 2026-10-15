@@ -1,6 +1,4 @@
 COMPILER_ERROR_NEURON = [
-    "test_decomp.py::TestDecompNEURON::test_comprehensive_diff_neuron_float64",
-    "test_decomp.py::TestDecompNEURON::test_comprehensive_linalg_vander_neuron_float32",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_masked_cumprod_neuron_float64",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_conv1d_neuron_bfloat16",
     "test_decomp.py::TestDecompNEURON::test_comprehensive_nn_functional_conv1d_neuron_float16",
@@ -35,7 +33,6 @@ COMPILER_ERROR_NEURON = [
     "test_ops.py::TestFakeTensorNEURON::test_fake_nn_functional_conv_transpose1d_neuron_float32",
     "test_ops.py::TestFakeTensorNEURON::test_fake_nn_functional_conv_transpose2d_neuron_float32",
     "test_ops.py::TestFakeTensorNEURON::test_fake_nn_functional_conv_transpose3d_neuron_float32",
-    "test_foreach.py::TestForeachNEURON::test_binary_op_scalar_with_overlapping_tensors__foreach_pow_neuron_bool",
     "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcdiv_is_fastpath_False_neuron_bool",
     "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcdiv_is_fastpath_False_neuron_float32",
     "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcdiv_is_fastpath_False_neuron_float64",
@@ -62,7 +59,6 @@ COMPILER_ERROR_NEURON = [
     "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcmul_is_fastpath_True_neuron_int64",
     "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcmul_is_fastpath_True_neuron_int8",
     "test_foreach.py::TestForeachNEURON::test_pointwise_op_with_tensor_of_scalarlist_overload__foreach_addcmul_is_fastpath_True_neuron_uint8",
-    "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_abs_neuron_float32",
     "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_conv_transpose1d_neuron_bfloat16",
     "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_conv_transpose1d_neuron_float16",
     "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_conv_transpose1d_neuron_float32",
@@ -101,30 +97,36 @@ COMPILER_ERROR_NEURON = [
     "test_modules.py::TestModuleNEURON::test_non_contiguous_tensors_nn_LazyConv1d_neuron_float32",
     "test_modules.py::TestModuleNEURON::test_non_contiguous_tensors_nn_LazyConv1d_neuron_float64",
     "test_ops.py::TestCommonNEURON::test_dtypes_nn_functional_conv_transpose2d_neuron",
-    "test_ops.py::TestCommonNEURON::test_dtypes_nn_functional_cosine_similarity_neuron",
     "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_nn_functional_conv_transpose1d_neuron_int64",
     "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_nn_functional_conv_transpose2d_neuron_int64",
     "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_nn_functional_conv_transpose3d_neuron_int64",
-    "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_div_floor_rounding_neuron_int32",
     "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_nn_functional_conv_transpose2d_neuron_float32",
-    "test_ops.py::TestCommonNEURON::test_variant_consistency_eager_nn_functional_cosine_embedding_loss_neuron_float32",
     "test_ops_fwd_gradients.py::TestFwdGradientsNEURON::test_fn_fwgrad_bwgrad_nn_functional_conv_transpose3d_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_nn_functional_conv_transpose3d_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_conv_transpose3d_neuron_float64",
     "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_grid_sampler_2d_neuron_float64",
-    "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_grid_sampler_3d_neuron_float64",
-    "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_nn_functional_grid_sample_neuron_float64",
     "test_debug_utils.py::TestBackendOverrideIntegrationNEURON::test_multiple_rules_neuron",
-    "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_abs_neuron_bfloat16",
     "test_ops.py::TestCommonNEURON::test_python_ref_meta__refs_div_floor_rounding_neuron_bfloat16",
-    "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_abs_neuron_bool",
-    "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_abs_neuron_float16",
-    "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_abs_neuron_int8",
-    "test_ops.py::TestFakeTensorNEURON::test_fake_crossref_backward_no_amp_t_copy_neuron_float32",
     "test_indexing.py::TestIndexingNEURON::test_index_select_neuron_float8_e4m3fn",
-    "test_sort_and_select.py::TestSortAndSelect*NEURON::test_topk_neuron",
     "test_transformers.py::TestSDPAFailureModesNEURON::test_sdpa_unbacked_no_dde_neuron",
-    # [NCC_IBCG901] BIRCodeGenLoop assertion error:
+    # [NCC_IBCG901    # nll_loss: torch-mlir compiler error during the meta cross-reference test.
+    "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_nll_loss_neuron_bfloat16",
+    "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_nll_loss_neuron_float16",
+    "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_nll_loss_neuron_float32",
+    "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_nll_loss_neuron_float64",
+    "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_nn_functional_nll_loss_neuron_bfloat16",
+    "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_nn_functional_nll_loss_neuron_float16",
+    "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_nn_functional_nll_loss_neuron_float32",
+    "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_nn_functional_nll_loss_neuron_float64",
+    "test_meta.py::TestMetaNEURON::test_meta_outplace_nn_functional_nll_loss_neuron_bfloat16",
+    "test_meta.py::TestMetaNEURON::test_meta_outplace_nn_functional_nll_loss_neuron_float16",
+    "test_meta.py::TestMetaNEURON::test_meta_outplace_nn_functional_nll_loss_neuron_float32",
+    "test_meta.py::TestMetaNEURON::test_meta_outplace_nn_functional_nll_loss_neuron_float64",
+    # threshold(uint8): torch-mlir compiler error for uint8 dtype.
+    "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_nn_functional_threshold_neuron_uint8",
+    "test_meta.py::TestMetaNEURON::test_dispatch_symbolic_meta_outplace_nn_functional_threshold_neuron_uint8",
+    "test_meta.py::TestMetaNEURON::test_meta_outplace_nn_functional_threshold_neuron_uint8",
+    # BIRCodeGenLoop assertion error:
     # Too many strides!" when lowering aten::convolution with strided weights.
     "test_convolution.py::TestConvolutionNNDeviceTypeNEURON::test_conv_noncontig_weights_neuron",
     # --- Persistent compile failures across three consistent runs ---
@@ -139,11 +141,5 @@ COMPILER_ERROR_NEURON = [
     # (foreach_abs / foreach_neg / foreach_cos / foreach_sinh / foreach_erf /
     # foreach_atan on different devices hit these paths across int8/int16/int32/
     # int64/float16/float64)
-    "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_abs_neuron_int32",
-    "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_abs_neuron_int64",
-    "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_neg_neuron_int8",
-    "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_cos_neuron_float64",
-    "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_erf_neuron_int64",
-    "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_abs_neuron_int16",
-    "test_foreach.py::TestForeachNEURON::test_unary_op_tensors_on_different_devices__foreach_ceil_neuron_uint8",
+    # gather: torch-mlir fails to lower gather for non-float32 dtypes.
 ]

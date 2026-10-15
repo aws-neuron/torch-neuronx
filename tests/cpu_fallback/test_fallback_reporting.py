@@ -2,7 +2,7 @@
 
 Verifies that all CPU fallback/roundtrip paths added in the
 "report all CPU fallback paths in get_fallback_ops()" change are properly
-reported in torch_neuronx.get_fallback_ops(), so ModuScope's offloading
+reported in torch_neuronx.get_fallback_ops(), so Neuron Model Suite's offloading
 stats accurately reflect performance-impacting CPU involvement.
 
 The paths under test are:
@@ -288,7 +288,7 @@ class TestFallbackReportingNegative:
     """Negative tests: on-device ops must NOT be reported as fallbacks.
 
     These guard against over-reporting — an op that runs fully on Neuron should
-    never appear in get_fallback_ops(), otherwise ModuScope's offloading stats
+    never appear in get_fallback_ops(), otherwise Neuron Model Suite's offloading stats
     would be inflated with false positives.
     """
 
@@ -354,10 +354,14 @@ class TestFallbackReportingNegative:
 class TestFallbackReportingRegressionBaseline:
     """Baseline: previously-reported ops must still be reported (no regression)."""
 
-    def test_normal_still_reported(self):
+    def test_normal_not_reported(self):
+        """aten::normal_ runs on device via the NKI RNG, so it is not a fallback.
+
+        This previously asserted the opposite: normal_ had no Neuron kernel and
+        torch.randn bounced to CPU. It now lowers on device, so reporting it as
+        a fallback would overstate the module-level test offloading stats.
+        """
         torch_neuronx.clear_op_tracking()
         _ = torch.randn(4, device="neuron")  # uses aten::normal_
-        torch.neuron.synchronize()
-        fallback_ops = torch_neuronx.get_fallback_ops()
-        assert isinstance(fallback_ops, list)
-        assert "aten::normal_" in fallback_ops
+        _assert_not_reported("aten::normal_")
+        assert isinstance(torch_neuronx.get_fallback_ops(), list)

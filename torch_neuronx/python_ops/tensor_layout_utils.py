@@ -8,7 +8,18 @@ import torch
 def match_layout(
     source: torch.Tensor, reference: torch.Tensor, out: torch.Tensor = None
 ) -> torch.Tensor:
-    """Return source with the same layout as reference, copying only if needed, in out tensor."""
+    """Return the source when strides match, otherwise copy it to a destination.
+
+    Args:
+        source (torch.Tensor): Tensor containing the values to return.
+        reference (torch.Tensor): Tensor whose strides determine whether a copy is needed.
+        out (torch.Tensor, optional): Destination used when a copy is required;
+            its layout is not validated. Defaults to ``None`` (allocate from
+            ``reference``).
+
+    Returns:
+        torch.Tensor: ``source`` when strides match, otherwise the copied destination.
+    """
     if source.stride() == reference.stride():
         return source
     if out is None:
@@ -18,7 +29,7 @@ def match_layout(
 
 
 class KernelType(Enum):
-    """Enumeration of available contiguous copy kernel types"""
+    """Represent the available tensor-copy kernel strategies."""
 
     RANK2 = auto()  # One outer loop + memcpy
     RANK3 = auto()  # Two outer loops + memcpy
@@ -26,14 +37,16 @@ class KernelType(Enum):
 
 
 def collapse_for_bulk_copy(t: torch.Tensor) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """
-    Collapse broadcast dims (size==1) and any dense-suffix chain
-    **only if the resulting innermost stride is 1**.
+    """Collapse broadcast dimensions and unit-stride dense suffixes.
 
-    Returns
-    -------
-    shape   : Tuple[int, ...]
-    stride  : Tuple[int, ...]
+    Args:
+        t (torch.Tensor): Tensor whose shape and strides are collapsed.
+
+    Returns:
+        tuple[tuple[int, ...], tuple[int, ...]]: Collapsed shape and strides.
+
+    Note:
+        Dense suffixes collapse only when the resulting innermost stride is one.
     """
     shape = list(t.shape)
     stride = list(t.stride())
@@ -72,11 +85,17 @@ def collapse_for_bulk_copy(t: torch.Tensor) -> tuple[tuple[int, ...], tuple[int,
 
 
 def select_kernel(shape: tuple[int, ...], stride: tuple[int, ...]) -> KernelType:
-    """
-    Decide which implementation to call after collapse_for_bulk_copy().
+    """Select a copy kernel for a collapsed shape and stride.
+
+    Args:
+        shape (tuple[int, ...]): Collapsed tensor shape.
+        stride (tuple[int, ...]): Collapsed tensor strides.
 
     Returns:
-        KernelType: The appropriate kernel type for the given shape and stride
+        KernelType: Copy strategy for the collapsed layout.
+
+    Raises:
+        RuntimeError: If the layout is scalar or unexpectedly contiguous rank one.
     """
     # If there are no dimensions (scalar), this is an error
     # Scalars are always contiguous and should never reach kernel selection
@@ -112,20 +131,39 @@ def select_kernel(shape: tuple[int, ...], stride: tuple[int, ...]) -> KernelType
 
 
 def get_collapsed_rank(shape: tuple[int, ...]) -> int:
-    """Get the effective rank after collapsing"""
+    """Return the effective rank of a collapsed shape.
+
+    Args:
+        shape (tuple[int, ...]): Collapsed tensor shape.
+
+    Returns:
+        int: Number of dimensions in ``shape``.
+    """
     return len(shape)
 
 
 def has_unit_stride(strides: tuple[int, ...]) -> bool:
-    """Check if any stride is 1"""
+    """Check whether any tensor stride is one.
+
+    Args:
+        strides (tuple[int, ...]): Tensor strides to inspect.
+
+    Returns:
+        bool: ``True`` when at least one stride is one.
+    """
     return any(s == 1 for s in strides)
 
 
 def get_contiguous_block_size(shape: list[int], strides: list[int]) -> int:
-    """
-    Calculate the size of the contiguous block at the end of the tensor.
+    """Calculate the element count in a tensor's contiguous suffix.
 
-    Returns the number of elements that can be copied at once.
+    Args:
+        shape (list[int]): Tensor shape.
+        strides (list[int]): Tensor strides.
+
+    Returns:
+        int: Number of trailing elements copyable together, or ``0`` when no
+            contiguous suffix exists.
     """
     if not shape or not strides:
         return 0

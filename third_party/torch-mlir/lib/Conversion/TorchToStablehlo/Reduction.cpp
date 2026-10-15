@@ -41,6 +41,25 @@ static SmallVector<int64_t> getReduceOutputShape(ArrayRef<int64_t> inputShape,
   return reduceResultShape;
 }
 
+// An unsigned type and i1 (torch bool, values 0 and 1) hold their extremes
+// outside the signed range. The signed helpers give 128 for the lowest ui8 and
+// false for the highest i1, so a max reduce over ui8 and a min reduce over bool
+// return the init value instead of the real extreme. Match the width-1 test that
+// Basic.cpp uses for the comparison type.
+static bool hasUnsignedRange(mlir::IntegerType intTy) {
+  return intTy.getWidth() == 1 || intTy.isUnsigned();
+}
+
+static APInt getLowestValueOfIntType(mlir::IntegerType intTy) {
+  return hasUnsignedRange(intTy) ? APInt::getMinValue(intTy.getWidth())
+                                 : APInt::getSignedMinValue(intTy.getWidth());
+}
+
+static APInt getHighestValueOfIntType(mlir::IntegerType intTy) {
+  return hasUnsignedRange(intTy) ? APInt::getMaxValue(intTy.getWidth())
+                                 : APInt::getSignedMaxValue(intTy.getWidth());
+}
+
 static Value createInitialValueForReduceOp(Operation *op, Type elementTy,
                                            PatternRewriter &rewriter) {
   auto constType = RankedTensorType::get({}, elementTy);
@@ -67,7 +86,7 @@ static Value createInitialValueForReduceOp(Operation *op, Type elementTy,
     } else if (isa<mlir::IntegerType>(elementTy)) {
       constAttr = DenseElementsAttr::get(
           constType,
-          {APInt::getSignedMinValue(elementTy.getIntOrFloatBitWidth())});
+          {getLowestValueOfIntType(cast<mlir::IntegerType>(elementTy))});
     }
   }
 
@@ -80,7 +99,7 @@ static Value createInitialValueForReduceOp(Operation *op, Type elementTy,
     } else if (isa<mlir::IntegerType>(elementTy)) {
       constAttr = DenseElementsAttr::get(
           constType,
-          {APInt::getSignedMaxValue(elementTy.getIntOrFloatBitWidth())});
+          {getHighestValueOfIntType(cast<mlir::IntegerType>(elementTy))});
     }
   }
 

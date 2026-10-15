@@ -15,16 +15,31 @@ from torch_neuronx.profiling import NeuronConfig, ProfileMode
 
 
 class MLP(torch.nn.Module):
+    """Construct a two-layer MLP for Neuron profiling.
+
+    Args:
+        hidden (int, optional): Input and output feature size. Defaults to ``4096``.
+    """
+
     def __init__(self, hidden: int = 4096):
         super().__init__()
         self.fc1 = torch.nn.Linear(hidden, hidden * 4, bias=False)
         self.fc2 = torch.nn.Linear(hidden * 4, hidden, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the two linear layers with a ReLU activation.
+
+        Args:
+            x (torch.Tensor): Input tensor with ``hidden`` trailing features.
+
+        Returns:
+            torch.Tensor: MLP output with the same shape as ``x``.
+        """
         return self.fc2(torch.relu(self.fc1(x)))
 
 
 def main():
+    """Profile compiled MLP inference on the Neuron device."""
     torch.manual_seed(0)
     device = torch.device("neuron")
 

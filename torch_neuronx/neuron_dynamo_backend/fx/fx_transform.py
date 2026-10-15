@@ -167,26 +167,26 @@ def convert_fx_to_stablehlo(
     job: CompilationJob | None = None,
     static_input_indices: list[int] | None = None,
 ) -> tuple[str, FunctionIO, list[TensorSpec]]:
-    """
-    Convert FX GraphModule to StableHLO using torch-mlir with collective support
-
-    Pipeline:
-    1. Apply FX graph-level collective transformations
-    2. Import FX to RAW Torch dialect
-    3. Apply custom Neuron transformations/lowerings
-    4. Lower to Torch backend IR
-    5. Lower to StableHLO IR
+    """Lower an FX graph module to StableHLO with torch-MLIR.
 
     Args:
-        gm: FX GraphModule with Aten operations (from AOTAutograd)
-        example_inputs: Example input tensors
-        job: CompilationJob for artifact management. If None, artifact dumping is skipped.
+        gm (torch.fx.GraphModule): Post-AOTAutograd graph with ATen operations.
+        example_inputs (Any): Accepted for API compatibility but currently unused.
+        aliasing_info (dict[int, int] | None, optional): NEFF output-to-input index
+            map. Defaults to ``None``.
+        job (CompilationJob | None, optional): Artifact dumper. Defaults to ``None``.
+        static_input_indices (list[int] | None, optional): Input indices to stamp as
+            transposable weights, or ``None`` to omit the metadata. Defaults to ``None``.
 
     Returns:
-        tuple: (stablehlo_module, io_spec, cast_spec)
-            - stablehlo_module (Module): StableHLO MLIR module.
-            - io_spec (FunctionIO): Input/output specifications for Executor.
-            - cast_spec (list[TensorSpec]): Output specifications for dtype preservation.
+        tuple[Module, FunctionIO, list[TensorSpec]]: StableHLO module, executor IO
+        specification, and output dtype specification captured before f64-to-f32 conversion.
+
+    Raises:
+        ValueError: If lowering produces a module without outputs.
+
+    Note:
+        Adds hierarchy, dynamic-dimension, aliasing, and transposable-weight metadata.
     """
     model_name = get_model_name()
 

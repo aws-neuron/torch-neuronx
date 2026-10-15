@@ -5,10 +5,12 @@ handled during Neuron dispatch:
 
   - ``native`` (default): per-op cascade. A natively-supported op runs as S64
     on the compiler (GPSIMD); a non-native op is demoted on device via the
-    packed view (low 32 bits); matmul/conv (and other unsupported ops) fall
-    back to CPU. The "best available path per op".
+    packed view (low 32 bits); the ops in ``_UNSUPPORTED_INT64_OPS`` (for
+    example matmul and linear) fall back to CPU. Its conv entries do not match:
+    convolution reaches dispatch as ``aten::convolution``, so it runs on device
+    through the packed view. The "best available path per op".
   - ``packed``: force every int64 op through the packed view (low-word
-    on-device extraction). Non-packable ops (matmul/conv) fall back to CPU.
+    on-device extraction). The policy sends no int64 op to CPU in this mode.
   - ``cpu_bounce``: cast int64→int32 via a CPU roundtrip for every op (op still
     runs on device in int32). Safe but slow.
   - ``cpu_fallback``: run every int64 op *entirely on CPU* (no Neuron
@@ -39,11 +41,12 @@ _warned_ops: set[str] = set()
 
 
 class Int64Mode(Enum):
-    """How int64 tensors are handled when dispatched to Neuron.
+    """Define int64 execution modes for Neuron dispatch.
 
-    String values match the ``TORCH_NEURONX_INT64_MODE`` env var. The C++
-    ``Int64Mode`` enum in ``DispatchUtils.h`` mirrors these with stable integer
-    codes (cpu_bounce=0, native=1, packed=2, native_strict=3, cpu_fallback=4).
+    Note:
+        String values match ``TORCH_NEURONX_INT64_MODE``. The mirrored C++
+        ``Int64Mode`` uses stable codes: ``cpu_bounce=0``, ``native=1``,
+        ``packed=2``, ``native_strict=3``, and ``cpu_fallback=4``.
     """
 
     CPU_BOUNCE = "cpu_bounce"
@@ -54,7 +57,11 @@ class Int64Mode(Enum):
 
 
 class Int64Decision(str, Enum):
-    """Per-op routing decision (mirrors the C++ Int64Decision enum)."""
+    """Define per-op routing decisions shared with the C++ policy.
+
+    Note:
+        Values mirror the C++ ``Int64Decision`` enum.
+    """
 
     NATIVE = "native"
     DOWNCAST = "downcast"
@@ -63,12 +70,18 @@ class Int64Decision(str, Enum):
 
 @lru_cache(maxsize=1)
 def get_int64_mode() -> Int64Mode:
-    """Read the int64 execution mode from environment. Cached at first call.
+    """Read and cache the int64 execution mode from the environment.
 
-    Resolution order:
-      1. TORCH_NEURONX_INT64_MODE
-         (native | native_strict | packed | cpu_bounce | cpu_fallback)
-      2. Default: native (per-op cascade)
+    Returns:
+        Int64Mode: The normalized ``TORCH_NEURONX_INT64_MODE`` value, or
+        ``Int64Mode.NATIVE`` when the variable is unset.
+
+    Raises:
+        ValueError: If the configured value is not a recognized mode.
+
+    Note:
+        The first call caches the result. Supported values are ``native``,
+        ``native_strict``, ``packed``, ``cpu_bounce``, and ``cpu_fallback``.
     """
     mode_str = os.environ.get("TORCH_NEURONX_INT64_MODE")
     if mode_str is not None:
@@ -85,107 +98,86 @@ def get_int64_mode() -> Int64Mode:
 
 
 def is_packed_int64_mode() -> bool:
-    """Return True if int64 should use packed physical storage."""
+    """Check whether the active int64 mode is packed.
+
+    Returns:
+        bool: ``True`` when the active mode is ``packed``.
+    """
     return get_int64_mode() == Int64Mode.PACKED
 
 
 def is_native_int64_mode() -> bool:
-    """Return True if int64 passes through to the compiler as S64 (native)."""
+    """Check whether the active int64 mode is native.
+
+    Returns:
+        bool: ``True`` when the active mode is ``native``.
+    """
     return get_int64_mode() == Int64Mode.NATIVE
 
 
 def is_native_strict_int64_mode() -> bool:
-    """Return True if mode is native_strict (S64 for native ops, else CPU)."""
+    """Check whether the active int64 mode is native strict.
+
+    Returns:
+        bool: ``True`` when the active mode is ``native_strict``.
+    """
     return get_int64_mode() == Int64Mode.NATIVE_STRICT
 
 
 def is_cpu_bounce_int64_mode() -> bool:
-    """Return True if int64 uses CPU roundtrip cast (op still runs on device)."""
+    """Check whether int64 uses a CPU round-trip cast.
+
+    Returns:
+        bool: ``True`` when casts occur on CPU but the operation runs on a Neuron device.
+    """
     return get_int64_mode() == Int64Mode.CPU_BOUNCE
 
 
 def is_cpu_fallback_int64_mode() -> bool:
-    """Return True if every int64 op runs entirely on CPU (no Neuron execution)."""
+    """Check whether every int64 operation uses CPU fallback.
+
+    Returns:
+        bool: ``True`` when no int64 operation executes on a Neuron device.
+    """
     return get_int64_mode() == Int64Mode.CPU_FALLBACK
 
 
 def is_s64_passthrough() -> bool:
-    """Return True when int64 flows to the compiler as S64 (native or native_strict)."""
+    """Check whether the active mode permits S64 compiler passthrough.
+
+    Returns:
+        bool: ``True`` when the active mode is ``native`` or ``native_strict``.
+    """
     return get_int64_mode() in (Int64Mode.NATIVE, Int64Mode.NATIVE_STRICT)
 
 
-def native_int64_guard_allows(inputs) -> bool:
-    """Central guard for *when* native int64 (S64) is safe to use for an op.
+def use_packed_int64_view_for_op(op_name: str) -> bool:
+    """Check whether an operation uses the packed int64 physical view.
 
-    Native S64 execution deadlocks the compiler for certain input structures, so
-    a native-capable op runs as S64 only when its int64 operands match the cases
-    the compiler is known to handle; every other case falls back to the packed
-    int32[..., 2] path (correct, just low-word for magnitudes > 2**31).
+    Args:
+        op_name (str): Operation name to classify.
 
-    This is the single place to widen native int64 coverage — as compiler hangs
-    are fixed, relax a criterion here (a future PR need only touch this guard).
-    Must stay in lockstep with the C++ ``NativeInt64GuardAllows`` in
-    Int64Policy.h so the traced graph (fake) and the execution binding agree.
+    Returns:
+        bool: ``True`` in packed mode or for a native-mode downcast operation;
+            ``False`` otherwise.
 
-    Current safe criteria (conservative first version):
-      1. every int64 tensor operand is contiguous, AND
-      2. at most one int64 operand needs broadcasting to the common shape — a
-         native S64 binary op with BOTH operands broadcast (e.g. kron's
-         outer-product ``mul``) hangs the device.
-    """
-    import torch
-
-    int64_tensors: list = []
-
-    def _collect(x):
-        if isinstance(x, torch.Tensor):
-            if x.dtype == torch.int64 and x.dim() > 0:
-                int64_tensors.append(x)
-        elif isinstance(x, list | tuple):
-            for e in x:
-                _collect(e)
-
-    for a in inputs:
-        _collect(a)
-
-    if not int64_tensors:
-        return True
-    if any(not t.is_contiguous() for t in int64_tensors):
-        return False
-    try:
-        common = tuple(torch.broadcast_shapes(*[tuple(t.shape) for t in int64_tensors]))
-    except Exception:
-        return True
-    # Dual-broadcast (>=2 int64 operands differ from the common shape) hangs
-    # native S64 arithmetic; keep at most one broadcast operand on the native path.
-    return sum(1 for t in int64_tensors if tuple(t.shape) != common) < 2
-
-
-def use_packed_int64_view_for_op(op_name: str, inputs=None) -> bool:
-    """Whether ``op_name``'s int64 tensors execute on the packed int32[..., 2]
-    physical view rather than as S64.
-
-    True for explicit packed mode (every int64 op) and for the native cascade's
-    non-native (DOWNCAST) ops. A NATIVE op returns False (keeps S64) only when
-    the input guard allows it (see ``native_int64_guard_allows``); otherwise it
-    falls back to the packed view for this invocation. Python mirror of the C++
-    ``UsePackedInt64ViewForOp`` — the two must agree so the traced graph's int64
-    parameters (faked as int32[..., 2] here) match the physical view the C++
-    dispatcher binds at execution.
+    Note:
+        This mirrors C++ ``UsePackedInt64ViewForOp`` so fake traced parameters use
+        the same ``int32[..., 2]`` physical view bound by the C++ dispatcher.
     """
     if is_packed_int64_mode():
         return True
     if not is_s64_passthrough():
         return False
-    if Int64Policy.get().decide(op_name) == Int64Decision.DOWNCAST:
-        return True
-    # NATIVE-capable op: fall back to the packed view when the input guard
-    # rejects this invocation (non-contiguous / dual-broadcast); else keep S64.
-    return inputs is not None and not native_int64_guard_allows(inputs)
+    return Int64Policy.get().decide(op_name) == Int64Decision.DOWNCAST
 
 
 def reset_int64_mode_cache() -> None:
-    """Clear the cached mode. For testing only."""
+    """Clear the cached Python int64 mode and policy.
+
+    Note:
+        This helper is intended only for tests.
+    """
     get_int64_mode.cache_clear()
     Int64Policy.reset_cache()
 
@@ -205,17 +197,13 @@ _NATIVE_INT64_OPS: frozenset[str] = frozenset(
         "aten::maximum",
         "aten::minimum",
         "aten::floor_divide",
-        # Comparison — DISABLED: native S64 comparison hangs the device on
-        # non-contiguous int64. The hang is driven by the *output* transpose
-        # epilogue (inputs are contiguous at the binding), so the input-based
-        # native_int64_guard_allows can't gate it — keep these packed until the
-        # strided S64 compare+transpose codegen hang is fixed.
-        # "aten::eq",
-        # "aten::ne",
-        # "aten::gt",
-        # "aten::ge",
-        # "aten::lt",
-        # "aten::le",
+        # Comparison
+        "aten::eq",
+        "aten::ne",
+        "aten::gt",
+        "aten::ge",
+        "aten::lt",
+        "aten::le",
         # Bitwise
         "aten::bitwise_and",
         "aten::bitwise_or",
@@ -240,6 +228,7 @@ _NATIVE_INT64_OPS: frozenset[str] = frozenset(
         "aten::ones",
         "aten::full",
         "aten::empty",
+        "aten::eye",
         # Data movement
         "aten::slice",
         "aten::cat",
@@ -266,8 +255,13 @@ _NATIVE_INT64_OPS: frozenset[str] = frozenset(
         # (verified: packed handles it). Re-enable once the S64 gather codegen
         # is fixed.
         # "aten::gather",
-        # Embedding
-        "aten::embedding",
+        # Embedding - DISABLED. Native S64 embedding gather reads out of
+        # bounds at runtime (NRT 1006). The packed int32 view races
+        # cross-stream under HostCC and gives an intermittent NaN. Route it
+        # to a CPU int32 index roundtrip via DowncastArgs
+        # (kCpuBounceInt64Ops) instead. Re-enable once the cross-stream
+        # int64 hazard has a proper fix.
+        # "aten::embedding",
     }
 )
 
@@ -283,6 +277,7 @@ _UNSUPPORTED_INT64_OPS: frozenset[str] = frozenset(
         "aten::conv1d",
         "aten::conv2d",
         "aten::conv3d",
+        "aten::random_",  # covers .from/.to; int64 RNG is slower on-device than CPU fallback
     }
 )
 
@@ -321,11 +316,14 @@ _NKI_INT64_NATIVE: bool = False
 
 
 class Int64Policy:
-    """Per-op native int64 dispatch decision for the native / native_strict modes.
+    """Route int64 operations under a selected execution mode.
 
-    For packed / cpu_bounce modes this policy never forces a whole-op CPU
-    fallback — those modes keep their existing on-device handling — so
-    ``should_cpu_fallback`` returns False there.
+    Args:
+        mode (Int64Mode): Execution mode used for per-operation decisions.
+
+    Note:
+        In ``packed`` and ``cpu_bounce`` modes, this policy never forces whole-op
+        CPU fallback; those modes retain their existing on-device handling.
     """
 
     def __init__(self, mode: Int64Mode):
@@ -334,28 +332,59 @@ class Int64Policy:
     @staticmethod
     @functools.lru_cache(maxsize=1)
     def get() -> Int64Policy:
+        """Return the cached process-wide int64 policy.
+
+        Returns:
+            Int64Policy: Policy initialized from the cached active execution mode.
+        """
         return Int64Policy(get_int64_mode())
 
     @staticmethod
     def reset_cache() -> None:
+        """Clear the cached process-wide int64 policy."""
         Int64Policy.get.cache_clear()
 
     @property
     def mode(self) -> Int64Mode:
+        """Return the policy execution mode.
+
+        Returns:
+            Int64Mode: Mode captured when this policy was created.
+        """
         return self._mode
 
     @property
     def passes_s64_to_compiler(self) -> bool:
-        """True when int64 tensors flow through to the compiler as S64."""
+        """Check whether the mode permits S64 compiler passthrough.
+
+        Returns:
+            bool: ``True`` when the mode is ``native`` or ``native_strict``.
+        """
         return self._mode in (Int64Mode.NATIVE, Int64Mode.NATIVE_STRICT)
 
     # Back-compat alias used by kernel.py / op_impl.py / etc.
     @property
     def native_int64_enabled(self) -> bool:
+        """Check whether native int64 compiler handling is enabled.
+
+        Returns:
+            bool: The value of ``passes_s64_to_compiler``.
+
+        Note:
+            This property is a backward-compatible alias used by dispatch call sites.
+        """
         return self.passes_s64_to_compiler
 
     def decide(self, op_name: str) -> Int64Decision:
-        """Per-op decision."""
+        """Classify the int64 routing decision for an operation.
+
+        Args:
+            op_name (str): Operation name, optionally including an overload suffix.
+
+        Returns:
+            Int64Decision: ``UNSUPPORTED`` for CPU fallback, ``NATIVE`` for a listed
+            native op in an S64 mode, or ``DOWNCAST`` otherwise.
+        """
         if self.should_cpu_fallback(op_name):
             return Int64Decision.UNSUPPORTED
         base = _strip_overload(op_name)
@@ -364,15 +393,18 @@ class Int64Policy:
         return Int64Decision.DOWNCAST
 
     def should_cpu_fallback(self, op_name: str) -> bool:
-        """True if this op should run on CPU instead of Neuron.
+        """Determine whether an int64 operation should use CPU fallback.
 
-        - ``cpu_fallback``: every int64 op runs entirely on CPU.
-        - ``native`` / ``native_strict``: only ops steered away from Neuron
-          (UNSUPPORTED matmul/conv always; in native_strict any non-native op).
-        - ``packed`` / ``cpu_bounce``: never force a whole-op CPU fallback —
-          they keep their on-device handling (packed view / int32 cast).
+        Args:
+            op_name (str): Operation name, optionally including an overload suffix.
 
-        Callers still gate on the op actually having an int64 input.
+        Returns:
+            bool: ``True`` for every op in ``cpu_fallback`` mode, unsupported ops in
+            native modes, and non-native ops in ``native_strict`` mode. ``packed`` and
+            ``cpu_bounce`` modes never force whole-op CPU fallback.
+
+        Note:
+            Callers must separately verify that the operation has an int64 input.
         """
         if self._mode == Int64Mode.CPU_FALLBACK:
             return True
@@ -384,21 +416,35 @@ class Int64Policy:
         return self._mode == Int64Mode.NATIVE_STRICT and base not in _NATIVE_INT64_OPS
 
     def should_warn_downcast(self, op_name: str) -> bool:
-        """True if executing this op demotes int64 to int32 on device (native
-        cascade + non-native op → packed view, losing the upper 32 bits)."""
+        """Determine whether an operation needs a precision-loss warning.
+
+        Args:
+            op_name (str): Operation name to classify.
+
+        Returns:
+            bool: ``True`` for a ``DOWNCAST`` operation in ``native`` mode, where the
+            packed view drops the upper 32 bits.
+        """
         if self._mode != Int64Mode.NATIVE:
             return False
         return self.decide(op_name) == Int64Decision.DOWNCAST
 
     def get_compiler_flags(self, op_name: str) -> list[str]:
-        """Per-op compiler flags. Non-empty only for NATIVE (S64) ops.
+        """Return int64 compiler flags for an operation.
 
-        In the cascade, DOWNCAST ops are demoted to int32 on device via the
-        packed view before lowering, so the compiler only ever sees int32 for
-        them and needs no int64 flags. Only NATIVE ops keep S64 and pass
-        ``--native-int64=enabled`` (public compiler flag; the next SDK release
-        flips it to the default). Mirror of
-        ``KernelExecution.cpp::GetXLAAdditionalArgs``.
+        Args:
+            op_name (str): Operation name to classify.
+
+        Returns:
+            list[str]: Empty for ``DOWNCAST`` or ``UNSUPPORTED`` operations; otherwise
+                contains the native-int64 and implicit-downcast flags.
+
+        Note:
+            Downcast inputs use the packed view in ``packed`` and ``native`` modes, but
+            use a CPU round trip in ``cpu_bounce`` mode; unsupported operations never
+            reach the compiler. ``TORCH_NEURONX_INT64_FULL_CAST=1`` sets the native-int64
+            flag to ``disabled``; otherwise native operations use
+            ``--native-int64=enabled``.
         """
         decision = self.decide(op_name)
         if decision != Int64Decision.NATIVE:
@@ -411,7 +457,16 @@ class Int64Policy:
         return [native_flag, "--implicit-integer-downcast=all"]
 
     def warn_if_needed(self, op_name: str) -> None:
-        """Emit a one-time warning for ops demoted to int32 on device."""
+        """Emit a one-time warning for an int64 downcast operation.
+
+        Args:
+            op_name (str): Operation name to classify after removing its overload.
+
+        Note:
+            Each base op warns once per process when ``native`` mode runs it through
+            the packed low-32-bit view. The warning identifies ``native_strict`` and
+            ``cpu_bounce`` as opt-out modes.
+        """
         if not self.should_warn_downcast(op_name):
             return
         base = _strip_overload(op_name)
@@ -427,19 +482,31 @@ class Int64Policy:
 
 
 def get_native_int64_op_set() -> frozenset[str]:
+    """Return operations with confirmed native S64 compiler support.
+
+    Returns:
+        frozenset[str]: Base aten operation names that may execute natively.
+    """
     return _NATIVE_INT64_OPS
 
 
 def get_unsupported_int64_op_set() -> frozenset[str]:
+    """Return operations routed to CPU fallback in native int64 modes.
+
+    Returns:
+        frozenset[str]: Base aten operation names routed away from Neuron in native modes.
+    """
     return _UNSUPPORTED_INT64_OPS
 
 
 def init_cpp_policy() -> None:
-    """Initialize the C++ int64 policy op tables from the Python op sets.
+    """Initialize C++ int64 operation tables from the Python sets.
 
-    The active mode is read independently on the C++ side from
-    TORCH_NEURONX_INT64_MODE (DispatchUtils.h GetInt64Mode), so only the op
-    tables are pushed here.
+    Note:
+        C++ reads the active mode independently from ``TORCH_NEURONX_INT64_MODE``;
+        this function pushes only native and unsupported operation tables. An
+        unavailable ``_C`` module is logged at debug level; an absent binding is
+        ignored.
     """
     try:
         from torch_neuronx import _C
@@ -454,12 +521,18 @@ def init_cpp_policy() -> None:
 
 
 def set_int64_mode_for_testing(mode: Int64Mode | str) -> None:
-    """TEST ONLY: pin the int64 mode for the current process, syncing every layer.
+    """Set the process int64 mode across Python and C++ test layers.
 
-    Switches the env var, clears the Python lru caches (so ``get_int64_mode`` and
-    ``Int64Policy`` re-read it), and overrides the C++ mode storage + re-pushes the
-    op tables. This is what lets the pytest ``int64_mode`` marker exercise each
-    mode within a single process. Never called by production code.
+    Args:
+        mode (Int64Mode or str): Mode to store in ``TORCH_NEURONX_INT64_MODE``.
+
+    Raises:
+        ValueError: If a string does not identify a valid ``Int64Mode``.
+
+    Note:
+        This test-only helper updates the environment, clears both Python LRU
+        caches, overrides C++ mode storage when available, and re-pushes the
+        operation tables. Production code never calls it.
     """
     if isinstance(mode, str):
         mode = Int64Mode(mode)

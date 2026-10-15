@@ -18,30 +18,41 @@ from torch_neuronx.neuron_dynamo_backend.fx.passes.contiguous_memory import (
 from torch_neuronx.neuron_dynamo_backend.fx.passes.dynamic_shape_analysis import (
     DynamicShapeAnalysis,
 )
+from torch_neuronx.neuron_dynamo_backend.fx.passes.sdpa_causal_mask import (
+    SdpaCausalMaskRewrite,
+)
 
 
 class PreprocessResult(NamedTuple):
-    """Result of graph preprocessing."""
+    """Store pre-AOTAutograd graph preprocessing results.
+
+    Args:
+        graph_module (torch.fx.GraphModule): Graph after preprocessing passes.
+        analysis (dict): Mapping whose ``"pre_aot_pass_mutations"`` entry contains
+            the aliasing pass's ``PassMutations`` record.
+    """
 
     graph_module: torch.fx.GraphModule
     analysis: dict
 
 
 def preprocess_graph(gm: torch.fx.GraphModule) -> PreprocessResult:
-    """
-    Apply FX graph analysis and transformations before AOTAutograed.
+    """Apply FX passes before AOTAutograd processing.
 
     Args:
-        gm: Input GraphModule
+        gm (torch.fx.GraphModule): Graph module to transform.
 
     Returns:
-        PreprocessResult containing the graph and analysis results
+        PreprocessResult: Transformed graph and a mapping whose
+            ``"pre_aot_pass_mutations"`` entry is the aliasing pass's
+            ``PassMutations`` record.
     """
     aliasing_analysis = AliasingAnalysis()
     dynamic_shape_analysis = DynamicShapeAnalysis()
     ensure_contiguous = EnsureContiguousInputs()
+    sdpa_causal_mask = SdpaCausalMaskRewrite()
     pm = PassManager(
-        passes=[ensure_contiguous, aliasing_analysis, dynamic_shape_analysis],
+        passes=[ensure_contiguous, sdpa_causal_mask, aliasing_analysis, dynamic_shape_analysis],
         run_checks_after_each_pass=True,
     )
     pass_result = pm(gm)

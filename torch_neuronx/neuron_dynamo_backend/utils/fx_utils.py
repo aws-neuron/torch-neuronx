@@ -33,11 +33,20 @@ def _is_non_cpu_device(value) -> bool:
 
 
 def replace_device_with_cpu(gm: fx.GraphModule) -> fx.GraphModule:
-    """Return a copy of ``gm`` with every non-CPU ``device`` value rewritten
-    to CPU.
+    """Replace device-like FX call arguments with CPU devices.
 
-    Used before host-side replay of FX submodules whose trace baked in a
-    non-CPU device literal.
+    Args:
+        gm (fx.GraphModule): Graph module to inspect.
+
+    Returns:
+        fx.GraphModule: Original module when no rewrite is needed; otherwise a
+            module built from a copied graph. On call-function and call-method nodes,
+            positional non-CPU ``torch.device`` values and strings without ``"cpu"``,
+            plus such values in the ``device`` keyword, are rewritten to CPU.
+
+    Note:
+        The input graph module is not mutated. This supports host-side replay
+        when tracing baked a non-CPU device literal into a submodule.
     """
     new_graph = copy.deepcopy(gm.graph)
     modified = False

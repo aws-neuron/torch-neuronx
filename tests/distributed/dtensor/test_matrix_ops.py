@@ -22,13 +22,15 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 )
 
 import torch_neuronx
-from tests.pytorch_tests.distributed.common_distributed import NeuronDistributedBase
+from tests.distributed.dtensor.common_distributed import NeuronDistributedBase
 from tests.utils.neuron_test_utils import (
     assert_op_runs_on_neuron,
-    get_core_start_index,
     get_pytest_worker_index,
+    get_rank_core,
     track_neuron_ops,
 )
+
+pytestmark = pytest.mark.neuron_cores(8)
 
 # Set custom timeout for specific tests (in seconds)
 common_distributed.TIMEOUT_OVERRIDE["test_linear_tensor_parallel"] = 600
@@ -67,8 +69,7 @@ class DistMatrixOpsTest(NeuronDistributedBase, MultiProcessTestCase):
     @classmethod
     def _run(cls, rank, test_name, file_name, parent_pipe, **kwargs):
         process_index = get_pytest_worker_index()
-        core_start_index = get_core_start_index()
-        os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_start_index + rank)
+        os.environ["NEURON_RT_VISIBLE_CORES"] = str(get_rank_core(rank))
         rt_port = int(os.environ.get("NEURON_RT_PORT", "2025"))
         os.environ["NEURON_RT_ROOT_COMM_ID"] = f"localhost:{rt_port + process_index}"
         super()._run(rank, test_name, file_name, parent_pipe, **kwargs)

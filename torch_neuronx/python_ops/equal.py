@@ -52,7 +52,22 @@ import torch
 
 
 def equal_neuron(self: torch.Tensor, other: torch.Tensor) -> bool:
-    """Neuron implementation of ``aten::equal``."""
+    """Compare two same-device tensors and return a host Boolean.
+
+    Args:
+        self (torch.Tensor): First tensor to compare.
+        other (torch.Tensor): Second tensor to compare.
+
+    Returns:
+        bool: ``True`` when shapes match and all promoted values compare equal.
+
+    Raises:
+        RuntimeError: If the tensors are on different devices.
+
+    Note:
+        Mixed dtypes are promoted. NaNs compare unequal according to elementwise ``==``
+        semantics.
+    """
     import torch_neuronx
 
     if self.device != other.device:

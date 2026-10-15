@@ -31,6 +31,7 @@ from torch_neuronx.profiling import (
     NeuronConfig,
     NeuronProfiler,
     ProfileMode,
+    TimeTrigger,
     correlate_device_time,
     export_now,
     request_export,
@@ -1085,6 +1086,39 @@ class TestNeuronProfilerIntegration:
         assert (
             self._count_ntrace_records(os.path.join(trace_dir, "ntrace.pb")) > 0
         ), "Merged ntrace.pb has no records"
+
+    def test_time_policy_exports_without_explicit_requests(self):
+        # Timer exports grow part files during profiling; stop merges them into a valid trace.
+        self._run_neuron_workload()  # Warm up compilation before the measured session.
+        config = NeuronConfig(
+            modes=[ProfileMode.RUNTIME],
+            profile_output_dir=self.test_dir,
+            continuous_export=ContinuousExportConfig(
+                policy=TimeTrigger(interval_ms=100, mask=InspectExportMask.SYSTEM_PROFILE),
+            ),
+        )
+        with profile(activities=[ProfilerActivity.PrivateUse1], experimental_config=config):
+            trace_dir = self._session_trace_dir(self.test_dir)
+            for _ in range(2):
+                previous_size = self._part_files_size(trace_dir)
+                self._run_neuron_workload()
+                deadline = time.monotonic() + 5.0
+                while (
+                    self._part_files_size(trace_dir) <= previous_size
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                assert (
+                    self._part_files_size(trace_dir) > previous_size
+                ), "The timer did not export system events during the active session"
+
+        self._validate_nrt_output_files(self.test_dir, expect_ntrace=True)
+        assert self._count_ntrace_records(os.path.join(trace_dir, "ntrace.pb")) > 0
+        assert not any(
+            name.startswith("ntrace.nc") and name.endswith(".part")
+            for name in os.listdir(trace_dir)
+        )
+        assert not os.path.exists(os.path.join(trace_dir, "ntrace.pb.tmp"))
 
     def test_export_never_vs_driven_produces_equivalent_output(self):
         """Final on-disk output is equivalent whether export is driven or never.

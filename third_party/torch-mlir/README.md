@@ -49,7 +49,10 @@ subset above.
    commits the new torch-mlir rev expects (see upstream's
    `externals/llvm-project` and `externals/stablehlo` at the new SHA). Update
    `LLVM_COMMIT` / `LLVM_SHA256` and `STABLEHLO_COMMIT`.
-4. Rebuild: `./tools/build` (produces `_mlir.so`, `_torchMlir.so`,
+4. Regenerate the committed Torch dialect Python bindings and commit the result:
+   `../../tools/check-torch-mlir-python-bindings --fix`. Run this after step 2,
+   which can revert it.
+5. Rebuild: `./tools/build` (produces `_mlir.so`, `_torchMlir.so`,
    `_stablehlo.so`, `_C.so`).
-5. Verify: `./tools/run-torch-mlir-lit-tests && ./tools/run-torch-mlir-e2e-tests`,
+6. Verify: `./tools/run-torch-mlir-lit-tests && ./tools/run-torch-mlir-e2e-tests`,
    then `./tools/run-test`.

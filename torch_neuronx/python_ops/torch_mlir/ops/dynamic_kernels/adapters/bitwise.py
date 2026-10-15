@@ -87,6 +87,15 @@ def _prepare_io(input_a, input_b, dest=None, **_):
     device = input_a.device
 
     def to_16(t):
+        """Pad a boolean operand and view its bytes as ``int16``.
+
+        Args:
+            t (torch.Tensor): Boolean operand to prepare.
+
+        Returns:
+            torch.Tensor: Padded ``int16`` view; the view shares storage with the
+                prepared Boolean tensor.
+        """
         return _pad_or_contig(t.reshape(-1, H), M_ceil).view(torch.int16)
 
     a16 = to_16(input_a)
@@ -108,6 +117,7 @@ def _reshape_output(outputs, original_args):
 
 
 def register():
+    """Register the dynamic boolean bitwise-OR adapter."""
     register_dynamic_nki(
         "bitwise_or",
         DynamicNkiEntry(

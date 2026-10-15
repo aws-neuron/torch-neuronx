@@ -2,10 +2,8 @@
 
 For one ATen op, measures the time inside torch-neuronx's dispatch layer against
 the end-to-end call time. On the C++ path that is the ``Dispatch.Total`` metric.
-Ops still on the Python ``combined()`` path are not timed there, so
-``operation_registry._dispatch_times`` is read instead; it brackets the whole call
-including the kernel, so it is a wider measurement, and ``timing_source`` says
-which one a row came from.
+Every op dispatches in C++, so every row comes from that metric and
+``timing_source`` reports ``cpp_metric``.
 
 Each op lands in one bucket: ``timed``, ``no_dispatch`` (ran but never entered an
 instrumented path), ``no_sample`` (no valid input), or ``errored``.
@@ -25,12 +23,6 @@ import torch
 
 import torch_neuronx
 import torch_neuronx.metrics as met
-
-# Read at import, so the flag has to be exported before the process starts.
-from torch_neuronx.python_ops.torch_mlir.operation_registry import (
-    _DISPATCH_TIMING_ENABLED,
-    _dispatch_times,
-)
 
 # Also the parquet/Grafana schema. Append columns, never insert, so positions hold.
 DISPATCH_FIELDS = [
@@ -192,8 +184,7 @@ def _read_dispatch_time_us():
     """Dispatch time of the op just called.
 
     Returns ``(microseconds, dispatcher runs, which clock)``, or ``(None, 0, "")`` if
-    neither recorded anything. The Python accumulator is read only for ops that never
-    reach the C++ metric.
+    the metric recorded nothing.
 
     A count above 1024 means the metric's ring overwrote older timings and the time
     is an underestimate; the most any op reached in a full sweep is 6.
@@ -204,8 +195,6 @@ def _read_dispatch_time_us():
     data = met.get_metric_data("Dispatch.Total")
     if data and data["total_samples"] > 0:
         return _union_duration_ns(data["samples"]) / 1000.0, data["total_samples"], "cpp_metric"
-    if _DISPATCH_TIMING_ENABLED and _dispatch_times:
-        return max(_dispatch_times) / 1000.0, len(_dispatch_times), "python_accumulator"
     return None, 0, ""
 
 
@@ -234,8 +223,6 @@ def measure_op(op, sample, iters, warmup):
     samples = []
     for _ in range(iters):
         met.clear_all()
-        if _DISPATCH_TIMING_ENABLED and _dispatch_times is not None:
-            _dispatch_times.clear()
         torch_neuronx.synchronize()
 
         start_ns = time.perf_counter_ns()

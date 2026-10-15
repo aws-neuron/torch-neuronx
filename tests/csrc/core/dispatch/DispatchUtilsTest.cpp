@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <string>
 
 #include "torch_neuronx/csrc/core/dispatch/DispatchUtils.h"
 #include "torch_neuronx/csrc/core/dispatch/Int64Policy.h"
@@ -43,6 +44,11 @@ static c10::FunctionSchema CopySchema() {
 // Non-write inputs + write-aliased out = good schema for out-param tests.
 static c10::FunctionSchema ComplexOutSchema() {
   return c10::Dispatcher::singleton().findSchemaOrThrow("aten::complex", "out").schema();
+}
+
+// aten::embedding(Tensor weight, Tensor indices, ...) -- per-op cpu_bounce target (#2095).
+static c10::FunctionSchema EmbeddingSchema() {
+  return c10::Dispatcher::singleton().findSchemaOrThrow("aten::embedding", "").schema();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -244,6 +250,24 @@ TEST(DowncastArgsTest, Int64ToInt32_CpuBounce) {
   SetInt64ModeForTesting(Int64Mode::kNative);
 }
 
+TEST(DowncastArgsTest, EmbeddingInt64_PerOpCpuBounce) {
+  // aten::embedding is in kCpuBounceInt64Ops, so its int64 indices are routed
+  // through a CPU int32 roundtrip even in native mode. This avoids the native-S64
+  // gather that reads out of bounds cross-stream under HostCC (NRT 1006) and the
+  // packed int32[..., 2] view that races to an intermittent NaN. The float weight
+  // is untouched. Contrast Int64KeptInNativeMode_EvenForNonNativeOp (add keeps Long).
+  std::unordered_set<std::string> empty;
+  InitInt64Policy(empty, empty);
+  SetInt64ModeForTesting(Int64Mode::kNative);
+
+  auto weight = torch::ones({16, 4}, torch::kFloat32);
+  auto indices = torch::zeros({2, 3}, torch::kInt64);
+  std::vector<c10::IValue> args = {weight, indices};
+  DowncastArgs(args, EmbeddingSchema());
+  EXPECT_EQ(args[0].toTensor().scalar_type(), c10::ScalarType::Float);
+  EXPECT_EQ(args[1].toTensor().scalar_type(), c10::ScalarType::Int);
+}
+
 TEST(DowncastArgsTest, Int64Preserved_NativeMode) {
   // In native mode, int64 to a NATIVE-listed op reaches the compiler unchanged
   // (S64 passthrough). DowncastArgs is op-aware, so add must be registered.
@@ -336,6 +360,24 @@ TEST(DowncastArgsTest, Int64TensorListDowncast_CpuBounce) {
   for (size_t j = 0; j < other_after.size(); ++j) {
     EXPECT_EQ(other_after.get(j).scalar_type(), c10::ScalarType::Int);
   }
+}
+
+TEST(CloneIValueListContainersTest, DowncastDoesNotMutateSnapshot) {
+  std::unordered_set<std::string> empty;
+  InitInt64Policy(empty, empty);
+  SetInt64ModeForTesting(Int64Mode::kCpuBounce);
+
+  auto schema =
+      c10::Dispatcher::singleton().findSchemaOrThrow("aten::_foreach_add", "List").schema();
+  c10::List<at::Tensor> tensors({torch::ones({2}, torch::kInt64)});
+  std::vector<c10::IValue> args = {c10::IValue(tensors), c10::IValue(tensors.copy())};
+  auto snapshot = CloneIValueListContainers(args);
+
+  DowncastArgs(args, schema);
+
+  EXPECT_EQ(args[0].toTensorList().get(0).scalar_type(), c10::ScalarType::Int);
+  EXPECT_EQ(snapshot[0].toTensorList().get(0).scalar_type(), c10::ScalarType::Long);
+  SetInt64ModeForTesting(Int64Mode::kNative);
 }
 
 TEST(DowncastArgsTest, Int64TensorListPreserved_Native) {
@@ -553,6 +595,49 @@ TEST(HasComplexInputTest, ComplexInTensorList) {
   EXPECT_TRUE(HasComplexInput(args));
 }
 
+class ComplexDecompositionEnabledTest : public ::testing::Test {
+ protected:
+  static constexpr const char* kEnvName = "TORCH_NEURONX_COMPLEX_DECOMPOSE";
+
+  void SetUp() override {
+    const char* value = std::getenv(kEnvName);
+    if (value != nullptr) {
+      saved_value_ = value;
+      was_set_ = true;
+    }
+    unsetenv(kEnvName);
+  }
+
+  void TearDown() override {
+    if (was_set_) {
+      setenv(kEnvName, saved_value_.c_str(), 1);
+    } else {
+      unsetenv(kEnvName);
+    }
+  }
+
+ private:
+  bool was_set_ = false;
+  std::string saved_value_;
+};
+
+TEST_F(ComplexDecompositionEnabledTest, EnabledWhenUnset) {
+  EXPECT_TRUE(ComplexDecompositionEnabled());
+  EXPECT_TRUE(ShouldUseComplexDecomposition("reciprocal", true));
+  EXPECT_FALSE(ShouldUseComplexDecomposition("reciprocal", false));
+}
+
+TEST_F(ComplexDecompositionEnabledTest, CanBeDisabled) {
+  setenv(kEnvName, "0", 1);
+  EXPECT_FALSE(ComplexDecompositionEnabled());
+  EXPECT_FALSE(ShouldUseComplexDecomposition("reciprocal", true));
+}
+
+TEST_F(ComplexDecompositionEnabledTest, NativeComplexOpsRetainPriority) {
+  setenv(kEnvName, "1", 1);
+  EXPECT_FALSE(ShouldUseComplexDecomposition("abs", true));
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  ExtractBaseOpName
 // ═══════════════════════════════════════════════════════════════
@@ -731,6 +816,24 @@ TEST(TensorToMetaTest, DifferentDtypes) {
   EXPECT_EQ(TensorToMeta(torch::zeros({2}, torch::kHalf)).scalar_type(), c10::ScalarType::Half);
 }
 
+TEST(TensorToMetaTest, KeepsWrappedNumberOnCpu) {
+  auto wrapped = torch::tensor(7, torch::kInt64);
+  wrapped.unsafeGetTensorImpl()->set_wrapped_number(true);
+
+  auto meta = TensorToMeta(wrapped);
+
+  EXPECT_TRUE(meta.unsafeGetTensorImpl()->is_wrapped_number());
+  EXPECT_EQ(meta.scalar_type(), c10::ScalarType::Long);
+  EXPECT_TRUE(meta.device().is_cpu());
+  EXPECT_TRUE(meta.is_same(wrapped));
+}
+
+TEST(TensorToMetaTest, ExplicitZeroDimRemainsUnwrapped) {
+  auto explicit_tensor = torch::tensor(7, torch::kInt64);
+  auto meta = TensorToMeta(explicit_tensor);
+  EXPECT_FALSE(meta.unsafeGetTensorImpl()->is_wrapped_number());
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  IValueToMeta
 // ═══════════════════════════════════════════════════════════════
@@ -775,6 +878,195 @@ TEST(IValueToMetaTest, GenericListWithTensors) {
   auto list = result.toListRef();
   EXPECT_TRUE(list[0].toTensor().device().is_meta());
   EXPECT_EQ(list[1].toInt(), 42);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Meta-derived wrapped integer normalization
+// ═══════════════════════════════════════════════════════════════
+
+static at::Tensor WrappedLong(int64_t value) {
+  auto tensor = torch::tensor(value, torch::kInt64);
+  tensor.unsafeGetTensorImpl()->set_wrapped_number(true);
+  return tensor;
+}
+
+static c10::OperatorHandle FindOp(const char* name, const char* overload) {
+  return c10::Dispatcher::singleton().findSchemaOrThrow(name, overload);
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, ExactFamiliesUseMetaDerivedDtype) {
+  struct Case {
+    const char* name;
+    const char* overload;
+    bool has_alpha;
+    c10::ScalarType dtype;
+  };
+  const std::vector<Case> cases = {
+      {"aten::add", "Tensor", true, c10::ScalarType::Char},
+      {"aten::add", "Tensor", true, c10::ScalarType::Byte},
+      {"aten::add", "Tensor", true, c10::ScalarType::Short},
+      {"aten::add", "Tensor", true, c10::ScalarType::Int},
+      {"aten::mul", "Tensor", false, c10::ScalarType::Byte},
+      {"aten::mul", "Tensor", false, c10::ScalarType::Short},
+      {"aten::sub", "Tensor", true, c10::ScalarType::Char},
+      {"aten::sub", "Tensor", true, c10::ScalarType::Byte},
+      {"aten::sub", "Tensor", true, c10::ScalarType::Short},
+      {"aten::sub", "Tensor", true, c10::ScalarType::Int},
+  };
+
+  for (const auto& test_case : cases) {
+    auto op = FindOp(test_case.name, test_case.overload);
+    auto options = torch::TensorOptions().dtype(test_case.dtype);
+    std::vector<c10::IValue> args = {torch::tensor(5, options), WrappedLong(2)};
+    if (test_case.has_alpha) args.emplace_back(1);
+
+    ASSERT_TRUE(NormalizeWrappedIntegerScalarViaMeta(op, args, op.schema())) << test_case.name;
+    ASSERT_TRUE(args[1].isTensor());
+    EXPECT_EQ(args[1].toTensor().scalar_type(), test_case.dtype) << test_case.name;
+    EXPECT_FALSE(args[1].toTensor().unsafeGetTensorImpl()->is_wrapped_number()) << test_case.name;
+  }
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, PythonRegisteredMetaKernelsAreConservative) {
+  // These Meta kernels are registered by torch/_meta_registrations.py.  A
+  // standalone C++ test binary does not import those registrations, so this
+  // helper must conservatively leave the operands unchanged.  The Python
+  // hardware regression covers their positive routes after normal torch
+  // initialization.
+  for (const auto& [name, overload] : std::vector<std::pair<const char*, const char*>>{
+           {"aten::floor_divide", ""},
+           {"aten::rsub", "Tensor"},
+       }) {
+    auto op = FindOp(name, overload);
+    std::vector<c10::IValue> args = {
+        torch::tensor(5, torch::kUInt8),
+        WrappedLong(2),
+    };
+    if (std::string(name) == "aten::rsub") args.emplace_back(1);
+
+    EXPECT_FALSE(NormalizeWrappedIntegerScalarViaMeta(op, args, op.schema())) << name;
+    EXPECT_TRUE(args[1].toTensor().unsafeGetTensorImpl()->is_wrapped_number()) << name;
+  }
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, ExplicitTensorIsNotNormalized) {
+  auto op = FindOp("aten::add", "Tensor");
+  std::vector<c10::IValue> args = {
+      torch::tensor(5, torch::kInt16),
+      torch::tensor(2, torch::kInt64),
+      1,
+  };
+
+  EXPECT_FALSE(NormalizeWrappedIntegerScalarViaMeta(op, args, op.schema()));
+  EXPECT_EQ(args[1].toTensor().scalar_type(), c10::ScalarType::Long);
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, WrappedFirstOperandIsNormalized) {
+  auto op = FindOp("aten::add", "Tensor");
+  std::vector<c10::IValue> args = {
+      WrappedLong(2),
+      torch::tensor(5, torch::kInt16),
+      1,
+  };
+
+  ASSERT_TRUE(NormalizeWrappedIntegerScalarViaMeta(op, args, op.schema()));
+  EXPECT_EQ(args[0].toTensor().scalar_type(), c10::ScalarType::Short);
+  EXPECT_FALSE(args[0].toTensor().unsafeGetTensorImpl()->is_wrapped_number());
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, MultidimOperandIsNormalized) {
+  auto op = FindOp("aten::sub", "Tensor");
+  std::vector<c10::IValue> args = {
+      torch::zeros({8, 2048}, torch::kInt32),
+      WrappedLong(1),
+      1,
+  };
+
+  ASSERT_TRUE(NormalizeWrappedIntegerScalarViaMeta(op, args, op.schema()));
+  EXPECT_EQ(args[1].toTensor().scalar_type(), c10::ScalarType::Int);
+  EXPECT_EQ(args[1].toTensor().dim(), 0);
+  EXPECT_FALSE(args[1].toTensor().unsafeGetTensorImpl()->is_wrapped_number());
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, SameDtypeOperandIsLeftUnchanged) {
+  auto op = FindOp("aten::sub", "Tensor");
+  std::vector<c10::IValue> args = {
+      torch::zeros({8, 2048}, torch::kInt64),
+      WrappedLong(1),
+      1,
+  };
+
+  EXPECT_FALSE(NormalizeWrappedIntegerScalarViaMeta(op, args, op.schema()));
+  EXPECT_TRUE(args[1].toTensor().unsafeGetTensorImpl()->is_wrapped_number());
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, VerdictIsMemoizedByKey) {
+  // A rejected verdict stored under a key is reused for later calls with the
+  // same key without consulting Meta again, so a normalizable call that
+  // (artificially) shares the key is left unchanged.
+  const std::string key = "VerdictIsMemoizedByKey";
+  auto div = FindOp("aten::div", "Tensor");
+  std::vector<c10::IValue> div_args = {torch::zeros({4}, torch::kInt32), WrappedLong(2)};
+  EXPECT_FALSE(NormalizeWrappedIntegerScalarViaMeta(div, div_args, div.schema(), key));
+
+  auto sub = FindOp("aten::sub", "Tensor");
+  std::vector<c10::IValue> sub_args = {torch::zeros({4}, torch::kInt32), WrappedLong(1), 1};
+  EXPECT_FALSE(NormalizeWrappedIntegerScalarViaMeta(sub, sub_args, sub.schema(), key));
+  EXPECT_TRUE(sub_args[1].toTensor().unsafeGetTensorImpl()->is_wrapped_number());
+
+  // A positive verdict is reused as well and still casts the scalar.
+  const std::string sub_key = "VerdictIsMemoizedByKey:sub";
+  for (int i = 0; i < 2; ++i) {
+    std::vector<c10::IValue> args = {torch::zeros({4}, torch::kInt32), WrappedLong(1), 1};
+    ASSERT_TRUE(NormalizeWrappedIntegerScalarViaMeta(sub, args, sub.schema(), sub_key)) << i;
+    EXPECT_EQ(args[1].toTensor().scalar_type(), c10::ScalarType::Int) << i;
+  }
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, NonPromotingTensorRoleIsRejected) {
+  auto op = FindOp("aten::gather", "");
+  std::vector<c10::IValue> args = {
+      torch::tensor(5, torch::kInt16),
+      0,
+      WrappedLong(0),
+      false,
+  };
+
+  EXPECT_FALSE(NormalizeWrappedIntegerScalarViaMeta(op, args, op.schema()));
+  EXPECT_TRUE(args[2].toTensor().unsafeGetTensorImpl()->is_wrapped_number());
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, OutputPolicyMustProveOperandDtype) {
+  auto div = FindOp("aten::div", "Tensor");
+  std::vector<c10::IValue> div_args = {
+      torch::tensor(5, torch::kInt16),
+      WrappedLong(2),
+  };
+  EXPECT_FALSE(NormalizeWrappedIntegerScalarViaMeta(div, div_args, div.schema()));
+  EXPECT_TRUE(div_args[1].toTensor().unsafeGetTensorImpl()->is_wrapped_number());
+
+  auto eq = FindOp("aten::eq", "Tensor");
+  std::vector<c10::IValue> eq_args = {
+      torch::tensor(5, torch::kInt16),
+      WrappedLong(2),
+  };
+  EXPECT_FALSE(NormalizeWrappedIntegerScalarViaMeta(eq, eq_args, eq.schema()));
+  EXPECT_TRUE(eq_args[1].toTensor().unsafeGetTensorImpl()->is_wrapped_number());
+}
+
+TEST(NormalizeWrappedIntegerScalarViaMetaTest, WritableOutRouteIsUnchanged) {
+  auto op = FindOp("aten::add", "out");
+  auto wrapped = WrappedLong(2);
+  std::vector<c10::IValue> args = {
+      torch::tensor(5, torch::kInt16),
+      wrapped,
+      1,
+      torch::empty({}, torch::kInt32),
+  };
+
+  EXPECT_FALSE(NormalizeWrappedIntegerScalarViaMeta(op, args, op.schema()));
+  EXPECT_TRUE(args[1].toTensor().unsafeGetTensorImpl()->is_wrapped_number());
+  EXPECT_EQ(args[3].toTensor().scalar_type(), c10::ScalarType::Int);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -852,6 +1144,149 @@ TEST(RawNrtCopyOverlapsTest, NonZeroStorageOffsets) {
 
   auto c = base.slice(0, 100, 150);  // storage_offset=100; no overlap with a
   EXPECT_FALSE(RawNrtCopyOverlaps(a, c));
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CoalesceAdjacentViews — does a TensorList tile one storage?
+// ═══════════════════════════════════════════════════════════════
+
+namespace {
+c10::List<at::Tensor> MakeList(std::vector<at::Tensor> ts) {
+  c10::List<at::Tensor> l;
+  for (auto& t : ts) l.push_back(t);
+  return l;
+}
+}  // namespace
+
+TEST(CoalesceAdjacentViewsTest, AdjacentSlicesTileAndSpanTheUnion) {
+  auto base = torch::zeros({4096}, torch::kFloat32);
+  auto out =
+      CoalesceAdjacentViews(MakeList({base.slice(0, 0, 1024), base.slice(0, 1024, 2048),
+                                      base.slice(0, 2048, 3072), base.slice(0, 3072, 4096)}));
+  ASSERT_TRUE(out.defined());
+  EXPECT_EQ(out.numel(), 4096);
+  EXPECT_EQ(out.storage_offset(), 0);
+  EXPECT_EQ(out.storage().data(), base.storage().data());
+}
+
+TEST(CoalesceAdjacentViewsTest, UnevenSplitsStillTile) {
+  auto base = torch::zeros({1236}, torch::kFloat32);
+  auto out = CoalesceAdjacentViews(MakeList({base.slice(0, 0, 300), base.slice(0, 300, 400),
+                                             base.slice(0, 400, 1212), base.slice(0, 1212, 1236)}));
+  ASSERT_TRUE(out.defined());
+  EXPECT_EQ(out.numel(), 1236);
+}
+
+TEST(CoalesceAdjacentViewsTest, SpanStartsAtTheFirstEntrysOffset) {
+  auto base = torch::zeros({200}, torch::kFloat32);
+  auto out = CoalesceAdjacentViews(MakeList({base.slice(0, 50, 100), base.slice(0, 100, 150)}));
+  ASSERT_TRUE(out.defined());
+  EXPECT_EQ(out.storage_offset(), 50);
+  EXPECT_EQ(out.numel(), 100);  // union is [50, 150), never past the inputs
+}
+
+TEST(CoalesceAdjacentViewsTest, DeclinesOnOffsetGap) {
+  auto base = torch::zeros({4096}, torch::kFloat32);
+  // second slice starts at 2048, not where the first ended (1024)
+  EXPECT_FALSE(CoalesceAdjacentViews(MakeList({base.slice(0, 0, 1024), base.slice(0, 2048, 3072)}))
+                   .defined());
+}
+
+TEST(CoalesceAdjacentViewsTest, DeclinesOnOutOfOrderOffsets) {
+  auto base = torch::zeros({2048}, torch::kFloat32);
+  EXPECT_FALSE(CoalesceAdjacentViews(MakeList({base.slice(0, 1024, 2048), base.slice(0, 0, 1024)}))
+                   .defined());
+}
+
+TEST(CoalesceAdjacentViewsTest, DeclinesOnSeparateStorages) {
+  EXPECT_FALSE(CoalesceAdjacentViews(MakeList({torch::zeros({16}, torch::kFloat32),
+                                               torch::zeros({16}, torch::kFloat32)}))
+                   .defined());
+}
+
+TEST(CoalesceAdjacentViewsTest, DeclinesOnNonOneDim) {
+  auto base = torch::zeros({64, 64}, torch::kFloat32);
+  EXPECT_FALSE(CoalesceAdjacentViews(MakeList({base, base})).defined());
+}
+
+TEST(CoalesceAdjacentViewsTest, DeclinesOnNonContiguous) {
+  auto base = torch::zeros({2048}, torch::kFloat32);
+  auto strided = base.slice(0, 0, 1024, /*step=*/2);
+  EXPECT_FALSE(strided.is_contiguous());
+  EXPECT_FALSE(CoalesceAdjacentViews(MakeList({strided})).defined());
+}
+
+// Dtype, not element size: bf16 and fp16 are both two bytes, so an element-size
+// comparison would accept this and type the span as the first entry, casting every
+// element to bf16 where the pairwise copies cast each to its own dtype.
+TEST(CoalesceAdjacentViewsTest, DeclinesOnMixedDtypeOfEqualElementSize) {
+  auto base = torch::zeros({2048}, torch::kBFloat16);
+  auto a = base.slice(0, 0, 1024);
+  auto b = base.slice(0, 1024, 2048).view(torch::kFloat16);
+  EXPECT_EQ(a.element_size(), b.element_size());
+  EXPECT_FALSE(CoalesceAdjacentViews(MakeList({a, b})).defined());
+}
+
+// Both flags live outside memory, so a span built from entry 0 would copy entry 1's
+// bytes untransformed. conj() stands in for the shared
+// `if (t.is_neg() || t.is_conj())` branch here because it is plain ATen in C++;
+// the neg half is covered from Python, where _neg_view() is directly available
+// (tests/python_ops/test_foreach_copy.py).
+TEST(CoalesceAdjacentViewsTest, DeclinesOnConjOnAnyEntry) {
+  auto base = torch::zeros({2048}, torch::kComplexFloat);
+  auto a = base.slice(0, 0, 1024);
+  auto b = base.slice(0, 1024, 2048).conj();
+  ASSERT_TRUE(b.is_conj());
+  EXPECT_FALSE(CoalesceAdjacentViews(MakeList({a, b})).defined());
+  EXPECT_FALSE(CoalesceAdjacentViews(MakeList({b, a})).defined());
+}
+
+TEST(CoalesceAdjacentViewsTest, ZeroNumelEntriesDoNotBreakAdjacency) {
+  auto base = torch::zeros({2048}, torch::kFloat32);
+  auto empty = torch::empty({0}, torch::kFloat32);
+  auto out =
+      CoalesceAdjacentViews(MakeList({base.slice(0, 0, 1024), empty, base.slice(0, 1024, 2048)}));
+  ASSERT_TRUE(out.defined());
+  EXPECT_EQ(out.numel(), 2048);  // the empty contributes nothing to the span
+}
+
+TEST(CoalesceAdjacentViewsTest, LeadingZeroNumelSeedsFromFirstNonEmpty) {
+  auto base = torch::zeros({200}, torch::kFloat32);
+  auto out =
+      CoalesceAdjacentViews(MakeList({torch::empty({0}, torch::kFloat32), base.slice(0, 50, 150)}));
+  ASSERT_TRUE(out.defined());
+  EXPECT_EQ(out.storage_offset(), 50);
+  EXPECT_EQ(out.numel(), 100);
+}
+
+TEST(CoalesceAdjacentViewsTest, ZeroNumelDoesNotBridgeAGap) {
+  auto base = torch::zeros({4096}, torch::kFloat32);
+  EXPECT_FALSE(
+      CoalesceAdjacentViews(MakeList({base.slice(0, 0, 1024), torch::empty({0}, torch::kFloat32),
+                                      base.slice(0, 2048, 3072)}))
+          .defined());
+}
+
+TEST(CoalesceAdjacentViewsTest, AllEmptyDeclines) {
+  EXPECT_FALSE(CoalesceAdjacentViews(MakeList({torch::empty({0}, torch::kFloat32),
+                                               torch::empty({0}, torch::kFloat32)}))
+                   .defined());
+}
+
+TEST(CoalesceAdjacentViewsTest, EmptyListDeclines) {
+  EXPECT_FALSE(CoalesceAdjacentViews(MakeList({})).defined());
+}
+
+TEST(CoalesceAdjacentViewsTest, SingleEntryTilesItself) {
+  auto base = torch::zeros({512}, torch::kFloat32);
+  auto out = CoalesceAdjacentViews(MakeList({base}));
+  ASSERT_TRUE(out.defined());
+  EXPECT_EQ(out.numel(), 512);
+}
+
+TEST(CoalesceAdjacentViewsTest, UndefinedEntryDeclines) {
+  auto base = torch::zeros({512}, torch::kFloat32);
+  EXPECT_FALSE(CoalesceAdjacentViews(MakeList({base, at::Tensor()})).defined());
 }
 
 }  // namespace

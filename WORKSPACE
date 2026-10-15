@@ -23,6 +23,23 @@ http_archive(
     strip_prefix = "llvm-project-" + LLVM_COMMIT,
     urls = ["https://github.com/llvm/llvm-project/archive/{commit}.tar.gz".format(commit = LLVM_COMMIT)],
     patch_cmds = [
+        # GCC 15 default-constructor fix. Remove when LLVM pin includes 05dc519011cd.
+        (
+            "python3 -c 'from pathlib import Path; "
+            + "p = Path(\"llvm/include/llvm/IR/CFG.h\"); s = p.read_text(); "
+            + "old = \"  explicit inline SuccIterator(InstructionT *Inst)\"; "
+            + "assert s.count(old) == 1; "
+            + "p.write_text(s.replace(old, \"  inline SuccIterator() : Inst(nullptr), Idx(0) {}\\n\" + old, 1))'"
+        ),
+        # GCC 15 indexed-accessor fix. Remove when LLVM pin includes bad300bda1b9.
+        (
+            "python3 -c 'from pathlib import Path; "
+            + "p = Path(\"llvm/include/llvm/ADT/STLExtras.h\"); s = p.read_text(); "
+            + "old = \"  public:\\n    // Index into this iterator, invoking a static method on the derived type.\"; "
+            + "new = \"  public:\\n    iterator() : iterator::indexed_accessor_iterator(nullptr, 0) {}\\n"
+            + "    // Index into this iterator, invoking a static method on the derived type.\"; "
+            + "assert s.count(old) == 1; p.write_text(s.replace(old, new, 1))'"
+        ),
         # GCC destructor template-id fix — remove when LLVM pin includes 8f85bb16548c
         "sed -i 's/~OptionValue<OpPassManager>()/~OptionValue()/' mlir/lib/Pass/PassRegistry.cpp",
         # GCC 11 ambiguous operator== fix — remove when LLVM pin includes 17f5f5ba5597

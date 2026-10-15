@@ -12,12 +12,26 @@ from torch_neuronx.utils import global_version_hash
 
 
 def nki_torch_fn(*args, **nki_params):
-    """Global torch function for all NKI kernels."""
+    """Invoke the shared NKI kernel wrapper with operation-specific parameters.
+
+    Args:
+        *args (Any): Tensor and constant arguments passed to the NKI kernel.
+        **nki_params (Any): Kernel registry, grid, aliasing, and backend parameters.
+
+    Returns:
+        Any: Result returned by ``nki_kernel_wrapper``.
+    """
     return nki_kernel_wrapper(**nki_params, args=args)
 
 
 class NkiKernel(TorchMlirKernel):
-    """Specialized kernel for NKI that handles aliasing in execution tensor preparation."""
+    """Execute NKI kernels with specialized cache keys and output aliasing.
+
+    Note:
+        Cache keys include kernel and backend identities, constants, launch grid,
+        tensor shapes and dtypes, and the global version. Output metadata is padded
+        to match provided aliased-output tuples before parent execution logic runs.
+    """
 
     def _generate_unified_cache_key(self, inputs: tuple, kwargs: dict, context=None) -> str:
         """Use kernel identity, backend_config, and constant_args for NKI caching."""
@@ -129,7 +143,13 @@ class NkiKernel(TorchMlirKernel):
 
 
 class NKITorchMlirOpImpl(TorchMlirOpImpl):
-    """Single torch-mlir op implementation for all NKI kernels."""
+    """Dispatch all registered NKI kernels through one torch-mlir operation.
+
+    Note:
+        For aliased calls, the shared instance creates actual outputs from ``return_types``,
+        appends aliased positional tensor inputs as ``out`` targets, and returns only the
+        actual outputs.
+    """
 
     def __init__(self):
         # Use the global NKI torch function
@@ -201,7 +221,15 @@ class NKITorchMlirOpImpl(TorchMlirOpImpl):
             raise RuntimeError(f"NKI kernel execution failed: {result.error_msg}")
 
     def can_handle(self, *args, **kwargs) -> bool:
-        """Check if this implementation can handle the given arguments."""
+        """Check whether every positional tensor argument is on a Neuron device.
+
+        Args:
+            *args (Any): Positional arguments to inspect.
+            **kwargs (Any): Keyword arguments accepted and ignored.
+
+        Returns:
+            bool: ``True`` when all positional tensor arguments use a Neuron device.
+        """
         for arg in args:
             if isinstance(arg, torch.Tensor) and arg.device.type != "neuron":
                 return False
@@ -222,7 +250,21 @@ def get_nki_torch_mlir_op(
     constant_args_key: int,
     return_types: list,
 ):
-    """Get the global NKI op and call it with the specific kernel parameters."""
+    """Create a callable that invokes the global NKI operation with fixed parameters.
+
+    Args:
+        kernel_idx (int): Index of the registered NKI kernel.
+        grid (Any): NKI kernel launch grid.
+        backend_config (str): Serialized backend configuration.
+        operand_output_aliases (dict[int, int]): Input-to-output alias mapping.
+        args (list): Operation arguments accepted but not used when creating the callable.
+        arg_names (list[str]): Names corresponding to kernel arguments.
+        constant_args_key (int or str): Registered constant-argument key, or ``-1``.
+        return_types (list[tuple]): Output dtype and shape pairs used for aliased calls.
+
+    Returns:
+        Callable: Function that forwards arguments to the shared NKI operation.
+    """
     # Create the NKI parameters
     nki_params = {
         "kernel_idx": kernel_idx,

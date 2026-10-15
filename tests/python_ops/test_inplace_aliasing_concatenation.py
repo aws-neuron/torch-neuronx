@@ -17,7 +17,7 @@ that may not occur in all environments. Tests are designed to verify the
 aliasing logic is correct regardless of whether groups form.
 
 Run with:
-    NEURON_CPP_DISPATCH=1 TORCH_NEURONX_ENABLE_CONCATENATION=1 \
+    TORCH_NEURONX_ENABLE_CONCATENATION=1 \
     TORCH_NEURONX_ENABLE_CONCATENATION_ALIASING=1 \
     pytest tests/python_ops/test_inplace_aliasing_concatenation.py -xvs
 """

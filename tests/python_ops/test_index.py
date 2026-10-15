@@ -168,6 +168,47 @@ class TestIndexRegistration:
             assert_op_did_not_run_on_neuron("index")
             assert_op_runs_on_neuron("nonzero")
 
+    @pytest.mark.xfail(
+        condition=os.environ.get("NEURON_LAUNCH_BLOCKING") == "1",
+        reason="Need to update the op logging for sync mode for short-circuited tests",
+    )
+    @pytest.mark.parametrize(
+        "shape,mask_shape",
+        [
+            ((8, 4), (8,)),
+            ((2, 3, 4), (2,)),
+            ((2, 3, 4), (2, 3)),
+        ],
+    )
+    def test_boolean_mask_all_false_partial_rank(self, shape, mask_shape):
+        """All-false mask over leading dims keeps the un-indexed trailing dims.
+
+        (8, 4) indexed by an all-false (8,) mask is (0, 4): the short-circuit that
+        skips the kernel must reproduce that shape rather than a flat (0,).
+        """
+        x_cpu = torch.randn(shape)
+        mask_cpu = torch.zeros(mask_shape, dtype=torch.bool)
+        expected = x_cpu[mask_cpu]
+
+        with track_neuron_ops():
+            x = x_cpu.to(device="neuron")
+            mask = mask_cpu.to(device="neuron")
+            result = x[mask]
+            assert result.shape == expected.shape
+            torch.testing.assert_close(result.cpu(), expected)
+            assert_op_did_not_run_on_neuron("index")
+            assert_op_runs_on_neuron("nonzero")
+
+    def test_boolean_mask_shape_mismatch_raises(self):
+        x = torch.empty(2, 3, 4, device="neuron")
+        mask = torch.zeros(5, dtype=torch.bool, device="neuron")
+
+        with pytest.raises(
+            IndexError,
+            match=r"The shape of the mask \[5\].*indexed tensor \[2, 3, 4\]",
+        ):
+            _ = x[mask]
+
     @assert_raises(IndexError, match=r"index .* is out of bounds for dimension 0 with size 4")
     def test_out_of_bounds_indexing_raises_error(self):
         """Test that out-of-bounds indexing raises IndexError like PyTorch."""

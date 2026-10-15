@@ -43,6 +43,16 @@ for _name, _op in _CMP_OPS.items():
         def wrapper(
             input_tensor: torch.Tensor, threshold: torch.Tensor, ctrl: torch.Tensor
         ) -> torch.Tensor:
+            """Run a scalar-threshold comparison kernel.
+
+            Args:
+                input_tensor (torch.Tensor): Values to compare.
+                threshold (torch.Tensor): Runtime threshold column.
+                ctrl (torch.Tensor): Runtime row-control values.
+
+            Returns:
+                torch.Tensor: Boolean comparison mask.
+            """
             return wrapped[_GRID](input_tensor, threshold, ctrl)
 
         return wrapper
@@ -52,6 +62,16 @@ for _name, _op in _CMP_OPS.items():
         def wrapper(
             input_a: torch.Tensor, input_b: torch.Tensor, ctrl: torch.Tensor
         ) -> torch.Tensor:
+            """Run a tensor-to-tensor comparison kernel.
+
+            Args:
+                input_a (torch.Tensor): Left comparison operand.
+                input_b (torch.Tensor): Right comparison operand.
+                ctrl (torch.Tensor): Runtime row-control values.
+
+            Returns:
+                torch.Tensor: Boolean comparison mask.
+            """
             return wrapped[_GRID](input_a, input_b, ctrl)
 
         return wrapper
@@ -113,6 +133,14 @@ def _compile_key(x, other, out=None, **_):
 
 def _make_compare_entry(name):
     def compile_fn(compile_key):
+        """Compile a comparison NEFF for one operand form.
+
+        Args:
+            compile_key (tuple): Baked hidden width, dtype, and tensor-operand flag.
+
+        Returns:
+            tuple: StableHLO bytes and the compiled NEFF cache key.
+        """
         from torch_neuronx.python_ops.torch_mlir.kernel import TorchMlirKernel
 
         H, dtype, tensor_operand = compile_key  # noqa: N806
@@ -133,6 +161,21 @@ def _make_compare_entry(name):
         return _compile_or_load_neff(kernel, graph_name, (x, other, ctrl), out)
 
     def prepare_io(x, other, *, dest=None, **_):
+        """Marshal comparison operands and output buffers for the kernel.
+
+        Args:
+            x (torch.Tensor): Left operand, read without mutation.
+            other (torch.Tensor or float-convertible scalar): Scalar threshold or
+                same-shape right operand, read without mutation.
+            dest (torch.Tensor, optional): Reusable contiguous Boolean destination.
+                The returned output aliases it and the kernel writes it in place.
+                Defaults to ``None``.
+            **_ (Any): Additional dispatch keywords, which are ignored.
+
+        Returns:
+            tuple: Kernel inputs, a one-element output-buffer tuple, and the runtime
+            row count. The output buffer aliases ``dest`` when it is supplied.
+        """
         M, H = _dynamic_mh(x)  # noqa: N806
         device = x.device
         second = (
@@ -154,5 +197,6 @@ def _make_compare_entry(name):
 
 
 def register():
+    """Register all scalar and tensor comparison adapters."""
     for name in _CMP_OPS:
         register_dynamic_nki(name, _make_compare_entry(name))

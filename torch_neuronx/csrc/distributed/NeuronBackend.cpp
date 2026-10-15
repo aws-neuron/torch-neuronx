@@ -28,6 +28,7 @@
 #include "torch_neuronx/csrc/core/dispatch/DtypeUtils.h"
 #include "torch_neuronx/csrc/core/rdma/RdmaManager.h"
 #include "torch_neuronx/csrc/core/runtime/NRTUtils.h"
+#include "torch_neuronx/csrc/core/streams/StreamConfig.h"
 #include "torch_neuronx/csrc/core/utils/PlatformUtils.h"
 #include "torch_neuronx/csrc/distributed/DistributedUtils.h"
 #include "torch_neuronx/csrc/distributed/DynamicCollectiveTiling.h"
@@ -104,13 +105,9 @@ c10::intrusive_ptr<NeuronWork> NeuronBackend::CreateWork(const std::vector<at::T
 }
 
 bool NeuronBackend::UseHostCC() const {
-  static const bool hostcc_enabled = []() {
-    const char* val = std::getenv("TORCH_NEURONX_ENABLE_HOST_CC");
-    return val != nullptr && val[0] != '\0' && std::string(val) != "0";
-  }();
   auto current = at::neuron::getCurrentNeuronStream();
   auto default_stream = at::neuron::getDefaultNeuronStream();
-  return (current != default_stream) && hostcc_enabled;
+  return current != default_stream && at::neuron::config::IsHostCCEnabled();
 }
 
 }  // namespace distributed
@@ -136,11 +133,7 @@ int64_t CollectiveBucketSizeBytes() {
 
 // Default policy (in-NEFF flow only).
 bool UseSplitDefaultForCurrentStream() {
-  static const bool hostcc_enabled = []() {
-    const char* val = std::getenv("TORCH_NEURONX_ENABLE_HOST_CC");
-    return val != nullptr && val[0] != '\0' && std::string(val) != "0";
-  }();
-  if (!hostcc_enabled) return true;
+  if (!at::neuron::config::IsHostCCEnabled()) return true;
   auto current = at::neuron::getCurrentNeuronStream();
   auto default_stream = at::neuron::getDefaultNeuronStream();
   return current == default_stream;
@@ -1348,13 +1341,6 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::alltoall(std::vector<at::Tensor>& 
                   group_size % 32 == 0,
               "unsupported world size ", group_size,
               ", supported sizes: 2, 4, 8, 16, or multiples of 32");
-  // Each replica group start rank must be a multiple of group size.
-  for (size_t i = 0; i < replica_groups.size(); ++i) {
-    const auto& g = replica_groups[i];
-    TORCH_CHECK(!g.empty() && g[0] % group_size == 0,
-                "replica group start ranks must be multiples of world size (", group_size,
-                "), found: group[", i, "] starts at rank ", g.empty() ? -1 : g[0]);
-  }
   auto input_shape = input_tensors[0].sizes();
 
   // Allocate temp concatenated result
@@ -1431,7 +1417,17 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::alltoall_base(
   // so we re-check the
   // world-size / replica-group constraints enforced by alltoall(), plus an LNC=2
   // guard for the NeuronSwitch (Trn3) fabric.
-  if (UseNkiAllToAllV()) {
+  //
+  // The kernel only serves replica groups made of whole devices (4 ranks per device
+  // under LNC=2): sizes 4, 8, 16, or multiples of 32. A 2-rank group is half a device;
+  // the kernel does not reject it, it hangs. Such groups take the padded even
+  // all-to-all below instead. This is what torch's ring-attention backward needs: it
+  // expresses the grad-KV rotation as a permute_tensor, i.e. an uneven
+  // all_to_all_single, on the context-parallel group.
+  const bool use_nki = UseNkiAllToAllV();
+  const bool nki_supports_group =
+      group_size == 4 || group_size == 8 || group_size == 16 || group_size % 32 == 0;
+  if (use_nki && nki_supports_group) {
     auto work =
         CreateWork({output_tensor}, {input_tensor}, c10d::OpType::ALLTOALL_BASE, opts.asyncOp);
     try {
@@ -1443,6 +1439,14 @@ c10::intrusive_ptr<c10d::Work> NeuronBackend::alltoall_base(
     }
     FinishWork(work, opts.asyncOp);
     return work;
+  }
+
+  if (use_nki) {
+    TORCH_WARN_ONCE("alltoall_base: uneven splits on a ", group_size,
+                    "-rank group cannot use the NKI all_to_all_v kernel (supported group "
+                    "sizes: 4, 8, 16, or multiples of 32); using the padded even all-to-all "
+                    "fallback. The fallback is only correct when every rank's largest send "
+                    "chunk has the same size, e.g. the permute_tensor pattern.");
   }
 
   // Uneven splits: pad each sender's chunks to max_in_size, do an even alltoall via the

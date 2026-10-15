@@ -108,11 +108,6 @@ class OperationExecutionEngine {
   //                  op->stream->runtime_queue_, no worker hop.
   void SubmitOperation(std::shared_ptr<OperationContext> op);
 
-  // Push a host-side ALLOC/DEALLOC hint through dispatch_queue_. Hints are
-  // consumed by the concat engine and dropped at transfer time — they never
-  // reach runtime_queue_.
-  void RecordHint(std::unique_ptr<OperationContext> hint, const NeuronStream& stream);
-
   void SubmitCompilationTask(OperationContext* operation);
 
   // Notify the runtime worker that an operation is ready
@@ -204,11 +199,8 @@ class OperationExecutionEngine {
   // Preprocessing helpers prologue attached with operations if needed
   void ProcessPreprocessingTask(OperationContext* operation);
 
-  // Shared completion logic for both sync and async compilation paths.
-  void HandleCompilationComplete(OperationContext* operation);
-
-  // Retires compile-only failures here; executable failures remain stream-ordered.
-  void RouteCompilationFailure(OperationContext* operation, const std::string& error);
+  void HandleCascadingCompilationComplete(const std::shared_ptr<ConcatenationState>& state);
+  bool HandleFailedCompilation(OperationContext* operation, StreamImpl* stream);
 
   // Handle execution failure for concatenated operations
   // Returns true if this was a concatenated op failure that requires retry
@@ -216,8 +208,21 @@ class OperationExecutionEngine {
                                           const std::string& error_msg);
 
  protected:
+  struct ConcatenationQueueDepthSnapshot {
+    int64_t current_depth;
+    bool needs_flush;
+
+    bool ShouldBypassConcatenation(size_t ready_count, int64_t low_threshold) const {
+      return static_cast<int64_t>(ready_count) + current_depth <= low_threshold;
+    }
+  };
+
+  ConcatenationQueueDepthSnapshot SnapshotConcatenationQueueDepth(bool shutdown) const;
+
   void ProcessPrepareTask(OperationContext* operation) noexcept;
   virtual void ProcessCompilationTask(OperationContext* operation);
+  void HandleCompilationComplete(OperationContext* operation);
+  void RouteCompilationFailure(OperationContext* operation, const std::string& error);
   void ProcessCompletions(StreamImpl* stream, const XUCompletionState& completed_seqs);
   bool ScheduleOperation(OperationContext* op, StreamImpl* stream);
   bool ScheduleAllocOperation(OperationContext* op, StreamImpl* stream);
@@ -227,8 +232,7 @@ class OperationExecutionEngine {
   bool DispatchAsyncExecutionTask(OperationContext* operation) noexcept;
 
   // Move ops onto each target stream->runtime_queue_ in the order of
-  // `partitioned_raws`. `owners` maps each raw pointer to its shared_ptr;
-  // kHint entries are dropped instead of transferred.
+  // `partitioned_raws`. `owners` maps each raw pointer to its shared_ptr.
   void MoveToRuntimeQueueInOrder(
       const std::list<OperationContext*>& partitioned_raws,
       std::unordered_map<OperationContext*, std::shared_ptr<OperationContext>>& owners);

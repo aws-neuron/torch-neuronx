@@ -25,6 +25,13 @@ from torch.fx.experimental.proxy_tensor import (
 )
 from torch.utils.checkpoint import _CachedTorchDispatchMode, _CachingTorchDispatchMode
 
+try:
+    # WrapComplexMode (framework complex decomposition) exists only in PyTorch >= 2.13.
+    # Older releases (e.g. 2.11) must still be able to import torch_neuronx.
+    from torch._subclasses.complex_tensor import WrapComplexMode
+except ImportError:
+    WrapComplexMode = None
+
 from .nki_kernel import backend_config_str, get_config, return_types_of
 from .utils import get_platform_target, map_external_dtype_to_torch
 
@@ -39,6 +46,12 @@ wrap_nki_enabled_default = True
 
 
 def is_wrap_nki_enabled() -> bool:
+    """Return the thread-local wrapped-NKI dispatch preference.
+
+    Returns:
+        bool: Current thread-local preference, or the process default
+        (``True``) when the calling thread has not set one.
+    """
     return getattr(wrap_nki_enabled, "value", wrap_nki_enabled_default)
 
 
@@ -99,6 +112,15 @@ def _cast_int64_args_to_int32(args: tuple, kwargs: dict):
     }
 
     def restore(result):
+        """Restore int64 dtypes in NKI kernel outputs.
+
+        Args:
+            result (Any): Kernel output to restore.
+
+        Returns:
+            Any: The output with immediate ``int32`` tensors converted to
+            ``int64``. Other values pass through unchanged.
+        """
         if isinstance(result, torch.Tensor):
             return result.to(torch.int64) if result.dtype == torch.int32 else result
         if isinstance(result, tuple | list):
@@ -113,8 +135,14 @@ def _cast_int64_args_to_int32(args: tuple, kwargs: dict):
 
 @contextlib.contextmanager
 def set_wrap_nki_enabled(enabled: bool) -> Generator[None, None, None]:
-    """If nki kernels annotated with @wrap_nki should dispatch via HOP
-    or go straight to the nki kernel execution.
+    """Temporarily set the thread-local wrapped-NKI dispatch preference.
+
+    Args:
+        enabled (bool): Value to assign to the thread-local preference.
+
+    Yields:
+        None: Control while the requested preference is active. The previous
+        value is restored on exit.
     """
     try:
         prev = is_wrap_nki_enabled()
@@ -125,6 +153,14 @@ def set_wrap_nki_enabled(enabled: bool) -> Generator[None, None, None]:
 
 
 class NKIRegistry:
+    """Manage NKI kernel registrations and compile-time argument mappings.
+
+    Note:
+        Non-tensor kernel arguments are embedded during tracing. Arguments that
+        cannot cross the Dynamo backend are registered here; compiled kernels
+        consume tensor inputs only.
+    """
+
     id_to_kernel: ClassVar[dict[int, TorchNativeKernel]] = {}
     kernel_to_id: ClassVar[dict[TorchNativeKernel, int]] = {}
     kernel_arg_names: ClassVar[dict[int, list[str]]] = {}
@@ -137,14 +173,30 @@ class NKIRegistry:
     and only consume tensor inputs.
     """
     constant_args: ClassVar[dict[int, dict[str, Any]]] = {}
+    # Per-kernel opt-in: the kernel returns its mutated inputs, so the eager
+    # lowering can drop the duplicate mutated-input outputs and write in place.
+    alias_in_place: ClassVar[dict[int, bool]] = {}
 
     def add_kernel(
         self,
         kernel: TorchNativeKernel,
         kernel_arg_names: list[str],
         kernel_default_args: dict[str, Any] | None = None,
+        alias_outputs_in_place: bool = False,
     ) -> int:
         # Returns index on the table
+        """Register an NKI kernel and return its stable identifier.
+
+        Args:
+            kernel (TorchNativeKernel): Kernel to register.
+            kernel_arg_names (list[str]): Kernel argument names in call order.
+            kernel_default_args (dict[str, Any], optional): Default arguments. Defaults to ``None``.
+            alias_outputs_in_place (bool, optional): Deduplicate returned mutated inputs so the NEFF
+                writes them in place. Defaults to ``False``.
+
+        Returns:
+            int: Existing or newly assigned kernel identifier.
+        """
         if kernel_default_args is None:
             kernel_default_args = {}
 
@@ -156,37 +208,105 @@ class NKIRegistry:
         self.kernel_to_id[kernel] = idx
         self.kernel_arg_names[idx] = kernel_arg_names
         self.kernel_default_args[idx] = kernel_default_args
+        self.alias_in_place[idx] = alias_outputs_in_place
         return idx
 
     def get_kernel(self, idx: int) -> TorchNativeKernel:
         # Returns the NKI kernel at the given index
+        """Retrieve a registered NKI kernel by identifier.
+
+        Args:
+            idx (int): Kernel identifier.
+
+        Returns:
+            TorchNativeKernel: Registered kernel.
+
+        Raises:
+            AssertionError: If the identifier is not registered.
+        """
         assert idx in self.id_to_kernel, f"{idx} not in kernel registry"
         return self.id_to_kernel[idx]
 
     def get_kernel_arg_names(self, idx: int) -> list[str]:
+        """Retrieve argument names for a registered NKI kernel.
+
+        Args:
+            idx (int): Kernel identifier.
+
+        Returns:
+            list[str]: Kernel argument names in call order.
+
+        Raises:
+            AssertionError: If the identifier has no argument names.
+        """
         assert idx in self.kernel_arg_names
         return self.kernel_arg_names[idx]
 
     def get_kernel_default_args(self, idx: int) -> dict[str, Any]:
+        """Retrieve default arguments for a registered NKI kernel.
+
+        Args:
+            idx (int): Kernel identifier.
+
+        Returns:
+            dict[str, Any]: Default values keyed by argument name.
+
+        Raises:
+            AssertionError: If the identifier has no default arguments.
+        """
         assert idx in self.kernel_default_args
         return self.kernel_default_args[idx]
 
+    def get_alias_outputs_in_place(self, idx: int) -> bool:
+        """Return whether a registered kernel aliases mutated outputs in place.
+
+        Args:
+            idx (int): Kernel identifier.
+
+        Returns:
+            bool: Stored opt-in value, or ``False`` when the identifier has no entry.
+        """
+        return self.alias_in_place.get(idx, False)
+
     def add_constant_args(self, args: dict[str, Any], hash_key: int | str):
+        """Store compile-time arguments under a lookup key.
+
+        Args:
+            args (dict[str, Any]): Compile-time arguments to store.
+            hash_key (int or str): Lookup key for the arguments.
+
+        Raises:
+            AssertionError: If ``hash_key`` is ``-1``.
+        """
         assert hash_key != -1
         self.constant_args[hash_key] = args
 
     def get_constant_args(self, hash_key: int | str) -> dict[str, Any]:
         # Returns the constant args
+        """Retrieve compile-time arguments by lookup key.
+
+        Args:
+            hash_key (int or str): Lookup key for the arguments.
+
+        Returns:
+            dict[str, Any]: Stored mapping object; mutating it changes the
+            registry entry.
+
+        Raises:
+            AssertionError: If the key is not registered.
+        """
         assert hash_key in self.constant_args
         return self.constant_args[hash_key]
 
     def reset_table(self) -> None:
         # Resets the table
+        """Clear all registered kernels and compile-time arguments."""
         self.id_to_kernel = {}
         self.kernel_to_id = {}
         self.kernel_arg_names = {}
         self.kernel_default_args = {}
         self.constant_args = {}
+        self.alias_in_place = {}
 
 
 kernel_registry = NKIRegistry()
@@ -196,7 +316,21 @@ kernel_registry = NKIRegistry()
 def register_nki_constant_args(
     arg_names: tuple[str, ...], replica_group_arg_names: tuple[str, ...], *args: Any
 ) -> str:
-    """Register compile-time NKI arguments before they cross the HOP boundary."""
+    """Register compile-time NKI arguments before they cross the HOP boundary.
+
+    Args:
+        arg_names (tuple[str, ...]): Names corresponding to ``args``.
+        replica_group_arg_names (tuple[str, ...]): Names whose values are
+            normalized to ``ReplicaGroup`` objects.
+        *args (Any): Compile-time argument values.
+
+    Returns:
+        str: Value-derived lookup key for the registered arguments.
+
+    Raises:
+        ValueError: If ``arg_names`` and ``args`` have different lengths.
+        KeyError: If a replica-group name is absent from ``arg_names``.
+    """
     constant_args = dict(zip(arg_names, args, strict=True))
     for name in replica_group_arg_names:
         value = constant_args[name]
@@ -211,6 +345,17 @@ def merge_tensor_constant_args(
     kernel_idx: int, args: Sequence[Any], arg_names: Sequence[str], constant_args_key: int
 ) -> Sequence[Any]:
     # Merges tensor args with constant args
+    """Merge runtime tensor arguments with registered compile-time arguments.
+
+    Args:
+        kernel_idx (int): Registered kernel identifier.
+        args (Sequence[Any]): Runtime argument values.
+        arg_names (Sequence[str]): Names corresponding to ``args``.
+        constant_args_key (int or str): Lookup key for compile-time arguments.
+
+    Returns:
+        dict[str, Any]: All kernel arguments in signature order.
+    """
     kernel_arg_names = kernel_registry.get_kernel_arg_names(kernel_idx)
     constant_args = kernel_registry.get_constant_args(constant_args_key)
     tensor_args_dict = merge_names_and_args(arg_names, args)
@@ -224,12 +369,24 @@ def merge_tensor_constant_args(
 
 
 def merge_names_and_args(arg_names: Sequence[str], args: Sequence[Any]):
+    """Map argument names to values in positional order.
+
+    Args:
+        arg_names (Sequence[str]): Argument names.
+        args (Sequence[Any]): Argument values.
+
+    Returns:
+        dict[str, Any]: Mapping of paired names and values, truncated when the
+        sequences have different lengths.
+    """
     return dict(zip(arg_names, args))  # noqa: B905
 
 
 # TODO: rename here and fx_importer to avoid confusion (e.g. NKIKernelHOP)
 # Used for wrapping a NKI Kernel
 class NKIKernelWrapper(HigherOrderOperator):
+    """Represent the higher-order operator used to dispatch registered NKI kernels."""
+
     def __init__(self) -> None:
         super().__init__("nki_kernel_wrapper", cacheable=True)
 
@@ -273,6 +430,21 @@ def get_kernel_config(
     arg_names: Sequence[str],
     constant_args_key: int,
 ):
+    """Specialize an NKI kernel configuration from argument metadata.
+
+    Args:
+        kernel_idx (int): Registered kernel identifier.
+        grid (NKIGridType): Kernel launch grid; when nonempty, its first value
+            specializes the kernel, while an empty grid remains gridless for NKI
+            to resolve.
+        args (Sequence[Any]): Runtime argument values.
+        arg_names (Sequence[str]): Names corresponding to ``args``.
+        constant_args_key (int or str): Registered key, or ``-1`` when constants
+            are inline.
+
+    Returns:
+        FrameworkConfig: Specialized NKI framework configuration.
+    """
     kernel = kernel_registry.get_kernel(kernel_idx)
     if constant_args_key == -1:
         merged_args = merge_names_and_args(arg_names, args)
@@ -288,8 +460,9 @@ def get_kernel_config(
                 meta_args[k] = torch.empty(arg.shape, dtype=arg.dtype, device="meta")
             else:
                 meta_args[k] = arg
-        lnc = grid[0] if grid else 1
-        dconfig = get_config(kernel[lnc], **meta_args)
+        # Keep a gridless launch gridless. A forced LNC=1 contradicts an LNC=2
+        # compile and fails with NCC_EVRF066. Let NKI resolve the grid instead.
+        dconfig = get_config(kernel[grid[0]] if grid else kernel, **meta_args)
     return dconfig
 
 
@@ -306,6 +479,25 @@ def nki_kernel_wrapper_meta(
     has_side_effect: bool = False,
     has_collectives: bool = False,
 ):
+    """Create meta outputs for a registered NKI kernel.
+
+    Args:
+        kernel_idx (int): Registered kernel identifier.
+        grid (NKIGridType): Kernel launch grid.
+        backend_config (str): Dispatch-schema field accepted and ignored by meta execution.
+        operand_output_aliases (dict[int, int]): Dispatch-schema field accepted and ignored.
+        args (Sequence[Any]): Kernel argument values.
+        arg_names (Sequence[str]): Names corresponding to ``args``.
+        constant_args_key (int or str): Registered constant-argument key,
+            or ``-1``.
+        has_side_effect (bool, optional): Dispatch-schema field accepted and ignored.
+            Defaults to ``False``.
+        has_collectives (bool, optional): Dispatch-schema field accepted and ignored.
+            Defaults to ``False``.
+
+    Returns:
+        torch.Tensor or tuple[torch.Tensor, ...]: Meta outputs described by the kernel.
+    """
     dconfig = get_kernel_config(kernel_idx, grid, args, arg_names, constant_args_key)
     return_types = return_types_of(dconfig)
 
@@ -320,6 +512,19 @@ def nki_kernel_wrapper_meta(
 
 
 def get_dconfig_and_tensor_args(kernel_idx, grid, args, arg_names, constant_args_key):
+    """Separate tensor and constant arguments and specialize the NKI kernel.
+
+    Args:
+        kernel_idx (int): Registered kernel identifier.
+        grid (NKIGridType): Kernel launch grid.
+        args (Sequence[Any]): Kernel argument values.
+        arg_names (Sequence[str]): Names corresponding to ``args``.
+        constant_args_key (int or str): Registered key, or ``-1``.
+
+    Returns:
+        tuple[FrameworkConfig, Sequence[Any], Sequence[str], int | str]: Specialized
+        configuration, tensor values, tensor names, and constant-argument key.
+    """
     if constant_args_key == -1:
         tensor_args = []
         tensor_arg_names = []
@@ -353,6 +558,25 @@ def nki_kernel_wrapper_dense(
     has_side_effect: bool = False,
     has_collectives: bool = False,
 ):
+    """Execute a registered NKI kernel through the torch-mlir dispatch path.
+
+    Args:
+        kernel_idx (int): Registered kernel identifier.
+        grid (NKIGridType): Kernel launch grid.
+        backend_config (str): Value replaced by kernel specialization.
+        operand_output_aliases (dict[int, int]): Aliases replaced by specialization.
+        args (Sequence[Any]): Kernel argument values.
+        arg_names (Sequence[str]): Names corresponding to ``args``.
+        constant_args_key (int or str): Registered key, or ``-1``.
+        has_side_effect (bool, optional): Accepted and ignored. Defaults to ``False``.
+        has_collectives (bool, optional): Accepted and ignored. Defaults to ``False``.
+
+    Returns:
+        torch.Tensor or tuple[torch.Tensor, ...]: Configured kernel outputs.
+
+    Note:
+        Specialized input-to-output aliases mutate the corresponding input tensors.
+    """
     (
         dconfig,
         tensor_args,
@@ -397,6 +621,27 @@ def nki_kernel_wrapper_fake_tensor_mode(
     has_side_effect: bool = False,
     has_collectives: bool = False,
 ) -> Any:
+    """Create fake outputs for a registered NKI kernel.
+
+    Args:
+        mode (FakeTensorMode): Active fake tensor mode.
+        kernel_idx (int): Registered kernel identifier.
+        grid (NKIGridType): Kernel launch grid.
+        backend_config (str): Dispatch-schema field accepted and ignored.
+        operand_output_aliases (dict[int, int]): Dispatch-schema field accepted and ignored.
+        args (Sequence[Any]): Kernel argument values.
+        arg_names (Sequence[str]): Names corresponding to ``args``.
+        constant_args_key (int or str): Registered constant-argument key,
+            or ``-1``.
+        has_side_effect (bool, optional): Dispatch-schema field accepted and ignored.
+            Defaults to ``False``.
+        has_collectives (bool, optional): Dispatch-schema field accepted and ignored.
+            Defaults to ``False``.
+
+    Returns:
+        Any: Fake outputs on the first tensor argument's device, or on the
+        Neuron device when no tensor argument is present.
+    """
     dconfig = get_kernel_config(kernel_idx, grid, args, arg_names, constant_args_key)
     return_types = return_types_of(dconfig)
     # Match device of input tensors — default to neuron
@@ -432,6 +677,26 @@ def nki_kernel_wrapper_proxy_torch_dispatch_mode(
     has_side_effect: bool = False,
     has_collectives: bool = False,
 ):
+    """Trace a registered NKI kernel into a proxy graph.
+
+    Args:
+        proxy_mode (ProxyTorchDispatchMode): Active proxy tracing mode.
+        kernel_idx (int): Registered kernel identifier.
+        grid (NKIGridType): Kernel launch grid.
+        backend_config (str): Configuration accepted and replaced by specialization.
+        operand_output_aliases (dict[int, int]): Aliases accepted and replaced by specialization.
+        args (Sequence[Any]): Kernel argument values.
+        arg_names (Sequence[str]): Names corresponding to ``args``.
+        constant_args_key (int or str): Registered constant-argument key,
+            or ``-1``.
+        has_side_effect (bool, optional): Preserve the call under dead-code elimination.
+            Defaults to ``False``.
+        has_collectives (bool, optional): Flag accepted and replaced by specialization.
+            Defaults to ``False``.
+
+    Returns:
+        Any: Kernel outputs associated with the traced proxy.
+    """
     (
         dconfig,
         tensor_args,
@@ -472,6 +737,65 @@ def nki_kernel_wrapper_proxy_torch_dispatch_mode(
     return track_tensor_tree(out, out_proxy, constant=None, tracer=proxy_mode.tracer)
 
 
+def nki_kernel_wrapper_wrap_complex_mode(
+    mode: "WrapComplexMode",
+    *,
+    kernel_idx: int,
+    grid: NKIGridType,
+    backend_config: str,
+    operand_output_aliases: dict[int, int],
+    args: Sequence[Any],
+    arg_names: Sequence[str],
+    constant_args_key: int,
+    **hop_kwargs: Any,
+) -> Any:
+    """Redispatch a real-valued NKI kernel through complex decomposition.
+
+    Args:
+        mode (WrapComplexMode): Already-popped complex mode accepted for dispatch.
+        kernel_idx (int): Registered kernel identifier.
+        grid (NKIGridType): Kernel launch grid.
+        backend_config (str): Serialized backend configuration.
+        operand_output_aliases (dict[int, int]): Tensor-input to output alias mapping.
+        args (Sequence[Any]): Kernel argument values.
+        arg_names (Sequence[str]): Names corresponding to ``args``.
+        constant_args_key (int or str): Registered constant-argument key.
+        **hop_kwargs (Any): Remaining HOP options forwarded unchanged.
+
+    Returns:
+        Any: Result from the next NKI kernel dispatch handler.
+
+    Raises:
+        NotImplementedError: If any tensor argument has a complex dtype.
+    """
+    complex_inputs = [
+        name
+        for name, arg in zip(arg_names, args, strict=False)
+        if isinstance(arg, torch.Tensor) and arg.is_complex()
+    ]
+    if complex_inputs:
+        raise NotImplementedError(
+            f"NKI kernel {kernel_registry.get_kernel(kernel_idx).__name__} received "
+            f"complex tensor input(s) {complex_inputs}; NKI kernels support real dtypes "
+            "only. Convert to real (e.g. torch.view_as_real) before the kernel call."
+        )
+
+    return nki_kernel_wrapper(
+        kernel_idx=kernel_idx,
+        grid=grid,
+        backend_config=backend_config,
+        operand_output_aliases=operand_output_aliases,
+        args=args,
+        arg_names=arg_names,
+        constant_args_key=constant_args_key,
+        **hop_kwargs,
+    )
+
+
+if WrapComplexMode is not None:
+    nki_kernel_wrapper.py_impl(WrapComplexMode)(nki_kernel_wrapper_wrap_complex_mode)
+
+
 @nki_kernel_wrapper.py_functionalize_impl
 def nki_kernel_wrapper_functionalize(
     ctx: "BaseFunctionalizeAPI",
@@ -485,6 +809,26 @@ def nki_kernel_wrapper_functionalize(
     has_side_effect: bool = False,
     has_collectives: bool = False,
 ) -> None:
+    """Redispatch a registered NKI kernel through functionalization.
+
+    Args:
+        ctx (BaseFunctionalizeAPI): Functionalization context.
+        kernel_idx (int): Registered kernel identifier.
+        grid (NKIGridType): Kernel launch grid.
+        backend_config (str): Configuration accepted and replaced by specialization.
+        operand_output_aliases (dict[int, int]): Aliases accepted and replaced by specialization.
+        args (Sequence[Any]): Kernel argument values.
+        arg_names (Sequence[str]): Names corresponding to ``args``.
+        constant_args_key (int or str): Registered constant-argument key,
+            or ``-1``.
+        has_side_effect (bool, optional): Preserve the call under dead-code elimination.
+            Defaults to ``False``.
+        has_collectives (bool, optional): Flag accepted and replaced by specialization.
+            Defaults to ``False``.
+
+    Returns:
+        Any: Functionalized kernel outputs with declared mutations committed.
+    """
     unwrapped_args = [
         ctx.unwrap_tensors(arg) if isinstance(arg, torch.Tensor) else arg for arg in args
     ]
@@ -534,6 +878,24 @@ nki_kernel_wrapper.fallthrough(DispatchKey.AutogradCPU)
 
 
 class NKIHOPCaller:
+    """Represent a callable registered NKI kernel and its launch configuration.
+
+    Args:
+        kernel_idx (int or None): Registered kernel identifier.
+        grid (NKIGridType or None): Kernel launch grid.
+        kernel_arg_names (list[str]): Kernel argument names in call order.
+        kernel_default_args (dict[str, Any]): Default values keyed by argument name.
+        has_side_effect (bool, optional): Whether the call has side effects.
+            Defaults to ``False``.
+
+    Note:
+        Outside compilation, eager dispatch uses the C++ path when enabled, at
+        least one tensor is present, and every tensor input is a real Neuron
+        tensor. That path rejects complex tensors, applies aliases by copy-back
+        unless the NEFF already writes in place, and returns one tensor or a
+        tuple. Graph capture uses the higher-order operator path.
+    """
+
     kernel_arg_names: list[str]
     kernel_default_args: dict[str, Any]
     _is_nki_kernel: bool
@@ -680,31 +1042,50 @@ class NKIHOPCaller:
 # This will execute the kernel registration during tracing
 # and fold it to the constant kernel idx.
 @torch._dynamo.assume_constant_result
-def register_kernel_to_torch(nki_func, k_fields, arg_names, kernel_default_args, **kwargs):
+def register_kernel_to_torch(
+    nki_func, k_fields, arg_names, kernel_default_args, alias_outputs_in_place=False, **kwargs
+):
+    """Construct and register a platform-specific Torch native NKI kernel.
+
+    Args:
+        nki_func (Callable): NKI kernel function.
+        k_fields (dict[str, Any]): Torch native kernel dataclass fields.
+        arg_names (list[str]): Kernel argument names in call order.
+        kernel_default_args (dict[str, Any]): Default values keyed by argument name.
+        alias_outputs_in_place (bool, optional): Deduplicate returned mutated inputs so the NEFF
+            writes them in place. Defaults to ``False``.
+        **kwargs (Any): Additional ``TorchNativeKernel`` options.
+
+    Returns:
+        int: Existing or newly assigned kernel identifier.
+    """
     kernel = TorchNativeKernel(nki_func, **k_fields, target=get_platform_target(), **kwargs)
-    return kernel_registry.add_kernel(kernel, arg_names, kernel_default_args)
+    return kernel_registry.add_kernel(
+        kernel, arg_names, kernel_default_args, alias_outputs_in_place=alias_outputs_in_place
+    )
 
 
-def wrap_nki(nki_kernel, has_side_effect: bool = False, **kwargs) -> Any:
-    """Allows capture of a nki kernel into a graph via torch.compile
+def wrap_nki(
+    nki_kernel, has_side_effect: bool = False, alias_outputs_in_place: bool = False, **kwargs
+) -> Any:
+    """Wrap an NKI kernel for eager execution and capture by the Dynamo backend.
 
-    These technologies perform Dispatcher-based tracing (via
-    ``__torch_dispatch__``) and cannot see calls to raw nki kernels.
-    The ``wrap_nki`` API wraps a nki kernel into a callable that
-    can actually be traced into a graph.
+    Raw NKI calls are invisible to dispatcher-based tracing; the wrapper is traceable into a graph.
 
-    ``has_side_effect=True`` marks the lowered custom call as side-effecting so
-    it survives dead-code elimination even when its result is unused. Needed for
-    kernels whose effect is the call itself (e.g. a bounds check that faults via
-    ``oob_mode.error``); otherwise the optimizer drops the call and the effect
-    never runs.
+    Args:
+        nki_kernel (TorchNativeKernel): NKI kernel to wrap.
+        has_side_effect (bool, optional): Preserve calls whose effect is the call itself under
+            dead-code elimination. Defaults to ``False``.
+        alias_outputs_in_place (bool, optional): Deduplicate returned mutated inputs so the NEFF
+            writes them in place. Defaults to ``False``.
+        **kwargs (Any): Additional ``TorchNativeKernel`` options.
 
-    Note on int64: ``wrap_nki`` is the kernel-compile primitive and
-    deliberately has no policy gating. It just compiles and runs whatever
-    NKI emits. Pre-NKI-151, NKI silently demotes int64 to int32 inside
-    its lowering, so direct ``wrap_nki(kernel)(int64_x)`` calls return
-    int32 with int32-precision values. Use ``@nki_op(...)`` for the
-    int64 policy contract (cast/raise/warn per ``Int64Mode``).
+    Returns:
+        NKIHOPCaller: Callable wrapper that supports launch-grid indexing.
+
+    Note:
+        No int64 policy is applied. Before NKI-151, direct calls silently demote int64 inputs
+        and return int32 outputs with int32-precision values. Use ``nki_op`` for policy handling.
     """
     sig = inspect.signature(nki_kernel.func)
     arg_names = list(sig.parameters.keys())
@@ -716,7 +1097,12 @@ def wrap_nki(nki_kernel, has_side_effect: bool = False, **kwargs) -> Any:
     k_fields = {f.name: getattr(nki_kernel, f.name) for f in fields(nki_kernel) if f.name != "func"}
 
     kernel_idx = register_kernel_to_torch(
-        nki_kernel.func, k_fields, arg_names, kernel_default_args, **kwargs
+        nki_kernel.func,
+        k_fields,
+        arg_names,
+        kernel_default_args,
+        alias_outputs_in_place=alias_outputs_in_place,
+        **kwargs,
     )
 
     return NKIHOPCaller(
@@ -728,26 +1114,42 @@ def nki_op(
     name: str,
     fn: Callable | None = None,
     mutates_args: str | Iterable[str] = {},
+    fake_fn: Callable | None = None,
 ) -> Callable:
-    """Create a custom operator whose implementation is backed by NKI kernels.
-
-    Similar to triton_op but for Neuron NKI kernels.
+    """Create a PyTorch custom operator backed by an NKI implementation.
 
     Args:
-        name (str): A name for the custom op that looks like "{namespace}::{name}",
-            e.g. "mylib::my_add".
-        mutates_args (Iterable[str] or "unknown"): The names of args that the function mutates.
+        name (str): Qualified operator name in ``namespace::name`` form.
+        fn (Callable, optional): Function to register immediately. Defaults to ``None``.
+        mutates_args (Iterable[str] or str, optional): Names of arguments that ``fn`` mutates,
+            or ``"unknown"``. Defaults to ``{}``.
+        fake_fn (Callable, optional): Fake-tensor implementation; ``fn`` is used when omitted.
+            Defaults to ``None``.
+
+    Returns:
+        Callable: Decorator when ``fn`` is ``None``; otherwise the registered custom operator.
 
     Example::
-        >>> @nki_op("mylib::add", mutates_args={})
-        >>> def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        >>>     output = torch.empty_like(x)
-        >>>     wrap_nki(add_kernel)(x, y, output)
-        >>>     return output
+
+        >>> impl = torch_neuronx.wrap_nki(add_kernel)  # doctest: +SKIP
+        >>> @torch_neuronx.nki_op("mylib::add", mutates_args={})  # doctest: +SKIP
+        >>> def add(x, y): return impl(x, y)  # doctest: +SKIP
+
+    Note:
+        Pass ``fake_fn`` when ``fn`` cannot run on fake or meta tensors.
     """
 
     def dec(fn: Callable):
         # All inner wrap_nki/nki.jit calls go through NkiDispatchEager C++ dispatch.
+        """Register a function as the configured NKI-backed custom operator.
+
+        Args:
+            fn (Callable): Operator implementation to register.
+
+        Returns:
+            Callable: Registered PyTorch custom operator.
+        """
+
         def backend_fn(*args, **kwargs):
             # Int64 mode policy gate. NKI's kernel language doesn't yet
             # support int64 (NKI-151); kernels lower int64 to int32
@@ -770,6 +1172,18 @@ def nki_op(
             # neuronx-cc LegalizeInt64 pass that the regular DOWNCAST
             # contract relies on; NKI doesn't have that pass, so the
             # framework provides the equivalent at the kernel boundary.
+            """Apply int64 policy handling and invoke the NKI-backed implementation.
+
+            Args:
+                *args (Any): Positional operator arguments.
+                **kwargs (Any): Keyword operator arguments.
+
+            Returns:
+                Any: Result from the registered implementation.
+
+            Raises:
+                NotImplementedError: If strict native int64 mode rejects NKI demotion.
+            """
             if _has_int64_input(args, kwargs):
                 from torch_neuronx.int64_policy import (
                     _NKI_INT64_NATIVE,
@@ -836,13 +1250,27 @@ def nki_op(
             mutates_args=mutates_args,
             schema=infer_schema(fn, mutates_args=mutates_args),
         )
-        # We require that the user pass us a function that is make_fx traceable,
-        # so we can just register it as the Fake/meta kernel.
-        result.register_fake(fn)
+        # Most ops pass a make_fx traceable function, so it doubles as the
+        # Fake/meta kernel. An op whose body calls a NKI kernel directly is not
+        # traceable: running it on a meta tensor tries to compile the kernel and
+        # raises. Such an op must pass fake_fn.
+        result.register_fake(fake_fn if fake_fn is not None else fn)
         from torch._subclasses.functional_tensor import FunctionalTensorMode
 
         # This allows torch.compile to trace the internal function
         def functional_decomp(mode, op, types, args, kwargs):
+            """Redispatch supported functional tensor inputs to the source function.
+
+            Args:
+                mode (FunctionalTensorMode): Active functional tensor mode.
+                op (Callable): Dispatched operator accepted for protocol compatibility and ignored.
+                types (Sequence[type]): Participating tensor subclass types.
+                args (Sequence[Any]): Positional operator arguments.
+                kwargs (dict[str, Any]): Keyword operator arguments.
+
+            Returns:
+                Any: Source-function result or ``NotImplemented`` for unsupported subclasses.
+            """
             import torch._subclasses
 
             unrecognized_types = [

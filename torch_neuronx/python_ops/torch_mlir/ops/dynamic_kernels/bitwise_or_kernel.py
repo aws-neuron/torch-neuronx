@@ -17,15 +17,19 @@ import nki.language as nl
 
 @nki.jit()
 def bitwise_or_kernel(input_a, input_b, num_m_tiles):
-    """
-    Elementwise bitwise or on the int16-viewed operands: output = input_a | input_b.
+    """Apply bitwise OR to int16-packed Boolean-mask operands.
 
     Args:
-        input_a: [m_static, hidden_half] int16 on HBM (a bool[m_static, H] view)
-        input_b: [m_static, hidden_half] int16 on HBM (a bool[m_static, H] view)
-        num_m_tiles: [1, 1] int32 — number of 128-row tiles per program
+        input_a (tensor): Int16 view of the first ``bool[m_static, H]`` HBM operand.
+        input_b (tensor): Int16 view of the second ``bool[m_static, H]`` HBM operand.
+        num_m_tiles (tensor): Int32 ``[1, 1]`` count of 128-row tiles per program.
+
     Returns:
-        output: [m_static, hidden_half] int16 on HBM (viewed back to bool by caller)
+        tensor: Packed int16 result for the caller to view as Boolean values.
+
+    Note:
+        Packing is bit-exact for Boolean bytes and requires an even hidden width.
+        Rows outside the selected tiles remain unspecified in the static-capacity result.
     """
     m_static, hidden = input_a.shape
 
@@ -56,6 +60,11 @@ def bitwise_or_kernel(input_a, input_b, num_m_tiles):
     nisa.memset(m_tile_start, 0.0)
 
     def body(_i):
+        """Apply packed bitwise OR for one interleaved row tile.
+
+        Args:
+            _i (int): Loop index required by ``fori_loop`` and otherwise unused.
+        """
         for seg in range(len(h_starts)):
             h_start = h_starts[seg]
             h_width = h_widths[seg]

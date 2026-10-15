@@ -14,11 +14,21 @@ from torch.distributed._functional_collectives import all_reduce
 
 
 class SimpleModel(torch.nn.Module):
+    """Apply a linear layer followed by a functional all-reduce."""
+
     def __init__(self):
         super().__init__()
         self.linear = torch.nn.Linear(64, 64)
 
     def forward(self, x):
+        """Run the linear layer and sum its output across all processes.
+
+        Args:
+            x (torch.Tensor): Input tensor with a trailing dimension of 64.
+
+        Returns:
+            torch.Tensor: Sum-reduced linear-layer output.
+        """
         x = self.linear(x)
         x = all_reduce(x, "sum", list(range(dist.get_world_size())))
         return x
@@ -26,6 +36,7 @@ class SimpleModel(torch.nn.Module):
 
 def main():
     # Initialize distributed backend
+    """Run the compiled model across a ``neuron`` distributed process group."""
     dist.init_process_group("neuron")
     rank = dist.get_rank()
     torch.neuron.set_device(rank)

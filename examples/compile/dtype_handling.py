@@ -14,11 +14,21 @@ import torch
 
 @torch.compile(backend="neuron", dynamic=False)
 def add_tensors(x, y):
+    """Add two tensors through the Dynamo backend.
+
+    Args:
+        x (torch.Tensor): First input tensor.
+        y (torch.Tensor): Second input tensor.
+
+    Returns:
+        torch.Tensor: Element-wise sum using PyTorch type promotion.
+    """
     return x + y
 
 
 def main():
     # int64 inputs produce int64 outputs
+    """Demonstrate compiled addition for 64-bit and 32-bit dtypes."""
     x_int64 = torch.tensor([1, 2, 3], dtype=torch.int64, device="neuron")
     y_int64 = torch.tensor([4, 5, 6], dtype=torch.int64, device="neuron")
     result_int64 = add_tensors(x_int64, y_int64)

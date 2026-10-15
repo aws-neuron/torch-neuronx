@@ -31,6 +31,9 @@ struct LoweringResult {
   // Which flattened inputs the HLO actually uses
   std::vector<int> kept_input_indices;
 
+  // Number of inputs in the compiled IR. -1 preserves legacy filtering.
+  int64_t ir_input_count = -1;
+
   // Which original outputs the HLO produces (for reconstruction)
   std::vector<int> kept_output_indices;
 
@@ -91,6 +94,8 @@ inline void BindLoweringResult(py::module_& m) {
             lr->cache_key = val.cast<std::string>();
           else if (name == "kept_input_indices")
             lr->kept_input_indices = val.cast<std::vector<int>>();
+          else if (name == "ir_input_count")
+            lr->ir_input_count = val.cast<int64_t>();
           else if (name == "kept_output_indices")
             lr->kept_output_indices = val.cast<std::vector<int>>();
           else if (name == "output_specs")
@@ -129,6 +134,7 @@ inline void BindLoweringResult(py::module_& m) {
       .def_readwrite("stablehlo_bytes", &LoweringResult::stablehlo_bytes)
       .def_readwrite("cache_key", &LoweringResult::cache_key)
       .def_readwrite("kept_input_indices", &LoweringResult::kept_input_indices)
+      .def_readwrite("ir_input_count", &LoweringResult::ir_input_count)
       .def_readwrite("kept_output_indices", &LoweringResult::kept_output_indices)
       .def_readwrite("output_specs", &LoweringResult::output_specs)
       .def_readwrite("original_output_specs", &LoweringResult::original_output_specs)

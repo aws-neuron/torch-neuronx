@@ -197,6 +197,33 @@ def run_partial_group_alltoall_base_test(rank, world_size, kwargs):
     dist.barrier()
 
 
+def run_strided_group_alltoall_base_test(rank, world_size, kwargs):
+    """Every rank runs alltoall_base in its own strided group.
+
+    The groups partition the world: rank i joins the ranks i + k * stride. The runtime needs
+    every rank to load the collective. On trn2 a group that spans two chips fails in the
+    replica-group validation when another rank stays idle.
+    """
+    stride = kwargs["stride"]
+    groups = [list(range(i, world_size, stride)) for i in range(stride)]
+    # dist.new_group is collective. Every rank must create every group.
+    process_groups = [dist.new_group(g) for g in groups]
+    group_ranks = groups[rank % stride]
+    group_size = len(group_ranks)
+    # On trn2 a cross-chip pair needs a chunk of 4*k elements. The runtime asserts otherwise.
+    chunk_size = 4
+
+    input_tensor = torch.zeros(group_size * chunk_size, dtype=torch.float32)
+    for i in range(group_size):
+        input_tensor[i * chunk_size : (i + 1) * chunk_size] = rank * 10 + i + 1
+    input_tensor = input_tensor.to("neuron")
+    output_tensor = torch.zeros_like(input_tensor)
+
+    dist.all_to_all_single(output_tensor, input_tensor, group=process_groups[rank % stride])
+
+    verify_alltoall_base_results(world_size, rank, output_tensor, input_tensor, group_ranks)
+
+
 def run_5gb_tensor_test(rank, world_size, kwargs):
     """Test alltoall_base with 5GB tensor (~1.25 billion float32 elements)."""
     tensor_size = 1250000000  # ~5GB for float32
@@ -316,6 +343,12 @@ class TestAllToAllBase(BaseCollectiveOpTest):
         """Test alltoall_base with split sizes (all 1s)."""
         self.distributed_tester.run_test(run_split_sizes_alltoall_base_test)
 
+    @pytest.mark.xfail(
+        reason=(
+            "The NKI version in PR CI supports all_to_all_v receive displacements "
+            "only on NeuronSwitch-based instances; remove after the Trn2 artifacts are updated"
+        )
+    )
     def test_uneven_split_sizes_alltoall_base(self):
         """Test alltoall_base with uneven split sizes (permute_tensor / ring-attention pattern)."""
         self.distributed_tester.run_test(run_uneven_split_sizes_alltoall_base_test)
@@ -377,3 +410,49 @@ class TestAllToAllBaseWorldSize2(BaseCollectiveOpTest):
             run_uneven_split_sizes_alltoall_base_test,
             use_nki="0",
         )
+
+    @pytest.mark.parametrize("use_nki", [None, "1"])
+    def test_uneven_split_sizes_alltoall_base_routes_around_nki(self, use_nki):
+        """A 2-rank group is half a device, which the NKI all_to_all_v kernel cannot serve.
+
+        With the NKI path enabled (default or explicit) the backend must route the uneven
+        split to the padded fallback instead of dispatching the kernel, which hangs. This is
+        the pattern torch's ring-attention backward emits on a context-parallel group.
+        """
+        self.distributed_tester.run_test(
+            run_uneven_split_sizes_alltoall_base_test,
+            use_nki=use_nki,
+        )
+
+
+@pytest.mark.neuron_cores(8)
+class TestAllToAllBasePartialGroups(BaseCollectiveOpTest):
+    """alltoall_base over partial groups of an 8-rank world.
+
+    alltoall_base delegates to NeuronBackend::alltoall for both the even-split fast path and
+    the padded uneven-split path, so it inherits alltoall's group support and needs no group
+    validation of its own: groups whose start rank is not a multiple of the group size work
+    (they were rejected before that check was removed), and the shapes the device
+    interconnect cannot form are rejected by the runtime -- pinned for both entry points by
+    test_alltoall.py::TestAllToAllWorldSize8::test_alltoall_partial_group_unsupported_topology.
+    """
+
+    @property
+    def world_size(self) -> int:
+        return 8
+
+    @pytest.mark.parametrize("partial_group", [[0, 1, 2, 3], [1, 3]])
+    def test_partial_group_alltoall_base(self, partial_group):
+        """Test alltoall_base within a partial group, aligned and unaligned start ranks."""
+        self.distributed_tester.run_test(
+            run_partial_group_alltoall_base_test,
+            partial_group=partial_group,
+        )
+
+    def test_alltoall_base_strided_group(self):
+        """Pairs of rank i and rank i + 4 across two chips.
+
+        On trn2 the fabric links rank i to rank i + 4 only. The pair works only when every
+        rank in the world takes part in some group, so all four pairs run at once.
+        """
+        self.distributed_tester.run_test(run_strided_group_alltoall_base_test, stride=4)

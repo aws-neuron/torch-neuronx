@@ -15,7 +15,12 @@ logger = logging.getLogger(__name__)
 
 
 class ArgumentProcessor:
-    """Processes and prepares arguments for Neuron operations."""
+    """Process arguments for Neuron operations.
+
+    Args:
+        static_argnames (tuple[str, ...], optional): Keyword argument names to keep
+            static. Defaults to ``None``.
+    """
 
     def __init__(
         self,
@@ -31,18 +36,37 @@ class ArgumentProcessor:
 
     @property
     def static_argnums(self) -> tuple[int, ...]:
-        """Get static_argnums."""
+        """Return the configured static positional argument indices.
+
+        Returns:
+            tuple[int, ...]: Static positional argument indices.
+
+        Raises:
+            RuntimeError: If the indices have not been configured.
+        """
         if self._static_argnums is None:
             raise RuntimeError("static_argnums must be set before use")
         return self._static_argnums
 
     @static_argnums.setter
     def static_argnums(self, value: tuple[int, ...]) -> None:
-        """Set static_argnums."""
+        """Set the static positional argument indices.
+
+        Args:
+            value (tuple[int, ...]): Indices to store.
+        """
         self._static_argnums = value
 
     def preprocess_kwargs(self, kwargs: dict) -> dict:
-        """Preprocess kwargs by converting non-static int/float to tensors."""
+        """Convert dynamic numeric keyword arguments to Neuron tensors.
+
+        Args:
+            kwargs (dict): Keyword arguments to process.
+
+        Returns:
+            dict: Keyword arguments with exact ``int`` and ``float`` values converted
+            to ``int32`` and ``float32`` tensors on the Neuron device, respectively.
+        """
         if not kwargs:
             return kwargs
 
@@ -62,23 +86,27 @@ class ArgumentProcessor:
     def preprocess_inputs(
         self, inputs: tuple, scalar_to_tensor: bool = False, convert_int64: bool = True
     ) -> tuple:
-        """Preprocess inputs for Neuron compatibility.
-
-        Converts tensors, handles nested structures, maps torch.dtype to scalar type
-        integers, and optionally converts scalar values to tensors.
+        """Prepare positional inputs for Neuron compatibility.
 
         Args:
-            inputs: Original input tensors, scalars, and nested structures
-            scalar_to_tensor: If True, convert int/float scalars to tensors
-                Defaults to False.
-            convert_int64: If True, convert int64 to int32 via convert_for_neuron.
-                If False, skip int64 conversion (MLIR handles S64 natively).
-                Defaults to True.
+            inputs (tuple): Input tensors, scalars, dtypes, and nested structures.
+            scalar_to_tensor (bool, optional): Convert ``int`` and ``float`` scalars
+                to tensors. Defaults to ``False``.
+            convert_int64 (bool, optional): Apply enabled ``int64`` compatibility
+                conversion. Defaults to ``True``; packed mode retains logical ``int64``.
 
         Returns:
-            Tuple of preprocessed inputs
-        """
+            tuple: Inputs converted for Neuron lowering while static inputs remain unchanged.
 
+        Raises:
+            RuntimeError: If static positional indices have not been configured.
+            OverflowError: If packed-mode checking finds ``int64`` values outside ``int32``.
+
+        Note:
+            Nested sequences become tuples, and ``torch.dtype`` values become scalar-type
+            integers. Scalar conversions use the first top-level non-scalar tensor's device,
+            or the current Neuron device when no such tensor exists.
+        """
         # Prologues are enabled by default, but disabled if:
         # 1. TORCH_NEURONX_ENABLE_PROLOGUE env var is "0" or "false"
         # 2. OR sync mode is enabled
@@ -106,7 +134,14 @@ class ArgumentProcessor:
             scalar_device = None
 
         def preprocess_value(inp):
-            """preprocess a single input"""
+            """Prepare one input value for Neuron compatibility.
+
+            Args:
+                inp (object): Input value to process.
+
+            Returns:
+                object: Converted tensor, tuple, scalar-type integer, or original value.
+            """
             if isinstance(inp, torch.Tensor):
                 # Move CPU scalar tensors to target device (matches CUDA semantics)
                 if target_device and inp.device.type == "cpu" and inp.ndim == 0:
@@ -135,13 +170,17 @@ class ArgumentProcessor:
         )
 
     def generate_input_signature(self, inputs: tuple) -> tuple:
-        """Generate a signature for inputs (used for caching).
+        """Build a cache signature from positional inputs.
 
         Args:
-            inputs: Input tensors and scalars
+            inputs (tuple): Input tensors and scalar values.
 
         Returns:
-            Tuple representing the input signature
+            tuple: Shape-dtype pairs for top-level tensors, values for static
+            non-tensors, and type names for other runtime values.
+
+        Raises:
+            RuntimeError: If static indices are unset when a non-tensor is classified.
         """
         signature_parts = []
 
@@ -160,19 +199,33 @@ class ArgumentProcessor:
     def prepare_execution_inputs(
         self, inputs: tuple, device: torch.device
     ) -> dict[str, torch.Tensor]:
-        """Prepare input dictionary for NEFF execution.
+        """Build the tensor input mapping for NEFF execution.
 
         Args:
-            inputs: Preprocessed inputs
-            device: Target device
+            inputs (tuple): Preprocessed positional inputs.
+            device (torch.device): Target execution device.
 
         Returns:
-            Dictionary mapping input names to tensors
+            dict[str, torch.Tensor]: Sequential names mapped to converted top-level
+            tensors, one-level sequence tensor or numeric elements, and dynamic scalars.
+
+        Raises:
+            RuntimeError: If static indices are unset when a non-tensor is classified.
+            OverflowError: If packed-mode checking finds ``int64`` values outside ``int32``.
         """
 
         def to_device(tensor: torch.Tensor) -> torch.Tensor:
             # Match device conversion semantics of CUDA, where input scalar (0-dimensional) CPU
             # tensors are automatically moved to the correct device
+            """Move an eligible CPU scalar tensor to the execution device.
+
+            Args:
+                tensor (torch.Tensor): Tensor to inspect.
+
+            Returns:
+                torch.Tensor: Tensor on its original device, or ``device`` for a
+                zero-dimensional CPU tensor.
+            """
             if tensor.device != device and tensor.device.type == "cpu" and tensor.ndim == 0:
                 tensor = tensor.to(device)
             return tensor
@@ -212,14 +265,20 @@ class ArgumentProcessor:
         return input_dict
 
     def extract_device(self, inputs: tuple, kwargs: dict | None = None) -> torch.device:
-        """Extract device from input tensors.
+        """Select the execution device from inputs and keyword arguments.
 
         Args:
-            inputs: Input tensors and scalars
-            kwargs: Keyword arguments (may contain 'device')
+            inputs (tuple): Input tensors and scalar values.
+            kwargs (dict, optional): Keyword arguments that may specify ``device``.
+                Defaults to ``None``.
 
         Returns:
-            Device from kwargs['device'], first tensor, or current neuron device
+            torch.device: The first top-level tensor's device, an explicit nondefault
+            device, or the process's current Neuron device.
+
+        Note:
+            A bare Neuron device or ``neuron:0`` keyword is remapped to the process's
+            current Neuron device when no input tensor determines the device.
         """
         # Try to get device from an input tensor first — this is the most
         # reliable source because the tensor is already on the correct device.
@@ -249,14 +308,14 @@ class ArgumentProcessor:
         return current_dev
 
     def add_static_to_cache_key(self, base_key: str, kwargs: dict) -> str:
-        """Add static keyword arguments to cache key.
+        """Append static keyword arguments to a cache key.
 
         Args:
-            base_key: Base cache key
-            kwargs: Keyword arguments
+            base_key (str): Base cache key.
+            kwargs (dict): Keyword arguments containing possible static values.
 
         Returns:
-            Extended cache key including static kwargs
+            str: Cache key extended with configured static keyword values.
         """
         if not self.static_argnames or not kwargs:
             return base_key

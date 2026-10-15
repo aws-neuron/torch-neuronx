@@ -338,6 +338,89 @@ class TestDedupSliceDimension:
         ), f"Numerical mismatch! max_diff={(result.cpu() - expected).abs().max().item()}"
 
 
+class TestInteriorOffsetTransposedDedup:
+    """Dedup safety for transposed views at an interior storage offset (PR #2100).
+
+    PR #2100 added an anchored prologue base for a transposed view at an unaligned
+    interior offset. The base starts at the view offset and needs one TRANSPOSE. An
+    aligned offset still decomposes to a base at offset 0 with a SLICE. A review asked
+    if a mixed pair (one anchored, one offset 0) can share one deduped input slot and
+    read the wrong data.
+
+    ComputeInputDedupMap keys on (storage base, selected base offset, shape). The
+    prologue decomposes each view first, so the offset is the anchored offset for the
+    unaligned view and 0 for the aligned view. Different bases give different keys and
+    separate slots. These tests confirm that the mixed pair stays correct, and that a
+    real same-offset pair still dedups.
+    """
+
+    R, C = 40, 36  # row length C=36: 100 % C != 0 (unaligned), 144 % C == 0 (aligned)
+
+    def _flat(self):
+        cpu = torch.randn(5000, dtype=torch.float32)
+        return cpu, cpu.to(device)
+
+    def _view_t(self, base, offset):
+        return base[offset : offset + self.R * self.C].view(self.R, self.C).t()
+
+    def test_mixed_anchoring_shared_storage(self):
+        """Unaligned + aligned transposed views into one storage, added together.
+
+        The unaligned view (offset 100) uses the anchored base. The aligned view
+        (offset 144) uses the offset-0 base. They do not share a slot, so the sum
+        stays correct.
+        """
+        cpu, neuron = self._flat()
+        a_cpu, a = self._view_t(cpu, 100), self._view_t(neuron, 100)
+        b_cpu, b = self._view_t(cpu, 144), self._view_t(neuron, 144)
+        assert not a.is_contiguous() and not b.is_contiguous()
+
+        expected = a_cpu + b_cpu
+        result = (a + b).cpu()
+
+        assert torch.allclose(
+            result, expected, atol=0
+        ), f"Numerical mismatch! max_diff={(result - expected).abs().max().item()}"
+        assert_no_unexpected_fallback()
+
+    def test_two_unaligned_offsets_shared_storage(self):
+        """Two unaligned transposed views at different offsets, added together.
+
+        Both views use an anchored base with the same shape but a different offset.
+        The dedup key includes the offset, so they stay in separate slots.
+        """
+        cpu, neuron = self._flat()
+        a_cpu, a = self._view_t(cpu, 100), self._view_t(neuron, 100)
+        b_cpu, b = self._view_t(cpu, 137), self._view_t(neuron, 137)
+        assert not a.is_contiguous() and not b.is_contiguous()
+
+        expected = a_cpu + b_cpu
+        result = (a + b).cpu()
+
+        assert torch.allclose(
+            result, expected, atol=0
+        ), f"Numerical mismatch! max_diff={(result - expected).abs().max().item()}"
+        assert_no_unexpected_fallback()
+
+    def test_same_unaligned_offset_dedups(self):
+        """The same unaligned transposed view added to itself dedups to one anchored slot.
+
+        This is the path PR #2100 relies on: both inputs share (base, offset, shape),
+        so dedup collapses them to one anchored slot at the view offset.
+        """
+        cpu, neuron = self._flat()
+        w_cpu, w = self._view_t(cpu, 100), self._view_t(neuron, 100)
+        assert not w.is_contiguous()
+
+        expected = w_cpu + w_cpu
+        result = (w + w).cpu()
+
+        assert torch.allclose(
+            result, expected, atol=0
+        ), f"Numerical mismatch! max_diff={(result - expected).abs().max().item()}"
+        assert_no_unexpected_fallback()
+
+
 @pytest.fixture
 def native_int64_mode(monkeypatch):
     """Pin TORCH_NEURONX_INT64_MODE=native across the Python + C++ layers.

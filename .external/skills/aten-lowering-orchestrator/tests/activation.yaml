@@ -1,0 +1,12 @@
+should_trigger:
+  - "Lower these ATen ops to Neuron in parallel: aten::fmod, aten::hardswish, aten::erfinv."
+  - "Take the CPU-fallback ops from the vertical coverage list and lower ten at a time."
+  - "Run a batch lowering of several ATen operators and open a draft PR for each one that passes."
+  - "Orchestrate lowering for this list of ops with one agent per op."
+should_not_trigger:
+  - prompt: "Add a lowering for aten::special_erf."
+    expected: aten-op-lowering
+  - prompt: "Review this torch-neuronx pull request."
+    expected: pr-review
+  - prompt: "Fix this failing upstream PyTorch test on Neuron."
+    expected: pytorch-upstream-test-debugger

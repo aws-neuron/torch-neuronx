@@ -12,8 +12,8 @@ from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.distributed._tensor.common_dtensor import with_comms
 
 import torch_neuronx
-from tests.pytorch_tests.distributed.common_distributed import NeuronDistributedBase
-from tests.utils.neuron_test_utils import get_core_start_index, get_pytest_worker_index
+from tests.distributed.dtensor.common_distributed import NeuronDistributedBase
+from tests.utils.neuron_test_utils import get_pytest_worker_index, get_rank_core
 
 common_distributed.TIMEOUT_OVERRIDE["test_dtensor_shard_normal_produces_distinct_values"] = 300
 common_distributed.TIMEOUT_OVERRIDE["test_dtensor_replicate_normal_produces_distinct_values"] = 300
@@ -42,8 +42,7 @@ class DTensorRNGTest(NeuronDistributedBase, MultiProcessTestCase):
     @classmethod
     def _run(cls, rank, test_name, file_name, parent_pipe, **kwargs):
         process_index = get_pytest_worker_index()
-        core_start_index = get_core_start_index()
-        os.environ["NEURON_RT_VISIBLE_CORES"] = str(core_start_index + rank)
+        os.environ["NEURON_RT_VISIBLE_CORES"] = str(get_rank_core(rank))
         rt_port = int(os.environ.get("NEURON_RT_PORT", "2025"))
         os.environ["NEURON_RT_ROOT_COMM_ID"] = f"localhost:{rt_port + process_index}"
         super()._run(rank, test_name, file_name, parent_pipe, **kwargs)

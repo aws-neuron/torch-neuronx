@@ -37,16 +37,16 @@ TORCH_DTYPE_TO_SCALAR_TYPE: dict[torch.dtype, int] = {
 
 
 def torch_dtype_to_scalar_type(dtype: torch.dtype) -> int | None:
-    """Convert a ``torch.dtype`` to its ``c10::ScalarType`` integer value.
+    """Convert a ``torch.dtype`` to its ``c10::ScalarType`` ordinal.
 
     Args:
-        dtype: PyTorch dtype to convert.
+        dtype (torch.dtype): PyTorch dtype to convert.
 
     Returns:
-        The integer value corresponding to the ``c10::ScalarType`` enum, or
-        ``None`` if the dtype is not mapped. Callers decide how to handle
-        unknown dtypes (raise, default, etc.) since behavior differs across
-        call sites.
+        int or None: Scalar type ordinal, or ``None`` for an unmapped dtype.
+
+    Note:
+        Callers choose whether to raise or use a fallback for unknown dtypes.
     """
     return TORCH_DTYPE_TO_SCALAR_TYPE.get(dtype)
 
@@ -74,8 +74,46 @@ TORCH_DTYPE_TO_SCALAR_TYPE_NAME: dict[torch.dtype, str] = {
 def torch_dtype_to_scalar_type_name(dtype: torch.dtype) -> str | None:
     """Return the ``c10::ScalarType`` name for a ``torch.dtype``.
 
-    Matches the spelling PyTorch uses in error messages (e.g. ``torch.float16``
-    -> ``"Half"``). Returns ``None`` for unmapped dtypes; callers decide how to
-    handle them.
+    Args:
+        dtype (torch.dtype): PyTorch dtype to convert.
+
+    Returns:
+        str or None: PyTorch-style type name, or ``None`` when unmapped.
+
+    Note:
+        Names match PyTorch error messages, such as ``"Half"`` for
+        ``torch.float16``; callers handle unknown dtypes.
     """
     return TORCH_DTYPE_TO_SCALAR_TYPE_NAME.get(dtype)
+
+
+# ATen spells some error messages with the C++ ``TypeMeta`` name rather than the
+# ``ScalarType`` name, for example "Expected out tensor to have dtype".
+TORCH_DTYPE_TO_TYPE_META_NAME: dict[torch.dtype, str] = {
+    torch.float32: "float",
+    torch.float64: "double",
+    torch.float16: "c10::Half",
+    torch.bfloat16: "c10::BFloat16",
+    torch.int64: "long int",
+    torch.int32: "int",
+    torch.int16: "short int",
+    torch.int8: "signed char",
+    torch.uint8: "unsigned char",
+    torch.bool: "bool",
+}
+
+
+def torch_dtype_to_type_meta_name(dtype: torch.dtype) -> str | None:
+    """Return the C++ ``TypeMeta`` name for a ``torch.dtype``.
+
+    Args:
+        dtype (torch.dtype): PyTorch dtype to convert.
+
+    Returns:
+        str | None: ATen ``TypeMeta`` spelling, or ``None`` when unmapped.
+
+    Note:
+        TypeMeta spellings differ from ScalarType names; for example, ``torch.int64``
+        maps to ``"long int"`` rather than ``"Long"``.
+    """
+    return TORCH_DTYPE_TO_TYPE_META_NAME.get(dtype)

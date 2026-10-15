@@ -3,20 +3,31 @@
 import hashlib
 import logging
 import os
+import pickle
 import secrets
 import shutil
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+
+import torch
+
+from torch_neuronx.utils import get_rank
 
 logger = logging.getLogger(__name__)
 
 
 def get_artifacts_directory() -> Path:
-    """Get the artifacts directory from environment variable or default.
+    """Return the directory used for compilation artifacts.
 
-    Uses TORCH_NEURONX_DEBUG_DIR if set, otherwise /tmp/neuron_backend.
+    Returns:
+        Path: Configured artifact directory or ``/tmp/neuron_backend``.
+
+    Note:
+        Use ``TORCH_NEURONX_DEBUG_DIR`` when set; otherwise use
+        ``/tmp/neuron_backend``.
     """
     debug_dir = os.getenv("TORCH_NEURONX_DEBUG_DIR")
     path = Path(debug_dir if debug_dir else "/tmp/neuron_backend")
@@ -24,27 +35,60 @@ def get_artifacts_directory() -> Path:
 
 
 def get_nfs_cache_dir() -> str:
-    """Get NFS cache directory from environment variable."""
+    """Return the shared NEFF cache directory.
+
+    Returns:
+        str: Configured shared cache directory or ``/tmp/neff_cache``.
+
+    Note:
+        Use ``TORCH_NEURONX_NEFF_CACHE_DIR`` when set; otherwise use
+        ``/tmp/neff_cache``.
+    """
     return os.getenv("TORCH_NEURONX_NEFF_CACHE_DIR", "/tmp/neff_cache")
 
 
 def get_local_cache_dir() -> str:
-    """Get local cache directory from environment variable."""
+    """Return the local NEFF cache directory.
+
+    Returns:
+        str: Configured local cache directory or ``/tmp/local_cache``.
+
+    Note:
+        Use ``TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR`` when set; otherwise use
+        ``/tmp/local_cache``.
+    """
     return os.getenv("TORCH_NEURONX_NEFF_LOCAL_CACHE_DIR", "/tmp/local_cache")
 
 
 def is_caching_disabled() -> bool:
-    """Check if caching is disabled via environment variable."""
+    """Report whether NEFF caching is disabled.
+
+    Returns:
+        bool: ``True`` when ``TORCH_NEURONX_NEFF_DISABLE_CACHE`` is ``true``,
+        ``1``, or ``yes``, ignoring case.
+    """
     return os.getenv("TORCH_NEURONX_NEFF_DISABLE_CACHE", "").lower() in ("true", "1", "yes")
 
 
 def get_lock_timeout() -> int:
-    """Get lock timeout from environment variable."""
+    """Return the NEFF cache lock timeout in seconds.
+
+    Returns:
+        int: ``TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT``, or ``1200`` when unset.
+
+    Raises:
+        ValueError: If the configured timeout is not an integer.
+    """
     return int(os.getenv("TORCH_NEURONX_NEFF_CACHE_LOCK_TIMEOUT", "1200"))
 
 
 def is_preserve_artifacts_enabled() -> bool:
-    """Get whether artifact preservation enabled"""
+    """Report whether compilation artifacts should be preserved.
+
+    Returns:
+        bool: ``True`` when ``TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS`` is
+        ``true``, ``1``, or ``yes``, ignoring case.
+    """
     return os.getenv("TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS", "").lower() in (
         "true",
         "1",
@@ -53,7 +97,12 @@ def is_preserve_artifacts_enabled() -> bool:
 
 
 def atomic_write_bytes(file_path: Path, data: bytes) -> None:
-    """Atomically write bytes to file using temp file + rename."""
+    """Write bytes atomically by renaming a temporary file.
+
+    Args:
+        file_path (Path): Destination file path.
+        data (bytes): Bytes to write.
+    """
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Write to temporary file in same directory
@@ -66,31 +115,27 @@ def atomic_write_bytes(file_path: Path, data: bytes) -> None:
 
 
 class CompilationJob:
-    """Manages a single compilation job's artifact paths and lifecycle.
+    """Manage artifact paths and lifecycle for one compilation job.
 
-    Each compilation job gets a unique directory under the base artifacts directory.
-    Artifacts are always written; the ``preserve`` flag only controls cleanup.
+    Args:
+        op_name (str): Operation name included in the unique job identifier.
 
-    Directory hierarchy::
-
-        {base_dir}/
-        ├── {job_id}/
-        │   ├── fx_graphs/{model}_{ts}.fx.txt
-        │   ├── transformed_fx/{model}_{ts}.transformed.fx.txt
-        │   ├── raw/{model}_{ts}.torch_raw.mlir
-        │   ├── stablehlo/{model}_{ts}.stablehlo.mlir
-        │   └── torch_mlir_error/{model}_{ts}.mlir
-        └── neuronx-cc/
-            └── {hash}/
+    Note:
+        Each job writes artifacts beneath a unique directory in the base artifact
+        directory. FX graphs, transformed graphs, raw Torch IR, StableHLO, and
+        Torch-MLIR errors use separate subdirectories. Neuron compiler work uses a
+        hash-named directory under ``neuronx-cc``. The preservation setting controls
+        whether these artifacts are removed during cleanup.
     """
 
     def __init__(self, op_name: str):
         self.op_name = op_name
+        self.rank = get_rank()
         self.timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
         self.job_id = self._generate_job_id()
         self.preserve = is_preserve_artifacts_enabled()
         self._base_dir = get_artifacts_directory()
-        self._job_dir = self._base_dir / self.job_id
+        self._job_dir = self._base_dir / "torch_neuronx" / f"rank{self.rank}" / self.job_id
         self._pass_counter = 0
         working_dir_hash = hashlib.sha256(self.job_id.encode(errors="ignore")).hexdigest()
         self._neuronx_cc_directory = self._base_dir / "neuronx-cc" / working_dir_hash
@@ -130,14 +175,14 @@ class CompilationJob:
         return directory / filename
 
     def save_fx_graph(self, model_name: str, gm) -> Path:
-        """Save FX graph as human-readable text.
+        """Save an FX graph as human-readable text.
 
         Args:
-            model_name: Model name for the artifact filename.
-            gm: FX GraphModule to save.
+            model_name (str): Model name used in the artifact filename.
+            gm (torch.fx.GraphModule): FX graph module to save.
 
         Returns:
-            Path: {job_dir}/fx_graphs/{model}_{ts}.fx.txt
+            Path: Path to the saved ``fx_graphs`` artifact.
         """
         path = self._make_path("fx_graphs", model_name, ".fx.txt")
         with open(path, "w") as f:
@@ -146,15 +191,15 @@ class CompilationJob:
         return path
 
     def save_pass_fx(self, model_name: str, gm, pass_name: str) -> Path:
-        """Save FX graph after an individual pass under transformed_fx/.
+        """Save an FX graph produced by an individual transformation pass.
 
         Args:
-            model_name: Model name for the artifact filename.
-            gm: FX GraphModule to save.
-            pass_name: Name of the pass (typically the class name).
+            model_name (str): Model name used in the artifact filename.
+            gm (torch.fx.GraphModule): FX graph module to save.
+            pass_name (str): Pass name included in the artifact filename.
 
         Returns:
-            Path: {job_dir}/transformed_fx/{model}_{ts}.pass_{idx}_{name}.fx.txt
+            Path: Path to the indexed artifact under ``transformed_fx``.
         """
         pass_index = self._pass_counter
         self._pass_counter += 1
@@ -166,14 +211,14 @@ class CompilationJob:
         return path
 
     def save_transformed_fx(self, model_name: str, gm) -> Path:
-        """Save transformed FX graph as human-readable text.
+        """Save a transformed FX graph as human-readable text.
 
         Args:
-            model_name: Model name for the artifact filename.
-            gm: FX GraphModule to save (after collective transforms).
+            model_name (str): Model name used in the artifact filename.
+            gm (torch.fx.GraphModule): Transformed FX graph module to save.
 
         Returns:
-            Path: {job_dir}/transformed_fx/{model}_{ts}.fx.txt
+            Path: Path to the saved ``transformed_fx`` artifact.
         """
         path = self._make_path("transformed_fx", model_name, ".fx.txt")
         with open(path, "w") as f:
@@ -182,14 +227,14 @@ class CompilationJob:
         return path
 
     def save_raw_torch(self, model_name: str, mlir_module) -> Path:
-        """Save RAW Torch IR as text.
+        """Save raw Torch IR as text.
 
         Args:
-            model_name: Model name for the artifact filename.
-            mlir_module: MLIR module to save.
+            model_name (str): Model name used in the artifact filename.
+            mlir_module (object): MLIR module whose operation is serialized.
 
         Returns:
-            Path: {job_dir}/raw/{model}_{ts}.torch_raw.mlir
+            Path: Path to the saved ``raw`` Torch MLIR artifact.
         """
         path = self._make_path("raw", model_name, ".torch_raw.mlir")
         with open(path, "w") as f:
@@ -198,14 +243,14 @@ class CompilationJob:
         return path
 
     def save_stablehlo(self, model_name: str, mlir_module) -> Path:
-        """Save StableHLO as text.
+        """Save StableHLO IR as text.
 
         Args:
-            model_name: Model name for the artifact filename.
-            mlir_module: MLIR module to save.
+            model_name (str): Model name used in the artifact filename.
+            mlir_module (object): MLIR module whose operation is serialized.
 
         Returns:
-            Path: {job_dir}/stablehlo/{model}_{ts}.stablehlo.mlir
+            Path: Path to the saved ``stablehlo`` artifact.
         """
         path = self._make_path("stablehlo", model_name, ".stablehlo.mlir")
         with open(path, "w") as f:
@@ -214,25 +259,38 @@ class CompilationJob:
         return path
 
     def get_err_mlir_path(self, model_name: str) -> Path:
-        """Get the path for saving MLIR error artifacts.
+        """Create a path for a Torch-MLIR error artifact.
+
+        Args:
+            model_name (str): Model name used in the artifact filename.
 
         Returns:
-            Path: {job_dir}/torch_mlir_error/{model}_{ts}.mlir
+            Path: Path under the job's ``torch_mlir_error`` directory.
         """
         return self._make_path("torch_mlir_error", model_name, ".mlir")
 
     def get_neuronx_cc_workdir(self) -> Path:
-        """Get the working directory for neuronx-cc compiler invocation.
+        """Return the Neuron compiler working directory.
 
         Returns:
-            Path: Working directory path for neuronx-cc.
+            Path: Hash-named working directory under ``neuronx-cc``.
         """
         return self._neuronx_cc_directory
 
-    def cleanup(self):
-        """Remove job directory if preserve is False.
+    def get_dump_dir(self) -> str:
+        """Return this job's directory as a string.
 
-        Never touches the neuronx-cc directory.
+        Returns:
+            str: Compilation job directory.
+        """
+        return str(self._job_dir)
+
+    def cleanup(self):
+        """Remove compilation artifact directories unless preservation is enabled.
+
+        Note:
+            Remove both the job directory and Neuron compiler working directory when
+            they exist. Log cleanup failures instead of raising them.
         """
         try:
             if self.preserve:
@@ -254,25 +312,196 @@ class CompilationJob:
 
 @contextmanager
 def compilation_job(op_name: str):
-    """Context manager for CompilationJob that ensures cleanup on exit.
-
-    Creates a CompilationJob and automatically calls cleanup() when the context exits,
-    regardless of whether an exception occurred.
+    """Create a compilation job that is cleaned up on context exit.
 
     Args:
-        op_name: Operation name for the compilation job.
+        op_name (str): Operation name for the compilation job.
 
     Yields:
-        CompilationJob: The compilation job instance.
-
-    Example:
-        >>> with compilation_job("my_model") as job:
-        ...     job.save_fx_graph("my_model", gm)
-        ...     # ... do compilation work ...
-        ... # cleanup() is called automatically here
+        CompilationJob: Job whose cleanup runs even when the context raises.
     """
     job = CompilationJob(op_name)
     try:
         yield job
     finally:
         job.cleanup()
+
+
+@dataclass
+class TensorDumpPolicy:
+    """Configure tensor-dump directions and rank filters.
+
+    Args:
+        dump_inputs (bool, optional): Whether to dump inputs. Defaults to ``False``.
+        dump_outputs (bool, optional): Whether to dump outputs. Defaults to ``False``.
+        input_ranks (set[int], optional): Input ranks to dump. Defaults to an empty set.
+        output_ranks (set[int], optional): Output ranks to dump. Defaults to an empty set.
+        input_all_ranks (bool, optional): Whether to dump inputs on every rank.
+            Defaults to ``False``.
+        output_all_ranks (bool, optional): Whether to dump outputs on every rank.
+            Defaults to ``False``.
+    """
+
+    dump_inputs: bool = False
+    dump_outputs: bool = False
+    input_ranks: set[int] = field(default_factory=set)
+    output_ranks: set[int] = field(default_factory=set)
+    input_all_ranks: bool = False
+    output_all_ranks: bool = False
+
+    def should_dump_inputs(self, rank: int) -> bool:
+        """Check whether inputs should be dumped for a rank.
+
+        Args:
+            rank (int): Rank to check.
+
+        Returns:
+            bool: ``True`` when input dumping includes the rank.
+        """
+        if not self.dump_inputs:
+            return False
+        return self.input_all_ranks or rank in self.input_ranks
+
+    def should_dump_outputs(self, rank: int) -> bool:
+        """Check whether outputs should be dumped for a rank.
+
+        Args:
+            rank (int): Rank to check.
+
+        Returns:
+            bool: ``True`` when output dumping includes the rank.
+        """
+        if not self.dump_outputs:
+            return False
+        return self.output_all_ranks or rank in self.output_ranks
+
+
+def _parse_tensor_dump_policy() -> TensorDumpPolicy:
+    """Parse TORCH_NEURONX_DYNAMO_TENSOR_DUMPS into a TensorDumpPolicy.
+
+    The environment variable holds semicolon-delimited ``key=value`` pairs.
+    Keys are ``inputs`` or ``outputs``. Values are ``all`` or a
+    comma-separated rank list.
+    """
+    env_value = os.environ.get("TORCH_NEURONX_DYNAMO_TENSOR_DUMPS", "")
+
+    if not env_value.strip():
+        return TensorDumpPolicy()
+
+    dump_inputs = False
+    dump_outputs = False
+    input_ranks: set[int] = set()
+    output_ranks: set[int] = set()
+    input_all_ranks = False
+    output_all_ranks = False
+
+    for part in env_value.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+
+        if "=" not in part:
+            logger.warning(f"Invalid tensor dump config entry (missing '='): '{part}'")
+            continue
+
+        key, value = part.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip()
+
+        if key == "inputs":
+            dump_inputs = True
+            if value.lower() == "all":
+                input_all_ranks = True
+            else:
+                input_ranks = _parse_rank_list(value)
+        elif key == "outputs":
+            dump_outputs = True
+            if value.lower() == "all":
+                output_all_ranks = True
+            else:
+                output_ranks = _parse_rank_list(value)
+        else:
+            logger.warning(f"Unknown tensor dump config key: '{key}'")
+
+    return TensorDumpPolicy(
+        dump_inputs=dump_inputs,
+        dump_outputs=dump_outputs,
+        input_ranks=input_ranks,
+        output_ranks=output_ranks,
+        input_all_ranks=input_all_ranks,
+        output_all_ranks=output_all_ranks,
+    )
+
+
+def _parse_rank_list(value: str) -> set[int]:
+    """Parse a comma-separated list of rank integers."""
+    ranks = set()
+    for item in value.split(","):
+        item = item.strip()
+        if item:
+            try:
+                ranks.add(int(item))
+            except ValueError:
+                logger.warning(f"Invalid rank value in tensor dump config: '{item}'")
+    return ranks
+
+
+class TensorDumper:
+    """Write input and output tensor dumps for one executor.
+
+    Args:
+        dump_dir (str): Root directory for input and output dump subdirectories.
+
+    Note:
+        The policy and current rank are read on every dump call.
+    """
+
+    def __init__(self, dump_dir: str):
+        self._dump_dir = Path(dump_dir)
+
+    def dump_tensors(self, tensors: list, execution_count: int, is_input: bool) -> None:
+        """Dump selected tensors as pickled NumPy arrays.
+
+        Args:
+            tensors (list[torch.Tensor]): Tensors that support transfer to CPU and
+                conversion to NumPy.
+            execution_count (int): Invocation count included in the filename.
+            is_input (bool): Whether to apply input policy and naming instead of output
+                policy and naming.
+
+        Note:
+            Writes ``inputs/inp-<rank>-<count>.p`` or
+            ``outputs/out-<rank>-<count>.p`` beneath the dump root. Each file contains
+            keys such as ``input0`` or ``output0``. Converts bfloat16 tensors to float32
+            and logs conversion or write failures without raising.
+        """
+        policy = _parse_tensor_dump_policy()
+        rank = get_rank()
+        if is_input and not policy.should_dump_inputs(rank):
+            return
+        if not is_input and not policy.should_dump_outputs(rank):
+            return
+
+        prefix = "inp" if is_input else "out"
+        key_prefix = "input" if is_input else "output"
+        subdir = "inputs" if is_input else "outputs"
+        rank_3digit = f"{rank:03d}"
+        filename = f"{prefix}-{rank_3digit}-{execution_count}.p"
+        filepath = self._dump_dir / subdir / filename
+
+        try:
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+
+            tensor_dict = {}
+            for i, tensor in enumerate(tensors):
+                t = tensor.detach().cpu()
+                if t.dtype == torch.bfloat16:
+                    t = t.float()
+                tensor_dict[f"{key_prefix}{i}"] = t.numpy()
+
+            with open(filepath, "wb") as f:
+                pickle.dump(tensor_dict, f)
+
+            logger.debug(f"Dumped {len(tensors)} {key_prefix} tensors to {filepath}")
+        except Exception as e:
+            logger.warning(f"Failed to dump {key_prefix} tensors to {filepath}: {e}")

@@ -17,10 +17,14 @@
 #include "torch_neuronx/csrc/c10/neuron/NeuronStream.h"
 #include "torch_neuronx/csrc/core/NeuronDevice.h"
 #include "torch_neuronx/csrc/core/OperationExecutionEngine.h"
+#include "torch_neuronx/csrc/core/ProfilerMappingCollector.h"
+#include "torch_neuronx/csrc/core/cache/PersistentCacheBackend.h"
 #include "torch_neuronx/csrc/core/compilation/CompilationCache.h"
 #include "torch_neuronx/csrc/core/runtime/ModelHandleCache.h"
+#include "torch_neuronx/csrc/core/streams/StreamConfig.h"
 #include "torch_neuronx/csrc/core/streams/StreamImpl.h"
 #include "torch_neuronx/csrc/core/utils/TempDirectory.h"
+#include "torch_neuronx/csrc/profiler/ProfilerEventBuffer.h"
 
 using namespace at::neuron;
 using namespace at::neuron::testing;
@@ -363,6 +367,139 @@ TEST_F(StreamImplTest, EventRecordCapturesStreamImplIdentity) {
   EXPECT_NE(event.recorded_stream_impl(), nullptr);
 }
 
+TEST_F(StreamImplTest, WaitStreamAliasesDoNotSubmitEvents) {
+  if (!config::AreStreamsEnabled() || config::IsHostCCEnabled()) {
+    GTEST_SKIP() << "Requires streams enabled and HostCC disabled";
+  }
+  NeuronStream producer(32, 0, NeuronStream::UNCHECKED);
+  NeuronStream consumer(64, 0, NeuronStream::UNCHECKED);
+  ASSERT_NE(producer.id(), consumer.id());
+  auto* impl = producer.get_stream_impl();
+  ASSERT_EQ(impl, consumer.get_stream_impl());
+
+  CompilationCache compilation_cache;
+  ModelHandleCache model_handle_cache;
+  ScopedTestEngine scoped_engine(&compilation_cache, &model_handle_cache);
+  auto pending = MakeEventOp(EventDirectKernelExecution::EventAction::kSignal, impl);
+  scoped_engine->InjectIntoRuntimeQueue(impl, pending);
+  EXPECT_FALSE(producer.query());
+
+  EXPECT_NO_THROW(consumer.wait_stream(producer));
+  scoped_engine->Shutdown();
+  EXPECT_EQ(scoped_engine->RuntimeQueueSize(impl), 1);
+  EXPECT_TRUE(scoped_engine->dispatch_queue_.empty());
+  EXPECT_EQ(pending->result_future.wait_for(0ms), std::future_status::timeout);
+  scoped_engine->ClearRuntimeQueue(impl);
+  scoped_engine->dispatch_queue_.clear();
+}
+
+TEST_F(StreamImplTest, CollectiveUsesDefaultFifoAndReportsFailure) {
+  if (!config::AreStreamsEnabled() || config::IsHostCCEnabled()) {
+    GTEST_SKIP() << "Requires streams enabled and HostCC disabled";
+  }
+  nrt_instance_info_t info{};
+  info.family = NRT_INSTANCE_TRN3;
+  ON_CALL(*MockNRT::GetInstance(), nrt_get_instance_info(_, _))
+      .WillByDefault(DoAll(SetArgPointee<0>(info), Return(NRT_SUCCESS)));
+
+  NeuronStream caller(32, /*device_index=*/0, NeuronStream::UNCHECKED);
+  auto* default_impl = GetDefaultStreamImpl(0);
+  auto kernel = std::make_unique<MockCompilableKernelExecution>("default_fifo_test", "", "",
+                                                                /*has_collectives=*/true);
+  auto* kernel_ptr = kernel.get();
+  auto op = std::make_unique<OperationContext>(std::move(kernel));
+  auto* op_ptr = op.get();
+  EXPECT_CALL(*kernel_ptr, Schedule(_, _, 0))
+      .WillOnce([&](NRT_STATUS*, nrt::SequenceId*, c10::StreamId) -> bool {
+        EXPECT_EQ(op_ptr->stream, default_impl);
+        EXPECT_EQ(op_ptr->stream_id, caller.id());
+        throw std::runtime_error("collective execution failure");
+      });
+  SubmitOperationContext(caller, std::move(op));
+  EXPECT_THROW(caller.get_stream_impl()->Synchronize(), std::runtime_error);
+  EXPECT_NO_THROW(default_impl->Synchronize());
+}
+
+TEST_F(StreamImplTest, NoncollectiveKeepsCallerFifoAndLogicalId) {
+  if (!config::AreStreamsEnabled()) GTEST_SKIP() << "Requires streams enabled";
+  nrt_instance_info_t info{};
+  info.family = NRT_INSTANCE_TRN3;
+  ON_CALL(*MockNRT::GetInstance(), nrt_get_instance_info(_, _))
+      .WillByDefault(DoAll(SetArgPointee<0>(info), Return(NRT_SUCCESS)));
+
+  NeuronStream caller(32, /*device_index=*/0, NeuronStream::UNCHECKED);
+  auto kernel = std::make_unique<MockCompilableKernelExecution>("pool_fifo_test", "", "",
+                                                                /*has_collectives=*/false);
+  auto* kernel_ptr = kernel.get();
+  auto op = std::make_unique<OperationContext>(std::move(kernel));
+  auto* op_ptr = op.get();
+  EXPECT_CALL(*kernel_ptr, Schedule(_, _, caller.get_stream_impl()->stream_id))
+      .WillOnce([&](NRT_STATUS*, nrt::SequenceId*, c10::StreamId) -> bool {
+        EXPECT_EQ(op_ptr->stream, caller.get_stream_impl());
+        EXPECT_EQ(op_ptr->stream_id, caller.id());
+        throw std::runtime_error("noncollective execution failure");
+      });
+  SubmitOperationContext(caller, std::move(op));
+  EXPECT_THROW(caller.get_stream_impl()->Synchronize(), std::runtime_error);
+  EXPECT_NO_THROW(GetDefaultStreamImpl(0)->Synchronize());
+}
+
+TEST_F(StreamImplTest, DirectSubmissionFailureStaysOnExecutionStream) {
+  nrt_instance_info_t info{};
+  info.family = NRT_INSTANCE_TRN3;
+  ON_CALL(*MockNRT::GetInstance(), nrt_get_instance_info(_, _))
+      .WillByDefault(DoAll(SetArgPointee<0>(info), Return(NRT_SUCCESS)));
+  auto* execution_stream = NeuronStream(32, 0, NeuronStream::UNCHECKED).get_stream_impl();
+  auto kernel = std::make_unique<MockCompilableKernelExecution>("direct_failure_test");
+  auto* kernel_ptr = kernel.get();
+  auto op = std::make_unique<OperationContext>(std::move(kernel));
+  ASSERT_EQ(op->stream_id, 0);
+  EXPECT_CALL(*kernel_ptr, Schedule(_, _, execution_stream->stream_id))
+      .WillOnce([](NRT_STATUS*, nrt::SequenceId*, c10::StreamId) -> bool {
+        throw std::runtime_error("direct submission failure");
+      });
+  execution_stream->SubmitOperationContext(std::move(op));
+  EXPECT_THROW(execution_stream->Synchronize(), std::runtime_error);
+  EXPECT_NO_THROW(GetDefaultStreamImpl(0)->Synchronize());
+}
+
+TEST_F(StreamImplTest, ProfilerUsesSelectedDefaultOrPoolStream) {
+  StreamImpl default_stream(0, 0);
+  auto& mappings = ProfilerMappingCollector::Instance();
+  mappings.GetAndClear();
+  mappings.SetEnabled(true);
+  ProfilerEventBuffer buffer;
+  buffer.activate();
+  setActiveProfilerBuffer(&buffer);
+  // Logical stream 96 represents a collective flattened onto the default implementation.
+  for (c10::StreamId logical_id : {0, 32, 64, 96}) {
+    auto* selected_stream = logical_id == 0 || logical_id == 96 ? &default_stream : stream_.get();
+    auto op = std::make_shared<OperationContext>(std::make_unique<MockNeuronKernelExecution>());
+    op->stream = selected_stream;
+    op->stream_id = logical_id;
+    op->nrt_async_state_.is_scheduled = true;
+    op->nrt_async_state_.sequence_id = logical_id + 1;
+    auto* engine = static_cast<MockOperationExecutionEngine*>(engine_);
+    engine->InjectIntoRuntimeQueue(selected_stream, op);
+    selected_stream->CompleteOperation(op.get());
+  }
+  setActiveProfilerBuffer(nullptr);
+  mappings.SetEnabled(false);
+  auto recorded_mappings = mappings.GetAndClear();
+  ASSERT_EQ(recorded_mappings.size(), 4);
+  for (c10::StreamId logical_id : {0, 32, 64, 96}) {
+    const auto& entries = recorded_mappings.at(logical_id + 1);
+    ASSERT_EQ(entries.size(), 1);
+    EXPECT_EQ(entries[0].stream_id, logical_id);
+  }
+  auto events = buffer.drain();
+  ASSERT_EQ(events.size(), 4);
+  EXPECT_EQ(events[0].stream_id, 0);
+  EXPECT_EQ(events[1].stream_id, 1);
+  EXPECT_EQ(events[2].stream_id, 1);
+  EXPECT_EQ(events[3].stream_id, 0);
+}
+
 namespace {
 
 // A minimal device op of the given kernel type, execution-ready.
@@ -458,7 +595,7 @@ TEST_F(StreamImplTest, GateC_CrossXUSync) {
                                                  /*refresh_completion=*/false));
 }
 
-// (d) A cross-stream event_wait gates only while a prior op is in flight;
+// (d) A pending cross-stream event_wait gates while a prior op is in flight;
 //     a same-stream wait never gates, and neither does a wait with no prior
 //     in-flight op.
 TEST_F(StreamImplTest, GateD_CrossStreamEventWait) {
@@ -479,6 +616,82 @@ TEST_F(StreamImplTest, GateD_CrossStreamEventWait) {
   EXPECT_FALSE(stream_->IsScheduleGatedByPriorOp(same.get(), KernelTypeEnum::kEvent,
                                                  /*prior_ops_in_flight=*/true,
                                                  /*refresh_completion=*/false));
+}
+
+TEST_F(StreamImplTest, CompletedCrossStreamWaitDoesNotDrainConsumer) {
+  auto producer = std::make_shared<StreamImpl>(0, 2);
+  NeuronEvent event;
+  event.get_impl()->is_recorded.store(true, std::memory_order_relaxed);
+  event.get_impl()->recorded_stream_impl.store(producer.get(), std::memory_order_relaxed);
+  auto kernel = std::make_unique<EventDirectKernelExecution>(
+      "event_wait", event, EventDirectKernelExecution::EventAction::kWait, 0);
+  OperationContext op(std::move(kernel));
+  op.MarkExecutionReady();
+
+  EXPECT_FALSE(op.IsSchedulable());
+  EXPECT_TRUE(stream_->IsScheduleGatedByPriorOp(&op, KernelTypeEnum::kEvent,
+                                                /*prior_ops_in_flight=*/true,
+                                                /*refresh_completion=*/false));
+
+  event.complete_event();
+  EXPECT_TRUE(op.IsSchedulable());
+  EXPECT_EQ(config::IsHostCCEnabled(),
+            stream_->IsScheduleGatedByPriorOp(&op, KernelTypeEnum::kEvent,
+                                              /*prior_ops_in_flight=*/true,
+                                              /*refresh_completion=*/false));
+}
+
+TEST_F(StreamImplTest, QueuedComputeWaitPreservesEventCompletion) {
+  auto producer = std::make_shared<StreamImpl>(0, 0);
+  NeuronEvent event;
+  event.get_impl()->is_recorded.store(true);
+  event.get_impl()->recorded_stream_impl.store(producer.get());
+  event.get_impl()->allow_queue_ordering = true;
+  auto kernel = std::make_unique<EventDirectKernelExecution>(
+      "event_wait", event, EventDirectKernelExecution::EventAction::kWait, 0);
+  OperationContext op(std::move(kernel));
+  op.MarkExecutionReady();
+  auto& info = stream_->GetLastScheduledInfo();
+  info.valid = true;
+  info.kind = LastKind::kDeviceXU;
+  info.xu = NRTA_XU_COMPUTE;
+  info.sequence_id = 10;
+
+  EXPECT_TRUE(stream_->IsScheduleGatedByPriorOp(&op, KernelTypeEnum::kEvent, true, false));
+  event.get_impl()->queued_compute_sequence.store(20);
+  EXPECT_EQ(config::IsHostCCEnabled(),
+            stream_->IsScheduleGatedByPriorOp(&op, KernelTypeEnum::kEvent, true, false));
+  EXPECT_FALSE(op.IsSchedulable());
+  EXPECT_FALSE(event.query());
+  event.complete_event();
+  EXPECT_TRUE(op.IsSchedulable());
+}
+
+TEST_F(StreamImplTest, QueueWaitCannotHideConsumerHostWork) {
+  auto producer = std::make_shared<StreamImpl>(0, 0);
+  NeuronEvent event;
+  event.get_impl()->is_recorded.store(true);
+  event.get_impl()->recorded_stream_impl.store(producer.get());
+  event.get_impl()->allow_queue_ordering = true;
+  event.get_impl()->queued_compute_sequence.store(20);
+  auto kernel = std::make_unique<EventDirectKernelExecution>(
+      "event_wait", event, EventDirectKernelExecution::EventAction::kWait, 0);
+  OperationContext op(std::move(kernel));
+  op.MarkExecutionReady();
+  auto& info = stream_->GetLastScheduledInfo();
+  info.valid = true;
+  info.kind = LastKind::kHost;
+  info.host_completion_seq = 1;
+  EXPECT_TRUE(stream_->IsScheduleGatedByPriorOp(&op, KernelTypeEnum::kEvent, true, false));
+  info.kind = LastKind::kDeviceXU;
+  info.xu = NRTA_XU_TENSOR_OP;
+  info.sequence_id = 1;
+  EXPECT_TRUE(stream_->IsScheduleGatedByPriorOp(&op, KernelTypeEnum::kEvent, true, false));
+  info.xu = NRTA_XU_COMPUTE;
+  EXPECT_EQ(config::IsHostCCEnabled(),
+            stream_->IsScheduleGatedByPriorOp(&op, KernelTypeEnum::kEvent, true, false));
+  event.get_impl()->allow_queue_ordering = false;
+  EXPECT_TRUE(stream_->IsScheduleGatedByPriorOp(&op, KernelTypeEnum::kEvent, true, false));
 }
 
 // No prior op (last_scheduled_info_ invalid) → never gated, regardless of type.
@@ -660,6 +873,37 @@ TEST_F(ResolvePersistentCacheKeyTest, NeffDirectKernelLegacyModePrefersCacheEntr
   EXPECT_EQ(resolved, *compiled_pk);
   EXPECT_NE(resolved, *exec_own_pk);
 }
+
+// put_neff_cache() stores a NEFF under a name the cache key cannot derive, because no
+// compile step ran to agree on one. The recorded name must win in both keying modes: in
+// legacy mode the key derives hash(base_key || config), where no NEFF was ever written.
+class StagedNeffHintTest : public ResolvePersistentCacheKeyTest,
+                           public ::testing::WithParamInterface<bool> {};
+
+TEST_P(StagedNeffHintTest, StagedNeffResolvesThroughTheHint) {
+  InitCache(/*hlo_content_key=*/GetParam());
+
+  const std::string base_key = "staged_graph_key";
+  const std::string staged_name = "staged_graph_key";  // put_neff_cache uses the base key
+  const std::vector<uint8_t> neff_bytes{1, 2, 3, 4};
+
+  at::neuron::PersistentCacheBackend backend;
+  ASSERT_TRUE(backend.Put(staged_name, neff_bytes));
+  cache_->RegisterPersistentKeyHint(base_key, staged_name);
+
+  NeffDirectKernelExecution exec_kernel("staged_graph", base_key, {}, {}, {}, {}, 0, false);
+  ASSERT_TRUE(exec_kernel.GetHloBytes().empty());
+
+  // Without the hint this reaches NeffDirectKernelExecution::CompileToNeff(), which throws.
+  auto entry = cache_->GetOrCompileNeff(exec_kernel, /*stream_id=*/1);
+  ASSERT_NE(entry, nullptr);
+  EXPECT_EQ(entry->neff_bytes, neff_bytes);
+}
+
+INSTANTIATE_TEST_SUITE_P(BothKeyingModes, StagedNeffHintTest, ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& i) {
+                           return i.param ? "HloContentKey" : "LegacyKey";
+                         });
 
 // No cache entry (e.g. evicted) → returns empty, not a bogus value.
 TEST_F(ResolvePersistentCacheKeyTest, NeffDirectKernelCacheMissReturnsEmpty) {
