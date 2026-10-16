@@ -44,6 +44,8 @@ jobs:
     name: Resolve PR Labels
     if: github.event_name == 'merge_group'
     uses: ./.github/workflows/_reusable-resolve-labels.yml
+    with:
+      pr-ubuntu: "22.04"
 
   build-tests-image:
     name: Build Main Test Image
@@ -162,6 +164,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Evaluate gate
         run: |
+          echo "TEST-ONLY: resolve-labels pr_build_os='${{ needs.resolve-labels.outputs.pr_build_os }}' pr_ubuntu_codename='${{ needs.resolve-labels.outputs.pr_ubuntu_codename }}'"
           if [ "${{ github.event_name }}" != "merge_group" ]; then
             echo "pull_request context: gate is a no-op and passes."
             echo "The upstream-tests gate runs only inside the merge queue (merge_group)."

@@ -11,6 +11,12 @@ name: Resolve PR Labels
 
 on:
   workflow_call:
+    inputs:
+      pr-ubuntu:
+        description: "Pre-merge Ubuntu version in NN.NN format. Empty reads .github/nightly-wheel-matrix.json."
+        required: false
+        type: string
+        default: ""
     outputs:
       labels:
         description: "Comma-separated PR label names"
@@ -24,6 +30,12 @@ on:
       run_vertical:
         description: "true for ``ciflow:vertical`` or ``ciflow:full-suite``, or for ``module:aten-ops``/``module:dynamo``/``module:runtime-core`` when skip_upstream is false"
         value: ${{ jobs.resolve.outputs.run_vertical }}
+      pr_build_os:
+        description: "Neuron build OS label for pre-merge images."
+        value: ${{ jobs.resolve.outputs.pr_build_os }}
+      pr_ubuntu_codename:
+        description: "Ubuntu codename for pre-merge images."
+        value: ${{ jobs.resolve.outputs.pr_ubuntu_codename }}
 
 permissions:
   contents: read
@@ -39,7 +51,15 @@ jobs:
       skip_upstream: ${{ steps.lookup.outputs.skip_upstream }}
       run_full_suite: ${{ steps.lookup.outputs.run_full_suite }}
       run_vertical: ${{ steps.lookup.outputs.run_vertical }}
+      pr_build_os: ${{ steps.config.outputs.pr_build_os }}
+      pr_ubuntu_codename: ${{ steps.config.outputs.ubuntu_codename }}
     steps:
+      - uses: actions/checkout@v4
+      - name: Read the PR Ubuntu version
+        id: config
+        uses: ./.github/actions/read-pr-ubuntu
+        with:
+          pr-ubuntu: ${{ inputs.pr-ubuntu }}
       - name: Lookup PR labels for merge commit
         id: lookup
         uses: actions/github-script@v7
