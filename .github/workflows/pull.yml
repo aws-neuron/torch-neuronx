@@ -128,9 +128,7 @@ jobs:
       # A fork run checks out the base branch (github.sha), not the fork. The
       # runner then uses our .github/ actions. The code under test is in the image.
       checkout_ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      # TEST-ONLY on contribute-9.9: no-op PR checks (no image build, no Kaizen).
-      # Restore: ${{ github.event_name == 'merge_group' }}
-      noop: true
+      noop: ${{ github.event_name == 'merge_group' }}
       dkms: ${{ vars.NEURON_DKMS || 'private-torch-neuronx-main-stable' }}
 
   block-perf:
@@ -143,9 +141,7 @@ jobs:
       enforce-mfu-threshold: true
       # Empty on a fork run, so it checks out the base branch. See internal-tests.
       checkout-ref: ${{ github.event.pull_request.head.sha }}
-      # TEST-ONLY on contribute-9.9: no-op PR checks (no image build, no Kaizen).
-      # Restore: ${{ github.event_name == 'merge_group' }}
-      noop: true
+      noop: ${{ github.event_name == 'merge_group' }}
 
   # Fork pull request runs only. A manual run reports on the base branch, so
   # post the result on the pull request head commit.
