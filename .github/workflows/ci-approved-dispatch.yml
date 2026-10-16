@@ -1,0 +1,162 @@
+name: CI approved dispatch
+
+# The safe-to-test label starts PR Checks on a fork pull request. It is the only
+# way to start them. A maintainer does not start pull.yml by hand.
+#
+# WARNING: this file works only while its branch is the default branch.
+# GitHub resolves pull_request_target against the default branch. It ignores the
+# pull request base branch. On any other branch this file is inert. There is no
+# run and no error. labeler.yml shows the result: it returns 404 "not found on
+# the default branch" and has never run. The owner who makes the next contribute
+# branch default must copy this file to it.
+#
+# WARNING: this workflow must never check out or run pull request code.
+# pull_request_target gives the job a write-scoped token while the pull request
+# is untrusted. The body is three API calls. head_sha is a dispatch input, not a
+# checkout ref.
+#
+# check-approval in pull.yml requires the safe-to-test label, an open pull
+# request, pr.base.ref equal to the run branch, and the current head_sha. It
+# re-validates every condition inside the run, so this workflow does not need to
+# repeat them.
+#
+# A push removes the label. See the revoke job. An approval is for one commit.
+on:
+  pull_request_target:
+    types: [labeled, synchronize]
+    # Only the latest contribute branch accepts pull requests, and it is also
+    # the default branch.
+    branches: ['contribute-*']
+
+permissions: {}
+
+concurrency:
+  # Key on the pull request number. Under pull_request_target, GITHUB_REF is the
+  # default branch and is the same for every pull request, so a github.ref group
+  # holds all of them and cancels one dispatch with another.
+  #
+  # The last part separates the two actions. GitHub claims the group before it
+  # reads the job conditions, and it keeps one pending run for each group.
+  # Without the separator, a push or an unrelated label can replace a pending
+  # dispatch, and the dispatch never happens.
+  group: >-
+    ${{ github.workflow }}-${{ github.event.pull_request.number }}-${{
+      github.event.action == 'synchronize' && 'revoke'
+      || (github.event.label.name == 'safe-to-test' && 'approve')
+      || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: Dispatch PR Checks
+    # Fork pull requests only. A branch in this repository gets PR Checks from
+    # the pull.yml triggers. A second run would race it and report the same job
+    # names.
+    if: >-
+      github.event.action == 'labeled' &&
+      github.event.label.name == 'safe-to-test' &&
+      github.event.pull_request.head.repo.full_name != github.repository
+    # Use the check-approval runner, not ubuntu-latest. This job is the only
+    # path that starts tests for a fork pull request. The GitHub-hosted pool
+    # saturates for long periods.
+    runs-on: [self-hosted, linux, "neuron.image:neuron-gate-tools", "neuron.run-${{ github.run_id }}-dispatch"]
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          LABELER: ${{ github.event.sender.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        with:
+          script: |
+            const labeler = process.env.LABELER;
+            const prNumber = Number(process.env.PR_NUMBER);
+
+            // A triage user can apply a label. Require write access instead,
+            // because the label starts tests on contributor code. The permission
+            // field reports maintain as write and triage as read. This call needs
+            // only Metadata read access.
+            const { data: access } = await github.rest.repos.getCollaboratorPermissionLevel({
+              ...context.repo, username: labeler,
+            });
+            if (!['admin', 'write'].includes(access.permission)) {
+              core.setFailed(`${labeler} has '${access.permission}', not write. The dispatch stopped.`);
+              return;
+            }
+
+            // Read the pull request again. The event payload is old if the
+            // contributor pushed after the label. check-approval fails unless
+            // head_sha is current.
+            const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: prNumber });
+            if (pr.state !== 'open') {
+              core.setFailed(`PR #${prNumber} is ${pr.state}, not open. The dispatch stopped.`);
+              return;
+            }
+
+            // Start the run on the pull request base branch. check-approval
+            // rejects a run on a different branch, and that branch holds the
+            // pull.yml that must test the change. Read the value instead of
+            // hardcoding it, so contribute version changes need no edit.
+            const ref = pr.base.ref;
+            core.info(`Dispatch pull.yml on ${ref} for PR #${prNumber} (${pr.head.sha})`);
+            await github.rest.actions.createWorkflowDispatch({
+              ...context.repo,
+              workflow_id: 'pull.yml',
+              ref,
+              inputs: { pr_number: String(prNumber), head_sha: pr.head.sha },
+            });
+            core.info('The dispatch is complete. check-approval validates the label and the commit.');
+
+            // Keep PR Checks pending. pr-gate.yml set it when the pull request
+            // opened. The dispatched run needs a runner before check-approval
+            // reports, and the per-job rows come later still. A success here
+            // would make the pull request read as green while no test has run.
+            // report-to-pr posts the final state after the rows exist.
+            await github.rest.repos.createCommitStatus({
+              ...context.repo,
+              sha: pr.head.sha,
+              state: 'pending',
+              context: 'PR Checks',
+              description: `Approved by ${labeler}. The tests start soon.`,
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+
+  revoke:
+    name: Remove the approval
+    # A new commit is not the commit that the maintainer reviewed. Remove the
+    # label so the next approval is one action. If the label stayed, a second
+    # add would send no labeled event, and the maintainer would have to remove it
+    # first.
+    #
+    # pr-gate.yml posts PR Checks as pending on the new commit, so the pull
+    # request shows that it waits for a new approval. check-approval also refuses
+    # a stale head_sha, so an in-flight run that loses the label fails closed.
+    if: >-
+      github.event.action == 'synchronize' &&
+      github.event.pull_request.head.repo.full_name != github.repository &&
+      contains(github.event.pull_request.labels.*.name, 'safe-to-test')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        with:
+          script: |
+            const prNumber = Number(process.env.PR_NUMBER);
+            try {
+              await github.rest.issues.removeLabel({
+                ...context.repo, issue_number: prNumber, name: 'safe-to-test',
+              });
+              core.info(`Removed safe-to-test from PR #${prNumber}. A new commit needs a new approval.`);
+            } catch (err) {
+              // A 404 means a maintainer removed the label first. That is not an
+              // error.
+              if (err.status !== 404) throw err;
+              core.info('The label was already removed.');
+            }

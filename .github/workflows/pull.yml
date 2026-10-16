@@ -6,9 +6,9 @@ on:
   # synchronize re-runs the suite on the new SHA (gate checks approval via API).
   pull_request:
     types: [synchronize]
-  # A fork pull request gets no automatic run. A maintainer comments /test
-  # (pr-commands.yml), which starts this workflow with the two inputs below.
-  # Leave both empty for a normal manual run.
+  # A fork pull request gets no automatic run. A maintainer adds the
+  # safe-to-test label, and ci-approved-dispatch.yml starts this workflow with
+  # the two inputs below. Leave both empty for a normal manual run.
   workflow_dispatch:
     inputs:
       pr_number:
@@ -79,7 +79,7 @@ jobs:
               } else if (!pr.labels.some(l => l.name === 'safe-to-test')) {
                 core.setFailed(`PR #${prInput} does not have the safe-to-test label.`);
               } else if (pr.head.sha !== headSha) {
-                core.setFailed(`PR #${prInput} changed after the review. Review ${pr.head.sha} and comment /test again.`);
+                core.setFailed(`PR #${prInput} changed after the review. Review ${pr.head.sha}, then add the safe-to-test label again.`);
               } else {
                 await github.rest.repos.createCommitStatus({
                   ...context.repo, sha: headSha, state: 'pending', context: 'PR Checks',
@@ -116,6 +116,103 @@ jobs:
             // const approved = [...latestByUser.values()].includes('APPROVED');
             const approved = true;
             core.setOutput('run', String(approved && !draft && !release && !skip));
+  # Publish one commit status for each job of this run on the pull request head
+  # commit. A fork pull request run starts on the base branch, so GitHub does
+  # not attach the jobs to the pull request. Only the PR Checks rollup links the
+  # two. A commit status target_url is kept, so each status links to its own job
+  # log. A check run details_url is replaced by GitHub, so a status is correct
+  # here and a check run is not.
+  report-job-status:
+    name: Report job status
+    # The fork path only. On the other paths the run head_sha is the pull
+    # request head, so GitHub attaches the jobs and these statuses would be
+    # duplicates.
+    if: github.event_name == 'workflow_dispatch' && needs.check-approval.outputs.pr_number != ''
+    needs: check-approval
+    runs-on: [self-hosted, linux, "neuron.image:neuron-gate-tools", "neuron.run-${{ github.run_id }}-report-job-status"]
+    timeout-minutes: 560
+    permissions:
+      statuses: write
+      actions: read
+    steps:
+      # Keep this best effort. The report is cosmetic and must not fail a run
+      # that passed. report-to-pr posts the final state of each job, so a lost
+      # loop cannot leave a status at pending.
+      - continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ needs.check-approval.outputs.head_sha }}
+        with:
+          script: |
+            const headSha = process.env.HEAD_SHA;
+            const runId = context.runId;
+
+            // The jobs API returns the display name. A job with no `name:` key
+            // reports its id, so check-approval and report-to-pr appear under
+            // their ids. Exclude all three: this job would report itself,
+            // report-to-pr runs after the loop, and check-approval is a gate,
+            // not a test.
+            const SKIP = new Set(['Report job status', 'report-to-pr', 'check-approval']);
+
+            const POLL_MS = 30000;
+            // internal-tests and block-perf carry neuron.timeout:32400, which is
+            // 540 minutes. A shorter deadline freezes every row at pending for
+            // hours and leaves report-to-pr to correct them at the end.
+            const DEADLINE = Date.now() + 550 * 60 * 1000;
+
+            // A commit status has four states. There is no neutral state and no
+            // skipped state. A skipped job gets no row at all. torch-mlir-e2e-tests
+            // has `if: false`, so a skipped job mapped to success would show a
+            // disabled suite as a passing check.
+            const reportable = (job) => job.conclusion !== 'skipped';
+            const stateOf = (job) => {
+              if (job.status !== 'completed') return 'pending';
+              if (job.conclusion === 'success') return 'success';
+              if (job.conclusion === 'cancelled') return 'error';
+              return 'failure';
+            };
+
+            // Keep the full "Parent / Child" name. internal-tests and block-perf
+            // call different reusable workflows, so two child jobs can have the
+            // same name. A short name would make them share one status context.
+            const last = new Map();
+
+            for (;;) {
+              let jobs = [];
+              try {
+                const { data } = await github.rest.actions.listJobsForWorkflowRun({
+                  ...context.repo, run_id: runId, per_page: 100,
+                });
+                jobs = data.jobs.filter((j) => !SKIP.has(j.name) && reportable(j));
+              } catch (err) {
+                core.warning(`The jobs API failed: ${err.status} ${err.message}`);
+              }
+
+              for (const job of jobs) {
+                const state = stateOf(job);
+                const description = String(job.status !== 'completed' ? job.status : job.conclusion).slice(0, 140);
+                const key = `${state}|${description}`;
+                if (last.get(job.name) === key) continue;
+                try {
+                  await github.rest.repos.createCommitStatus({
+                    ...context.repo, sha: headSha, context: job.name, state, description,
+                    target_url: job.html_url,
+                  });
+                  last.set(job.name, key);
+                  core.info(`${job.name} is ${state} (${description})`);
+                } catch (err) {
+                  core.warning(`The status post failed for "${job.name}": ${err.status} ${err.message}`);
+                }
+              }
+
+              if (jobs.length > 0 && jobs.every((j) => j.status === 'completed')) break;
+              if (Date.now() > DEADLINE) {
+                core.warning('The deadline passed. report-to-pr posts the final state.');
+                break;
+              }
+              await new Promise((r) => setTimeout(r, POLL_MS));
+            }
+
   internal-tests:
     needs: [check-approval]
     if: needs.check-approval.outputs.run == 'true'
@@ -152,7 +249,45 @@ jobs:
     timeout-minutes: 10
     permissions:
       statuses: write
+      actions: read
     steps:
+      # Post the final state of each job before the rollup. report-job-status
+      # polls, so a lost runner or a passed deadline can leave a status at
+      # pending. A pending status on a pull request reads as a check that never
+      # ends.
+      - name: Report the final job states
+        if: always() && github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ needs.check-approval.outputs.head_sha }}
+        with:
+          script: |
+            const SKIP = new Set(['Report job status', 'report-to-pr', 'check-approval']);
+            // See report-job-status: a skipped job gets no row.
+            const reportable = (job) => job.conclusion !== 'skipped';
+            const stateOf = (job) => {
+              if (job.status !== 'completed') return 'pending';
+              if (job.conclusion === 'success') return 'success';
+              if (job.conclusion === 'cancelled') return 'error';
+              return 'failure';
+            };
+            const { data } = await github.rest.actions.listJobsForWorkflowRun({
+              ...context.repo, run_id: context.runId, per_page: 100,
+            });
+            for (const job of data.jobs.filter((j) => !SKIP.has(j.name) && reportable(j))) {
+              try {
+                await github.rest.repos.createCommitStatus({
+                  ...context.repo, sha: process.env.HEAD_SHA, context: job.name,
+                  state: stateOf(job),
+                  description: String(job.conclusion || job.status).slice(0, 140),
+                  target_url: job.html_url,
+                });
+              } catch (err) {
+                core.warning(`The status post failed for "${job.name}": ${err.status} ${err.message}`);
+              }
+            }
+
       - uses: actions/github-script@v7
         env:
           HEAD_SHA: ${{ needs.check-approval.outputs.head_sha }}
