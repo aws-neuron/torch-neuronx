@@ -1,10 +1,5 @@
 name: Read PR Ubuntu version
-description: Read the pre-merge Ubuntu version from the pr-ubuntu input, or else from the wheel matrix config.
-inputs:
-  pr-ubuntu:
-    description: Pre-merge Ubuntu version in NN.NN format. Empty reads .github/nightly-wheel-matrix.json.
-    required: false
-    default: ""
+description: Read the pre-merge Ubuntu version from the wheel matrix config.
 outputs:
   pr_build_os:
     description: Neuron build OS label for pre-merge images.
@@ -25,19 +20,14 @@ runs:
         import re
         from pathlib import Path
 
-        # Set inline: step env does not reach run steps on the gate runner.
-        pr_ubuntu = "${{ inputs.pr-ubuntu }}"
-        source = "the pr-ubuntu input"
+        config = json.loads(Path(".github/nightly-wheel-matrix.json").read_text())
+        pr_ubuntu = config.get("pr_ubuntu")
         if not pr_ubuntu:
-            config = json.loads(Path(".github/nightly-wheel-matrix.json").read_text())
-            pr_ubuntu = config.get("pr_ubuntu")
-            source = ".github/nightly-wheel-matrix.json"
-            if not pr_ubuntu:
-                raise SystemExit("pr_ubuntu is required in nightly-wheel-matrix.json.")
-            if pr_ubuntu not in config.get("ubuntu_versions", []):
-                raise SystemExit("pr_ubuntu must be in ubuntu_versions.")
+            raise SystemExit("pr_ubuntu is required in nightly-wheel-matrix.json.")
         if not re.fullmatch(r"[0-9]{2}\.[0-9]{2}", pr_ubuntu):
             raise SystemExit("pr_ubuntu must use the NN.NN format.")
+        if pr_ubuntu not in config.get("ubuntu_versions", []):
+            raise SystemExit("pr_ubuntu must be in ubuntu_versions.")
 
         codenames = {
             "22.04": "jammy",
@@ -48,7 +38,6 @@ runs:
         if not ubuntu_codename:
             raise SystemExit(f"pr_ubuntu {pr_ubuntu} has no Ubuntu codename mapping.")
 
-        print(f"Pre-merge Ubuntu {pr_ubuntu} ({ubuntu_codename}) from {source}.")
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             output.write(f"pr_build_os=ubuntu{pr_ubuntu}\n")
             output.write(f"ubuntu_codename={ubuntu_codename}\n")

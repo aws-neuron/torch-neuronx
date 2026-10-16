@@ -44,8 +44,6 @@ jobs:
     name: Resolve PR Labels
     if: github.event_name == 'merge_group'
     uses: ./.github/workflows/_reusable-resolve-labels.yml
-    with:
-      pr-ubuntu: "22.04"
 
   build-tests-image:
     name: Build Main Test Image

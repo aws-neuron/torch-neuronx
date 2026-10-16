@@ -11,12 +11,6 @@ name: Resolve PR Labels
 
 on:
   workflow_call:
-    inputs:
-      pr-ubuntu:
-        description: "Pre-merge Ubuntu version in NN.NN format. Empty reads it from the wheel matrix config."
-        required: false
-        type: string
-        default: ""
     outputs:
       labels:
         description: "Comma-separated PR label names"
@@ -58,8 +52,6 @@ jobs:
       - name: Read the PR Ubuntu version
         id: config
         uses: ./.github/actions/read-pr-ubuntu
-        with:
-          pr-ubuntu: ${{ inputs.pr-ubuntu }}
       - name: Lookup PR labels for merge commit
         id: lookup
         uses: actions/github-script@v7
