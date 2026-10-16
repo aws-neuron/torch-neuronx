@@ -240,6 +240,9 @@ jobs:
       build_os: ${{ needs.check-approval.outputs.pr_build_os }}
       ubuntu_codename: ${{ needs.check-approval.outputs.pr_ubuntu_codename }}
       checkout_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      # The commit the image must hold. checkout_ref above is the base branch on a
+      # dispatched fork run, by design, because the code under test is in the image.
+      head_sha: ${{ github.event.pull_request.head.sha || needs.check-approval.outputs.head_sha }}
       noop: ${{ github.event_name == 'merge_group' }}
       dkms: public
 
@@ -248,7 +251,7 @@ jobs:
     if: needs.check-approval.outputs.run == 'true'
     uses: ./.github/workflows/_reusable-block-perf.yml
     with:
-      runner-labels: ${{ format('["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.internal_compute.persistent-storage:read","neuron.build-image","neuron.build-os:{2}","neuron.build-arg:UBUNTU_CODENAME:{3}","neuron.run-{0}-block-perf","neuron.pr:{1}","neuron.timeout:32400","neuron.dkms:public"]', github.run_id, github.event.pull_request.number || needs.check-approval.outputs.pr_number, needs.check-approval.outputs.pr_build_os, needs.check-approval.outputs.pr_ubuntu_codename) }}
+      runner-labels: ${{ format('["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.internal_compute.persistent-storage:read","neuron.build-image","neuron.build-os:{2}","neuron.build-arg:UBUNTU_CODENAME:{3}","neuron.run-{0}-block-perf","neuron.pr:{1}","neuron.sha:{4}","neuron.timeout:32400","neuron.dkms:public"]', github.run_id, github.event.pull_request.number || needs.check-approval.outputs.pr_number, needs.check-approval.outputs.pr_build_os, needs.check-approval.outputs.pr_ubuntu_codename, github.event.pull_request.head.sha || needs.check-approval.outputs.head_sha) }}
       artifact-prefix: block-perf
       enforce-mfu-threshold: true
       checkout-ref: ${{ github.event.pull_request.head.sha }}

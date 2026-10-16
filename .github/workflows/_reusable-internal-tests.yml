@@ -23,6 +23,15 @@ on:
         required: false
         type: string
         default: ''
+      head_sha:
+        description: >-
+          Commit to build the image from. A dispatched fork run starts on the base
+          branch, so the webhook sees the base tip. Without this the image holds
+          mainline and the suite reports a pass on the pull request. Leave empty on
+          merge_group to keep the payload commit.
+        required: false
+        type: string
+        default: ''
       build_os:
         description: Operating system label for a build image.
         required: false
@@ -89,14 +98,15 @@ jobs:
       '["self-hosted","linux","neuron.image:neuron-gate-tools","neuron.run-{0}-{1}-noop-{2}"]',
       github.run_id, inputs.suite_id, matrix.node)) || inputs.build_image &&
       fromJSON(format(
-      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.build-image","neuron.build-os:{5}","neuron.build-arg:UBUNTU_CODENAME:{6}","neuron.run-{0}-{1}","neuron.pr:{2}","neuron.timeout:32400"{3}{4}]',
+      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.build-image","neuron.build-os:{5}","neuron.build-arg:UBUNTU_CODENAME:{6}","neuron.run-{0}-{1}","neuron.pr:{2}","neuron.sha:{7}","neuron.timeout:32400"{3}{4}]',
       github.run_id,
       matrix.node,
       inputs.pr_number,
       matrix.neff_cache && ',"neuron.internal_compute.persistent-storage:read"' || '',
       inputs.dkms != '' && format(',"neuron.dkms:{0}"', inputs.dkms) || '',
       inputs.build_os,
-      inputs.ubuntu_codename
+      inputs.ubuntu_codename,
+      inputs.head_sha
       )) || fromJSON(format(
       '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.run-{0}-{1}-{2}","neuron.image:{3}","neuron.timeout:32400"{4}{5}]',
       github.run_id,
@@ -142,12 +152,13 @@ jobs:
       '["self-hosted","linux","neuron.image:neuron-gate-tools","neuron.run-{0}-{1}-noop-{2}"]',
       github.run_id, inputs.suite_id, 'cpp-lit-accuracy')) || inputs.build_image &&
       fromJSON(format(
-      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.build-image","neuron.build-os:{3}","neuron.build-arg:UBUNTU_CODENAME:{4}","neuron.run-{0}-cpp-lit-accuracy","neuron.pr:{1}","neuron.timeout:32400"{2}]',
+      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.build-image","neuron.build-os:{3}","neuron.build-arg:UBUNTU_CODENAME:{4}","neuron.run-{0}-cpp-lit-accuracy","neuron.pr:{1}","neuron.sha:{5}","neuron.timeout:32400"{2}]',
       github.run_id,
       inputs.pr_number,
       inputs.dkms != '' && format(',"neuron.dkms:{0}"', inputs.dkms) || '',
       inputs.build_os,
-      inputs.ubuntu_codename
+      inputs.ubuntu_codename,
+      inputs.head_sha
       )) || fromJSON(format(
       '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.run-{0}-{1}-cpp-lit-accuracy","neuron.image:{2}","neuron.timeout:32400"{3}]',
       github.run_id,
