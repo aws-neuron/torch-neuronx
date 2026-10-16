@@ -101,8 +101,16 @@ jobs:
               }
               return;
             }
+            // A fork pull request runs only through the safe-to-test dispatch above.
+            const head = context.payload.pull_request.head.repo || {};
+            if (head.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
+              core.setOutput('run', 'false');
+              return;
+            }
             const draft = context.payload.pull_request.draft;
-            const release = context.payload.pull_request.base.ref.startsWith('release-');
+            // A release base can also be a publication test branch, such as
+            // e2e/release-publication/<id>/release-N.M.
+            const release = /(^|\/)release-/.test(context.payload.pull_request.base.ref);
             const skip = (context.payload.pull_request.labels || []).some(l => l.name === 'ciflow:skip-pr-checks');
             // pull_request_review: only run on actual approval.
             // Comments will cancel the in-flight suite (unavoidable with

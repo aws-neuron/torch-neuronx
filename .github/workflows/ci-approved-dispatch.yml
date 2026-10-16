@@ -87,12 +87,17 @@ jobs:
               return;
             }
 
-            // Read the pull request again. The event payload is old if the
-            // contributor pushed after the label. check-approval fails unless
-            // head_sha is current.
+            // Dispatch only the commit that the maintainer labelled. If the
+            // contributor pushed after the label, stop. The revoke job removes the
+            // label, and the new commit needs a new review.
+            const labelled = context.payload.pull_request.head.sha;
             const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: prNumber });
             if (pr.state !== 'open') {
               core.setFailed(`PR #${prNumber} is ${pr.state}, not open. The dispatch stopped.`);
+              return;
+            }
+            if (pr.head.sha !== labelled) {
+              core.setFailed(`PR #${prNumber} changed after the label. Review ${pr.head.sha}, then add safe-to-test again.`);
               return;
             }
 
@@ -101,12 +106,12 @@ jobs:
             // pull.yml that must test the change. Read the value instead of
             // hardcoding it, so contribute version changes need no edit.
             const ref = pr.base.ref;
-            core.info(`Dispatch pull.yml on ${ref} for PR #${prNumber} (${pr.head.sha})`);
+            core.info(`Dispatch pull.yml on ${ref} for PR #${prNumber} (${labelled})`);
             await github.rest.actions.createWorkflowDispatch({
               ...context.repo,
               workflow_id: 'pull.yml',
               ref,
-              inputs: { pr_number: String(prNumber), head_sha: pr.head.sha },
+              inputs: { pr_number: String(prNumber), head_sha: labelled },
             });
             core.info('The dispatch is complete. check-approval validates the label and the commit.');
 
@@ -117,7 +122,7 @@ jobs:
             // report-to-pr posts the final state after the rows exist.
             await github.rest.repos.createCommitStatus({
               ...context.repo,
-              sha: pr.head.sha,
+              sha: labelled,
               state: 'pending',
               context: 'PR Checks',
               description: `Approved by ${labeler}. The tests start soon.`,
@@ -138,7 +143,7 @@ jobs:
       github.event.action == 'synchronize' &&
       github.event.pull_request.head.repo.full_name != github.repository &&
       contains(github.event.pull_request.labels.*.name, 'safe-to-test')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, "neuron.image:neuron-gate-tools", "neuron.run-${{ github.run_id }}-revoke"]
     timeout-minutes: 10
     permissions:
       pull-requests: write

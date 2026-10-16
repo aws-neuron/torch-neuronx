@@ -13,6 +13,8 @@
 #   gh api 'repos/<org>/<repo>/codeowners/errors?ref=<branch>'
 # -- Catch-all --
 *                                                   @aws-neuron/torch-neuronx-approvers
+# -- CI. The more specific rules below still win. --
+/.github/                                           @aws-neuron/torch-infra-approvers @aws-neuron/torch-neuronx-approvers
 # -- CODEOWNERS itself --
 CODEOWNERS                                          @aws-singhada @galaind @aws-neuron/torch-neuronx-approvers
 # -- C++ Runtime (default for csrc; SMEs override below) --
@@ -65,4 +67,3 @@ tests/pytorch_tests_native/                         @aws-neuron/torch-neuronx-ap
 /setup.py                                           @aws-neuron/torch-infra-approvers @aws-neuron/torch-neuronx-approvers
 /pyproject.toml                                     @aws-neuron/torch-infra-approvers @aws-neuron/torch-neuronx-approvers
 /*.sh                                               @aws-neuron/torch-infra-approvers @aws-neuron/torch-neuronx-approvers
-/.github/                                           @aws-neuron/torch-infra-approvers @aws-neuron/torch-neuronx-approvers
