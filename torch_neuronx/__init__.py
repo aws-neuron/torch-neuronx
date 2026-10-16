@@ -1,3 +1,4 @@
+# TEST: check the merge queue image build. Do not merge.
 try:
     from importlib.metadata import version as _pkg_version
 
