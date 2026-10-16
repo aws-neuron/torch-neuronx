@@ -7,7 +7,7 @@ Inputs:
   * the dist config (the ``{"nodes": [...]}`` shape produced by the
     upstream test config files)
   * the PR's labels (list of strings — typically resolved by
-    ``_resolve-labels.yml`` from the merge commit's PR)
+    ``_reusable-resolve-labels.yml`` from the merge commit's PR)
   * a "force full suite" override (typically driven by the
     ``ciflow:run-full-suite`` manual label)
 
@@ -89,7 +89,7 @@ class SelectionDecision:
 def parse_labels_csv(raw: str | None) -> list[str]:
     """Parse a CSV of label names into a deduplicated, stripped list.
 
-    The PR-labels output from ``_resolve-labels.yml`` is a CSV string;
+    The PR-labels output from ``_reusable-resolve-labels.yml`` is a CSV string;
     callers pass it through here so empty/whitespace handling is
     centralized.
     """

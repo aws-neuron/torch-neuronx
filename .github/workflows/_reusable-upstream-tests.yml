@@ -6,11 +6,11 @@ name: PyTorch Upstream Test Suite
 #
 # Job graph (3 jobs — GitHub Actions constraint: dynamic matrix cannot run in
 # the same job as the matrix generator):
-#   compute-pytorch-upstream-matrix (ubuntu-latest)
+#   compute-pytorch-upstream-matrix (Neuron gate runner)
 #     ↓ outputs matrix
 #   pytorch-upstream-test-suite (26 parallel trn2 nodes)
 #     ↓ uploads per-node artifacts
-#   aggregate-pytorch-upstream (ubuntu-latest)
+#   aggregate-pytorch-upstream (gate runner)
 #     ↓ downloads all artifacts, prints summary, writes GH job summary
 
 on:
@@ -53,7 +53,7 @@ on:
         description: >
           Override that forces the full dist config even when ``labels``
           is set. Used by the merge-queue gate to honor the
-          ``ciflow:full-suite`` manual PR label. Other callers
+          ``ciflow:run-full-suite`` manual PR label. Other callers
           leave it as default ``false`` and just pass empty ``labels``.
         required: false
         type: boolean
@@ -228,31 +228,34 @@ jobs:
     name: Aggregate PyTorch Upstream Test Results
     needs: [pytorch-upstream-test-suite]
     if: always()
-    runs-on: ubuntu-latest
+    # A full run peaks near 1 GiB of memory, so use a larger instance than the default t3.micro.
+    runs-on: [self-hosted, linux, "neuron.image:neuron-gate-tools", "neuron.ec2:c7a.xlarge", "neuron.run-${{ github.run_id }}-upstream-aggregate"]
+    timeout-minutes: 30
     outputs:
       failure_count: ${{ steps.summarize.outputs.failure_count }}
       gate_passed: ${{ steps.summarize.outputs.gate_passed }}
     steps:
       - uses: actions/checkout@v4
+      # The download-artifact action runs on the host. The run steps run in the
+      # gate container, which shares only the workspace and RUNNER_TEMP.
       - name: Download all upstream artifacts
         uses: actions/download-artifact@v4
         with:
-          path: /tmp/upstream-results
+          path: ${{ runner.temp }}/upstream-results
           pattern: upstream-pytorch-*
       - name: Install aggregator dependencies
-        # ubuntu-latest doesn't have the test image's `[dev]` extras
-        # installed, so the aggregator's pyarrow import fails without
-        # this. Pin to a version that has prebuilt wheels for python 3.12.
-        run: pip install "pyarrow>=15,<20"
+        # The gate image does not have the test image's `[dev]` extras, so the
+        # aggregator's pyarrow import fails without this.
+        run: python3 -m pip install "pyarrow>=15,<20"
+      # The gate container drops step env, so pass the inputs inline.
       - name: Summarize results
         id: summarize
-        env:
-          DIST_CONFIG: tests/pytorch_tests_native/${{ inputs.dist-config }}
-          MAX_FAILURES: ${{ inputs.max-failures }}
         run: |
+          max_failures="${{ inputs.max-failures }}"
           python3 tests/pytorch_tests_native/runner/aggregate_upstream_results.py \
-            /tmp/upstream-results --dist-config "$DIST_CONFIG" \
-            ${MAX_FAILURES:+--max-failures $MAX_FAILURES}
+            "${RUNNER_TEMP}/upstream-results" \
+            --dist-config "tests/pytorch_tests_native/${{ inputs.dist-config }}" \
+            ${max_failures:+--max-failures "$max_failures"}
       - name: Bundle all node artifacts into single archive
         if: always()
         uses: actions/upload-artifact@v4
@@ -263,7 +266,7 @@ jobs:
           # into results_dir and the aggregator would double-count every test
           # under the "all" label (bypassing the soft_fail gate exclusion).
           name: upstream-results-bundle
-          path: /tmp/upstream-results/
+          path: ${{ runner.temp }}/upstream-results/
           retention-days: 30
       # Artifact name ``custom-test-artifacts`` triggers the DevOps mirror
       # to copy contents to S3 verbatim. The directory tree inside becomes
@@ -273,5 +276,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: custom-test-artifacts
-          path: /tmp/upstream-results/custom-test-artifacts/
+          path: ${{ runner.temp }}/upstream-results/custom-test-artifacts/
           retention-days: 30

@@ -1,0 +1,99 @@
+name: 🐛 Bug Report
+description: Report a bug in torch-neuronx
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        #### Before you file a bug, please check that it is not already known.
+
+        - [Existing and past issues](https://github.com/aws-neuron/torch-neuronx/issues?q=is%3Aissue+sort%3Acreated-desc+)
+        - [Neuron release notes](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/release-notes/index.html)
+          — known issues and limitations are listed per release
+        - [Neuron troubleshooting guide](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/troubleshooting.html)
+        - [Neuron runtime troubleshooting](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/neuron-runtime/nrt-troubleshoot.html)
+        - [Neuron container troubleshooting](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/deploy/troubleshooting.html)
+        - [PyTorch on Neuron documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/frameworks/torch/index.html)
+
+        If the behaviour you see is a documented limitation, there is nothing for us to
+        fix here. Open a feature request instead.
+  - type: textarea
+    attributes:
+      label: 🐛 Describe the bug
+      description: |
+        A clear description of the bug. Include a minimal code snippet to reproduce the issue and the error message or stack trace you observe.
+      placeholder: |
+        A clear and concise description of what the bug is.
+
+        ```python
+        # Sample code to reproduce the problem
+        ```
+
+        ```
+        The error message you got, with the full traceback.
+        ```
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Reproduction
+      description: |
+        A script we can run to see the failure. Make it as small as you can, and use as
+        little compute as the failure allows — a single core is better than a whole
+        instance. A unit test is the ideal form.
+      placeholder: |
+        ```python
+        import torch
+        import torch_neuronx
+
+        def test_repro():
+            x = torch.randn(4, 4, device="neuron")
+            ...
+        ```
+
+        Command:
+
+        ```
+        ```
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        ⚠️ **SECURITY WARNING:** Please review any text you paste to ensure it does not
+        contain sensitive information such as:
+        - AWS account IDs, ARNs, or access keys
+        - Instance IDs, private IP addresses, or internal hostnames
+        - Private S3 paths or endpoints
+        - Personal or confidential data
+
+        Consider replacing sensitive values with placeholders like `<ACCOUNT_ID>`
+        when sharing logs, configuration, or code.
+  - type: textarea
+    attributes:
+      label: Environment
+      description: |
+        Run this and paste the output:
+
+        ```sh
+        python -m torch_neuronx.collect_env
+        ```
+
+        Or list these by hand: torch-neuronx, PyTorch, neuronx-cc, Neuron runtime,
+        driver, collectives, and tools versions, and your instance type.
+
+        Check what you paste before you submit.
+      placeholder: |
+        The output of `python -m torch_neuronx.collect_env`, or the versions listed above.
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: >
+        Thanks for contributing 🎉!

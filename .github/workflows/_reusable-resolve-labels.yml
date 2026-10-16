@@ -13,7 +13,7 @@ on:
   workflow_call:
     inputs:
       pr-ubuntu:
-        description: "Pre-merge Ubuntu version in NN.NN format. Empty reads .github/nightly-wheel-matrix.json."
+        description: "Pre-merge Ubuntu version in NN.NN format. Empty reads it from the wheel matrix config."
         required: false
         type: string
         default: ""
@@ -22,10 +22,10 @@ on:
         description: "Comma-separated PR label names"
         value: ${{ jobs.resolve.outputs.labels }}
       skip_upstream:
-        description: "true if ``ciflow:skip-upstream`` is present without ``ciflow:full-suite``"
+        description: "true if ``ciflow:skip-upstream`` is present"
         value: ${{ jobs.resolve.outputs.skip_upstream }}
       run_full_suite:
-        description: "true if ``ciflow:full-suite`` is present"
+        description: "true if ``ciflow:run-full-suite`` is present"
         value: ${{ jobs.resolve.outputs.run_full_suite }}
       run_vertical:
         description: "true for ``ciflow:vertical`` or ``ciflow:full-suite``, or for ``module:aten-ops``/``module:dynamo``/``module:runtime-core`` when skip_upstream is false"
@@ -113,16 +113,14 @@ jobs:
             const csv = labels.join(',');
             core.info(`labels=${csv}`);
             core.setOutput('labels', csv);
-            const fullSuite = labels.includes('ciflow:full-suite');
-            const skipUpstream =
-              labels.includes('ciflow:skip-upstream') && !fullSuite;
+            const skipUpstream = labels.includes('ciflow:skip-upstream');
             core.setOutput(
               'skip_upstream',
               skipUpstream ? 'true' : 'false',
             );
             core.setOutput(
               'run_full_suite',
-              fullSuite ? 'true' : 'false',
+              labels.includes('ciflow:run-full-suite') ? 'true' : 'false',
             );
             // Run the vertical suite when the PR touches a vertical file
             // (labeler applies ciflow:vertical), or when ciflow:full-suite
@@ -133,7 +131,7 @@ jobs:
             core.setOutput(
               'run_vertical',
               (labels.includes('ciflow:vertical')
-                || fullSuite
+                || labels.includes('ciflow:full-suite')
                 || (!skipUpstream
                     && (labels.includes('module:aten-ops')
                         || labels.includes('module:dynamo')
