@@ -1,0 +1,12 @@
+should_trigger:
+  - "Review this torch-neuronx pull request and report any blocking issues."
+  - "Please do a code review of my current torch-neuronx branch against main."
+  - "Self-review these local changes before I submit a pull request."
+  - "Check this torch-neuronx PR for test gaps and backward-compatibility risks."
+should_not_trigger:
+  - prompt: "Explain how the torch-neuronx dispatcher selects an operation implementation."
+    expected: torch-neuronx-docs
+  - prompt: "Fix this failing upstream PyTorch test on Neuron."
+    expected: pytorch-upstream-test-debugger
+  - prompt: "Add a lowering for aten::special_erf."
+    expected: aten-op-lowering

@@ -1,0 +1,44 @@
+name: Read PR Ubuntu version
+description: Read the pre-merge Ubuntu version from the wheel matrix config.
+outputs:
+  pr_build_os:
+    description: Neuron build OS label for pre-merge images.
+    value: ${{ steps.config.outputs.pr_build_os }}
+  ubuntu_codename:
+    description: Ubuntu codename for pre-merge images.
+    value: ${{ steps.config.outputs.ubuntu_codename }}
+runs:
+  using: composite
+  steps:
+    - name: Read the matrix config
+      id: config
+      shell: bash
+      run: |
+        python3 - <<'PY'
+        import json
+        import os
+        import re
+        from pathlib import Path
+
+        config = json.loads(Path(".github/nightly-wheel-matrix.json").read_text())
+        pr_ubuntu = config.get("pr_ubuntu")
+        if not pr_ubuntu:
+            raise SystemExit("pr_ubuntu is required in nightly-wheel-matrix.json.")
+        if not re.fullmatch(r"[0-9]{2}\.[0-9]{2}", pr_ubuntu):
+            raise SystemExit("pr_ubuntu must use the NN.NN format.")
+        if pr_ubuntu not in config.get("ubuntu_versions", []):
+            raise SystemExit("pr_ubuntu must be in ubuntu_versions.")
+
+        codenames = {
+            "22.04": "jammy",
+            "24.04": "noble",
+            "26.04": "resolute",
+        }
+        ubuntu_codename = codenames.get(pr_ubuntu)
+        if not ubuntu_codename:
+            raise SystemExit(f"pr_ubuntu {pr_ubuntu} has no Ubuntu codename mapping.")
+
+        with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+            output.write(f"pr_build_os=ubuntu{pr_ubuntu}\n")
+            output.write(f"ubuntu_codename={ubuntu_codename}\n")
+        PY

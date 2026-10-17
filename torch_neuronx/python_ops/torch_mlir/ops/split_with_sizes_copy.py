@@ -1,0 +1,135 @@
+"""MLIR implementation of split_with_sizes_copy for FSDP optimization."""
+
+import torch
+
+from torch_neuronx.python_ops.base import ExecutionResult
+
+from ...auto_registration import neuron_op
+from ..op_impl import TorchMlirOpImpl
+
+
+def _split_copy_fn(input_tensor, split_sizes=None, dim=0, out=None):
+    """Split function for MLIR tracing.
+
+    split_sizes and dim are passed as static kwargs - they are concrete
+    Python values during tracing, not symbolic tensors.
+
+    Uses narrow+clone pattern which decomposes to stablehlo.slice ops.
+    This is more efficient than torch.split which produces gather ops,
+    since slice uses contiguous DMA copy rather than indexed random access.
+    """
+    results = []
+    offset = 0
+    for size in split_sizes:
+        results.append(
+            torch.narrow(input_tensor, dim, offset, size).clone(
+                memory_format=torch.contiguous_format
+            )
+        )
+        offset += size
+    return tuple(results)
+
+
+@neuron_op("aten::split_with_sizes_copy.out", disable_dtype_autocast=True, priority=90)
+class SplitWithSizesCopyMLIR(TorchMlirOpImpl):
+    """Implement fused ``split_with_sizes_copy.out`` with Torch-MLIR."""
+
+    def __init__(self):
+        super().__init__(
+            aten_op_name="aten::split_with_sizes_copy.out",
+            torch_fn=_split_copy_fn,
+            output_params=("out",),
+            # split_sizes and dim are static kwargs - concrete values during tracing
+            static_argnames=("split_sizes", "dim"),
+        )
+
+    def translate_args(self, *args, **kwargs):
+        """Translate raw ATen split arguments into kernel arguments.
+
+        Args:
+            *args (Any): Input tensor, split sizes, and optional dimension.
+            **kwargs (Any): Keyword dimension and output tensors.
+
+        Returns:
+            tuple: A one-item positional-argument tuple and a dictionary of static
+                split arguments and output tensors.
+        """
+        input_tensor = args[0]
+        split_sizes = tuple(int(s) for s in args[1]) if len(args) > 1 else ()
+        dim = int(args[2]) if len(args) > 2 else int(kwargs.get("dim", 0))
+        out = kwargs.get("out")
+        return (input_tensor,), {"split_sizes": split_sizes, "dim": dim, "out": out}
+
+    def can_handle(self, *args, **kwargs) -> bool:
+        """Check whether the input and outputs use a Neuron device.
+
+        Args:
+            *args (Any): Positional split arguments with the input tensor first.
+            **kwargs (Any): Keyword arguments containing the output tensors.
+
+        Returns:
+            bool: ``True`` when the input and every output are Neuron tensors.
+        """
+        input_tensor = args[0]
+        if not isinstance(input_tensor, torch.Tensor):
+            return False
+        if input_tensor.device.type != "neuron":
+            return False
+        # Check output tensors
+        out = kwargs.get("out")
+        if out is None:
+            return False
+        return all(t.device.type == "neuron" for t in out)
+
+    def execute(self, *args, **kwargs):
+        """Execute fused split copies through Torch-MLIR.
+
+        Args:
+            *args (Any): Translated arguments with the input tensor first.
+            **kwargs (Any): Static split sizes, dimension, and output tensors.
+
+        Returns:
+            ExecutionResult: Success with ``output=None`` for empty work or completed
+                output writes; otherwise failure details.
+
+        Note:
+            Non-contiguous inputs are materialized contiguously before kernel execution.
+        """
+        input_tensor = args[0]
+        split_sizes = kwargs.get("split_sizes", ())
+        dim = kwargs.get("dim", 0)
+        out = kwargs.get("out")
+
+        n_outputs = len(split_sizes)
+
+        # Handle edge cases
+        if n_outputs == 0 or input_tensor.numel() == 0:
+            return ExecutionResult(success=True, output=None)
+
+        if out is None or len(out) != n_outputs:
+            return ExecutionResult(
+                success=False,
+                error_msg=f"Expected {n_outputs} out tensors, got {len(out) if out else 0}",
+            )
+
+        # Ensure input is contiguous for efficient splitting
+        src_prepared = input_tensor
+        if not input_tensor.is_contiguous():
+            from ...cast_policy import ensure_contiguous_on_device
+
+            src_prepared = ensure_contiguous_on_device(input_tensor)
+
+        # Pass split_sizes and dim as static kwargs (not traced)
+        mlir_kwargs = {
+            "split_sizes": split_sizes,
+            "dim": dim,
+            "out": tuple(out),
+        }
+
+        # Execute via parent - only src_prepared is a traced tensor
+        result = super().execute(src_prepared, **mlir_kwargs)
+
+        # .out variant must return None (data written to out tensors)
+        if result.success:
+            return ExecutionResult(success=True, output=None)
+        return result

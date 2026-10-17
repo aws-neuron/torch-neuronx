@@ -1,0 +1,224 @@
+name: Vertical Op Tests (Reusable)
+
+# Reusable workflow for the vertical ATen op suites (eager + compile). One
+# definition drives every consumer; the caller picks the mode, the image, and
+# the shape budget. This mirrors _upstream-tests.yml: the caller builds the test
+# image once and passes it, so the vertical stage reuses the caller's image.
+#
+# Modes (input ``mode``):
+#   coverage -- async run. Records op status and writes dashboard parquet.
+#   perf     -- synchronous run (--perf-timing) for per-op timing. Writes
+#               parquet to the perf tables.
+#   gate     -- one-shape run under NEURON_COVERAGE_GATE=1 through run_gate.py.
+#               The job result gates the merge. It writes no dashboard parquet.
+#
+# Job graph:
+#   vertical-tests (trn2: eager + compile on inputs.image, writes CSVs)
+#       -> aggregate (gate runner: CSV -> parquet -> S3; non-gate modes)
+#
+# The aggregate job uploads the ``custom-test-artifacts`` artifact, which the
+# DevOps mirror copies to S3 verbatim for Athena. A run can upload that artifact
+# name only once, so each consumer stays a separate workflow run (nightly.yml
+# already uses the name for the upstream tables).
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "coverage | perf | gate. Selects the command and the outputs."
+        required: true
+        type: string
+      image:
+        description: "Test image URI. The caller builds it and passes it, the same way _upstream-tests.yml takes image."
+        required: true
+        type: string
+      max-shapes-per-op:
+        description: "Cap shape-registry entries per op. Pass 0 to sweep every shape. Record-only modes use it; gate mode hardcodes one shape in run_gate.py."
+        required: false
+        type: string
+        default: "10"
+      num-workers:
+        description: "pytest-xdist worker count (one logical NeuronCore each). The op tests are single-core, so trn2 runs 64. Perf pins a lower count for stable timing."
+        required: false
+        type: string
+        default: "64"
+      priority:
+        description: 'Internal-compute priority. Omit for normal; "high" jumps the queue.'
+        required: false
+        type: string
+        default: ""
+      runner-timeout:
+        description: "neuron.timeout label (seconds). The fleet keeps the runner alive this long."
+        required: false
+        type: string
+        default: "32400"
+      job-timeout-minutes:
+        description: "GitHub job timeout for the trn2 test job."
+        required: false
+        type: number
+        default: 600
+      # Persistent NEFF cache. On by default: the node hydrates the shared S3
+      # cache to local NVMe before the run and reads from it. Fail-open: an S3
+      # error degrades to a cold compile, never blocks the run. Perf must run
+      # cold to measure real compile time, so the perf caller passes false.
+      download-neff-cache:
+        description: "Hydrate the persistent NEFF cache from the shared S3 store before the run. Default true."
+        required: false
+        type: boolean
+        default: true
+      # Upload the local cache back to S3 after the run. Only the nightly seeding
+      # run sets this; the cache module refuses to upload unless the branch is
+      # main, so a PR / custom-branch run can never write to the shared cache.
+      refresh-neff-cache:
+        description: "Upload the local NEFF cache back to the shared store after the run. Default false. Set true only by the nightly seeding run."
+        required: false
+        type: boolean
+        default: false
+      dkms:
+        description: "Value of the neuron.dkms runner label. Empty uses the branch config pin."
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_DEFAULT_REGION: us-west-2
+
+jobs:
+  # Run eager + compile in one pytest session. conftest aggregates each suite's
+  # per-op JSON into its own CSV under NEURON_COVERAGE_CSV_DIR, which sits under
+  # outputs/ so run_test.sh ships it with the test-results artifact.
+  vertical-tests:
+    name: Vertical ${{ inputs.mode }} (trn2)
+    # Append the neuron.priority label only when the caller sets a priority
+    # (only the gate does), and the persistent-storage label only when the cache
+    # is enabled: :write when this run uploads (nightly seed), else :read. That
+    # label makes the fleet inject the storage bucket/prefix env vars into the
+    # pod. Both mirror _upstream-tests.yml.
+    runs-on: >-
+      ${{ fromJSON(format(
+      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:trn2.48xlarge","neuron.run-{0}-vertical-{1}","neuron.image:{2}","neuron.timeout:{3}"{4}{5}{6}]',
+      github.run_id,
+      inputs.mode,
+      inputs.image,
+      inputs.runner-timeout,
+      inputs.priority != '' && format(',"neuron.priority:{0}"', inputs.priority) || '',
+      inputs.download-neff-cache && format(',"neuron.internal_compute.persistent-storage:{0}"', inputs.refresh-neff-cache && 'write' || 'read') || '',
+      inputs.dkms != '' && format(',"neuron.dkms:{0}"', inputs.dkms) || ''
+      )) }}
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
+    env:
+      CSV_SUBDIR: ${{ inputs.mode == 'perf' && 'vertical_perf' || 'vertical_coverage' }}
+      PERF_FLAG: ${{ inputs.mode == 'perf' && '--perf-timing' || '' }}
+      # NEURON_CACHE_KEY_SHAPES is exported inside TEST_COMMAND below, not here.
+      # Internal compute forwards only the TEST_COMMAND text and strips a
+      # job-level env:, so a value set here never reaches the container.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      # gate mode runs run_gate.py (assert + retry); coverage/perf record status.
+      # conftest writes step_summary.md next to the CSVs. run_test.sh copies
+      # outputs/ to test-results/, and append-step-summary posts the panel.
+      #
+      # compile_time_limit (600s in every mode) bounds one compile and reports
+      # compile_timeout. The non-forked runs add --timeout=720 as the outer per-op
+      # backstop for a hang in the exec loop or the correctness oracle, which
+      # nothing else caps. Use signal method, not thread.
+      #
+      # Perf splits the two suites into two pytest runs. The eager suite keeps a
+      # live Neuron runtime, so it cannot fork; it runs at -n 16 with the signal
+      # --timeout for stable per-op timing. The compile suite has no live
+      # runtime, so it runs --forked at the caller worker count for process
+      # isolation and a clean neuronx-cc teardown per op. The forked run drops
+      # --timeout and uses an outer "timeout -s KILL". A per-test signal
+      # --timeout is not safe with --forked: the alarm fires in the parent while
+      # it waits in proc.join, which raises a pytest INTERNALERROR and fails the
+      # whole run.
+      # The forked run also sets NEURON_COMPILE_HARD_ABORT=1, so compile_time_limit
+      # ends the child process on a compile that ignores SIGALRM and has no
+      # subprocess to kill. The test pre-writes a compile_timeout row, so the
+      # status survives. This is safe only with --forked, where each test owns
+      # its process.
+      # A fused run cannot fork, because the eager half would segfault (see
+      # run_upstream_tests.py). coverage and gate keep one fused, non-forked run
+      # with the signal --timeout: they record status, not timing.
+      #
+      # Persistent NEFF cache: hydrate the shared cache before the run and upload
+      # it after (upload is main-gated inside the module and runs only for the
+      # seeding caller). Internal compute forwards only TEST_COMMAND, so export
+      # the cache-key shape flag and the GitHub context env the cache reads
+      # (branch gate, run id, sha). Capture
+      # the mode exit code around the upload. Gate mode propagates it to block the
+      # merge. The record-only modes (coverage, perf) always exit 0, so an
+      # informational failure never fails the caller run.
+      - uses: ./.github/actions/run-test-suite
+        with:
+          test-command: >-
+            export NEURON_CACHE_KEY_SHAPES='1' GITHUB_REF_NAME='${{ github.ref_name }}' GITHUB_RUN_ID='${{ github.run_id }}' GITHUB_SHA='${{ github.sha }}' ;
+            ${{ inputs.download-neff-cache && 'python testing/vertical/neff_cache_ctl.py hydrate ;' || '' }}
+            ${{ inputs.mode == 'gate'
+                && format('python testing/vertical/run_gate.py outputs/{0}', env.CSV_SUBDIR)
+                || (inputs.mode == 'perf'
+                    && format('NEURON_COVERAGE_CSV_DIR=outputs/{0} python -m pytest tests/vertical/test_target_ops_coverage.py {1} --max-shapes-per-op {2} -n 16 --timeout=720 --timeout-method=signal --tb=no -q ; rc1=$? ; NEURON_COVERAGE_CSV_DIR=outputs/{0} NEURON_COMPILE_HARD_ABORT=1 timeout -s KILL 9000 python -m pytest tests/vertical/test_target_ops_compile_coverage.py {1} --max-shapes-per-op {2} -n {3} --forked --tb=no -q ; rc2=$? ; test $rc1 -eq 0 -a $rc2 -eq 0', env.CSV_SUBDIR, env.PERF_FLAG, inputs.max-shapes-per-op, inputs.num-workers)
+                    || format('NEURON_COVERAGE_CSV_DIR=outputs/{0} python -m pytest tests/vertical/test_target_ops_coverage.py tests/vertical/test_target_ops_compile_coverage.py {1} --max-shapes-per-op {2} -n {3} --timeout=720 --timeout-method=signal --tb=no -q', env.CSV_SUBDIR, env.PERF_FLAG, inputs.max-shapes-per-op, inputs.num-workers)) }} ;
+            rc=$? ;
+            ${{ (inputs.download-neff-cache && inputs.refresh-neff-cache) && 'python testing/vertical/neff_cache_ctl.py upload ;' || '' }}
+            exit ${{ inputs.mode == 'gate' && '$rc' || '0' }}
+          artifact-name: vertical-${{ inputs.mode }}-results
+          summary-path: test-results/outputs/${{ env.CSV_SUBDIR }}/step_summary.md
+
+  # Convert the shipped CSVs to parquet on a plain runner (credential-free) and
+  # upload the custom-test-artifacts tree for the DevOps S3 mirror. The gate
+  # writes no parquet, so this job runs for the record-only modes only.
+  aggregate:
+    name: Aggregate Vertical Results
+    needs: [vertical-tests]
+    if: always() && inputs.mode != 'gate'
+    runs-on: [self-hosted, linux, "neuron.image:neuron-gate-tools", "neuron.run-${{ github.run_id }}-vertical-aggregate-${{ inputs.mode }}"]
+    timeout-minutes: 30
+    env:
+      RUN_KIND_FLAG: ${{ inputs.mode == 'perf' && '--run-kind perf' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      # The download-artifact action runs on the host. The run steps run in the
+      # gate container, which shares only the workspace and RUNNER_TEMP.
+      - name: Download results
+        uses: actions/download-artifact@v4
+        with:
+          name: vertical-${{ inputs.mode }}-results
+          path: ${{ runner.temp }}/vertical-results-in
+      - name: Install aggregator dependencies
+        # The gate image lacks the test image's [dev] extras, so pyarrow must be
+        # installed here.
+        run: python3 -m pip install "pyarrow>=15,<20"
+      - name: Convert CSVs to parquet
+        run: |
+          set -euo pipefail
+          eager=$(find "${RUNNER_TEMP}/vertical-results-in" -name 'target_ops_coverage_*.csv' | head -n1)
+          compile=$(find "${RUNNER_TEMP}/vertical-results-in" -name 'target_ops_compile_coverage_*.csv' | head -n1)
+          if [ -n "$eager" ]; then
+            python3 testing/vertical/aggregate_vertical_results.py \
+              --csv "$eager" --suite target_ops_coverage ${{ env.RUN_KIND_FLAG }} --output-dir "${RUNNER_TEMP}/vertical-results"
+          else
+            echo "WARNING: no eager CSV found"
+          fi
+          if [ -n "$compile" ]; then
+            python3 testing/vertical/aggregate_vertical_results.py \
+              --csv "$compile" --suite target_ops_compile_coverage ${{ env.RUN_KIND_FLAG }} --output-dir "${RUNNER_TEMP}/vertical-results"
+          else
+            echo "WARNING: no compile CSV found"
+          fi
+      # Artifact name custom-test-artifacts triggers the DevOps mirror to copy
+      # contents to S3 verbatim. The directory tree becomes the S3 key suffix
+      # the Athena tables read from.
+      - name: Upload parquet to dashboard S3 prefix
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: custom-test-artifacts
+          path: ${{ runner.temp }}/vertical-results/custom-test-artifacts/
+          retention-days: 30

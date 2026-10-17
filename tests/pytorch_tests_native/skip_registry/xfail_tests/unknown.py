@@ -1,0 +1,18 @@
+UNKNOWN = [
+    "test_foreach.py::TestForeachNEURON::test_big_num_tensors__foreach_max_use_cuda_graph_True_w_empty_True_neuron_float64",
+    "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_true_divide_neuron_bool",
+    "test_meta.py::TestMetaNEURON::test_meta_outplace_uniform_neuron_float32",
+    "test_meta.py::TestMetaNEURON::test_meta_outplace__foreach_add_neuron_uint8",
+    "test_foreach.py::TestForeachNEURON::test_autodiff__foreach_acos_inplace_neuron_float64",
+    "test_foreach.py::TestForeachNEURON::test_autodiff__foreach_cos_inplace_neuron_float64",
+    "test_decomp.py::TestDecompNEURON::test_quick_addmm_decomposed_neuron_int8",
+    "test_foreach.py::TestForeachNEURON::test_all_zero_size_tensors_do_not_launch_kernel__foreach_sign_neuron_float32",
+    "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_torch_ops_aten__safe_softmax_default_neuron_bfloat16",
+    "test_meta.py::TestMetaNEURON::test_dispatch_meta_outplace_torch_ops_aten__safe_softmax_default_neuron_int64",
+    "test_meta.py::TestMetaNEURON::test_meta_outplace_torch_ops_aten__safe_softmax_default_neuron_float32",
+    "test_meta.py::TestMetaNEURON::test_meta_outplace_transpose_neuron_uint8",
+    "test_ops.py::TestCommonNEURON::test_noncontiguous_samples_transpose_neuron_float32",
+    "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_grad_trace_neuron_float64",
+    "test_ops_gradients.py::TestBwdGradientsNEURON::test_fn_gradgrad_linalg_pinv_neuron_float64",
+    "test_meta.py::TestMetaNEURON::test_meta_outplace_torch_ops_aten__safe_softmax_default_neuron_float64",
+]

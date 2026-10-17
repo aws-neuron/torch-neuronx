@@ -1,0 +1,492 @@
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <cstdlib>
+#include <memory>
+#include <vector>
+
+#include "tests/csrc/mocks/MockKernelExecution.h"
+#include "tests/csrc/mocks/MockStreamImpl.h"
+#include "torch_neuronx/csrc/core/metrics/NeuronMetrics.h"
+#include "torch_neuronx/csrc/core/utils/ErrorRecovery.h"
+#include "torch_neuronx/csrc/core/utils/OpErrorHandler.h"
+
+using namespace at::neuron;
+namespace mock = at::neuron::testing;
+
+class ErrorRecoveryTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    // Clear environment variables for consistent testing
+    unsetenv("NEURON_FALLBACK_ENABLED");
+    unsetenv("NEURON_OOM_RECOVERY_ENABLED");
+
+    error_recovery_ = std::make_unique<ErrorRecovery>();
+    mock_stream_.SetDefaultBehavior();
+
+    // Set up default expectation for WaitForPriorOperationsToComplete
+    EXPECT_CALL(mock_stream_, WaitForPriorOperationsToComplete(::testing::_))
+        .WillRepeatedly(::testing::Return());
+  }
+
+  void TearDown() override {
+    // Clean up environment
+    unsetenv("NEURON_FALLBACK_ENABLED");
+    unsetenv("NEURON_OOM_RECOVERY_ENABLED");
+  }
+
+  std::unique_ptr<ErrorRecovery> error_recovery_;
+  mock::MockStreamImpl mock_stream_;
+};
+
+// Test ErrorRecovery constructor and configuration
+TEST_F(ErrorRecoveryTest, ConstructorAndConfiguration) {
+  // Test 1: Default configuration (fallback enabled)
+  {
+    ErrorRecovery recovery;
+    EXPECT_TRUE(recovery.ShouldAttemptCpuFallback());
+  }
+
+  // Test 2: Fallback disabled with "0"
+  {
+    setenv("NEURON_FALLBACK_ENABLED", "0", 1);
+    ErrorRecovery recovery;
+    EXPECT_FALSE(recovery.ShouldAttemptCpuFallback());
+    unsetenv("NEURON_FALLBACK_ENABLED");
+  }
+
+  // Test 3: Fallback enabled with "true"
+  {
+    setenv("NEURON_FALLBACK_ENABLED", "true", 1);
+    ErrorRecovery recovery;
+    EXPECT_TRUE(recovery.ShouldAttemptCpuFallback());
+    unsetenv("NEURON_FALLBACK_ENABLED");
+  }
+
+  // Test 4: Fallback enabled with "1"
+  {
+    setenv("NEURON_FALLBACK_ENABLED", "1", 1);
+    ErrorRecovery recovery;
+    EXPECT_TRUE(recovery.ShouldAttemptCpuFallback());
+    unsetenv("NEURON_FALLBACK_ENABLED");
+  }
+}
+
+// Test should_attempt_cpu_fallback method
+TEST_F(ErrorRecoveryTest, ShouldAttemptCpuFallback) {
+  // Test 1: Enabled (default configuration)
+  EXPECT_TRUE(error_recovery_->ShouldAttemptCpuFallback());
+
+  // Test 2: Disabled configuration
+  setenv("NEURON_FALLBACK_ENABLED", "0", 1);
+  ErrorRecovery disabled_recovery;
+  EXPECT_FALSE(disabled_recovery.ShouldAttemptCpuFallback());
+  unsetenv("NEURON_FALLBACK_ENABLED");
+}
+
+// Test execute_cpu_fallback method
+TEST_F(ErrorRecoveryTest, ExecuteCpuFallbackWithMockOperation) {
+  // Create a mock operation for testing
+  std::vector<torch::Tensor> inputs = {torch::ones({2, 3})};
+  std::vector<torch::Tensor> outputs = {torch::ones({2, 3})};
+
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("test_op", inputs, outputs);
+
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+
+  OperationContext mock_op(std::move(mock_kernel), "test_stack_trace");
+  mock_op.submit_time = std::chrono::steady_clock::now();
+
+  // Execute CPU fallback - this will fail due to mock operation
+  auto result = error_recovery_->ExecuteCpuFallback(&mock_op);
+
+  // The result should indicate failure for mock operation
+  EXPECT_FALSE(result.IsSuccess());
+}
+
+// Test RecoverConcatenationFailure function
+TEST_F(ErrorRecoveryTest, RecoverConcatenationFailureWithNullOperation) {
+  // Test that RecoverConcatenationFailure handles null operation gracefully
+  RecoverConcatenationFailure(nullptr);
+  // Should not crash - just debug log and return
+}
+
+TEST_F(ErrorRecoveryTest, RecoverConcatenationFailureWithNonConcatenatedOperation) {
+  // Create a mock operation that is NOT concatenated
+  std::vector<torch::Tensor> inputs = {torch::ones({2, 3})};
+  std::vector<torch::Tensor> outputs = {torch::ones({2, 3})};
+
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("test_op", inputs, outputs);
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+
+  OperationContext mock_op(std::move(mock_kernel), "test_stack_trace");
+  mock_op.submit_time = std::chrono::steady_clock::now();
+  mock_op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+
+  // Operation without concatenation state should handle gracefully
+  EXPECT_FALSE(mock_op.HasConcatenatedOperation());
+  EXPECT_FALSE(mock_op.IsConcatenatedOperation());
+
+  // Should not crash
+  RecoverConcatenationFailure(&mock_op);
+}
+
+TEST_F(ErrorRecoveryTest, RecoverConcatenationFailureWithConcatenatedOperation) {
+  // Create cascading operations (individual ops that will be merged)
+  std::vector<torch::Tensor> inputs1 = {torch::ones({2, 3})};
+  std::vector<torch::Tensor> outputs1 = {torch::ones({2, 3})};
+  auto mock_kernel1 =
+      std::make_unique<mock::MockNeuronKernelExecution>("cascading_op1", inputs1, outputs1);
+  EXPECT_CALL(*mock_kernel1, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel1, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+
+  auto cascading_op1 =
+      std::make_unique<OperationContext>(std::move(mock_kernel1), "cascading_stack_trace1");
+  cascading_op1->submit_time = std::chrono::steady_clock::now();
+  cascading_op1->stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+
+  std::vector<torch::Tensor> inputs2 = {torch::ones({2, 3})};
+  std::vector<torch::Tensor> outputs2 = {torch::ones({2, 3})};
+  auto mock_kernel2 =
+      std::make_unique<mock::MockNeuronKernelExecution>("cascading_op2", inputs2, outputs2);
+  EXPECT_CALL(*mock_kernel2, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel2, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+
+  auto cascading_op2 =
+      std::make_unique<OperationContext>(std::move(mock_kernel2), "cascading_stack_trace2");
+  cascading_op2->submit_time = std::chrono::steady_clock::now();
+  cascading_op2->stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+
+  // Create the concatenated (merged) operation
+  std::vector<torch::Tensor> concat_inputs = {torch::ones({4, 3})};
+  std::vector<torch::Tensor> concat_outputs = {torch::ones({4, 3})};
+  auto concat_kernel =
+      std::make_unique<mock::MockNeuronKernelExecution>("concat_op", concat_inputs, concat_outputs);
+  EXPECT_CALL(*concat_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*concat_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+
+  auto concat_op =
+      std::make_unique<OperationContext>(std::move(concat_kernel), "concat_stack_trace");
+  concat_op->submit_time = std::chrono::steady_clock::now();
+  concat_op->stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+
+  // Store raw pointers for cascading ops vector
+  std::vector<OperationContext*> cascading_ops = {cascading_op1.get(), cascading_op2.get()};
+
+  // Track whether the failure callback was invoked
+  bool callback_invoked = false;
+  OperationContext* callback_received_op = nullptr;
+
+  // Create ConcatenationState with failure callback
+  auto concatenation_state = std::make_shared<ConcatenationState>(
+      std::move(concat_op), cascading_ops, [&](OperationContext* failed_op) {
+        callback_invoked = true;
+        callback_received_op = failed_op;
+      });
+
+  // Set up the raw pointer for the concatenated operation (after move)
+  OperationContext* concat_op_ptr = concatenation_state->GetConcatenatedOperation();
+  concat_op_ptr->concatenation_state_raw_ = concatenation_state.get();
+
+  // Set up shared_ptr for cascading operations
+  cascading_op1->concatenation_state_ = concatenation_state;
+  cascading_op2->concatenation_state_ = concatenation_state;
+
+  // Verify concatenation state is set up correctly
+  EXPECT_TRUE(cascading_op1->HasConcatenatedOperation());
+  EXPECT_FALSE(cascading_op1->IsConcatenatedOperation());
+  EXPECT_TRUE(cascading_op2->HasConcatenatedOperation());
+  EXPECT_FALSE(cascading_op2->IsConcatenatedOperation());
+  EXPECT_TRUE(concat_op_ptr->IsConcatenatedOperation());
+
+  // Test 1: RecoverConcatenationFailure on cascading operation should invoke callback
+  RecoverConcatenationFailure(cascading_op1.get());
+  EXPECT_TRUE(callback_invoked);
+  EXPECT_EQ(callback_received_op, concat_op_ptr);
+
+  // Reset for next test
+  callback_invoked = false;
+  callback_received_op = nullptr;
+
+  // Test 2: RecoverConcatenationFailure on concatenated operation itself should invoke callback
+  RecoverConcatenationFailure(concat_op_ptr);
+  EXPECT_TRUE(callback_invoked);
+  EXPECT_EQ(callback_received_op, concat_op_ptr);
+}
+
+// Test attempt_recovery method (main entry point)
+TEST_F(ErrorRecoveryTest, AttemptRecovery) {
+  // Helper function to create mock operation
+  auto create_mock_operation = []() {
+    std::vector<torch::Tensor> inputs = {torch::ones({2, 3})};
+    std::vector<torch::Tensor> outputs = {torch::ones({2, 3})};
+
+    auto mock_kernel =
+        std::make_unique<mock::MockNeuronKernelExecution>("test_op", inputs, outputs);
+    EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+    EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+
+    auto mock_op = std::make_unique<OperationContext>(std::move(mock_kernel), "test_stack_trace");
+    mock_op->submit_time = std::chrono::steady_clock::now();
+    return mock_op;
+  };
+
+  // Test 1: Fallback enabled (default) - should try CPU fallback
+  {
+    auto mock_op = create_mock_operation();
+    mock_op->stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+
+    torch_neuronx::ExecutionRuntimeException exec_error("Test execution error");
+    auto result = error_recovery_->AttemptRecovery(mock_op.get(), exec_error);
+
+    EXPECT_FALSE(result.IsSuccess());  // Mock operation will fail
+  }
+
+  // Test 2: Fallback disabled - should not try CPU fallback
+  {
+    setenv("NEURON_FALLBACK_ENABLED", "0", 1);
+    ErrorRecovery disabled_recovery;
+
+    auto mock_op = create_mock_operation();
+    mock_op->stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+
+    torch_neuronx::ExecutionRuntimeException exec_error("Test execution error");
+    auto result = disabled_recovery.AttemptRecovery(mock_op.get(), exec_error);
+
+    EXPECT_EQ(result.status, OperationContextResult::kPending);  // Default result
+
+    unsetenv("NEURON_FALLBACK_ENABLED");
+  }
+}
+
+// Test OOM recovery configuration
+TEST_F(ErrorRecoveryTest, OOMRecoveryConfiguration) {
+  // Default: OOM recovery enabled
+  {
+    ErrorRecovery recovery;
+    EXPECT_TRUE(recovery.ShouldAttemptCpuFallback());
+  }
+
+  // Disabled with "0"
+  {
+    setenv("NEURON_OOM_RECOVERY_ENABLED", "0", 1);
+    ErrorRecovery recovery;
+    auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("alloc_op");
+    EXPECT_CALL(*mock_kernel, GetKernelType())
+        .WillRepeatedly(::testing::Return(KernelTypeEnum::kAlloc));
+    EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+    EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+    EXPECT_CALL(*mock_kernel, Schedule(::testing::_, ::testing::_, ::testing::_)).Times(0);
+
+    OperationContext op(std::move(mock_kernel), "stack");
+    op.submit_time = std::chrono::steady_clock::now();
+    op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+
+    torch_neuronx::ExecutionRuntimeException err("OOM", NRT_RESOURCE);
+    auto result = recovery.AttemptRecovery(&op, err);
+    EXPECT_EQ(result.status, OperationContextResult::kPending);
+    unsetenv("NEURON_OOM_RECOVERY_ENABLED");
+  }
+
+  // Enabled with "1", delta sanity check on the constructor
+  {
+    setenv("NEURON_OOM_RECOVERY_ENABLED", "1", 1);
+    ErrorRecovery recovery;
+    unsetenv("NEURON_OOM_RECOVERY_ENABLED");
+  }
+}
+
+// Test that kAlloc ops with NRT_RESOURCE error route to OOM recovery
+TEST_F(ErrorRecoveryTest, AttemptRecoveryForAllocKernel) {
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("alloc_op");
+  EXPECT_CALL(*mock_kernel, GetKernelType())
+      .WillRepeatedly(::testing::Return(KernelTypeEnum::kAlloc));
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+  // Schedule is called as retry after emptyCache — succeed on retry
+  EXPECT_CALL(*mock_kernel, Schedule(::testing::_, ::testing::_, ::testing::_))
+      .WillOnce(::testing::Return(true));
+
+  OperationContext op(std::move(mock_kernel), "stack");
+  op.submit_time = std::chrono::steady_clock::now();
+  op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+
+  torch_neuronx::ExecutionRuntimeException err("OOM", NRT_RESOURCE);
+  auto result = error_recovery_->AttemptRecovery(&op, err);
+  EXPECT_TRUE(result.IsSuccess());
+}
+
+// Test that OOM recovery is skipped when disabled via env var
+TEST_F(ErrorRecoveryTest, AttemptRecoveryForAllocKernelDisabled) {
+  setenv("NEURON_OOM_RECOVERY_ENABLED", "0", 1);
+  ErrorRecovery recovery;
+
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("alloc_op");
+  EXPECT_CALL(*mock_kernel, GetKernelType())
+      .WillRepeatedly(::testing::Return(KernelTypeEnum::kAlloc));
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+  // Schedule should NOT be called
+  EXPECT_CALL(*mock_kernel, Schedule(::testing::_, ::testing::_, ::testing::_)).Times(0);
+
+  OperationContext op(std::move(mock_kernel), "stack");
+  op.submit_time = std::chrono::steady_clock::now();
+  op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+
+  torch_neuronx::ExecutionRuntimeException err("OOM", NRT_RESOURCE);
+  auto result = recovery.AttemptRecovery(&op, err);
+  EXPECT_EQ(result.status, OperationContextResult::kPending);
+
+  unsetenv("NEURON_OOM_RECOVERY_ENABLED");
+}
+
+// Test that non-kAlloc ops with NRT_RESOURCE do NOT route to OOM recovery
+TEST_F(ErrorRecoveryTest, AttemptRecoveryForNonAllocKernel) {
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("hlo_op");
+  EXPECT_CALL(*mock_kernel, GetKernelType())
+      .WillRepeatedly(::testing::Return(KernelTypeEnum::kHLO));
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+
+  OperationContext op(std::move(mock_kernel), "stack");
+  op.submit_time = std::chrono::steady_clock::now();
+  op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+
+  torch_neuronx::ExecutionRuntimeException err("OOM", NRT_RESOURCE);
+  auto result = error_recovery_->AttemptRecovery(&op, err);
+  // Non-kAlloc, non-compilable → default pending result, no OOM recovery
+  EXPECT_EQ(result.status, OperationContextResult::kPending);
+}
+
+TEST_F(ErrorRecoveryTest, AttemptRecovery_ExecutionError_CompilableOp_DoesNotFallback) {
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("compilable_op");
+  EXPECT_CALL(*mock_kernel, GetKernelType())
+      .WillRepeatedly(::testing::Return(KernelTypeEnum::kHLO));
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(true));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+  EXPECT_CALL(*mock_kernel, Schedule(::testing::_, ::testing::_, ::testing::_)).Times(0);
+
+  OperationContext op(std::move(mock_kernel), "stack");
+  op.submit_time = std::chrono::steady_clock::now();
+  op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+
+  // Non-OOM execution error (no NRT_RESOURCE) on a compilable op.
+  torch_neuronx::ExecutionRuntimeException err("Out-of-bounds index");
+  auto result = error_recovery_->AttemptRecovery(&op, err);
+
+  EXPECT_FALSE(result.IsSuccess());
+  EXPECT_EQ(result.status, OperationContextResult::kPending);
+  EXPECT_TRUE(result.GetError().empty());
+}
+
+TEST_F(ErrorRecoveryTest, AttemptRecoveryForAllocKernelRetryStillOOM) {
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("alloc_op");
+  EXPECT_CALL(*mock_kernel, GetKernelType())
+      .WillRepeatedly(::testing::Return(KernelTypeEnum::kAlloc));
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+  // Simulate the post-patch contract: Schedule returns normally but surfaces
+  // NRT_RESOURCE via the out-param.
+  EXPECT_CALL(*mock_kernel, Schedule(::testing::_, ::testing::_, ::testing::_))
+      .WillOnce(
+          ::testing::DoAll(::testing::SetArgPointee<0>(NRT_RESOURCE), ::testing::Return(false)));
+
+  OperationContext op(std::move(mock_kernel), "stack");
+  op.submit_time = std::chrono::steady_clock::now();
+  op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+
+  torch_neuronx::ExecutionRuntimeException err("OOM", NRT_RESOURCE);
+  auto result = error_recovery_->AttemptRecovery(&op, err);
+  EXPECT_FALSE(result.IsSuccess());
+  EXPECT_EQ(result.status, OperationContextResult::kFailed);
+  EXPECT_THAT(result.GetError(), ::testing::HasSubstr("OOM recovery failed"));
+}
+
+TEST_F(ErrorRecoveryTest, OOMRecoveryIncrementsTelemetryCounters) {
+  constexpr int kDeviceId = 0;
+  auto& registry = at::neuron::metrics::DeviceMemoryStatsRegistry::Instance();
+  auto& stats = registry.GetDeviceStats(kDeviceId);
+  const uint64_t retries_before = stats.num_alloc_retries.load(std::memory_order_relaxed);
+  const uint64_t ooms_before = stats.num_ooms.load(std::memory_order_relaxed);
+
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("alloc_op");
+  EXPECT_CALL(*mock_kernel, GetKernelType())
+      .WillRepeatedly(::testing::Return(KernelTypeEnum::kAlloc));
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+  EXPECT_CALL(*mock_kernel, Schedule(::testing::_, ::testing::_, ::testing::_))
+      .WillOnce(
+          ::testing::DoAll(::testing::SetArgPointee<0>(NRT_RESOURCE), ::testing::Return(false)));
+
+  OperationContext op(std::move(mock_kernel), "stack");
+  op.submit_time = std::chrono::steady_clock::now();
+  op.stream = reinterpret_cast<StreamImpl*>(&mock_stream_);
+
+  torch_neuronx::ExecutionRuntimeException err("OOM", NRT_RESOURCE);
+  auto result = error_recovery_->AttemptRecovery(&op, err);
+
+  EXPECT_FALSE(result.IsSuccess());
+  EXPECT_EQ(stats.num_alloc_retries.load(std::memory_order_relaxed), retries_before + 1);
+  EXPECT_EQ(stats.num_ooms.load(std::memory_order_relaxed), ooms_before + 1);
+}
+
+// --- Per-op OOB error handler routing ---------------------------------------
+
+// ShouldSurfaceOOBException is true only for the out-of-bounds NRT status.
+TEST_F(ErrorRecoveryTest, ShouldSurfaceOOBExceptionTrueForOOB) {
+  torch_neuronx::ExecutionRuntimeException oob("OOB", NRT_EXEC_OOB);
+  EXPECT_TRUE(error_recovery_->ShouldSurfaceOOBException(oob));
+}
+
+TEST_F(ErrorRecoveryTest, ShouldSurfaceOOBExceptionFalseForOtherStatus) {
+  torch_neuronx::ExecutionRuntimeException busy("busy", static_cast<NRT_STATUS>(1005));
+  EXPECT_FALSE(error_recovery_->ShouldSurfaceOOBException(busy));
+  torch_neuronx::ExecutionRuntimeException oom("oom", NRT_RESOURCE);
+  EXPECT_FALSE(error_recovery_->ShouldSurfaceOOBException(oom));
+}
+
+TEST_F(ErrorRecoveryTest, ShouldSurfaceOOBExceptionFalseWhenNoNRTStatus) {
+  torch_neuronx::ExecutionRuntimeException no_status("no NRT status");
+  EXPECT_FALSE(error_recovery_->ShouldSurfaceOOBException(no_status));
+}
+
+// SurfaceOOBException delegates to the op's registered error handler: it is a
+// no-op when no handler is registered, and propagates the handler's exception
+// when one is (and the op carries a reconstruction context).
+TEST_F(ErrorRecoveryTest, SurfaceOOBExceptionNoHandlerIsNoOp) {
+  OpErrorHandler::RegisterInvoker({});  // no handler
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("aten::scatter");
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+  OperationContext op(std::move(mock_kernel), "stack");
+  op.cpu_fallback_context.input_metadata.emplace_back(TensorMarker{});
+
+  EXPECT_NO_THROW(error_recovery_->SurfaceOOBException(&op));
+}
+
+TEST_F(ErrorRecoveryTest, SurfaceOOBExceptionPropagatesHandlerException) {
+  OpErrorHandler::RegisterInvoker([](const std::string&, OpErrorContext&) {
+    throw std::runtime_error("index 7 is out of bounds for dimension 0 with size 4");
+  });
+  auto mock_kernel = std::make_unique<mock::MockNeuronKernelExecution>("aten::scatter");
+  EXPECT_CALL(*mock_kernel, RequiresCompilation()).WillRepeatedly(::testing::Return(false));
+  EXPECT_CALL(*mock_kernel, ValidateImpl()).WillRepeatedly(::testing::Return(true));
+  OperationContext op(std::move(mock_kernel), "stack");
+  op.cpu_fallback_context.input_metadata.emplace_back(TensorMarker{});
+
+  try {
+    error_recovery_->SurfaceOOBException(&op);
+    FAIL() << "expected the handler's exception to propagate";
+  } catch (const std::runtime_error& e) {
+    EXPECT_STREQ(e.what(), "index 7 is out of bounds for dimension 0 with size 4");
+  }
+  OpErrorHandler::RegisterInvoker({});
+}
+
+int main(int argc, char** argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

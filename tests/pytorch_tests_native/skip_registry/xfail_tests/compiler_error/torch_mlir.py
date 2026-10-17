@@ -1,0 +1,20 @@
+COMPILER_ERROR_TORCH_MLIR = [
+    "test_torch.py::TestTorchDeviceTypeNEURON::test_dim_function_empty_neuron",
+    "test_indexing.py::TestIndexingNEURON::test_index_select_neuron_float8_e4m3fnuz",
+    "test_indexing.py::TestIndexingNEURON::test_index_select_neuron_float8_e5m2",
+    "test_indexing.py::TestIndexingNEURON::test_index_select_neuron_float8_e5m2fnuz",
+    "test_indexing.py::TestIndexingNEURON::test_take_along_dim_neuron_float32",
+    "test_indexing.py::TestIndexingNEURON::test_take_along_dim_neuron_int64",
+    "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_bfloat16",
+    "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_bool",
+    "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_float16",
+    "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_int16",
+    "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_int32",
+    "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_int64",
+    "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_int8",
+    "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_uint8",
+    # PT 2.14: new unsigned integer dtype instantiations
+    "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_uint16",
+    "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_uint32",
+    "test_shape_ops.py::TestShapeOpsNEURON::test_flip_neuron_uint64",
+]

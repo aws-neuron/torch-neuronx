@@ -1,0 +1,51 @@
+name: Nightly Workflow for torch-neuronx (refresh NEFF cache and block perf goldens)
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-tests-image:
+    name: Build the tests image
+    if: vars.CI_CACHE_REFRESH_ENABLED == 'true'
+    runs-on: [
+      self-hosted,
+      linux,
+      neuron.build-nightly-image,
+      "neuron.run-${{ github.run_id }}-build-tests-image",
+      "neuron.dockerfile:Dockerfile.nightly-test",
+      "neuron.build-arg:PYTORCH_CHANNEL:stable"
+    ]
+    timeout-minutes: 60
+    outputs:
+      image: ${{ steps.wait.outputs.image_uri }}
+    steps:
+      - name: Wait for the tests image
+        id: wait
+        run: |
+          set -eo pipefail
+          /opt/neuron-ci/wait-for-nightly-image.sh | tee /tmp/image-output.log
+          IMAGE_URI=$(grep "Nightly base image ready:" /tmp/image-output.log | sed 's/.*ready: //')
+          echo "Tests image ready: $IMAGE_URI"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+  tests:
+    name: Nightly tests
+    needs: [build-tests-image]
+    uses: ./.github/workflows/_reusable-full-wheel-tests.yml
+    with:
+      suite_id: seed
+      image: ${{ needs.build-tests-image.outputs.image }}
+      refresh_neff_cache: true
+      refresh_persistent_goldens: true
+      enforce_mfu_threshold: true
+      dkms: public

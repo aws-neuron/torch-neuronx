@@ -1,0 +1,179 @@
+name: Block Perf Tests
+
+# =============================================================================
+# Reusable workflow for block performance + collective performance tests.
+#
+# Invoked by:
+#   - pull.yml (PR checks, TRN2)
+#   - _reusable-full-wheel-tests.yml (Nightly and Dependency Guard, both platforms)
+#
+# Tests are grouped by model and run sequentially on a single node per
+# group via run_group.py. This reduces each platform's node usage from 8 to 3.
+# Model groups run 1/0, then FSDPv2 entries at 1/1 on the same node.
+# HostCC failures are advisory. Baseline failures and interruptions remain strict.
+#
+# Platform-specific MFU goldens in the JSON configs are the reconstructible
+# seed. Every MFU-bearing group automatically hydrates a higher high-water
+# baseline from the repo-scoped, 7-day-TTL cache. Only nightly.yml on main,
+# or nightly.yml on a release or contribute branch when the repository variable
+# CI_CACHE_REFRESH_ENABLED is true, can refresh it.
+#
+# Each golden threshold contains a per-test, per-platform tolerance band.
+# A failed MFU gate runs once more before the group verdict.
+# Every workflow uses a 1.0 multiplier. Set enforce=false to disable gates
+# entirely (legacy escape hatch).
+#
+# Persistent golden policy:
+#   - PR and dependency-guard jobs read but never write.
+#   - Only nightly.yml on main, or nightly.yml on a release or contribute
+#     branch when CI_CACHE_REFRESH_ENABLED is true, gets write access.
+#   - Each passing test updates a median-of-5 history under a monotone baseline
+#     floor, and retained values are rewritten to refresh their TTL.
+#   - A failed test keeps its cached entry; passing siblings still update.
+#   - If no MFU test passes, the group does not write.
+#
+# See tests/blocks/block_perf/group_configs/README.md for full details.
+# =============================================================================
+
+on:
+  workflow_call:
+    inputs:
+      runner-labels:
+        description: 'Optional JSON runs-on override; pull.yml uses this for build-image runners'
+        required: false
+        type: string
+        default: ''
+      image:
+        description: 'Docker image URI for generated internal-compute runners; ignored when runner-labels is set'
+        required: false
+        type: string
+        default: ''
+      artifact-prefix:
+        description: 'Prefix for uploaded artifacts (e.g. "block-perf" or "wheel-block-perf")'
+        required: true
+        type: string
+      runner-label-prefix:
+        description: 'Prefix for generated neuron.run labels; defaults to artifact-prefix'
+        required: false
+        type: string
+        default: ''
+      include-trn3pds-b1:
+        description: 'Run the matrix on TRN3PDS B1 in addition to TRN2'
+        required: false
+        type: boolean
+        default: false
+      enforce-mfu-threshold:
+        description: 'If true, enforce the selected platform MFU regression gates'
+        required: false
+        type: boolean
+        default: false
+      mfu-threshold-multiplier:
+        description: 'Multiplier on the selected platform threshold (<1.0 loosens); defaults to the canonical 1.0 policy.'
+        required: false
+        type: string
+        default: '1.0'
+      refresh-persistent-goldens:
+        description: 'Refresh passing MFU tests only from the canonical nightly on main'
+        required: false
+        type: boolean
+        default: false
+      checkout-ref:
+        description: 'Git ref/SHA to checkout. PR-review-triggered callers pass the PR head SHA; empty string falls back to default checkout (e.g. nightly).'
+        required: false
+        type: string
+        default: ''
+      noop:
+        description: 'If true, skip the perf run and pass instantly (satisfies required merge-queue checks without re-running on the merge-group commit).'
+        required: false
+        type: boolean
+        default: false
+      dkms:
+        description: 'Value of the neuron.dkms runner label. Empty uses the branch config pin.'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write  # required by the internal-compute dispatcher (OIDC auth for StartWorkload)
+
+jobs:
+  block-perf:
+    name: ${{ matrix.group.display_name }} (${{ matrix.platform == 'trn2' && 'trn2' || 'trn3pds B1' }})
+    env:
+      MATRIX_LABEL: ${{ format('{0}{1}', matrix.group.id, matrix.platform != 'trn2' && format('-{0}', matrix.platform) || '') }}
+    # Pull checks provide a complete label override. Image-based callers use
+    # this template, selecting the instance, storage access, and run suffix.
+    # The neuron.run label must identify one matrix leg. It includes the
+    # platform and the group ID. The legs do not use the same label set.
+    # The infra group omits the persistent-storage label. A shared label
+    # can assign a runner to the wrong leg. The runner then uses the wrong
+    # persistent-storage setting. The other leg stays in the queue.
+    runs-on: >-
+      ${{ inputs.noop && fromJSON(format(
+      '["self-hosted","linux","neuron.image:neuron-gate-tools","neuron.run-{0}-{1}-noop-{2}-{3}"]',
+      github.run_id, inputs.runner-label-prefix || inputs.artifact-prefix, matrix.platform, matrix.group.id
+      )) || fromJSON(inputs.runner-labels || format(
+      '["self-hosted","linux","neuron","neuron.internal_compute","neuron.internal_compute:{0}","neuron.run-{1}-{2}-{3}-{6}","neuron.image:{4}","neuron.timeout:32400"{5}{7}]',
+      matrix.platform == 'trn2' && 'trn2.48xlarge' || 'trn3-dev1.48xlarge',
+      github.run_id,
+      inputs.runner-label-prefix || inputs.artifact-prefix,
+      matrix.platform,
+      inputs.image,
+      matrix.group.id != 'infra-group' && format(',"neuron.internal_compute.persistent-storage:{0}"', inputs.refresh-persistent-goldens && ((github.ref == 'refs/heads/main' && endsWith(github.workflow_ref, '/.github/workflows/nightly.yml@refs/heads/main')) || (vars.CI_CACHE_REFRESH_ENABLED == 'true' && (startsWith(github.ref, 'refs/heads/contribute-') || startsWith(github.ref, 'refs/heads/release-')) && endsWith(github.workflow_ref, format('/.github/workflows/nightly.yml@{0}', github.ref)))) && 'write' || 'read') || '',
+      matrix.group.id,
+      inputs.dkms != '' && format(',"neuron.dkms:{0}"', inputs.dkms) || ''
+      )) }}
+    timeout-minutes: 600
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(inputs.include-trn3pds-b1 && '["trn2","trn3pds-b1"]' || '["trn2"]') }}
+        group:
+          - id: qwen3-group
+            display_name: Block Perf Qwen3
+            config: tests/blocks/block_perf/group_configs/qwen3.json
+
+          - id: gpt-oss-group
+            display_name: Block Perf GPT-OSS
+            config: tests/blocks/block_perf/group_configs/gpt_oss.json
+
+          - id: infra-group
+            display_name: Block Perf Infra
+            config: tests/blocks/block_perf/group_configs/infra.json
+
+    # Serialize the only writers for a platform/group. Read-only runs retain
+    # run-scoped groups and do not block one another.
+    concurrency:
+      group: ${{ inputs.refresh-persistent-goldens && ((github.ref == 'refs/heads/main' && endsWith(github.workflow_ref, '/.github/workflows/nightly.yml@refs/heads/main')) || (vars.CI_CACHE_REFRESH_ENABLED == 'true' && (startsWith(github.ref, 'refs/heads/contribute-') || startsWith(github.ref, 'refs/heads/release-')) && endsWith(github.workflow_ref, format('/.github/workflows/nightly.yml@{0}', github.ref)))) && matrix.group.id != 'infra-group' && format('block-perf-goldens-{0}-{1}', matrix.platform, matrix.group.id) || format('block-perf-{0}-{1}-{2}', github.run_id, matrix.platform, matrix.group.id) }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+        if: ${{ !inputs.noop }}
+        with:
+          # Empty string => default checkout. PR-review-triggered runs pass the
+          # PR head SHA so we test the PR code, not the base branch (the default
+          # checkout ref for pull_request_review events is the base branch).
+          ref: ${{ inputs.checkout-ref }}
+
+      - name: Merge-queue no-op
+        if: ${{ inputs.noop }}
+        run: echo "Ran on PR head before queue entry; pass as no-op in merge queue."
+
+      - uses: ./.github/actions/run-test-suite
+        if: ${{ !inputs.noop }}
+        with:
+          test-command: >-
+            TORCH_NEURONX_ENABLE_STREAMS=1
+            TORCH_NEURONX_ENABLE_HOST_CC=0
+            GITHUB_REF_NAME=${{ github.ref_name }}
+            GITHUB_RUN_ID=${{ github.run_id }}
+            GITHUB_SHA=${{ github.sha }}
+            python tests/blocks/block_perf/run_group.py
+            ${{ matrix.group.id != 'infra-group' && '--both-modes --hostcc-advisory' || '' }}
+            --config ${{ matrix.group.config }}
+            --platform ${{ matrix.platform }}
+            ${{ inputs.refresh-persistent-goldens && ((github.ref == 'refs/heads/main' && endsWith(github.workflow_ref, '/.github/workflows/nightly.yml@refs/heads/main')) || (vars.CI_CACHE_REFRESH_ENABLED == 'true' && (startsWith(github.ref, 'refs/heads/contribute-') || startsWith(github.ref, 'refs/heads/release-')) && endsWith(github.workflow_ref, format('/.github/workflows/nightly.yml@{0}', github.ref)))) && matrix.group.id != 'infra-group' && '--refresh-persistent-goldens' || '' }}
+            ${{ !inputs.enforce-mfu-threshold && '--skip-mfu-threshold' || format('--mfu-threshold-multiplier {0}', inputs.mfu-threshold-multiplier) }}
+          artifact-name: ${{ format('{0}-{1}{2}-results', inputs.artifact-prefix, matrix.platform != 'trn2' && format('{0}-', matrix.platform) || '', matrix.group.id) }}

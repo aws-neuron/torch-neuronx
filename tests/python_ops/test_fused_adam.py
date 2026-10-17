@@ -1,0 +1,1017 @@
+import pytest
+import torch
+
+import torch_neuronx
+from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, track_neuron_ops
+
+
+class TestFusedAdamW:
+    def _compare_optimizer_states(self, cpu_opt, neuron_opt):
+        """Compare optimizer internal states between CPU and Neuron."""
+        cpu_params = list(cpu_opt.param_groups[0]["params"])
+        neuron_params = list(neuron_opt.param_groups[0]["params"])
+
+        for cpu_param, neuron_param in zip(cpu_params, neuron_params, strict=False):
+            cpu_state = cpu_opt.state.get(cpu_param, {})
+            neuron_state = neuron_opt.state.get(neuron_param, {})
+
+            # Compare state keys
+            assert set(cpu_state.keys()) == set(neuron_state.keys()), (
+                f"State keys mismatch: CPU={set(cpu_state.keys())}, "
+                f"Neuron={set(neuron_state.keys())}"
+            )
+
+            # Compare state values
+            for key in cpu_state:
+                if key == "step":
+                    # Step is a tensor, compare values
+                    cpu_step = (
+                        cpu_state[key].item() if hasattr(cpu_state[key], "item") else cpu_state[key]
+                    )
+                    neuron_step = (
+                        neuron_state[key].cpu().item()
+                        if hasattr(neuron_state[key], "item")
+                        else neuron_state[key]
+                    )
+                    assert (
+                        cpu_step == neuron_step
+                    ), f"Step count mismatch: CPU={cpu_step}, Neuron={neuron_step}"
+                else:
+                    # Other state variables (exp_avg, exp_avg_sq, max_exp_avg_sq)
+                    torch.testing.assert_close(
+                        neuron_state[key].cpu(),
+                        cpu_state[key],
+                        rtol=1e-5 if cpu_state[key].dtype == torch.float32 else 1e-3,
+                        atol=1e-6 if cpu_state[key].dtype == torch.float32 else 1e-3,
+                        msg=f"State '{key}' mismatch",
+                    )
+
+    @pytest.mark.parametrize("skip_expert", [False, True], ids=["equal-counters", "skipped-expert"])
+    def test_fused_adamw_per_parameter_steps(self, skip_expert, record_property):
+        """Bias corrections use each active parameter's runtime counter."""
+        import json
+        from unittest.mock import patch
+
+        from torch_neuronx.python_ops.torch_mlir.ops import optimizer as optimizer_ops
+
+        if not optimizer_ops._has_nki_adam_kernels:
+            pytest.skip("Requires the NKI fused AdamW implementation")
+
+        shapes = [(128,), (128, 2)]
+        params_cpu = [
+            torch.linspace(-0.02, 0.02, torch.Size(shape).numel()).reshape(shape).requires_grad_()
+            for shape in shapes
+        ]
+        params_neuron = [p.detach().clone().to("neuron").requires_grad_() for p in params_cpu]
+        optimizer_cpu = torch.optim.AdamW(params_cpu, lr=4e-4, fused=True)
+        optimizer_neuron = torch.optim.AdamW(params_neuron, lr=4e-4, fused=True)
+        expert_activity = (False, True, False, True) if skip_expert else (True,) * 4
+        expected_steps = [0, 0]
+        parameter_checks = []
+        full_group_lowering_count = None
+
+        with (
+            patch.object(
+                optimizer_ops,
+                "_make_adam_compute_fn",
+                wraps=optimizer_ops._make_adam_compute_fn,
+            ) as make_compute_fn,
+            patch.object(torch, "_fused_adamw_", wraps=torch._fused_adamw_) as fused_call,
+        ):
+            for step, expert_active in enumerate(expert_activity, start=1):
+                active = (True, expert_active)
+                for i, (cpu_param, neuron_param) in enumerate(
+                    zip(params_cpu, params_neuron, strict=True)
+                ):
+                    grad = torch.linspace(0.1, 0.2, cpu_param.numel()).reshape(cpu_param.shape)
+                    grad = grad * (1.0 + 0.1 * step)
+                    cpu_param.grad = grad if active[i] else None
+                    neuron_param.grad = grad.to("neuron") if active[i] else None
+                    expected_steps[i] += int(active[i])
+
+                optimizer_cpu.step()
+                with track_neuron_ops():
+                    optimizer_neuron.step()
+                    assert_op_runs_on_neuron("_fused_adamw_")
+
+                # The last fused call is Neuron's: verify its actual grouped counters.
+                grouped_params = fused_call.call_args.args[0]
+                grouped_steps = [t.cpu().item() for t in fused_call.call_args.args[5]]
+                assert all(p.device.type == "neuron" for p in grouped_params)
+                assert len(grouped_params) == sum(active)
+                assert grouped_steps == [
+                    n for n, used in zip(expected_steps, active, strict=True) if used
+                ]
+
+                self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+                own_steps = []
+                max_parameter_errors = []
+                moment_errors = []
+                for i, (cpu_param, neuron_param) in enumerate(
+                    zip(params_cpu, params_neuron, strict=True)
+                ):
+                    cpu_state = optimizer_cpu.state.get(cpu_param, {})
+                    neuron_state = optimizer_neuron.state.get(neuron_param, {})
+                    if expected_steps[i] == 0:
+                        assert not cpu_state and not neuron_state
+                        own_steps.append(None)
+                    else:
+                        assert cpu_state["step"].item() == expected_steps[i]
+                        assert neuron_state["step"].cpu().item() == expected_steps[i]
+                        own_steps.append(expected_steps[i])
+                    moment_errors.append(
+                        {
+                            key: (neuron_state[key].cpu() - cpu_state[key]).abs().max().item()
+                            for key in ("exp_avg", "exp_avg_sq")
+                            if key in cpu_state
+                        }
+                    )
+                    expected = cpu_param.detach().clone()
+                    actual = neuron_param.detach().cpu().clone()
+                    max_parameter_errors.append((actual - expected).abs().max().item())
+                    parameter_checks.append((step, i, actual, expected))
+
+                if expert_active:
+                    if full_group_lowering_count is None:
+                        full_group_lowering_count = make_compute_fn.call_count
+                    else:
+                        assert (
+                            make_compute_fn.call_count == full_group_lowering_count
+                        ), "Counter values changed without changing two-parameter metadata"
+
+                record_property(
+                    f"step_{step}",
+                    json.dumps(
+                        {
+                            "active": active,
+                            "grouped_steps": grouped_steps,
+                            "own_steps": own_steps,
+                            "parameter_max_abs": max_parameter_errors,
+                            "moment_max_abs": moment_errors,
+                            "lowering_calls": make_compute_fn.call_count,
+                        }
+                    ),
+                )
+
+        # Check every update after completing skip/resume and cache-reuse coverage.
+        for step, i, actual, expected in parameter_checks:
+            torch.testing.assert_close(
+                actual,
+                expected,
+                rtol=1e-5,
+                atol=1e-6,
+                msg=f"Parameter {i} after update {step} used the wrong bias correction",
+            )
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    def test_fused_adamw_basic(self, dtype):
+        """Test AdamW fused accuracy against CPU."""
+        torch.manual_seed(42)
+
+        param_cpu = torch.randn(10, dtype=dtype, requires_grad=True)
+        param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        optimizer_cpu = torch.optim.AdamW([param_cpu], lr=0.001, fused=False)
+        optimizer_neuron = torch.optim.AdamW([param_neuron], lr=0.001, fused=True)
+
+        for _ in range(3):
+            loss_cpu = param_cpu.sum()
+            loss_cpu.backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            loss_neuron = param_neuron.sum()
+            loss_neuron.backward()
+
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adamw_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    def test_fused_adamw_multiple_params(self):
+        """Test AdamW with multiple parameters of different shapes."""
+        torch.manual_seed(42)
+
+        # Params with different shapes
+        params_cpu = [
+            torch.randn(10, requires_grad=True),
+            torch.randn(5, 8, requires_grad=True),
+            torch.randn(3, 4, 2, requires_grad=True),
+            torch.randn(100, requires_grad=True),
+        ]
+        params_neuron = [p.detach().clone().to("neuron").requires_grad_(True) for p in params_cpu]
+
+        optimizer_cpu = torch.optim.AdamW(params_cpu, lr=0.01, fused=False)
+        optimizer_neuron = torch.optim.AdamW(params_neuron, lr=0.01, fused=True)
+
+        for _ in range(2):
+            loss_cpu = sum(p.sum() for p in params_cpu)
+            loss_cpu.backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            loss_neuron = sum(p.sum() for p in params_neuron)
+            loss_neuron.backward()
+
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adamw_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    @pytest.mark.parametrize(
+        "lr,betas,weight_decay,eps",
+        [
+            (0.001, (0.9, 0.999), 0.01, 1e-8),  # defaults
+            (0.1, (0.8, 0.95), 0.01, 1e-6),  # high lr
+            (0.01, (0.95, 0.999), 0.1, 1e-7),  # high weight decay
+            (0.005, (0.85, 0.9), 0.0, 1e-5),  # no weight decay
+        ],
+    )
+    def test_fused_adamw_different_hyperparams(self, lr, betas, weight_decay, eps):
+        """Test AdamW with different hyperparameters."""
+        torch.manual_seed(42)
+
+        param_cpu = torch.randn(20, requires_grad=True)
+        param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        optimizer_cpu = torch.optim.AdamW(
+            [param_cpu], lr=lr, betas=betas, weight_decay=weight_decay, eps=eps, fused=False
+        )
+        optimizer_neuron = torch.optim.AdamW(
+            [param_neuron], lr=lr, betas=betas, weight_decay=weight_decay, eps=eps, fused=True
+        )
+
+        for _ in range(3):
+            loss_cpu = param_cpu.pow(2).sum()
+            loss_cpu.backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            loss_neuron = param_neuron.pow(2).sum()
+            loss_neuron.backward()
+
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adamw_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    def test_fused_adamw_large_tensors(self):
+        """Test AdamW with larger tensors."""
+        torch.manual_seed(42)
+
+        param_cpu = torch.randn(1000, 512, requires_grad=True)
+        param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        optimizer_cpu = torch.optim.AdamW([param_cpu], lr=0.001, fused=False)
+        optimizer_neuron = torch.optim.AdamW([param_neuron], lr=0.001, fused=True)
+
+        loss_cpu = param_cpu.mean()
+        loss_cpu.backward()
+        optimizer_cpu.step()
+
+        loss_neuron = param_neuron.mean()
+        loss_neuron.backward()
+
+        with track_neuron_ops():
+            optimizer_neuron.step()
+            assert_op_runs_on_neuron("_fused_adamw_")
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    def test_fused_adamw_zero_grad(self):
+        """Test AdamW with zero gradients."""
+        torch.manual_seed(42)
+
+        param_cpu = torch.randn(10, requires_grad=True)
+        param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        optimizer_cpu = torch.optim.AdamW([param_cpu], lr=0.001, fused=False)
+        optimizer_neuron = torch.optim.AdamW([param_neuron], lr=0.001, fused=True)
+
+        # Set zero gradients
+        param_cpu.grad = torch.zeros_like(param_cpu)
+        param_neuron.grad = torch.zeros_like(param_neuron)
+
+        optimizer_cpu.step()
+
+        with track_neuron_ops():
+            optimizer_neuron.step()
+            assert_op_runs_on_neuron("_fused_adamw_")
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    def test_fused_adamw_mixed_shapes(self):
+        """Test AdamW with mixed parameter shapes including scalars and vectors."""
+        torch.manual_seed(42)
+
+        params_cpu = [
+            torch.randn(1, requires_grad=True),
+            torch.randn(50, requires_grad=True),  # 1D
+            torch.randn(10, 10, requires_grad=True),  # 2D
+            torch.randn(2, 3, 4, requires_grad=True),  # 3D
+        ]
+        params_neuron = [p.detach().clone().to("neuron").requires_grad_(True) for p in params_cpu]
+
+        optimizer_cpu = torch.optim.AdamW(params_cpu, lr=0.005, weight_decay=0.1, fused=False)
+        optimizer_neuron = torch.optim.AdamW(params_neuron, lr=0.005, weight_decay=0.1, fused=True)
+
+        for step in range(2):
+            # change loss each step
+            if step == 0:
+                loss_cpu = sum(p.abs().sum() for p in params_cpu)
+                loss_neuron = sum(p.abs().sum() for p in params_neuron)
+            else:
+                loss_cpu = sum(p.pow(2).mean() for p in params_cpu)
+                loss_neuron = sum(p.pow(2).mean() for p in params_neuron)
+
+            loss_cpu.backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            loss_neuron.backward()
+
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adamw_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    def test_fused_adamw_non_128_divisible_shapes(self):
+        """Test AdamW with param sizes not divisible by 128 (exercises padding path)."""
+        torch.manual_seed(42)
+
+        # 129 % 128 = 1, 200 % 128 = 72, 300 % 128 = 44
+        params_cpu = [
+            torch.randn(129, requires_grad=True),
+            torch.randn(10, 20, requires_grad=True),  # 200 elements
+            torch.randn(300, requires_grad=True),
+        ]
+        params_neuron = [p.detach().clone().to("neuron").requires_grad_(True) for p in params_cpu]
+
+        optimizer_cpu = torch.optim.AdamW(params_cpu, lr=0.01, fused=False)
+        optimizer_neuron = torch.optim.AdamW(params_neuron, lr=0.01, fused=True)
+
+        for _ in range(3):
+            sum(p.sum() for p in params_cpu).backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            sum(p.sum() for p in params_neuron).backward()
+            optimizer_neuron.step()
+            optimizer_neuron.zero_grad()
+
+        for pc, pn in zip(params_cpu, params_neuron, strict=False):
+            torch.testing.assert_close(pn.detach().cpu(), pc.detach(), rtol=1e-4, atol=1e-4)
+
+    def test_fused_adamw_flag_variants_in_one_process(self):
+        """Run both values of amsgrad, and of maximize, inside one test body.
+
+        The kernel cache is per process and keys on compute_fn's code object, which
+        every closure from one def shares. When the flags were captured rather than
+        passed, the first combination to run installed its kernel and later ones
+        lowered its graph: maximize=True kept the un-negated gradient, amsgrad=True
+        never updated max_exp_avg_sq. The per-flag tests below only catch that when
+        they happen to share a process in the right order; this asserts it directly.
+        False runs first because it is the value that installs the kernel.
+        """
+        for flag in ("amsgrad", "maximize"):
+            for value in (False, True):
+                torch.manual_seed(42)
+
+                param_cpu = torch.randn(16, requires_grad=True)
+                param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+                opt_cpu = torch.optim.AdamW([param_cpu], lr=0.01, fused=False, **{flag: value})
+                opt_neuron = torch.optim.AdamW([param_neuron], lr=0.01, fused=True, **{flag: value})
+
+                for _ in range(2):
+                    param_cpu.pow(2).sum().backward()
+                    opt_cpu.step()
+                    opt_cpu.zero_grad()
+
+                    param_neuron.pow(2).sum().backward()
+                    opt_neuron.step()
+                    opt_neuron.zero_grad()
+
+                self._compare_optimizer_states(opt_cpu, opt_neuron)
+                torch.testing.assert_close(
+                    param_neuron.detach().cpu(), param_cpu.detach(), rtol=1e-4, atol=1e-4
+                )
+
+    def test_fused_adamw_amsgrad(self):
+        """Test AdamW with AMSGrad enabled."""
+        torch.manual_seed(42)
+
+        param_cpu = torch.randn(20, requires_grad=True)
+        param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        optimizer_cpu = torch.optim.AdamW([param_cpu], lr=0.01, amsgrad=True, fused=False)
+        optimizer_neuron = torch.optim.AdamW([param_neuron], lr=0.01, amsgrad=True, fused=True)
+
+        for _ in range(3):
+            loss_cpu = param_cpu.pow(2).sum()
+            loss_cpu.backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            loss_neuron = param_neuron.pow(2).sum()
+            loss_neuron.backward()
+
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adamw_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    def test_fused_adamw_maximize(self):
+        """Test AdamW with maximize=True."""
+        torch.manual_seed(42)
+
+        param_cpu = torch.randn(15, requires_grad=True)
+        param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        optimizer_cpu = torch.optim.AdamW([param_cpu], lr=0.01, maximize=True, fused=False)
+        optimizer_neuron = torch.optim.AdamW([param_neuron], lr=0.01, maximize=True, fused=True)
+
+        for _ in range(2):
+            loss_cpu = param_cpu.sum()
+            loss_cpu.backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            loss_neuron = param_neuron.sum()
+            loss_neuron.backward()
+
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adamw_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    def test_fused_adamw_tensor_lr(self):
+        """Test AdamW with tensor learning rate."""
+        torch.manual_seed(42)
+
+        param_cpu = torch.randn(20, requires_grad=True)
+        param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        optimizer_cpu = torch.optim.AdamW([param_cpu], lr=torch.tensor(0.01), fused=False)
+        optimizer_neuron = torch.optim.AdamW(
+            [param_neuron], lr=torch.tensor(0.01, device="neuron"), fused=True
+        )
+
+        for _ in range(3):
+            loss_cpu = param_cpu.pow(2).sum()
+            loss_cpu.backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            loss_neuron = param_neuron.pow(2).sum()
+            loss_neuron.backward()
+
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adamw_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    def test_fused_adamw_buffer_donation(self):
+        """Test that fused AdamW properly donates buffers for in-place updates."""
+        torch.manual_seed(42)
+
+        # Create parameters as leaf tensors on neuron device
+        params = [
+            torch.randn(50, device="neuron", requires_grad=True),
+            torch.randn(10, 10, device="neuron", requires_grad=True),
+        ]
+
+        # Store original data pointers
+        param_ptrs = [p.data_ptr() for p in params]
+
+        optimizer = torch.optim.AdamW(params, lr=0.001, fused=True)
+
+        # Run a few optimization steps
+        for _ in range(3):
+            loss = sum(p.sum() for p in params)
+            loss.backward()
+
+            with track_neuron_ops():
+                optimizer.step()
+                assert_op_runs_on_neuron("_fused_adamw_")
+            optimizer.zero_grad()
+
+        # Verify parameters were updated in-place (same pointers)
+        for i, param in enumerate(params):
+            assert (
+                param.data_ptr() == param_ptrs[i]
+            ), f"Parameter {i} should be updated in-place with buffer donation"
+
+        # Verify optimizer state tensors also maintain their pointers
+        for param in params:
+            state = optimizer.state[param]
+            exp_avg_ptr = state["exp_avg"].data_ptr()
+            exp_avg_sq_ptr = state["exp_avg_sq"].data_ptr()
+
+            # Run one more step
+            loss = param.sum()
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            # State tensors should also be updated in-place
+            assert state["exp_avg"].data_ptr() == exp_avg_ptr, "exp_avg should be updated in-place"
+            assert (
+                state["exp_avg_sq"].data_ptr() == exp_avg_sq_ptr
+            ), "exp_avg_sq should be updated in-place"
+
+    def test_fused_adamw_amsgrad_buffer_donation(self):
+        """Test buffer donation with AMSGrad enabled."""
+        torch.manual_seed(42)
+
+        param = torch.randn(30, device="neuron", requires_grad=True)
+        param_ptr = param.data_ptr()
+
+        optimizer = torch.optim.AdamW([param], lr=0.01, amsgrad=True, fused=True)
+
+        # Run optimization steps
+        for _ in range(3):
+            loss = param.pow(2).sum()
+            loss.backward()
+
+            with track_neuron_ops():
+                optimizer.step()
+                assert_op_runs_on_neuron("_fused_adamw_")
+            optimizer.zero_grad()
+
+        # Verify parameter was updated in-place
+        assert param.data_ptr() == param_ptr, "Parameter should be updated in-place"
+
+        # Verify all optimizer state tensors maintain their pointers
+        state = optimizer.state[param]
+        exp_avg_ptr = state["exp_avg"].data_ptr()
+        exp_avg_sq_ptr = state["exp_avg_sq"].data_ptr()
+        max_exp_avg_sq_ptr = state["max_exp_avg_sq"].data_ptr()
+
+        # Run one more step
+        loss = param.sum()
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        # All state tensors should be updated in-place
+        assert state["exp_avg"].data_ptr() == exp_avg_ptr, "exp_avg should be updated in-place"
+        assert (
+            state["exp_avg_sq"].data_ptr() == exp_avg_sq_ptr
+        ), "exp_avg_sq should be updated in-place"
+        assert (
+            state["max_exp_avg_sq"].data_ptr() == max_exp_avg_sq_ptr
+        ), "max_exp_avg_sq should be updated in-place with AMSGrad"
+
+    def test_fused_adamw_scalar_params(self):
+        """Test AdamW with scalar (0-dim) params mixed with normal ones.
+
+        Reproduces the CLIP logit_scale failure where a scalar param caused
+        the NKI kernel to crash with: error: invalid shape: cannot be empty
+        """
+        torch.manual_seed(42)
+
+        params_cpu = [
+            torch.randn((), requires_grad=True),  # scalar — triggers the bug
+            torch.randn(49408, 768, requires_grad=True),
+            torch.randn(768, requires_grad=True),
+        ]
+        params_neuron = [p.detach().clone().to("neuron").requires_grad_(True) for p in params_cpu]
+
+        optimizer_cpu = torch.optim.AdamW(
+            params_cpu, lr=4e-4, betas=(0.9, 0.999), weight_decay=0.01, fused=False
+        )
+        optimizer_neuron = torch.optim.AdamW(
+            params_neuron, lr=4e-4, betas=(0.9, 0.999), weight_decay=0.01, fused=True
+        )
+
+        for _ in range(3):
+            loss_cpu = sum(p.sum() for p in params_cpu)
+            loss_cpu.backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            loss_neuron = sum(p.sum() for p in params_neuron)
+            loss_neuron.backward()
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adamw_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    def test_fused_adamw_mixed_zero_size_params(self):
+        """Test AdamW with zero-size parameters mixed with normal ones.
+
+        Reproduces the FSDPv2 scenario where DTensor sharding produces zero-size
+        parameter shards. Without the fix in optimizer.py, neuronx-cc crashes
+        with NCC_ITEN404 when compiling the fused adamw HLO.
+        """
+        torch.manual_seed(42)
+
+        # Mix of normal and zero-size params in the same optimizer group,
+        # mirroring FSDPv2 last-rank shards from the actual failure logs
+        params_cpu = [
+            torch.randn(39, 768, requires_grad=True),
+            torch.randn(0, 768, requires_grad=True),  # zero-size shard
+            torch.randn(12, requires_grad=True),
+            torch.randn(12, 768, requires_grad=True),
+        ]
+        params_neuron = [p.detach().clone().to("neuron").requires_grad_(True) for p in params_cpu]
+
+        optimizer_cpu = torch.optim.AdamW(params_cpu, lr=0.001, fused=False)
+        optimizer_neuron = torch.optim.AdamW(params_neuron, lr=0.001, fused=True)
+
+        for _step in range(3):
+            loss_cpu = sum(p.sum() for p in params_cpu)
+            loss_cpu.backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            loss_neuron = sum(p.sum() for p in params_neuron)
+            loss_neuron.backward()
+
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adamw_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+
+class TestFusedAdamWNKI:
+    """Tests specific to the NKI kernel implementation."""
+
+    def test_no_recompile_across_steps(self):
+        """NKI kernels should compile once and cache across optimizer steps."""
+        from unittest.mock import patch
+
+        from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
+
+        torch.manual_seed(42)
+        params = [
+            torch.randn(64, 128, device="neuron", requires_grad=True),
+            torch.randn(256, device="neuron", requires_grad=True),
+        ]
+        opt = torch.optim.AdamW(params, lr=0.001, fused=True)
+
+        with patch(
+            "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
+            wraps=convert_fx_to_stablehlo,
+        ) as mock_compiler:
+            for p in params:
+                p.grad = torch.randn_like(p)
+            opt.step()
+            opt.zero_grad()
+            count_after_step1 = mock_compiler.call_count
+            assert count_after_step1 > 0, "No compilation on first step"
+
+            for _ in range(4):
+                for p in params:
+                    p.grad = torch.randn_like(p)
+                opt.step()
+                opt.zero_grad()
+
+            assert (
+                mock_compiler.call_count == count_after_step1
+            ), f"Recompilation detected: {mock_compiler.call_count} vs {count_after_step1}"
+
+    def test_no_recompile_with_lr_scheduler(self):
+        """LR scheduler changes should not trigger recompilation."""
+        from unittest.mock import patch
+
+        from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
+        from torch_neuronx.python_ops.compilation import hlo_cache as _hlo_cache_mod
+
+        _orig_enabled = _hlo_cache_mod._enabled
+        _hlo_cache_mod._enabled = False
+
+        torch.manual_seed(42)
+        params = [
+            torch.randn(64, 128, device="neuron", requires_grad=True),
+            torch.randn(256, device="neuron", requires_grad=True),
+        ]
+        opt = torch.optim.AdamW(params, lr=0.001, fused=True)
+        scheduler = torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=5)
+
+        with patch(
+            "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
+            wraps=convert_fx_to_stablehlo,
+        ) as mock_compiler:
+            # Step 1: compiles
+            for p in params:
+                p.grad = torch.randn_like(p)
+            opt.step()
+            scheduler.step()
+            opt.zero_grad()
+            count_after_step1 = mock_compiler.call_count
+            assert count_after_step1 > 0, "No compilation on first step"
+
+            # Steps 2-5: LR changes each step, should not recompile
+            for _ in range(4):
+                for p in params:
+                    p.grad = torch.randn_like(p)
+                opt.step()
+                scheduler.step()
+                opt.zero_grad()
+
+            assert (
+                mock_compiler.call_count == count_after_step1
+            ), f"Recompilation on LR change: {mock_compiler.call_count} vs {count_after_step1}"
+
+        _hlo_cache_mod._enabled = _orig_enabled
+
+    def test_no_recompile_amsgrad(self):
+        """AMSGrad variant should also not recompile across steps."""
+        from unittest.mock import patch
+
+        from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
+
+        torch.manual_seed(42)
+        params = [torch.randn(128, device="neuron", requires_grad=True)]
+        opt = torch.optim.AdamW(params, lr=0.01, amsgrad=True, fused=True)
+
+        with patch(
+            "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
+            wraps=convert_fx_to_stablehlo,
+        ) as mock_compiler:
+            for p in params:
+                p.grad = torch.randn_like(p)
+            opt.step()
+            opt.zero_grad()
+            count_after_step1 = mock_compiler.call_count
+
+            for _ in range(4):
+                for p in params:
+                    p.grad = torch.randn_like(p)
+                opt.step()
+                opt.zero_grad()
+
+            assert mock_compiler.call_count == count_after_step1
+
+    def test_gpt_shapes(self):
+        """Correctness with GPT-OSS parameter shapes."""
+        torch.manual_seed(42)
+        shapes = [
+            (2374, 4096),
+            (8,),
+            (64, 4096),
+            (16, 4096),
+            (256, 1024),
+            (192, 4096),
+            (256, 3072),
+            (256,),
+        ]
+
+        params_cpu = [torch.randn(s, requires_grad=True) for s in shapes]
+        params_neuron = [p.detach().clone().to("neuron").requires_grad_(True) for p in params_cpu]
+
+        opt_cpu = torch.optim.AdamW(params_cpu, lr=0.001, amsgrad=True, fused=False)
+        opt_neuron = torch.optim.AdamW(params_neuron, lr=0.001, amsgrad=True, fused=True)
+
+        for _ in range(3):
+            sum(p.sum() for p in params_cpu).backward()
+            opt_cpu.step()
+            opt_cpu.zero_grad()
+
+            sum(p.sum() for p in params_neuron).backward()
+            with track_neuron_ops():
+                opt_neuron.step()
+                assert_op_runs_on_neuron("_fused_adamw_")
+            opt_neuron.zero_grad()
+
+        for i, (pc, pn) in enumerate(zip(params_cpu, params_neuron, strict=False)):
+            torch.testing.assert_close(
+                pn.detach().cpu(),
+                pc.detach(),
+                rtol=1e-4,
+                atol=1e-5,
+                msg=f"param[{i}] shape={shapes[i]} mismatch",
+            )
+
+    def test_many_steps_accumulation(self):
+        """10 optimizer steps to verify state accumulation."""
+        torch.manual_seed(42)
+        p_cpu = torch.randn(128, requires_grad=True)
+        p_neuron = p_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        opt_cpu = torch.optim.AdamW([p_cpu], lr=0.001, fused=False)
+        opt_neuron = torch.optim.AdamW([p_neuron], lr=0.001, fused=True)
+
+        for _ in range(10):
+            p_cpu.pow(2).sum().backward()
+            opt_cpu.step()
+            opt_cpu.zero_grad()
+
+            p_neuron.pow(2).sum().backward()
+            opt_neuron.step()
+            opt_neuron.zero_grad()
+
+        torch.testing.assert_close(
+            p_neuron.detach().cpu(),
+            p_cpu.detach(),
+            rtol=1e-4,
+            atol=1e-5,
+        )
+
+
+class TestFusedAdam:
+    """Tests for fused Adam (L2 regularization, not decoupled weight decay)."""
+
+    def _compare_optimizer_states(self, cpu_opt, neuron_opt):
+        """Compare optimizer internal states between CPU and Neuron."""
+        cpu_params = list(cpu_opt.param_groups[0]["params"])
+        neuron_params = list(neuron_opt.param_groups[0]["params"])
+
+        for cpu_param, neuron_param in zip(cpu_params, neuron_params, strict=False):
+            cpu_state = cpu_opt.state.get(cpu_param, {})
+            neuron_state = neuron_opt.state.get(neuron_param, {})
+
+            assert set(cpu_state.keys()) == set(neuron_state.keys()), (
+                f"State keys mismatch: CPU={set(cpu_state.keys())}, "
+                f"Neuron={set(neuron_state.keys())}"
+            )
+
+            for key in cpu_state:
+                if key == "step":
+                    cpu_step = (
+                        cpu_state[key].item() if hasattr(cpu_state[key], "item") else cpu_state[key]
+                    )
+                    neuron_step = (
+                        neuron_state[key].cpu().item()
+                        if hasattr(neuron_state[key], "item")
+                        else neuron_state[key]
+                    )
+                    assert cpu_step == neuron_step, "Step count mismatch"
+                else:
+                    torch.testing.assert_close(
+                        neuron_state[key].cpu(),
+                        cpu_state[key],
+                        rtol=1e-5 if cpu_state[key].dtype == torch.float32 else 1e-3,
+                        atol=1e-6 if cpu_state[key].dtype == torch.float32 else 1e-3,
+                        msg=f"State '{key}' mismatch",
+                    )
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_fused_adam_basic(self, dtype):
+        """Test Adam fused accuracy against CPU."""
+        torch.manual_seed(42)
+
+        param_cpu = torch.randn(10, dtype=dtype, requires_grad=True)
+        param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        optimizer_cpu = torch.optim.Adam([param_cpu], lr=0.001, fused=False)
+        optimizer_neuron = torch.optim.Adam([param_neuron], lr=0.001, fused=True)
+
+        for _ in range(3):
+            param_cpu.sum().backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            param_neuron.sum().backward()
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adam_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    def test_fused_adam_with_weight_decay(self):
+        """Test Adam with L2 weight decay."""
+        torch.manual_seed(42)
+
+        param_cpu = torch.randn(20, requires_grad=True)
+        param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        optimizer_cpu = torch.optim.Adam([param_cpu], lr=0.01, weight_decay=0.1, fused=False)
+        optimizer_neuron = torch.optim.Adam([param_neuron], lr=0.01, weight_decay=0.1, fused=True)
+
+        for _ in range(3):
+            param_cpu.pow(2).sum().backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            param_neuron.pow(2).sum().backward()
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adam_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    def test_fused_adam_multiple_params(self):
+        """Test Adam with multiple parameters."""
+        torch.manual_seed(42)
+
+        params_cpu = [
+            torch.randn(10, requires_grad=True),
+            torch.randn(5, 8, requires_grad=True),
+            torch.randn(100, requires_grad=True),
+        ]
+        params_neuron = [p.detach().clone().to("neuron").requires_grad_(True) for p in params_cpu]
+
+        optimizer_cpu = torch.optim.Adam(params_cpu, lr=0.01, weight_decay=0.01, fused=False)
+        optimizer_neuron = torch.optim.Adam(params_neuron, lr=0.01, weight_decay=0.01, fused=True)
+
+        for _ in range(2):
+            sum(p.sum() for p in params_cpu).backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            sum(p.sum() for p in params_neuron).backward()
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adam_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    def test_fused_adam_amsgrad(self):
+        """Test Adam with AMSGrad."""
+        torch.manual_seed(42)
+
+        param_cpu = torch.randn(20, requires_grad=True)
+        param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        optimizer_cpu = torch.optim.Adam([param_cpu], lr=0.01, amsgrad=True, fused=False)
+        optimizer_neuron = torch.optim.Adam([param_neuron], lr=0.01, amsgrad=True, fused=True)
+
+        for _ in range(3):
+            param_cpu.pow(2).sum().backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            param_neuron.pow(2).sum().backward()
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adam_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    def test_fused_adam_maximize(self):
+        """Test Adam with maximize=True."""
+        torch.manual_seed(42)
+
+        param_cpu = torch.randn(15, requires_grad=True)
+        param_neuron = param_cpu.detach().clone().to("neuron").requires_grad_(True)
+
+        optimizer_cpu = torch.optim.Adam([param_cpu], lr=0.01, maximize=True, fused=False)
+        optimizer_neuron = torch.optim.Adam([param_neuron], lr=0.01, maximize=True, fused=True)
+
+        for _ in range(2):
+            param_cpu.sum().backward()
+            optimizer_cpu.step()
+            optimizer_cpu.zero_grad()
+
+            param_neuron.sum().backward()
+            with track_neuron_ops():
+                optimizer_neuron.step()
+                assert_op_runs_on_neuron("_fused_adam_")
+            optimizer_neuron.zero_grad()
+
+        self._compare_optimizer_states(optimizer_cpu, optimizer_neuron)
+
+    def test_fused_adam_no_recompile(self):
+        """Adam NKI kernels should not recompile across steps."""
+        from unittest.mock import patch
+
+        from torch_neuronx.neuron_dynamo_backend.fx.fx_transform import convert_fx_to_stablehlo
+
+        torch.manual_seed(42)
+        params = [torch.randn(64, 128, device="neuron", requires_grad=True)]
+        opt = torch.optim.Adam(params, lr=0.001, weight_decay=0.01, fused=True)
+
+        with patch(
+            "torch_neuronx.neuron_dynamo_backend.fx.fx_transform.convert_fx_to_stablehlo",
+            wraps=convert_fx_to_stablehlo,
+        ) as mock_compiler:
+            for p in params:
+                p.grad = torch.randn_like(p)
+            opt.step()
+            opt.zero_grad()
+            count_after_step1 = mock_compiler.call_count
+
+            for _ in range(4):
+                for p in params:
+                    p.grad = torch.randn_like(p)
+                opt.step()
+                opt.zero_grad()
+
+            assert (
+                mock_compiler.call_count == count_after_step1
+            ), f"Recompilation detected: {mock_compiler.call_count} vs {count_after_step1}"

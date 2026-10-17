@@ -1,0 +1,811 @@
+from tests.pytorch_tests_native.neuron_test_registry import SkipGroup
+from tests.pytorch_tests_native.skip_registry import xfail_tests as x
+
+XFAIL_GROUPS: list[SkipGroup] = [
+    # TODO: Remove this XFAIL after the compiler error is fixed.
+    SkipGroup(
+        reason=(
+            "Compiler error: the compiler rejects the itemgetter slice graph with NCC_INLA001. "
+            "The DMA copy has a one-dimensional access pattern."
+        ),
+        tests=[
+            "test_functions.py::FunctionTests::test_itemgetter",
+            "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksFunctionTests::test_itemgetter_nested_graph_breaks",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.11] test_inplace_ops: Numerical tolerance mismatch on Neuron"
+            " hardware. Gradient metadata propagation differs from CPU reference"
+            " on bfloat16/float16 for various inplace ops (fmod, lerp, etc.)."
+        ),
+        tests=x.DYNAMO_INPLACE_METADATA_PROPAGATION,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.11] Test expects RuntimeError under FakeTensorMode that the"
+            " Neuron backend does not raise (compilation succeeds instead)."
+        ),
+        tests=[
+            "test_fake_tensor_mode_raises_error",
+        ],
+    ),
+    # TODO: Upstream fix needed - tests assert on log messages, which are different
+    #   for neuron backend because of differences in the callstack or backend function
+    #   itself
+    SkipGroup(
+        reason=(
+            "Error/log message format mismatch: Neuron backend produces "
+            "extra stack frames in graph-break and error messages"
+        ),
+        tests=x.DYNAMO_ERROR_LOG_FORMAT_MISMATCH,
+    ),
+    SkipGroup(
+        reason=("Inductor-specific logging/output tests fail on " "Neuron backend"),
+        tests=[
+            "LoggingTests::test_inductor_error",
+            "LoggingTests::test_inductor_info",
+            "LoggingTests::test_kernel_code",
+            "LoggingTests::test_output_code",
+            "StructuredTraceTest::test_dump_file",
+            "TestBackendOverrideIntegrationNEURON::test_multiple_rules_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=("Test output includes device='neuron:0' in string " "representation"),
+        tests=[
+            "ReorderLogsTests::test_constant_mutation",
+            "TpReprTests::test_structseq_repr_with_tensor_graph_breaks",
+        ],
+    ),
+    # TODO: Upstream fix needed - test input/output devices will mismatch
+    #   with the devices of results from the neuron backend
+    SkipGroup(
+        reason="index_put: Non-scalar tensor on cpu device, expected neuron",
+        tests=[
+            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_put_neuron_bfloat16",
+            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_put_neuron_float16",
+            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_put_neuron_float32",
+            "TestTensorMetaPropNEURON::test_inplace_ops_propagate_requires_grad_metadata_index_put_neuron_float64",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Device mismatch: test expects cpu output but gets neuron:0 "
+            "(autocast cpu graph break)"
+        ),
+        tests=[
+            "CtxManagerTests::test_autocast_cpu_graph_break",
+            "CtxManagerTests::test_autocast_cpu_graph_break_inner_fn",
+            "NestedGraphBreaksCtxManagerTests::test_autocast_cpu_graph_break_nested_graph_breaks",
+            "NestedGraphBreaksCtxManagerTests::test_autocast_cpu_graph_break_inner_fn_nested_graph_breaks",
+            "*CtxManagerTests::test_autocast_cpu_graph_break_inner_fn*",
+            "DynamicShapesCtxManagerTests::test_autocast_cpu_graph_break_inner_fn_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason=("Gradient device mismatch: neuron gradient assigned " "to cpu tensor"),
+        tests=x.DYNAMO_GRADIENT_NEURON_TO_CPU,
+    ),
+    SkipGroup(
+        reason="Device mismatch: mixed neuron:0 and cpu tensors",
+        tests=[
+            "DynamicShapesFunctionTests::test_itertools_compress_tensors_dynamic_shapes",
+        ],
+    ),
+    # TODO: Upstream fix needed - test hardcodes cuda-specific behavior
+    #   that must be modified to be device-agnostic
+    SkipGroup(
+        reason=("Neuron stream/event type mismatch in CUDA " "stream/event tests"),
+        tests=x.DYNAMO_STREAM_EVENT_TYPE_MISMATCH,
+    ),
+    SkipGroup(
+        reason="Test requires CUDA driver (record_stream / stream backward)",
+        tests=[
+            "TestStreams::test_record_stream_problem_basic",
+            "TestStreams::test_record_stream_problem_interleaved",
+            "TestStreams::test_stream_backward_simple",
+        ],
+    ),
+    SkipGroup(
+        reason="Hardcoded CUDA device reference: test uses .to('cuda') directly",
+        tests=[
+            "DynamicShapesFunctionTests::test_get_device_properties_tensor_device_dynamic_shapes",
+            "*FunctionTests::test_get_device_properties_tensor_device*",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Torch-MLIR scalar-tensor type mismatch: aten.add.Tensor/aten.mul.Tensor "
+            "operand must be a Torch tensor type but got a scalar"
+        ),
+        tests=x.DYNAMO_SCALAR_TENSOR_TYPE_MISMATCH,
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR unresolved materialization between i64 and tensor<i64> types"),
+        tests=x.DYNAMO_UNRESOLVED_MATERIALIZATION_I64,
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR return type mismatch: tensor<i64> vs i64"),
+        tests=[
+            "DynamicShapesAotAutogradFallbackTests::test_aot_autograd_expand_mutation_backwards_dynamic_shapes",
+            "DynamicShapesAotAutogradFallbackTests::test_aot_autograd_expand_mutation_functionalizes_dynamic_shapes",
+            "DynamicShapesReproTests::test_intermediate_leaf_requires_grad_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR reduction region element-type mismatch in select_scatter"),
+        tests=[
+            "DynamicShapesReproTests::test_select_scatter_mixed_dtype_dynamic_shapes",
+            "*ReproTests::test_select_scatter_mixed_dtype*",
+        ],
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR stablehlo.scatter dimension bounds mismatch"),
+        tests=[
+            "DynamicShapesReproTests::test_setitem_tensor_prop_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR stablehlo.concatenate inferred type incompatibility"),
+        tests=[
+            "*MiscTests::test_scalar_tensor_is_equivalent_to_symint_list_argument*",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Gradient device mismatch: CompiledFunctionBackward returns "
+            "gradients on neuron:0 but framework expects cpu"
+        ),
+        tests=x.DYNAMO_GRADIENT_DEVICE_MISMATCH,
+    ),
+    SkipGroup(
+        reason=("Device mismatch: mixed neuron:0 and cpu tensors"),
+        tests=x.DYNAMO_DEVICE_MISMATCH_MIXED,
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR failed to legalize 'operator'" "operator missing from Torch dialect"),
+        tests=x.DYNAMO_FAILED_TO_LEGALIZE_OPERATOR,
+    ),
+    SkipGroup(
+        reason=(
+            "Torch-MLIR failed to legalize runtime.assert"
+            "Runtime asserts embedded in the graph are not supported"
+        ),
+        tests=x.DYNAMO_FAILED_TO_LEGALIZE_RUNTIME_ASSERT,
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR failed to legalize tensor.dim"),
+        tests=x.DYNAMO_FAILED_TO_LEGALIZE_TENSOR_DIM,
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR failed to legalize constant.int"),
+        tests=x.DYNAMO_FAILED_TO_LEGALIZE_CONSTANT_INT,
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR lowering failure at aten.Int"),
+        tests=x.DYNAMO_LOWERING_FAILURE_ATEN_INT,
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR lowering failure at aten.gather"),
+        tests=x.DYNAMO_LOWERING_FAILURE_ATEN_GATHER,
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR lowering failure at aten.add"),
+        tests=x.DYNAMO_LOWERING_FAILURE_ATEN_ADD,
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR lowering failure at aten.zeros"),
+        tests=x.DYNAMO_LOWERING_FAILURE_ATEN_ZEROS,
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR lowering failure at aten.scatter_add"),
+        tests=x.DYNAMO_LOWERING_FAILURE_ATEN_SCATTER_ADD,
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR lowering failure at aten.cumsum"),
+        tests=x.DYNAMO_LOWERING_FAILURE_ATEN_CUMSUM,
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR lowering failure at aten.uniform"),
+        tests=[
+            "DynamicShapesReproTests::test_tensor_uniform_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR lowering failure at aten.ones"),
+        tests=[
+            "DynamicShapesReproTests::test_list_reverse_dynamic_shapes",
+            "DynamicShapesReproTests::test_ones_out_dynamic_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR lowering failure at aten.xlogy"),
+        tests=x.DYNAMO_LOWERING_FAILURE_ATEN_XLOGY,
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR lowering failure at aten.Float"),
+        tests=[
+            "*DefaultsTests::test_cast_tensor_single_elem*",
+            "*UnspecTests::test_symfloat_to_tensor*",
+        ],
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR lowering failure at aten.squeeze"),
+        tests=[
+            "DynamicShapesFunctionTests::test_unary_fold_op_dynamic_shapes",
+            "DynamicShapesFunctionTests::test_tensor_type5_dynamic_shapes",
+            "DynamicShapesMiscTests::test_scalar_tensor_is_equivalent_to_symint_argument_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR failed to legalize constant.bool"),
+        tests=[
+            "DynamicShapesMiscTests::test_unique_consecutive_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR lowering failure at aten.view"),
+        tests=[
+            "DynamicShapesReproTests::test_view_dtype_overload_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR lowering failure at aten.mul"),
+        tests=[
+            "SubclassTests::test_tensor_subclass_TwoTensor_return_shape",
+            "DynamicShapesReproTests::test_user_defined_iter_dynamic_shapes",
+            "DynamicShapesReproTests::test_as_strided_on_base_with_mutation_works_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason=("Torch-MLIR failed to legalize: aten.eq"),
+        tests=[
+            "HigherOrderOpVmapGuardTests::test_vmap_guard_fail_different_state",
+            "DynamicShapesMiscTests::test_ne_operator_with_custom_graphbreak_eq_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason=("HOP 'auto_functionalized_v2' not implemented in the FxImporter"),
+        tests=[
+            "DynamicShapesMiscTests::test_out_variant_custom_op_dynamic_shapes",
+            "*MiscTests::test_generate_trivial_abstract_impl*",
+            "*MiscTests::test_out_variant_custom_op*",
+            "NestedGraphBreakLoggingTests::test_nested_generic_ctx_mgr",
+        ],
+    ),
+    SkipGroup(
+        reason=("HOP 'invoke_subgraph' not implemented in the FxImporter"),
+        tests=[
+            "AOTAutogradCacheBundledTests::test_invoke_subgraph",
+            "AOTAutogradCacheTests::test_invoke_subgraph",
+            "GraphDededuplicationTests::test_param_transfer_to_submodule",
+            "GraphDededuplicationTests::test_tuple_return",
+            "*ActivationCheckpointingViaTagsTestsNEURON::test_region_activation_memory_budget_distinct_per_invoke_subgraph_raises_neuron*",
+            "RegionalInductorInvokeSubgraphTests::test_invoke_subgraph_functionalize_schema_cache",
+        ],
+    ),
+    SkipGroup(
+        reason=("HOP 'control_deps' not implemented in the FxImporter"),
+        tests=[
+            "TestStreams::test_event_synchronize_control_deps_e2e",
+            "TestStreams::test_event_synchronize_e2e",
+            "TestStreams::test_event_synchronize_inductor_lowering",
+            "TestStreams::test_inductor_lowering",
+        ],
+    ),
+    SkipGroup(
+        reason=("HOP 'run_and_save_rng_state' not implemented in the FxImporter"),
+        tests=[
+            "HOPCacheTests::test_checkpoint_with_dropout_caches_correctly",
+        ],
+    ),
+    SkipGroup(
+        reason=("HOP 'map_impl' not implemented in the FxImporter"),
+        tests=[
+            "DynamicShapesMiscTests::test_map_with_quantization_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason=("Missing fx_graph_runnable payload"),
+        tests=[
+            "FxGraphRunnableTest::test_all_gather_collective",
+            "FxGraphRunnableTest::test_basic_tensor_add",
+            "FxGraphRunnableTest::test_broadcast_collective",
+            "FxGraphRunnableTest::test_toy_model_basic",
+        ],
+    ),
+    SkipGroup(
+        reason=("AoTAutogradCache not supported: cache hit/miss count mismatch"),
+        tests=x.DYNAMO_AOT_AUTOGRAD_CACHE_HIT_MISS,
+    ),
+    SkipGroup(
+        reason=("Numerical precision mismatch on Neuron for inplace ops"),
+        tests=x.DYNAMO_NUMERICAL_PRECISION_INPLACE_OPS,
+    ),
+    SkipGroup(
+        reason="aten._to_copy.default dispatch failure for tensor subclass on Neuron",
+        tests=x.DYNAMO_TO_COPY_DISPATCH_FAILURE,
+    ),
+    SkipGroup(
+        reason=("Numerical precision or value mismatch on Neuron " "(non-inplace-op tests)"),
+        tests=x.DYNAMO_NUMERICAL_PRECISION_NON_INPLACE,
+    ),
+    SkipGroup(
+        reason="vmap recompile guard tests: RecompileError not raised on Neuron",
+        tests=x.DYNAMO_VMAP_RECOMPILE_GUARD,
+    ),
+    SkipGroup(
+        reason="vmap guard recompilation count is 0 on Neuron",
+        tests=[
+            "HigherOrderOpVmapGuardTests::test_vmap_grad_vmap_guard_fail",
+            "HigherOrderOpVmapGuardTests::test_vmap_guard_fail",
+            "HigherOrderOpVmapGuardTests::test_vmap_recompile_different_states",
+        ],
+    ),
+    SkipGroup(
+        reason="Stream sync_dealloc not emitted by Neuron backend",
+        tests=[
+            "TestStreams::test_del_attr_multi_stream_sync_dealloc",
+            "TestStreams::test_del_multi_stream_sync_dealloc",
+            "TestStreams::test_del_subscr_multi_stream_sync_dealloc",
+        ],
+    ),
+    SkipGroup(
+        reason=("Test expects BackendCompilerFailed but Neuron backend " "does not raise it"),
+        tests=[
+            "AOTAutogradCacheBundledTests::test_compiled_autograd_bypass",
+            "AOTAutogradCacheBundledTests::test_unsafe_mark_cacheable",
+            "AOTAutogradCacheTests::test_compiled_autograd_bypass",
+        ],
+    ),
+    SkipGroup(
+        reason="Neuron backend wrapper is not picklable",
+        tests=[
+            "OptimizedModuleTest::test_save_and_load_all_backends",
+            "OptimizedModuleTest::test_save_and_load_inductor",
+        ],
+    ),
+    SkipGroup(
+        reason="Neuron backend error: name 'sparsity' is not defined",
+        tests=[
+            "GetItemTests::test_opaque_object_getitem",
+            "*HooksTests::test_functools_arg_vary*",
+            "*HooksTests::test_intermediary_hooks_same_on_aot_eager*",
+            "*HooksTests::test_intermediary_hooks_same_on_inductor*",
+            "*HooksTests::test_intermediate_hook_with_closure_aot*",
+        ],
+    ),
+    SkipGroup(
+        reason="Neuron NEFF param_num / output_idx out of bounds",
+        tests=[
+            "AOTAutogradCacheBundledTests::test_dtensor_cache_hit",
+            "*MiscTests::test_builtin_abs*",
+            "TestNestedTensor::test_basic_autograd",
+        ],
+    ),
+    SkipGroup(
+        reason="_copy_from_and_resize size mismatch on Neuron",
+        tests=[
+            "DynamicShapesReproTests::test_sort_out_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason="RecursionError: maximum recursion depth exceeded on Neuron",
+        tests=[
+            "DynamicShapesReproTests::test_tokenization_dynamic_shapes",
+            "*MiscTests::test_sourceless_namedtuple*",
+        ],
+    ),
+    SkipGroup(
+        reason=("conv_transpose / functorch correctness failure on Neuron"),
+        tests=[
+            "ContextlibContextManagerTests::test_functorch_low_level_gb_False",
+            "DynamicShapesNNModuleTests::test_conv_transpose_call_forward_directly_dynamic_shapes",
+            "DynamicShapesNNModuleTests::test_conv_transpose_call_super_forward_directly_dynamic_shapes",
+            "*NNModuleTests::test_conv_transpose_call_forward_directly*",
+        ],
+    ),
+    SkipGroup(
+        reason=("Neuron backend returns unexpected number of outputs " "or wrong error type"),
+        tests=[
+            "AotAutogradFallbackTests::test_mutation",
+            "DynamicShapesAotAutogradFallbackTests::test_call_fn_with_non_const_inputs_aot_unsafe_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason=("Neuron ShardIndexInjection pass error for " "arange with float32 dtype"),
+        tests=[
+            "DynamicShapesMiscTests::test_arange_length_with_float32_dtype_dynamic_shapes",
+            "*MiscTests::test_arange_length_with_float32_dtype*",
+            "*UnspecTests::test_mark_unbacked_hint_consistency*",
+        ],
+    ),
+    SkipGroup(
+        reason=("Autograd engine stream assertion failure on Neuron"),
+        tests=[
+            "AOTAutogradCacheTests::test_aot_runtime_trace_joint",
+        ],
+    ),
+    SkipGroup(
+        reason=("Double backward error message mismatch on Neuron"),
+        tests=[
+            "DynamicShapesAotAutogradFallbackTests::test_double_backward_with_compile_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "execnet DumpError: can't serialize tensor or " "builtin_function_or_method with xdist"
+        ),
+        tests=[
+            "DynamicShapesFunctionTests::test_compare_constant_and_tensor_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason=("FakeTensor / meta tensor device propagation failure " "on Neuron"),
+        tests=[
+            "DynamicShapesReproTests::test_inplace_add_from_meta_tensor_factory_dynamic_shapes",
+            "*ReproTests::test_inplace_add_from_meta_tensor_factory*",
+        ],
+    ),
+    SkipGroup(
+        reason="HOP 'auto_functionalized_v2' not implemented in the FxImporter",
+        tests=[
+            "DynamicShapesMiscTests::test_generate_trivial_abstract_impl_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason=("CompiledFunctionBackward returns incorrect number " "of gradients on Neuron"),
+        tests=[
+            "DynamicShapesMiscTests::test_compile_with_userland_fake_tensor_mode_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason="Unsupported: Failed to convert args/kwargs to proxy",
+        tests=[
+            "DynamicShapesReproTests::test_issue164247_backend_eager_dynamic_shapes",
+        ],
+    ),
+    SkipGroup(
+        reason="Unsupported: Attempt to trace generator",
+        tests=[
+            "*HooksTests::test_post_acc_grad_hook*",
+            "*ActivationCheckpointingViaTagsTestsNEURON::test_tags_must_save_tensor_that_has_backward_hook_neuron*",
+        ],
+    ),
+    SkipGroup(
+        reason="AoTAutogradCache not supported: cache hit/miss count mismatch",
+        tests=[
+            "AOTAutogradCacheBundledTests::test_fx_graph_cache_off",
+            "AOTAutogradCacheTests::test_fx_graph_cache_off",
+        ],
+    ),
+    SkipGroup(
+        reason="Distributed rank not set",
+        tests=[
+            "FxGraphRunnableTest::test_all_reduce_collective",
+            "TestFakeDistributed::test_all_gather_tensor_gather_dim_0",
+            "TestFakeDistributed::test_all_gather_tensor_gather_dim_1_view_path",
+            "TestFakeDistributed::test_all_gather_tensor_gather_dim_2_chunk_cat_path",
+        ],
+    ),
+    SkipGroup(
+        reason="Assertion failure on Neuron: multithread compile dynamic",
+        tests=[
+            "*MiscTests::test_multithread_compile_dynamic*",
+        ],
+    ),
+    SkipGroup(
+        reason="Expected RuntimeError not raised on Neuron",
+        tests=[
+            "*ReproTests::test_one_hot_bounds_check_compiled*",
+            "*ActivationCheckpointingViaTagsTestsNEURON::test_region_activation_memory_budget_conflict_raises_neuron*",
+            "*ActivationCheckpointingViaTagsTestsNEURON::test_region_activation_memory_budget_partial_annotation_raises_neuron*",
+        ],
+    ),
+    SkipGroup(
+        reason="FunctionalTensor usage without FunctionalTensorMode",
+        tests=[
+            "*ReproTests::test_trace_functional_tensor_with*",
+        ],
+    ),
+    SkipGroup(
+        reason="Invalid device argument on Neuron",
+        tests=[
+            "*ReproTests::test_mem_leak_guards*",
+        ],
+    ),
+    SkipGroup(
+        reason="Neuron backend compilation failure for NestedTensor unbind",
+        tests=[
+            "TestNestedTensor::test_unbind",
+        ],
+    ),
+    SkipGroup(
+        reason="Numerical or count mismatch on Neuron",
+        tests=[
+            "TestPackage::test_automatic_dynamo_graph_breaks_from_print_model_as_fn_device_cpu",
+            "TestPackage::test_code_with_generator_device_cpu",
+        ],
+    ),
+    SkipGroup(
+        reason="Neuron compilation failure",
+        tests=[
+            "DynamicShapesAotAutogradFallbackTests::test_aot_autograd_expand_mutation_error_dynamic_shapes",
+            "*FunctionTests::test_quantize_per_tensor*",
+            "NbIntTests::test_tensor_float_dtype",
+            "*ReproTests::test_fp8_qdq_repeated_modules_no_recompile*",
+            "NestedGraphBreaksReproTests::test_fp8_qdq_repeated_modules_no_recompile_nested_graph_breaks",
+        ],
+    ),
+    SkipGroup(
+        reason="autograd.Function with functorch transforms requires setup_context",
+        tests=[
+            "AutogradFunctionFunctorchTests::test_old_style_autograd_function_with_grad_compiled",
+        ],
+    ),
+    SkipGroup(
+        reason="Unsupported: Failed to convert args/kwargs to proxy",
+        tests=[
+            "*ReproTests::test_issue164247_backend_eager*",
+        ],
+    ),
+    SkipGroup(
+        reason="Numerical precision mismatch on Neuron for float rounding",
+        tests=[
+            "UnspecTests::test_unspec_roundtrip_float_input",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "torch.compile graph capture fails on Neuron for dynamic ops"
+            " (randint, isin, interpolate, module.to)."
+        ),
+        tests=[
+            "MiscTestsDeviceNEURON::test_module_to_with_shared_weights_compile_neuron",
+            "MiscTestsDeviceNEURON::test_randint_no_graphbreak_neuron",
+            "MiscTestsDeviceNEURON::test_module_to_move_compile_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "CPU input tensor passed to a Neuron-compiled function. The"
+            " executor's _prepare_inputs no longer accepts cpu tensors with"
+            " fallback disabled (executor.py:121: tensor = inp.to(device_str))."
+        ),
+        tests=[
+            "TestWrapInductorCompiledRegions::test_fake_tensor_mode_works",
+            "*ActivationCheckpointingViaTagsTestsNEURON::test_frozen_dataclass_pytree_output_neuron*",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "TwoTensor subclass with nested differing sizes produces a"
+            " graph whose instruction count exceeds neuronx-cc's"
+            " 10,000,000 limit (NCC_EVRF007)."
+        ),
+        tests=[
+            "SubclassTests::test_subclass_TwoTensor_nested_diff_sizes",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.13] Complex dtype (complex64) unsupported on the Neuron StableHLO"
+            " backend. torch-mlir marks the complex-producing/consuming op illegal"
+            " ('failed to legalize operation torch.operator'); conj/neg alias hit"
+            " aten.ones_like dispatch failure. No complex support in the backend."
+        ),
+        tests=[
+            "test_complex.py::ComplexTests::test_simple",
+            "test_complex.py::ComplexTests::test_list_out",
+            "test_complex.py::ComplexTests::test_aliasing_semantics",
+            "test_complex.py::ComplexTests::test_view_as_real",
+            "test_complex.py::ComplexTests::test_rope",
+            "test_complex.py::ComplexTests::test_conj_alias",
+            "test_complex.py::ComplexTests::test_neg_alias",
+            "test_repros.py::*ReproTests::test_issue183886_istft_length_pads_in_fake_tensor*",
+            "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_issue183886_istft_length_pads_in_fake_tensor_nested_graph_breaks",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.13] pad_sequence with a mixed-dtype padding value produces a"
+            " constant whose dtype the importer cannot handle: 'LLVM ERROR:"
+            " unhandled type for getConstantWithGivenDtypeAndValue'."
+        ),
+        tests=[
+            "test_repros.py::*ReproTests::test_pad_sequence_mixed_dtype_padding_value*",
+            "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_pad_sequence_mixed_dtype_padding_value_nested_graph_breaks",
+        ],
+    ),
+    SkipGroup(
+        reason=("[PT2.13] HOP 'with_effects' not implemented in the FxImporter"),
+        tests=[
+            "test_repros.py::*ReproTests::test_linalg_inv_singular_aot_eager_raises*",
+            "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_linalg_inv_singular_aot_eager_raises_nested_graph_breaks",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.13] aten::_thnn_fused_gru_cell not implemented for the Neuron"
+            " backend (pad_packed_sequence graph break after packed GRU)."
+        ),
+        tests=[
+            "test_repros.py::*ReproTests::test_pad_packed_sequence_graph_break_after_packed_gru*",
+            "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksReproTests::test_pad_packed_sequence_graph_break_after_packed_gru_nested_graph_breaks",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.13] torch._dynamo.exc.Unsupported: Unsupported functorch tracing" " attempt."
+        ),
+        tests=[
+            "test_ctx_manager.py::*CtxManagerTests::test_functorch_get_dynamic_layer_stack_depth*",
+            "test_higher_order_ops.py::FuncTorchHigherOrderOpTests::test_compile_vmap_compiled_fn_jacrev_has_aux",
+            "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksCtxManagerTests::test_functorch_get_dynamic_layer_stack_depth_nested_graph_breaks",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.13] functorch low-level / autocast decorator: expected behavior"
+            " not observed on Neuron ('False is not true')."
+        ),
+        tests=[
+            "test_ctx_manager.py::*CtxManagerTests::test_functorch_low_level_gb_True*",
+            "test_ctx_manager.py::*CtxManagerTests::test_functorch_low_level_gb_False*",
+            "test_ctx_manager.py::CtxManagerTestsDeviceNEURON::test_autocast_decorator_neuron",
+            "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksCtxManagerTests::test_functorch_low_level_gb_True_nested_graph_breaks",
+            "test_nested_graph_breaks_wrapped.py::NestedGraphBreaksCtxManagerTests::test_functorch_low_level_gb_False_nested_graph_breaks",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.13] Default-device factory functions under TorchFunctionMode:"
+            " output device is 'neuron' but test asserts 'cpu'."
+        ),
+        tests=[
+            "test_modes.py::TorchFunctionModeTests::test_default_device_factory_functions",
+            "test_modes.py::TorchFunctionModeTests::test_default_device_factory_functions_priority",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT2.13] Functionalization error 'x must not already be a functional"
+            " tensor' when compiling under a functorch higher-order op."
+        ),
+        tests=[
+            "test_higher_order_ops.py::FuncTorchHigherOrderOpTests::test_functionalize_compiled_fn_does_not_copy_dynamo_attrs",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Subtest test: some subTest(case=...) cases are unsupported on Neuron"
+            " and report SUBXFAIL. The xfail marker applies to the whole method."
+        ),
+        tests=[
+            "MiscTests::test_new_tensor_break",
+            "NestedGraphBreaksMiscTests::test_new_tensor_break_nested_graph_breaks",
+        ],
+    ),
+    # ════════════════════════════════════════════════════════════════════
+    #  PT 2.14: new tests from @onlyCUDA → @onlyAccelerator or new OpInfo
+    # ════════════════════════════════════════════════════════════════════
+    SkipGroup(
+        reason=(
+            "[PT 2.14] neuronx-cc compilation failure (NCC_EMOD023):"
+            " StableHLO module contains ops not supported in HLO."
+        ),
+        tests=x.DYNAMO_NCC_EMOD023_COMPILATION_FAILURE,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] Compiled backward returns gradient on neuron:0"
+            " but test expects cpu. Tests use backend='eager' or"
+            " 'aot_eager' with CPU tensors."
+        ),
+        tests=[
+            "dynamo/test_activation_checkpointing.py::ActivationCheckpointingViaTagsTestsNEURON::test_nonlocal_mutation_neuron",
+            "dynamo/test_autograd_function.py::AutogradFunctionTests::test_apply_kwargs_old_style",
+            "dynamo/test_autograd_function.py::AutogradFunctionTests::test_apply_kwargs_setup_context",
+            "dynamo/test_autograd_function.py::AutogradFunctionTests::test_mark_dirty_discarded_output_grad",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] Dynamo graph structure assertion mismatch:"
+            " Neuron backend generates different FX graph structure"
+            " than what the test asserts."
+        ),
+        tests=x.DYNAMO_GRAPH_STRUCTURE_ASSERTION_MISMATCH,
+    ),
+    SkipGroup(
+        reason=("[PT 2.14] Neuron backend compiler failure or device" " mismatch in Dynamo tests."),
+        tests=[
+            "dynamo/test_aot_autograd.py::AotAutogradFallbackTestsDeviceNEURON::test_partitioner_filters_symbool_saved_for_bw_neuron",
+            "dynamo/test_nb_power.py::TestNbPower::test_pow_symnode_negative_exponent",
+            "dynamo/test_subclasses.py::TestIssubclass::test_wrapper_subclass_vmap_compile",
+            "dynamo/test_activation_checkpointing.py::RematerializeACNodesPassTests::test_attr_compile_submodules_in_checkpoint_wrapper",
+            "dynamo/test_misc.py::MiscTests::test_tensor_share_memory",
+            "dynamo/test_wrap_inductor_compiled_regions.py::TestWrapInductorCompiledRegions::test_sac_cached_value_fifo_mismatch",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] Miscellaneous Dynamo test failures on Neuron:"
+            " CUDA-specific tests, device guard, logging, numerical."
+        ),
+        tests=x.DYNAMO_MISC_FAILURES,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] Compiled backward returns gradient on neuron:0"
+            " but test expects cpu — device mismatch from fork patch #74"
+            " device-generalization (inputs on CPU, compiled output on device)."
+        ),
+        tests=[
+            "dynamo/test_repros.py::ReproTests::test_intermediate_leaf_requires_grad",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] Torch-MLIR lowering failure: 'torch.operator'"
+            " marked illegal — grid_sampler_2d not supported on Neuron."
+        ),
+        tests=[
+            "dynamo/test_repros.py::ReproTests::test_grid_sampler_2d_cpu_fallback_inductor",
+            "dynamo/test_repros.py::ReproTests::test_grid_sampler_2d_cpu_fallback_backward",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] neuronx-cc compilation failure or numerical"
+            " mismatch on device-generalized ReproTests methods."
+        ),
+        tests=[
+            "dynamo/test_repros.py::ReproTests::test_gather_out_dynamic_shapes",
+            "dynamo/test_repros.py::ReproTests::test_out_overload_channels_last",
+            "dynamo/test_repros.py::ReproTests::test_metaclass_descriptor",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] Higher-order operation 'invoke_subgraph' not"
+            " implemented in the Neuron FxImporter."
+        ),
+        tests=[
+            "dynamo/test_regional_inductor.py::RegionalInductorInvokeSubgraphTests::test_normal_inductor_hop_subgraph_uses_nested_post_grad_config",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] Nested graph breaks wrapped variants of tests"
+            " already xfailed in other dynamo groups. These are auto-"
+            "generated by test_nested_graph_breaks_wrapped.py via"
+            " make_test_cls_with_patches. Same root causes as originals."
+        ),
+        tests=x.DYNAMO_NESTED_GRAPH_BREAKS_WRAPPED,
+    ),
+    SkipGroup(
+        reason=(
+            "[PT 2.14] AOTAutograd does not support tracing graphs that"
+            " mutate autocast state. Test uses torch.autocast with graph"
+            " breaks; Neuron backend fails to compile the resulting graph."
+        ),
+        tests=[
+            "dynamo/test_ctx_manager.py::CtxManagerTests::test__enter__exit_autocast_graph_break_explicit_dtype",
+        ],
+    ),
+    SkipGroup(
+        reason=(
+            "Graph-break message only. Each test asserts Dynamo's own break"
+            " reason inline. neuron_overrides redirects backend='eager' to"
+            " 'neuron', so the Neuron block list breaks on torch.equal and"
+            " torch.linalg.lstsq first and reports its own reason. The break"
+            " still happens and fullgraph=True still raises Unsupported."
+        ),
+        tests=[
+            "dynamo/test_error_messages.py::ErrorMessagesTest::test_data_dependent_operator2",
+            "dynamo/test_error_messages.py::ErrorMessagesTest::test_dynamic_shape_operator_no_meta_kernel",
+        ],
+    ),
+]

@@ -1,0 +1,42 @@
+name: Append Step Summary
+description: >
+  Read a markdown summary file from the per-node artifact and append it to
+  GITHUB_STEP_SUMMARY for the current job. The runner inside the workload
+  cannot write to GITHUB_STEP_SUMMARY directly (env var isn't propagated
+  into the workload), so it persists the file inside the artifact and we
+  consume it here on the runner host.
+
+inputs:
+  summary-path:
+    description: >
+      Path to the markdown file to append. Resolved on the GH-runner host,
+      after the workload's outputs have been extracted. Empty appends nothing
+      (no fallback); each caller that emits a summary passes its own path.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Append summary to GITHUB_STEP_SUMMARY
+      uses: actions/github-script@v7
+      env:
+        # Pass the input via env var rather than ${{ }} interpolation into
+        # the JS script body — direct interpolation would let a caller-
+        # controlled input break out of the JS literal (script-injection
+        # anti-pattern).
+        INPUT_SUMMARY_PATH: ${{ inputs.summary-path }}
+      with:
+        script: |
+          const fs = require('fs');
+          const summaryPath = process.env.INPUT_SUMMARY_PATH;
+          if (!summaryPath) {
+            core.info('No summary-path provided; nothing to append.');
+            return;
+          }
+          if (!fs.existsSync(summaryPath)) {
+            core.warning(`No summary at ${summaryPath} — skipping.`);
+            return;
+          }
+          await core.summary.addRaw(fs.readFileSync(summaryPath, 'utf8')).write();
+          core.info(`Appended step summary from ${summaryPath}`);

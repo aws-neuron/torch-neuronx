@@ -1,0 +1,56 @@
+name: Run Test Suite
+description: Run a test command, copy outputs, and upload artifacts.
+
+inputs:
+  test-command:
+    description: The test command to run (e.g., "python3 tests/pytorch_tests_native/runner/run_upstream_tests.py --node dist-unit-tests")
+    required: true
+  artifact-name:
+    description: Name for the uploaded artifact
+    required: true
+  checkout:
+    description: "Whether to checkout the repo (set to 'false' if already checked out)"
+    default: "false"
+  artifact-path:
+    description: "Path to upload as artifact (relative to workspace)"
+    default: test-results/
+  summary-path:
+    description: >
+      Markdown step-summary file (on the runner host, after outputs are
+      extracted) to post to the job summary. Passed straight to the
+      append-step-summary action; empty appends nothing. A suite that emits
+      a summary passes its own path.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout
+      if: inputs.checkout == 'true'
+      uses: actions/checkout@v4
+
+    - name: Run Test
+      shell: bash
+      # TEST_COMMAND is passed via export inside the run block (not YAML env:)
+      # because the internal compute dispatcher only sends the run: block text
+      # to containers and strips YAML-level env:, if:, name:, etc.
+      # Similarly, ${GITHUB_ACTION_PATH} is not available on internal compute,
+      # so we use a repo-relative path to the script.
+      run: |
+        # Strict fallback: raise lowering/validation errors instead of silently using CPU.
+        export TEST_COMMAND='TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS=1 ${{ inputs.test-command }}'
+        .github/actions/run-test-suite/run_test.sh
+
+    - name: Append per-node step summary
+      if: always()
+      uses: ./.github/actions/append-step-summary
+      with:
+        summary-path: ${{ inputs.summary-path }}
+
+    - name: Upload Test Results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.artifact-path }}
+        retention-days: 30

@@ -1,0 +1,87 @@
+[project]
+name = "torch-neuronx"
+dynamic = ["version", "dependencies"]
+description = "Neuron Backend for PyTorch"
+license = "Apache-2.0"
+authors = [{name = "AWS Neuron Team"}]
+requires-python = ">=3.10,<3.15"
+
+[project.scripts]
+neuron-numa-launch = "torch_neuronx.numa:numa_launch_main"
+
+[project.entry-points."torch.backends"]
+torch_neuronx = "torch_neuronx:_autoload"
+
+[project.entry-points."torch_dynamo_backends"]
+neuron = "torch_neuronx.neuron_dynamo_backend.backend:neuron_backend"
+
+[build-system]
+# Use this PyTorch version for uv and isolated builds.
+requires = ["setuptools>=77.0.3", "wheel", "torch==2.14.0", "grpcio-tools"]
+build-backend = "setuptools.build_meta"
+
+[project.optional-dependencies]
+dev = [
+    "setuptools>=77.0.3",
+    "expecttest>=0.3.0",
+    "hypothesis",
+    "ninja>=1.11.1.4",
+    "pytest",
+    "pytest-xdist",
+    "pytest-html",
+    "pytest-cov",
+    "pytest-json-report",
+    "pytest-timeout",
+    "pytest-shard",
+    "ruff>=0.8.0",
+    "pyzstd",
+    "pytest-forked",
+    "PyYAML",
+    "multiprocess",
+    "pyarrow",
+]
+
+docs = [
+    "sphinx>=8.0",
+    "sphinx-book-theme",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-nightly"
+url = "https://download.pytorch.org/whl/nightly/cpu"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = ["build", "dist", ".eggs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "E402"]
+"tests/*" = ["S101", "F401"]  # Allow assert and unused imports in tests (torch_neuronx needs to be imported for side effects)
+"examples/**/*" = ["F401"]  # Allow unused imports in examples for side effects
+"**/dynamic_kernels/*_kernel.py" = ["B023"]  # nl.fori_loop bodies close over loop vars; traced immediately, so no late-binding hazard
+
+[tool.pytest.ini_options]
+addopts = "--dist=loadgroup"
+
+[tool.mypy]
+python_version = "3.14"
+files = ["torch_neuronx"]
+ignore_missing_imports = true
+no_error_summary = true
+
+# Files with large numbers of existing errors; remove as they are cleaned up.
+[[tool.mypy.overrides]]
+ignore_errors = true

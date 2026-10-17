@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package neuron.rdma;
+
+message MemoryRegion {
+  uint64 remote_addr = 1;
+  uint64 size = 2;
+  uint64 rkey = 3;
+}
+
+message TransferDescriptor {
+  repeated MemoryRegion regions = 1;
+  bytes receiver_endpoint =
+      2;  // Binary libfabric endpoint address from fi_getname
+  int32 device_id = 3;
+  uint32 transfer_id = 4;  // Unique ID for matching write-with-immediate data
+  int32 rank = 5;           // Receiver's rank (for local transfer detection)
+}

@@ -1,0 +1,198 @@
+name: Merge Queue Checks
+
+# Put the triggering PR(s) in the run title so the Actions list is scannable.
+# Queue runs carry the `pr-<N>` segment(s) in the synthetic queue ref.
+run-name: >-
+  ${{ github.event_name == 'merge_group'
+      && format('Merge Queue: {0}', github.event.merge_group.head_ref)
+      || format('[IGNORE NO-OP GATE] PR #{0}: {1}', github.event.pull_request.number, github.event.pull_request.title) }}
+
+# Pre-merge gate for branch.
+
+# GitHub couples merge-queue and PR required checks: a PR must PASS its required
+# checks before it can be ADDED to the queue. A `merge_group`-only check never
+# reports on the PR, so the PR can never enter the queue and `merge_group` never
+# fires. To break that, the REQUIRED check (`Merge Queue Gate Status`) runs on
+# BOTH events:
+#   * on `pull_request`  -> a no-op that passes instantly, so the PR can ENTER
+#                           the queue (it does NOT run the smoke suite);
+#   * on `merge_group`   -> mirrors the real smoke result, so it GATES the merge.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 'contribute-*'
+  merge_group:
+    types: [checks_requested]
+    branches:
+      - main
+      - 'contribute-*'
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: read   # resolve-labels needs to read the originating PR's labels
+
+env:
+  AWS_DEFAULT_REGION: us-west-2
+
+jobs:
+  # Resolve the originating PR's labels (merge_group only) so the gate runs
+  # the label-implied subset. PR number is parsed from the queue head_ref.
+  resolve-labels:
+    name: Resolve PR Labels
+    if: github.event_name == 'merge_group'
+    uses: ./.github/workflows/_reusable-resolve-labels.yml
+
+  build-tests-image:
+    name: Build Main Test Image
+    # Queue-only. Skipped for ciflow:skip-upstream PRs, unless the PR also runs
+    # the vertical gate (a vertical-file change), which needs this image too.
+    needs: [resolve-labels]
+    if: github.event_name == 'merge_group'
+        && (needs.resolve-labels.outputs.skip_upstream != 'true'
+            || needs.resolve-labels.outputs.run_vertical == 'true')
+    runs-on: [
+      self-hosted,
+      linux,
+      neuron.build-nightly-image,
+      "neuron.build-os:${{ needs.resolve-labels.outputs.pr_build_os }}",
+      "neuron.build-arg:UBUNTU_CODENAME:${{ needs.resolve-labels.outputs.pr_ubuntu_codename }}",
+      "neuron.run-${{ github.run_id }}-build-tests-image",
+      "neuron.dockerfile:Dockerfile.nightly-test",
+      "neuron.build-arg:PYTORCH_CHANNEL:stable"
+    ]
+    timeout-minutes: 60
+    outputs:
+      main_image: ${{ steps.wait.outputs.image_uri }}
+    steps:
+      - name: Wait for main test image build
+        id: wait
+        run: |
+          set -eo pipefail
+          /opt/neuron-ci/wait-for-nightly-image.sh | tee /tmp/main-output.log
+          IMAGE_URI=$(grep "Nightly base image ready:" /tmp/main-output.log | sed 's/.*ready: //')
+          echo "Main test image ready: $IMAGE_URI"
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+  pytorch-upstream-tests:
+    name: Merge Queue Gate (full upstream)
+    needs: [build-tests-image, resolve-labels]
+    if: github.event_name == 'merge_group'
+        && needs.build-tests-image.result == 'success'
+        && needs.resolve-labels.outputs.skip_upstream != 'true'
+    uses: ./.github/workflows/_reusable-upstream-tests.yml
+    with:
+      image: ${{ needs.build-tests-image.outputs.main_image }}
+      labels: ${{ needs.resolve-labels.outputs.labels }}
+      run-full-suite: ${{ needs.resolve-labels.outputs.run_full_suite == 'true' }}
+      # max-failures: "0" blocks the merge on any failure/flake — calibrate first.
+      max-failures: "0"
+      priority: high
+      dkms: public
+      # download-neff-cache defaults true, so the merge gate reads the nightly's
+      # seeded cache automatically. It never sets refresh-neff-cache, so a queued
+      # PR can't write to the shared cache.
+
+  # Vertical ATen op-coverage gate. Queue-only. It runs on the main test image
+  # and blocks the merge on a regression. It writes no dashboard parquet, so it
+  # never touches the artifact the nightly upstream tables use.
+  #
+  # It runs when run_vertical is true: the PR touches a vertical file
+  # (ciflow:vertical) or carries ciflow:full-suite, or it changes real code under
+  # module:aten-ops, module:dynamo, or module:runtime-core. A vertical-file change
+  # is always gated, even under ciflow:skip-upstream. A code-label PR that only
+  # changes docs, tests, or plumbing (skip_upstream) cannot move op routing, so
+  # the gate skips it. build-tests-image builds the shared image for the same
+  # reason. On by default; set VERTICAL_GATE_ENABLED to "false" as a kill switch.
+  # merge-queue-gate tolerates a skipped gate. The merge queue never runs coverage
+  # or perf, so a queued PR stays fast.
+  vertical-gate:
+    name: Vertical Op Gate
+    needs: [build-tests-image, resolve-labels]
+    if: github.event_name == 'merge_group'
+        && needs.build-tests-image.result == 'success'
+        && needs.resolve-labels.outputs.run_vertical == 'true'
+        && vars.VERTICAL_GATE_ENABLED != 'false'
+    uses: ./.github/workflows/_reusable-vertical-tests.yml
+    with:
+      mode: gate
+      image: ${{ needs.build-tests-image.outputs.main_image }}
+      priority: high
+      dkms: public
+
+  merge-queue-gate:
+    # This is the REQUIRED status check. It always runs (both events) so it can
+    # report on the PR head (letting the PR enter the queue) and on the merge
+    # group (gating the merge). It must RUN and exit 0 on PRs -- a skipped
+    # required check would stay "pending" and re-create the catch-22.
+    name: Merge Queue Gate Status
+    needs: [pytorch-upstream-tests, resolve-labels, vertical-gate]
+    if: always()
+    runs-on: [self-hosted, linux, "neuron.image:neuron-gate-tools", "neuron.run-${{ github.run_id }}-merge-queue-gate"]
+    timeout-minutes: 10
+    steps:
+      - name: Link batched PRs
+        # Reverse hop: link each PR gated by this (possibly batched) run so an
+        # ejected/failed run points back to its PR(s). Informational only.
+        if: github.event_name == 'merge_group'
+        continue-on-error: true
+        # Step env does not reach run steps on this runner. Read PR text from the event file.
+        run: |
+          MG_HEAD_REF=$(jq -r '.merge_group.head_ref // ""' "$GITHUB_EVENT_PATH")
+          # Commit message of the queued commit (== PR title for squash merges).
+          MG_COMMIT_MSG=$(jq -r '.merge_group.head_commit.message // ""' "$GITHUB_EVENT_PATH")
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          # Lead with the pr-<N>-<sha> token(s) carried in the queue ref.
+          tokens=$(echo "$MG_HEAD_REF" | grep -oE 'pr-[0-9]+-[0-9a-f]+' | sort -u | paste -sd' ' -)
+          # First line only -- commit messages can be multi-line.
+          subject=$(printf '%s\n' "$MG_COMMIT_MSG" | head -n1)
+          links=""
+          for n in $(echo "$MG_HEAD_REF" | grep -oE 'pr-[0-9]+' | sed 's/pr-//' | sort -un); do
+            links="${links}[#${n}](${REPO_URL}/pull/${n}) "
+          done
+          {
+            echo "## ${tokens:-(no pr token in ref)} — Merge Queue Gate"
+            echo ""
+            echo "Commit: ${subject:-(unavailable)}"
+            echo ""
+            echo "PR: ${links:-(none found in ref)}"
+            echo ""
+            echo "Queue ref: \`${MG_HEAD_REF}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Evaluate gate
+        run: |
+          if [ "${{ github.event_name }}" != "merge_group" ]; then
+            echo "pull_request context: gate is a no-op and passes."
+            echo "The upstream-tests gate runs only inside the merge queue (merge_group)."
+            exit 0
+          fi
+          # Evaluate the vertical op-coverage gate first, so ciflow:skip-upstream
+          # cannot bypass it. A skipped gate passes (not selected, or toggled
+          # off). Any other non-success result blocks the merge.
+          vresult="${{ needs.vertical-gate.result }}"
+          echo "vertical op gate job result: ${vresult:-<none>}"
+          if [ -n "$vresult" ] && [ "$vresult" != "success" ] && [ "$vresult" != "skipped" ]; then
+            echo "::error::Vertical Op Gate did not pass (result=$vresult)."
+            exit 1
+          fi
+          echo "Vertical Op Gate: ${vresult:-skipped} — no op-coverage regression."
+          # ciflow:skip-upstream skips only the full upstream suite.
+          if [ "${{ needs.resolve-labels.outputs.skip_upstream }}" = "true" ]; then
+            echo "Upstream suite intentionally skipped (ciflow:skip-upstream on the PR) — gate passes."
+            exit 0
+          fi
+          result="${{ needs.pytorch-upstream-tests.result }}"
+          gate="${{ needs.pytorch-upstream-tests.outputs.gate_passed }}"
+          count="${{ needs.pytorch-upstream-tests.outputs.failure_count }}"
+          threshold="${{ needs.pytorch-upstream-tests.outputs.max_failures }}"
+          echo "merge_group job rollup result: $result"
+          echo "failing tests (failed/error) counted by aggregator: ${count:-unknown}"
+          echo "max-failures threshold: ${threshold:-unset}"
+          echo "max-failures gate verdict: ${gate:-unknown}"
+          if [ "$gate" != "true" ]; then
+            echo "::error::Merge gate did not pass (gate_passed='${gate:-<empty>}', failure_count='${count:-<empty>}', max-failures threshold='${threshold:-<empty>}', job rollup result=$result)"
+            exit 1
+          fi
+          echo "Upstream gate passed: failing tests (${count:-unknown}) within the allowed max-failures threshold (${threshold:-unset})."
+          exit 0

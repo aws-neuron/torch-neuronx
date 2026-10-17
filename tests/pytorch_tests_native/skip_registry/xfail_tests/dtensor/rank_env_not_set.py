@@ -1,0 +1,18 @@
+DTENSOR_RANK_ENV_NOT_SET = [
+    "test_bmm_strategies",
+    "test_mm_strategies",
+    "test_redistribute_cost_latency",
+    "test_redistribute_cost_mesh_1d",
+    "test_redistribute_cost_mesh_2d",
+    "test_redistribute_cost_partial_to_different_partial_is_infinite",
+    "test_redistribute_cost_strided_shard",
+    "test_redistribute_cost_with_order",
+    "test_bmm_1d_mesh",
+    "test_bmm_2d_mesh",
+    "test_bmm_diffinndim_2d_mesh",
+    "test_bmm_diffoutndim_2d_mesh",
+    "test_linearity_1d_mesh",
+    "test_mm_1d_mesh",
+    "test_mm_2d_mesh",
+    "test_pointwise_1d_mesh",
+]

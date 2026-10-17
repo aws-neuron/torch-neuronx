@@ -1,0 +1,176 @@
+import pytest
+import torch
+
+import torch_neuronx
+from tests.utils.neuron_test_utils import (
+    assert_op_runs_on_neuron,
+    assert_raises,
+    track_neuron_ops,
+)
+
+
+class TestArange:
+    def test_arange_basic(self):
+        """Test arange basic"""
+        device = "neuron"
+
+        with track_neuron_ops():
+            input = torch.arange(0, 5, 1, dtype=torch.float32, device=device)
+            input_cpu = torch.arange(0, 5, 1, dtype=torch.float32)
+            assert input.device.type == device
+            assert input.device.type != input_cpu.device.type
+            assert_op_runs_on_neuron("aten::arange.start_out")
+
+    def test_arange_start_only(self):
+        """Test arange with only start parameter"""
+        device = "neuron"
+        with track_neuron_ops():
+            input = torch.arange(5, device=device)
+
+            input_cpu = torch.arange(5)
+            assert input.device.type == device
+            assert input_cpu.device.type == "cpu"
+
+            torch.testing.assert_close(input.cpu(), input_cpu)
+            assert_op_runs_on_neuron("aten::arange")
+
+    @pytest.mark.parametrize(
+        "dtype", [torch.float32, torch.float64, torch.float16, torch.int32, torch.int64]
+    )
+    def test_arange_different_dtypes(self, dtype):
+        """Test arange with different dtypes"""
+        device = "neuron"
+        with track_neuron_ops():
+            input = torch.arange(0, 5, 1, dtype=dtype, device=device)
+            input_cpu = torch.arange(0, 5, 1, dtype=dtype)
+            assert input.dtype == dtype
+            assert input.device.type == device
+            assert input_cpu.device.type == "cpu"
+            torch.testing.assert_close(input.cpu(), input_cpu)
+            assert_op_runs_on_neuron("aten::arange.start_out")
+
+    def test_arange_negative_step(self):
+        """Test arange with negative step"""
+        device = "neuron"
+        with track_neuron_ops():
+            input = torch.arange(5, -1, -1, dtype=torch.int32, device=device)
+            input_cpu = torch.arange(5, -1, -1, dtype=torch.int32)
+
+            assert input_cpu.device.type == "cpu"
+            assert input.device.type == device
+            torch.testing.assert_close(input.cpu(), input_cpu)
+            assert_op_runs_on_neuron("aten::arange.start_out")
+
+    def test_arange_float_steps(self):
+        """Test arange with float steps"""
+        device = "neuron"
+        with track_neuron_ops():
+            input = torch.arange(0, 2.5, 0.5, dtype=torch.float32, device=device)
+            input_cpu = torch.arange(0, 2.5, 0.5, dtype=torch.float32)
+
+            assert input.device.type == device
+            torch.testing.assert_close(input.cpu(), input_cpu)
+            assert_op_runs_on_neuron("aten::arange.start_out")
+
+    def test_arange_requires_grad(self):
+        """Test arange with requires_grad"""
+        device = "neuron"
+        with track_neuron_ops():
+            input = torch.arange(0, 5, 1, dtype=torch.float32, requires_grad=True, device=device)
+            assert input.requires_grad
+            assert input.device.type == device
+            assert_op_runs_on_neuron("aten::arange.start_out")
+
+    def test_arange_equal_bounds(self):
+        """Test arange with equal start and stop values"""
+        device = "neuron"
+        with track_neuron_ops():
+            input = torch.arange(start=1, end=1, step=1, dtype=torch.int32, device=device)
+            input_cpu = torch.arange(1, 1, 1, dtype=torch.int32)
+
+            assert input.device.type == device
+            assert input_cpu.device.type == "cpu"
+            assert input.numel() == 0
+            torch.testing.assert_close(input.cpu(), input_cpu)
+            assert_op_runs_on_neuron("aten::arange")
+
+    @assert_raises(RuntimeError, match="upper bound and lower bound inconsistent with step sign")
+    def test_arange_invalid_bounds(self):
+        """Test arange with invalid bounds (start > end)"""
+        device = "neuron"
+        torch.arange(1, 0, 1, dtype=torch.int32, device=device)
+
+    @assert_raises(RuntimeError, match="step must be nonzero")
+    def test_arange_invalid_stepsize(self):
+        """Test arange with stepsize 0"""
+        device = "neuron"
+        torch.arange(0, 5, 0, dtype=torch.int32, device=device)
+
+    def test_arange_explicit_layout(self):
+        """Test arange with explicitly specified layouts"""
+        device = "neuron"
+        with track_neuron_ops():
+            # Test with explicit strided layout
+            input_strided = torch.arange(5, device=device, layout=torch.strided)
+            assert input_strided.layout == torch.strided
+
+            # Test default matches strided
+            input_default = torch.arange(5, device=device)
+            assert input_default.layout == torch.strided
+
+            # Verify both produce same values
+            torch.testing.assert_close(input_strided.cpu(), input_default.cpu())
+
+            assert_op_runs_on_neuron("aten::arange")
+
+    def test_arange_out_dtype_inherited(self):
+        """Verify arange inherits dtype from out tensor when dtype is not specified."""
+        out_cpu = torch.empty(5, dtype=torch.int32)
+        out_neuron = torch.empty(5, dtype=torch.int32, device="neuron")
+
+        result_cpu = torch.arange(5, out=out_cpu)
+        result_neuron = torch.arange(5, out=out_neuron)
+
+        assert (
+            result_neuron.dtype == result_cpu.dtype
+        ), f"dtype mismatch: neuron={result_neuron.dtype}, cpu={result_cpu.dtype}"
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int32, torch.int64])
+    def test_arange_out_noncontiguous_narrow(self, dtype):
+        """A strided out= view is scattered respecting its stride and offset.
+
+        The [4] result must land in the view's two columns, giving
+        ((0, 0, 1), (0, 2, 3)), NOT be written contiguously from the view's
+        storage offset (which gave ((0, 0, 1), (2, 3, 0))).
+        """
+        x = torch.zeros(2, 3, device="neuron", dtype=dtype)
+        torch.arange(4, out=x.narrow(1, 1, 2), dtype=dtype)
+        expected = torch.tensor(((0, 0, 1), (0, 2, 3)), dtype=dtype)
+        torch.testing.assert_close(x.cpu(), expected, atol=0, rtol=0)
+
+    def test_arange_out_noncontiguous_permuted(self):
+        """A permuted out= view receives values in logical order."""
+        res = torch.zeros(3, 3, device="neuron").t()  # non-contiguous [3,3]
+        torch.arange(9, out=res, dtype=torch.float32)
+        expected = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+        torch.testing.assert_close(res.cpu(), expected, atol=0, rtol=0)
+
+    def test_arange_base_overload(self):
+        """Test aten::arange base overload (end only) dispatches correctly."""
+        device = "neuron"
+        with track_neuron_ops():
+            result = torch.ops.aten.arange(10, device=device)
+            expected = torch.arange(10)
+            assert result.device.type == device
+            torch.testing.assert_close(result.cpu(), expected)
+            assert_op_runs_on_neuron("aten::arange")
+
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float32])
+    def test_arange_base_overload_dtypes(self, dtype):
+        """Test aten::arange base overload with various dtypes."""
+        device = "neuron"
+        with track_neuron_ops():
+            result = torch.ops.aten.arange(8, dtype=dtype, device=device)
+            expected = torch.arange(8, dtype=dtype)
+            assert result.dtype == dtype
+            torch.testing.assert_close(result.cpu(), expected)

@@ -1,0 +1,10 @@
+set(LLVM_TARGET_DEFINITIONS TorchConversionOps.td)
+mlir_tablegen(TorchConversionOps.h.inc -gen-op-decls)
+mlir_tablegen(TorchConversionOps.cpp.inc -gen-op-defs)
+mlir_tablegen(TorchConversionDialect.h.inc -gen-dialect-decls -dialect=torch_c)
+mlir_tablegen(TorchConversionDialect.cpp.inc -gen-dialect-defs -dialect=torch_c)
+add_public_tablegen_target(MLIRTorchConversionOpsIncGen)
+add_dependencies(mlir-headers MLIRTorchConversionOpsIncGen)
+
+add_mlir_doc(TorchConversionDialect TorchConversionDialect TorchConversion/ -gen-dialect-doc)
+add_mlir_doc(TorchConversionOps TorchConversionOps TorchConversion/ -gen-op-doc)

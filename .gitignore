@@ -1,0 +1,92 @@
+# CodeGraph local index (per-machine; built via `codegraph init .`)
+.codegraph/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+*.egg
+dist/
+build/
+build
+neuron_artifacts/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.attach_pid*
+.eggs/
+
+# Documentation
+docs/build/
+build/docs/
+
+# Ruff
+.ruff_cache/
+.uv.lock
+
+# C++ build artifacts
+*.so
+*.o
+*.a
+*.dylib
+*.dll
+*.log
+
+# Bazel
+bazel-*
+
+# cmake
+CMakeFiles/
+cmake_install.cmake
+CMakeCache.txt
+Makefile
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pre-commit
+.pre-commit-config.yaml.lock
+
+# Neuron compiler auto-generated folders
+neuronxcc-*/
+log-neuron-cc.txt
+global_metric_store.json
+file.neff
+.torch_neuronx/
+
+# Ignore python files generated from proto
+torch_neuronx/protos/*.py
+torch_neuronx/protos/xla/*.py
+
+# Ignore generated upstream PyTorch test files.
+tests/pytorch_tests_native/torch/
+tests/pytorch_tests_native/test/
+
+# lock files
+MODULE.bazel.lock
+uv.lock
+.clangd
+build
+tests/huggingface/configs/huggingface/CausalLM/locks/
+
+# Agent skills live only in .external/skills (public) and .internal/skills (private).
+# Agent client folders are local-only; see .internal/README.md to set them up.
+.claude/
+.kiro/
+.agents/
+.codex/
+
+# Agent scratch directory - skills write temporary evidence under agent_space/.
+agent_space/

@@ -1,0 +1,68 @@
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include "torch_neuronx/csrc/core/compilation/CacheEntry.h"
+
+namespace at::neuron {
+
+// Configuration for neuronx-cc compilation.
+struct CompilationConfig {
+  // Framework type passed to neuronx-cc (e.g., "XLA", "NKI"). "XLA" is the
+  // canonical value neuronx-cc accepts for StableHLO MLIR input.
+  std::string framework;
+
+  // Platform target (e.g., "trn1", "trn2", "inf1")
+  std::string platform_target;
+
+  // Logical neuron cores setting (e.g., "1", "2")
+  std::string logical_neuron_cores;
+
+  // Compiler optimization level (e.g., "-O1", "-O2")
+  std::string optimization_level;
+
+  // Additional compiler arguments
+  std::string additional_args;
+
+  // Create config from environment (platform, cores, opt level, flags).
+  static CompilationConfig FromEnvironment();
+};
+
+// CompileResult (NEFF + optional wrapped_neff.hlo) is defined in CacheEntry.h so the compile
+// contract can be shared without depending on this header.
+
+// NeuronCompiler provides functionality to compile modules to NEFF format
+// using the neuronx-cc compiler subprocess. This class handles the entire
+// compilation pipeline from input bytes to executable NEFF files.
+class NeuronCompiler {
+ public:
+  // Compiles HLO bytes to NEFF format using the neuronx-cc compiler.
+  //
+  // Args:
+  //   hlo_bytes: The HLO module serialized as protobuf bytes or MLIR bytes
+  //   config: Compilation configuration with framework, platform, and optimization settings
+  //   ir_type: Type of IR being compiled ("StableHLO" for MLIR)
+  //   op_name: Optional operation name for IR dumping
+  //   cache_key: Optional cache key for IR dumping
+  //   kernel_class_name: Optional kernel class name for IR dumping
+  //
+  // Returns:
+  //   The compiled NEFF file as a byte vector
+  //
+  // Throws:
+  //   std::runtime_error if compilation fails or neuronx-cc is not found
+  static std::vector<uint8_t> CompileHloToNeff(
+      const std::vector<uint8_t>& hlo_bytes, const CompilationConfig& config,
+      const std::string& ir_type = "StableHLO", const std::string& op_name = "",
+      const std::string& cache_key = "", const std::string& kernel_class_name = "UnknownKernel");
+
+  // Compiles and returns both NEFF and wrapped_neff.hlo for WLO transform extraction.
+  static CompileResult CompileHloToNeffWithWlo(
+      const std::vector<uint8_t>& hlo_bytes, const CompilationConfig& config,
+      const std::string& ir_type = "StableHLO", const std::string& op_name = "",
+      const std::string& cache_key = "", const std::string& kernel_class_name = "UnknownKernel");
+};
+
+}  // namespace at::neuron

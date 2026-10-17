@@ -1,0 +1,131 @@
+"""
+Post-AOTAutograd graph processing pipeline.
+
+This module applies FX graph transformations after AOTAutograd has processed
+the graph. Includes flex attention legalization, in-place mutation handling,
+and None output removal.
+"""
+
+from typing import NamedTuple
+
+import torch
+from torch.fx.passes.infra.pass_manager import PassManager
+
+from torch_neuronx.kernels.cache_utils import CompilationJob
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import PassMutations
+from torch_neuronx.neuron_dynamo_backend.fx.passes.collective_legalization import (
+    CollectiveLegalization,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.dtensor_redistribute_optimization import (
+    DTensorRedistributeOptimization,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.flex_attention_legalization import (
+    FlexAttentionLegalization,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.flex_attention_nki_lowering import (
+    FlexAttentionNKILowering,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.functionalize_copy_inplace_result import (
+    FunctionalizeCopyInplacePass,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.legalize_bool_scalars import (
+    LegalizeBoolScalars,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.legalize_index_indices import (
+    LegalizeIndexIndices,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.neuron_fx_pass import NeuronFXPassState
+from torch_neuronx.neuron_dynamo_backend.fx.passes.remove_none_outputs import RemoveNoneOutputs
+from torch_neuronx.neuron_dynamo_backend.fx.passes.replace_device_mesh_placeholders import (
+    ReplaceDeviceMeshPlaceholders,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.rewrite_row_scatter_add import (
+    RewriteRowScatterAdd,
+)
+from torch_neuronx.neuron_dynamo_backend.fx.passes.vocab_sharding_spmd import (
+    ShardIndexInjection,
+    VocabShardingSPMD,
+)
+
+
+class PostAOTProcessingResults(NamedTuple):
+    """Store post-AOTAutograd graph processing results.
+
+    Args:
+        graph_module (torch.fx.GraphModule): Graph after all configured passes.
+        analysis (dict): Mapping whose ``"pass_mutations"`` entry contains the
+            per-pass mutation records.
+    """
+
+    graph_module: torch.fx.GraphModule
+    analysis: dict
+
+
+def post_aot_processing(
+    gm: torch.fx.GraphModule,
+    job: CompilationJob,
+    model_name: str,
+    pre_aot_pass_mutations: PassMutations | None = None,
+) -> PostAOTProcessingResults:
+    """Apply FX passes after AOTAutograd processing.
+
+    Args:
+        gm (torch.fx.GraphModule): Graph module to transform.
+        job (CompilationJob): Compilation job that controls artifact preservation.
+        model_name (str): Model name to use in artifact filenames.
+        pre_aot_pass_mutations (PassMutations | None, optional): Mutations recorded
+            before AOTAutograd. Defaults to ``None``.
+
+    Returns:
+        PostAOTProcessingResults: Transformed graph and an analysis mapping whose
+            ``"pass_mutations"`` entry contains the per-pass mutation records.
+    """
+    config = NeuronFXPassState(
+        job=job,
+        model_name=model_name,
+        dumping_enabled=job.preserve,
+        pre_aot_pass_mutations=pre_aot_pass_mutations,
+    )
+
+    flex_lowering_pass = FlexAttentionNKILowering(config)
+    flex_attention_pass = FlexAttentionLegalization(config)
+    functionalize_pass = FunctionalizeCopyInplacePass(config)
+    legalize_bool_scalars_pass = LegalizeBoolScalars(config)
+    # Runs before LegalizeIndexIndices so the negative-index normalization
+    # in that pass covers the rewritten aten.index_put nodes.
+    rewrite_row_scatter_add_pass = RewriteRowScatterAdd(config)
+    legalize_index_indices_pass = LegalizeIndexIndices(config)
+    remove_none_outputs = RemoveNoneOutputs(config)
+    replace_device_mesh = ReplaceDeviceMeshPlaceholders(config)
+    collective_legalization = CollectiveLegalization(config)
+    dtensor_redistribute = DTensorRedistributeOptimization(config)
+
+    # Vocab sharding SPMD passes
+    shard_injection = ShardIndexInjection(config)
+    vocab_sharding = VocabShardingSPMD(config)
+    spmd_vocab_passes = [shard_injection, vocab_sharding]
+
+    pm = PassManager(
+        passes=[
+            flex_lowering_pass,
+            flex_attention_pass,
+            functionalize_pass,
+            legalize_bool_scalars_pass,
+            rewrite_row_scatter_add_pass,
+            legalize_index_indices_pass,
+            remove_none_outputs,
+            replace_device_mesh,
+            dtensor_redistribute,  # Before collective legalization
+            *spmd_vocab_passes,
+            collective_legalization,
+        ],
+        run_checks_after_each_pass=True,
+        suppress_check_failures=False,
+    )
+    pass_result = pm(gm)
+
+    analysis_results = {
+        "pass_mutations": config.pass_mutations,
+    }
+
+    return PostAOTProcessingResults(pass_result.graph_module, analysis_results)

@@ -1,0 +1,28 @@
+{
+  "activation_dropout": 0.0,
+  "architectures": [
+    "BioGptForCausalLM"
+  ],
+  "attention_probs_dropout_prob": 0.1,
+  "bos_token_id": 0,
+  "eos_token_id": 2,
+  "hidden_act": "gelu",
+  "hidden_dropout_prob": 0.1,
+  "hidden_size": 32,
+  "initializer_range": 0.02,
+  "intermediate_size": 37,
+  "is_decoder": true,
+  "layer_norm_eps": 1e-12,
+  "layerdrop": 0.0,
+  "max_position_embeddings": 512,
+  "model_type": "biogpt",
+  "num_attention_heads": 4,
+  "num_hidden_layers": 5,
+  "pad_token_id": 1,
+  "scale_embedding": true,
+  "torch_dtype": "float32",
+  "transformers_version": "4.55.2",
+  "type_vocab_size": 16,
+  "use_cache": true,
+  "vocab_size": 42384
+}

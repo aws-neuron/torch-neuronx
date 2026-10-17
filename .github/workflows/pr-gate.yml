@@ -1,0 +1,65 @@
+name: PR gate
+
+# Post a pending PR Checks status when a fork pull request opens. Without it the
+# pull request shows a green combined status before any test runs, because
+# nothing else reports until a maintainer starts the tests.
+#
+# PR Checks is not a required check. Merge Queue Gate Status is, and it runs the
+# real suite on merge_group, so a green pull request cannot merge untested. This
+# workflow corrects the signal, not the merge gate.
+#
+# WARNING: this file works only while its branch is the default branch.
+# GitHub resolves pull_request_target against the default branch. It ignores the
+# pull request base branch. On any other branch this file is inert. There is no
+# run and no error. labeler.yml shows the result: it returns 404 "not found on
+# the default branch" and has never run. The owner who makes the next contribute
+# branch default must copy this file to it.
+#
+# WARNING: this workflow must never check out or run pull request code.
+# pull_request_target gives the job a write-scoped token while the pull request
+# is untrusted. The body is one API call. The head SHA is a status target, not a
+# checkout ref.
+#
+# The status stays pending until report-to-pr posts the final state. The
+# transitions are: this workflow, then ci-approved-dispatch.yml, then
+# check-approval, then report-to-pr. Each step keeps the status pending until the
+# per-job rows exist, so the pull request never reads as green before the tests
+# report.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches: ['contribute-*']
+
+permissions: {}
+
+concurrency:
+  # Key on the pull request number, not github.ref. Under pull_request_target,
+  # GITHUB_REF is the default branch and is the same for every pull request, so a
+  # github.ref group holds all of them and cancels one gate run with another.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: PR gate status
+    # Fork pull requests only. A branch in this repository gets PR Checks from
+    # the pull.yml triggers, so this status would stay pending forever.
+    if: github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      statuses: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            // No target_url. CONTRIBUTING.md has no section about fork pull
+            // requests, so there is no correct page to link. The description
+            // carries the instruction.
+            await github.rest.repos.createCommitStatus({
+              ...context.repo,
+              sha: context.payload.pull_request.head.sha,
+              state: 'pending',
+              context: 'PR Checks',
+              description: 'Waiting. A maintainer must add the safe-to-test label.',
+            });

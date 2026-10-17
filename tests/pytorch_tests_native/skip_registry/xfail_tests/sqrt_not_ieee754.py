@@ -1,0 +1,17 @@
+SQRT_NOT_IEEE754 = [
+    "test_decomp.py::TestDecompNEURON::test_quick_tril_indices_neuron_int32",
+    "test_decomp.py::TestDecompNEURON::test_quick_tril_indices_neuron_int64",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_tril_indices_neuron_int32",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_tril_indices_neuron_int64",
+    "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_tril_indices_neuron_int32",
+    "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_tril_indices_neuron_int64",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_triu_indices_neuron_int32",
+    "test_decomp.py::TestDecompNEURON::test_comprehensive_triu_indices_neuron_int64",
+    "test_decomp.py::TestDecompNEURON::test_quick_triu_indices_neuron_int32",
+    "test_decomp.py::TestDecompNEURON::test_quick_triu_indices_neuron_int64",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_triu_indices_neuron_int32",
+    "test_ops.py::TestCommonNEURON::test_python_ref__refs_triu_indices_neuron_int64",
+    "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_triu_indices_neuron_int32",
+    "test_ops.py::TestCommonNEURON::test_python_ref_torch_fallback__refs_triu_indices_neuron_int64",
+    "test_decomp.py::TestDecompNEURON::test_quick_linalg_vector_norm_neuron_float64",
+]

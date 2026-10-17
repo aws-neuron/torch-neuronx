@@ -1,0 +1,279 @@
+"""Shared helpers for the per-op dynamic NKI adapters.
+
+Op-agnostic building blocks every adapter imports: the min-tile compile/load
+path, the num_m_tiles device tensor cache, the gather/scatter structural pad,
+the out=/grad_input= buffer reuse, and the shared elementwise shape predicate +
+compile_key. Adapter modules (silu, elementwise, matmul, gather, scatter) hold
+only op-specific compile_fn/can_handle/prepare_io/reshape_output logic.
+"""
+
+import logging
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+_TILE_M = 128
+
+_SUPPORTED_DTYPES = (torch.bfloat16, torch.float32, torch.float16)
+
+# Weight-resident mm: rhs is num_tile_k*block_width*2 B/partition; SBUF 192 KiB/partition.
+# Single source of truth shared by the kernel (width selection) and the adapter (fit gate).
+_MM_RESIDENT_BUDGET = 192 * 1024 - 16 * 1024  # headroom for lhs/result scratch
+_MM_BLOCK_N_CANDIDATES = (1024, 512, 256, 128)
+
+
+def mm_block_size_n(num_tile_k: int) -> int:
+    """Select the widest candidate N-block whose resident right operand fits SBUF.
+
+    Args:
+        num_tile_k (int): Number of K-dimension tiles in the right operand.
+
+    Returns:
+        int: Selected N-block width, or the narrowest candidate when none fit.
+    """
+    for cand in _MM_BLOCK_N_CANDIDATES:
+        if num_tile_k * cand * 2 <= _MM_RESIDENT_BUDGET:
+            return cand
+    return _MM_BLOCK_N_CANDIDATES[-1]
+
+
+# One [_TILE_M, C] zero block for each (C, dtype, device), so a pad never allocates a
+# tensor whose shape depends on the token count.
+_ZERO_TILE_CACHE: dict[tuple[int, torch.dtype, str, int], torch.Tensor] = {}
+
+# Memoized [[num_tiles]] int32 device tensors: torch.tensor(..., device="neuron")
+# does a host->device copy every call, but the value only depends on num_tiles.
+# Keyed by (num_tiles, device.type, device.index); kernels read it read-only.
+_NUM_TILES_CACHE: dict[tuple[int, str, int], torch.Tensor] = {}
+
+
+def _num_tiles_tensor(num_tiles: int, device: torch.device) -> torch.Tensor:
+    key = (int(num_tiles), device.type, device.index if device.index is not None else -1)
+    t = _NUM_TILES_CACHE.get(key)
+    if t is None:
+        t = torch.tensor([[num_tiles]], dtype=torch.int32, device=device)
+        _NUM_TILES_CACHE[key] = t
+    return t
+
+
+def _ceil_to_tile(n: int) -> int:
+    """Round n up to a multiple of _TILE_M (128). n already a multiple -> n."""
+    return -(-int(n) // _TILE_M) * _TILE_M
+
+
+def _zero_tile(C: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:  # noqa: N803
+    """One cached [_TILE_M, C] block of zeros for each (C, dtype, device). Read-only:
+    callers copy out of it, so it stays zero for the life of the process."""
+    key = (int(C), dtype, device.type, device.index if device.index is not None else -1)
+    t = _ZERO_TILE_CACHE.get(key)
+    if t is None:
+        t = torch.zeros(_TILE_M, C, dtype=dtype, device=device)
+        _ZERO_TILE_CACHE[key] = t
+    return t
+
+
+def _pad_rows_to(t_2d: torch.Tensor, target_rows: int) -> torch.Tensor:
+    """Zero-pad [r, C] up to [target_rows, C] (r <= target_rows). Used to pad the
+    index/data to the baked source size T (gather/scatter) or the dynamic-M input
+    to a 128-multiple (mm/elementwise). No-op when r == target_rows."""
+    r = t_2d.shape[0]
+    if r == target_rows:
+        return t_2d
+    C = t_2d.shape[-1]  # noqa: N806
+    # A 128-multiple ceiling puts every padded row in the last tile, so zero only that
+    # fixed-size block. `torch.zeros(target_rows, C)` would key a NEFF on target_rows,
+    # which moves with the token count; a copy_ carries neither row count nor offset.
+    if target_rows >= _TILE_M and target_rows - r < _TILE_M:
+        out = torch.empty(target_rows, C, dtype=t_2d.dtype, device=t_2d.device)
+        out[target_rows - _TILE_M :] = _zero_tile(C, t_2d.dtype, t_2d.device)
+        out[:r] = t_2d
+        return out
+    padded = torch.zeros(target_rows, C, dtype=t_2d.dtype, device=t_2d.device)
+    padded[:r] = t_2d
+    return padded
+
+
+def _index_to_int32(idx: torch.Tensor) -> torch.Tensor:
+    """Narrow an int64 index operand to int32 (the kernels' vector_offset DMA needs int32).
+
+    ``idx.to(torch.int32)`` on device materializes via the packed-int64 unpack, which is keyed
+    on the element count and recompiles per count. The low-word alias is a strided view with the
+    same value (int64->int32 is low-32-bit truncation) but no kernel and no recompile.
+    """
+    if idx.dtype == torch.int32:
+        return idx
+    if idx.dtype == torch.int64:
+        from torch_neuronx.packed_storage import packed_int64_execution_view
+
+        return packed_int64_execution_view(idx, contiguous=False)
+    return idx.to(torch.int32)
+
+
+def _pad_or_contig(t_2d: torch.Tensor, M_ceil: int) -> torch.Tensor:  # noqa: N803
+    """Return a contiguous [M_ceil, C] buffer for the kernel DMA.
+
+    On the pad path (M_ceil > rows) ``_pad_rows_to`` allocates a fresh contiguous
+    zeros buffer and reads ``t_2d`` (possibly a strided view, e.g. a ``.chunk()``
+    output) directly into it — so a separate ``.contiguous()`` first would be a
+    redundant copy that also recompiles per token count. Contiguify only when no
+    pad happens (rows == M_ceil), where the view is passed to the kernel as-is."""
+    if t_2d.shape[0] == M_ceil:
+        return t_2d.contiguous()
+    return _pad_rows_to(t_2d, M_ceil)
+
+
+def _dest_reusable(dest, M, H, dtype, device) -> bool:  # noqa: N803
+    """True if a caller ``out=`` / ``grad_input=`` can back the NEFF's [M, H] output, i.e.
+    ``_dest_buffer`` aliases it. One that fails this needs dispatch_entry's copy-back,
+    which is stride-keyed — an adapter can decline it in ``can_handle``."""
+    return (
+        dest is not None
+        and dest.dtype == dtype
+        and dest.device.type == device.type
+        and dest.numel() == M * H
+        and dest.is_contiguous()
+    )
+
+
+def _dest_buffer(dest, M, H, dtype, device):  # noqa: N803
+    """Return the [M, H] output buffer for the NEFF to write into.
+
+    When the caller supplied a destination tensor (``out=`` / ``grad_input=``)
+    that is a usable contiguous buffer of the right dtype and element count, we
+    return a [M, H] view of it so the kernel writes the result in place and we
+    avoid the copy-back the framework would otherwise do for out/in-place
+    variants. Otherwise we allocate a fresh output.
+    """
+    if _dest_reusable(dest, M, H, dtype, device):
+        return dest.reshape(M, H)
+    return torch.empty(M, H, dtype=dtype, device=device)
+
+
+def _device_key(device):
+    return (device.type, device.index if device.index is not None else -1)
+
+
+# Memoized like _NUM_TILES_CACHE: the value depends only on M.
+_CTRL_CACHE: dict = {}
+
+
+def _ctrl_tensor(m: int, device) -> torch.Tensor:
+    """[2, 1] int32 = [[whole 128-row tiles], [tail tile's row offset = M - 128]]."""
+    key = (int(m), *_device_key(device))
+    t = _CTRL_CACHE.get(key)
+    if t is None:
+        t = torch.tensor([[m // _TILE_M], [m - _TILE_M]], dtype=torch.int32, device=device)
+        _CTRL_CACHE[key] = t
+    return t
+
+
+def _int16_dest_buffer(dest, M, H, device):  # noqa: N803
+    """[M, H//2] int16 buffer for a packed-bool NEFF. ``_dest_buffer`` needs a dtype match, but
+    out= is bool here; a contiguous bool dest backs it byte for byte, so view it as int16 and
+    write in place."""
+    if _dest_reusable(dest, M, H, torch.bool, device):
+        return dest.reshape(M, H).view(torch.int16)
+    return torch.empty(M, H // 2, dtype=torch.int16, device=device)
+
+
+def _scalar_operand(other):
+    """``other`` as a Python float when it is a scalar operand, else None.
+
+    The C++ dispatch path (the default) boxes a Python scalar as a 0-d float64 CPU tensor while
+    the Python path keeps a ``float``; gating on ``isinstance(other, Tensor)`` alone therefore
+    declines the .Scalar overload in production. A 0-d tensor on the DEVICE is not a scalar
+    operand: reading it host-side would sync every call.
+    """
+    if isinstance(other, torch.Tensor):
+        if other.dim() == 0 and other.device.type == "cpu":
+            return float(other)
+        return None
+    return float(other)
+
+
+def _dynamic_mh(x):
+    """(M, H) with the runtime-dynamic dim on M; H is baked. A leading product of >= one row tile
+    keeps the last dim as H ([6144, 720]); otherwise the last dim is the varying one, so collapse
+    to [numel, 1] ([1, seq] / [seq]). A 0-dim scalar has no last dim -> return [numel, 1]."""
+    n = x.numel()
+    if x.dim() == 0:
+        return n, 1
+    last = x.shape[-1]
+    if x.dim() >= 2 and last != 0 and (n // last) >= _TILE_M:
+        return n // last, last
+    return n, 1
+
+
+def _as_2d(t, M, H):  # noqa: N803
+    """[M, H] contiguous view. The .contiguous() is the only shape-keyed op left on this path,
+    so contiguous inputs must skip it."""
+    t_2d = t.reshape(M, H)
+    return t_2d if t_2d.is_contiguous() else t_2d.contiguous()
+
+
+def _compile_or_load_neff(kernel, graph_name, example_inputs, outputs):
+    """Compile (cold) or load (warm) a dynamic NKI kernel at min tile size.
+
+    ``outputs`` is accepted for signature symmetry with the adapters but is not
+    needed here — the cold path compiles + stores the NEFF without executing it.
+    On a warm cache, preload the persisted NEFF into the in-memory compilation
+    cache: ``execute_compiled_graph`` resolves NEFFs only from the in-memory cache,
+    and its persistent fallback derives a different cache key than the store path
+    so it can't load an XLA-stored NEFF directly. On a cold miss, compile + store
+    the NEFF once WITHOUT executing it, so the dispatch caller's
+    ``execute_compiled_graph`` runs the kernel exactly once on the real inputs.
+    Returns (hlo_bytes, cache_key).
+    """
+    import torch_neuronx
+
+    kernel.arg_processor._static_argnums = ()
+    processed_inputs = kernel.arg_processor.preprocess_inputs(example_inputs, scalar_to_tensor=True)
+    processed_kwargs = kernel.arg_processor.preprocess_kwargs({})
+
+    result = kernel._get_or_compile_hlo(processed_inputs, processed_kwargs, context=None)
+    hlo_bytes = result[0]
+    cache_key = result[-1]
+
+    # Warm path: load the persisted NEFF into the in-memory compilation cache and
+    # skip the compile. Guarded with getattr so running this Python against an older
+    # _C (without the binding) falls through to the cold compile below.
+    _preload = getattr(torch_neuronx._C, "_preload_neff_into_memory", None)
+    if _preload is not None and _preload(cache_key):
+        logger.debug("[DYN_NKI_CACHE] %s: WARM_PRELOAD -> skip compile", graph_name)
+        return hlo_bytes, cache_key
+
+    # Cold miss: compile + store the NEFF once WITHOUT executing it (compile_graph
+    # uses CompileOnlyKernelExecution). The kernel then runs exactly once, in the
+    # caller's execute_compiled_graph on the real inputs. Called unconditionally,
+    # matching execute_compiled_graph — both are torch.compile _C bindings the
+    # dynamic-NKI path requires.
+    logger.debug("[DYN_NKI_CACHE] %s: COLD_COMPILE -> compile_graph (no execute)", graph_name)
+    cache_key = torch_neuronx._C.compile_graph(cache_key, hlo_bytes, False)
+    torch_neuronx.synchronize()
+    return hlo_bytes, cache_key
+
+
+def _can_handle_elementwise_2d(x) -> bool:
+    """Shared predicate for the elementwise ops (silu/add/mul): 2D+ tensor on
+    neuron, supported dtype, M > 0. Any M works — prepare_io pads rows up to the
+    next 128-multiple. H is arbitrary too — the kernels tile the free dim at trace
+    time (512-wide + a final short tile)."""
+    if not isinstance(x, torch.Tensor):
+        return False
+    if x.device.type != "neuron":
+        return False
+    if x.dtype not in _SUPPORTED_DTYPES:
+        return False
+    if x.dim() < 2:
+        return False
+    H = x.shape[-1]  # noqa: N806
+    M = x.numel() // H  # noqa: N806
+    if M == 0 or H == 0:  # noqa: SIM103
+        return False
+    return True
+
+
+def _hidden_compile_key(*args, **_):
+    """Elementwise compile_key = (H, dtype) — both baked into the NEFF."""
+    return (int(args[0].shape[-1]), args[0].dtype)
