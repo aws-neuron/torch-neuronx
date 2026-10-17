@@ -1,3 +1,4 @@
+# TEST: check the external contributor flow on contribute-2.33. Do not merge.
 try:
     from importlib.metadata import PackageNotFoundError
     from importlib.metadata import version as _pkg_version
