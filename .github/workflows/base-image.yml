@@ -1,0 +1,59 @@
+name: Base Image
+
+# Builds the CI base image from Dockerfile.base-dependencies in NeuronGithubCIConfig,
+# with the Neuron packages that are public now, and tags it nightly-base-stable.
+# The tagger names the tag after this run's branch: run it on release-N.M to get
+# torch-neuronx-release-N.M-nightly-base-stable. Run it by hand after each SDK
+# release, once the new runtime and driver are in the public apt and pip repos.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-base:
+    name: Build the base image
+    runs-on: [
+      self-hosted,
+      linux,
+      neuron.build-nightly-image,
+      "neuron.build-os:ubuntu22.04",
+      "neuron.run-${{ github.run_id }}-build-base",
+      "neuron.dockerfile:Dockerfile.base-dependencies",
+      "neuron.build-arg:PYTHON_VERSION:3.12"
+    ]
+    timeout-minutes: 120
+    outputs:
+      image: ${{ steps.wait.outputs.image }}
+    steps:
+      - name: Wait for the base image
+        id: wait
+        run: |
+          set -eo pipefail
+          /opt/neuron-ci/wait-for-nightly-image.sh | tee /tmp/base-output.log
+          image=$(grep "Nightly base image ready:" /tmp/base-output.log | sed 's/.*ready: //')
+          test -n "$image"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+  tag-stable:
+    name: Tag the base image as stable
+    needs: [build-base]
+    runs-on: [
+      self-hosted,
+      linux,
+      neuron.tag-nightly-stable,
+      "neuron.run-${{ github.run_id }}-tag-base",
+      "neuron.nightly-image:${{ needs.build-base.outputs.image }}"
+    ]
+    timeout-minutes: 20
+    steps:
+      - name: Verify the stable tag
+        env:
+          NIGHTLY_IMAGE_URI: ${{ needs.build-base.outputs.image }}
+          TAG_SUFFIX: nightly-base-stable
+        run: /opt/neuron-ci/verify-stable-tag.sh
