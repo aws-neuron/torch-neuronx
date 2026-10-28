@@ -198,12 +198,6 @@ def pytest_addoption(parser):
         dest="ignore_paths",
         help="Ignore paths during test collection (can be used multiple times)",
     )
-    parser.addoption(
-        "--json_report",
-        action="store_true",
-        default="",
-        help="Collect distributed tests in upstream pytorch tests",
-    )
 
     parser.addoption(
         "--skip-distributed", action="store_true", default=False, help="Skip distributed tests"
