@@ -16,6 +16,7 @@ import sys
 import torch
 from torch._guards import detect_fake_mode
 from torch._refs.nn.functional import TensorLikeType
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 from torch_neuronx.python_ops.nki_kernels.bound_check import assert_index_in_bounds
 from torch_neuronx.utils import skip_op_preconditions
@@ -933,6 +934,15 @@ def cross_entropy_autograd_privateuse1(*args, **kwargs):
             weight=weight,
             reduction=reduction_str,
             ignore_index=ignore_index,
+        )
+
+    # The direct PrivateUse1 call below skips the unwrap of a wrapper subclass, for
+    # example the AsyncCollectiveTensor output of RowwiseParallel. Use the decomposition.
+    if any(is_traceable_wrapper_subclass(a) for a in args[:3]):
+        return torch.ops.aten.cross_entropy_loss.default._op_dk(
+            torch._C.DispatchKey.CompositeImplicitAutograd,
+            *args,
+            **kwargs,
         )
 
     # Plain tensors. Read positional args only, the same way the branch above does;

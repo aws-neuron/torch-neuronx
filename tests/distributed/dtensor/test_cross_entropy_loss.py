@@ -5,6 +5,7 @@ pred is a DTensor (Shard(-1) on vocab dim) and labels is a plain Tensor,
 causing: "aten.cross_entropy_loss.default got mixed torch.Tensor and DTensor"
 """
 
+import copy
 import os
 
 import pytest
@@ -17,7 +18,7 @@ from torch.distributed.tensor import (
     distribute_tensor,
 )
 from torch.distributed.tensor.debug import CommDebugMode
-from torch.distributed.tensor.parallel import loss_parallel
+from torch.distributed.tensor.parallel import RowwiseParallel, loss_parallel, parallelize_module
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     with_comms,
@@ -158,6 +159,27 @@ class DistCrossEntropyLossTest(NeuronDistributedBase, MultiProcessTestCase):
 
         self.assertTrue(dist_loss.placements[0].is_replicate())
         self.assertEqual(dist_loss.full_tensor(), ref_loss, atol=1e-3, rtol=1e-3)
+
+    @with_comms
+    def test_cross_entropy_loss_rowwise_parallel_output(self):
+        """Test cross_entropy on the AsyncCollectiveTensor output of RowwiseParallel."""
+        device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
+        torch.manual_seed(0)
+        ref_linear = torch.nn.Linear(16, 8, device=self.device_type)
+        linear = copy.deepcopy(ref_linear)
+        parallelize_module(linear, device_mesh, RowwiseParallel(input_layouts=Replicate()))
+        inputs = torch.randn(4, 16, device=self.device_type)
+        targets = torch.randint(0, 8, (4,), device=self.device_type)
+
+        ref_loss = functional.cross_entropy(ref_linear(inputs), targets)
+        ref_loss.backward()
+        loss = functional.cross_entropy(linear(inputs), targets)
+        loss.backward()
+
+        self.assertEqual(loss, ref_loss, atol=1e-3, rtol=1e-3)
+        self.assertEqual(
+            linear.weight.grad.full_tensor(), ref_linear.weight.grad, atol=1e-3, rtol=1e-3
+        )
 
     @with_comms
     def test_cross_entropy_loss_batch_sharded(self):
