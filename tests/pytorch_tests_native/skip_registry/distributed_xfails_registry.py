@@ -5,6 +5,21 @@ from tests.pytorch_tests_native.neuron_test_registry import SkipGroup
 XFAIL_GROUPS: list[SkipGroup] = [
     SkipGroup(
         reason=(
+            "[functional] The threaded process group copies tensors between Neuron devices, and"
+            " a cross-device copy keeps the result on the source device (issue #1021)."
+        ),
+        tests=[
+            "test_functional_api.py::TestTraceableCollectives::test_all_gather_into_tensor_coalesced_device_neuron",
+            "test_functional_api.py::TestTraceableCollectives::test_all_gather_tensor_device_neuron",
+            "test_functional_api.py::TestTraceableCollectives::test_all_reduce_coalesced_eager_device_neuron",
+            "test_functional_api.py::TestTraceableCollectives::test_all_reduce_eager_device_neuron",
+            "test_functional_api.py::TestTraceableCollectives::test_broadcast_device_neuron",
+            "test_functional_api.py::TestTraceableCollectives::test_reduce_scatter_into_tensor_coalesced_device_neuron",
+            "test_functional_api.py::TestTraceableCollectives::test_reduce_scatter_tensor_device_neuron",
+        ],
+    ),
+    SkipGroup(
+        reason=(
             "[accuracy] check_sharded_parity compares the FSDP reduce_scatter grad/param "
             "path against an unsharded reference; fp32 reduce-order non-associativity "
             "(compounded over Adam steps) lands ~1e-5 off, just over the strict "
