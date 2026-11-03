@@ -23,6 +23,7 @@
 #include "torch-mlir/Dialect/TorchConversion/IR/TorchConversionOps.h"
 #include "torch-mlir/Dialect/TorchConversion/Transforms/BackendTypeConversion.h"
 #include <limits>
+#include <numeric>
 #include <regex>
 
 using namespace mlir;
@@ -991,26 +992,14 @@ public:
 
   // Lower all_to_all_single to StableHLO operations.
   //
-  // PyTorch all_to_all_single(input, output_split_sizes, input_split_sizes,
-  // group) semantics:
-  // - input_split_sizes[i]: how much data rank i wants from the gathered tensor
-  // - output_split_sizes[i]: how much data rank i contributes (unused in this
-  // implementation)
-  // - Each rank gathers all data, then extracts only what it needs based on
-  // input_split_sizes
+  // all_to_all_single(input, output_split_sizes, input_split_sizes, group):
+  // - input_split_sizes[j] is the number of rows that this rank sends to rank j.
+  // - output_split_sizes[i] is the number of rows that this rank receives from
+  //   rank i.
   //
-  // Two lowering strategies:
-  // 1. Uniform splits (all elements equal): Use AllToAllOp directly for
-  // efficiency
-  // 2. Non-uniform splits: Use AllGatherOp + slice operations to handle permute
-  // gather patterns
-  //    - AllGatherOp collects all tensors: [rank0_data, rank1_data, ...]
-  //    - Slice operations extract portions based on input_split_sizes
-  //    - Offset calculation: each rank contributes actualRankSize to gathered
-  //    tensor
-  //    - Example: input_splits=[0,4] means rank 0 wants 0 elements, rank 1
-  //    wants 4 elements
-  //      from gathered tensor layout [rank0_4_elements, rank1_4_elements]
+  // Uniform splits lower to one AllToAllOp. Non-uniform splits pad each chunk
+  // to the input row count, exchange the chunks with one even AllToAllOp, and
+  // trim each received chunk.
   LogicalResult
   transformAllToAllSingle(Torch::OperatorOp op, OpAdaptor adaptor,
                           ConversionPatternRewriter &rewriter) const {
@@ -1019,8 +1008,8 @@ public:
       return rewriter.notifyMatchFailure(op, "expected 4 operands");
 
     Value input = operands[0];
-    Value inputSplitSizes = operands[1];
-    Value outputSplitSizes = operands[2];
+    Value outputSplitSizes = operands[1];
+    Value inputSplitSizes = operands[2];
     Value group = operands[3];
 
     // Handle non-uniform split sizes for permute gather
@@ -1099,55 +1088,97 @@ public:
 
     Value allToAllResult;
     if ((hasOutputSplits || hasInputSplits) && !isUniform) {
-      // Use all_gather + slice for non-uniform splits
-      auto gatheredType = RankedTensorType::get(
-          {inputType.getDimSize(0) * worldSize}, inputType.getElementType());
-      auto allGatherOp = stablehlo::AllGatherOp::create(
-          rewriter, op.getLoc(), gatheredType, ValueRange{input},
-          /*all_gather_dim=*/rewriter.getI64IntegerAttr(0), replicaGroupsAttr,
-          createChannelHandle(rewriter),
-          /*use_global_device_ids=*/rewriter.getUnitAttr());
-
-      SmallVector<int64_t> inputSplitSizes =
+      // The pad size must be equal on all ranks. A rank cannot see the input
+      // shapes of other ranks, so all ranks must have the same input row count.
+      if (!inputType.hasStaticShape())
+        return rewriter.notifyMatchFailure(
+            op, "non-uniform all_to_all_single needs a static input shape");
+      Location loc = op.getLoc();
+      Type elemType = inputType.getElementType();
+      int64_t rows = inputType.getDimSize(0);
+      if ((!hasInputSplits || !hasOutputSplits) && rows % worldSize != 0)
+        return rewriter.notifyMatchFailure(
+            op, "input rows are not divisible by the group size");
+      SmallVector<int64_t> sendRows =
           hasInputSplits ? inputSplits
-                         : SmallVector<int64_t>(
-                               worldSize, inputType.getDimSize(0) / worldSize);
-      SmallVector<int64_t> outputSplitSizes =
-          hasOutputSplits ? outputSplits : inputSplitSizes;
+                         : SmallVector<int64_t>(worldSize, rows / worldSize);
+      SmallVector<int64_t> recvRows =
+          hasOutputSplits ? outputSplits
+                          : SmallVector<int64_t>(worldSize, rows / worldSize);
+      if (static_cast<int64_t>(sendRows.size()) != worldSize ||
+          static_cast<int64_t>(recvRows.size()) != worldSize)
+        return rewriter.notifyMatchFailure(
+            op, "split size count is not equal to the group size");
+      auto outOfRange = [&](int64_t n) { return n < 0 || n > rows; };
+      if (std::accumulate(sendRows.begin(), sendRows.end(), int64_t{0}) !=
+              rows ||
+          llvm::any_of(sendRows, outOfRange) ||
+          llvm::any_of(recvRows, outOfRange))
+        return rewriter.notifyMatchFailure(
+            op, "split sizes do not fit the input rows");
 
-      SmallVector<Value> slices;
+      auto withRows = [&](int64_t n) {
+        SmallVector<int64_t> shape(inputType.getShape());
+        shape[0] = n;
+        return RankedTensorType::get(shape, elemType);
+      };
+      auto sliceRows = [&](Value v, int64_t start, int64_t n) -> Value {
+        auto vType = cast<RankedTensorType>(v.getType());
+        SmallVector<int64_t> starts(vType.getRank(), 0);
+        SmallVector<int64_t> limits(vType.getShape());
+        SmallVector<int64_t> strides(vType.getRank(), 1);
+        starts[0] = start;
+        limits[0] = start + n;
+        return stablehlo::SliceOp::create(
+            rewriter, loc, withRows(n), v,
+            rewriter.getDenseI64ArrayAttr(starts),
+            rewriter.getDenseI64ArrayAttr(limits),
+            rewriter.getDenseI64ArrayAttr(strides));
+      };
+
+      Value zero = stablehlo::ConstantOp::create(
+          rewriter, loc,
+          cast<ElementsAttr>(
+              rewriter.getZeroAttr(RankedTensorType::get({}, elemType))));
+      SmallVector<Value> chunks;
       int64_t offset = 0;
-      int64_t actualRankSize = inputType.getDimSize(0);
-      for (int64_t i = 0; i < worldSize; ++i) {
-        int64_t inputSize = inputSplitSizes[i];
-        if (inputSize > 0) {
-          auto sliceType =
-              RankedTensorType::get({inputSize}, inputType.getElementType());
-          auto slice = stablehlo::SliceOp::create(
-              rewriter, op.getLoc(), sliceType, allGatherOp.getResult(0),
-              rewriter.getDenseI64ArrayAttr({offset}),
-              rewriter.getDenseI64ArrayAttr({offset + inputSize}),
-              rewriter.getDenseI64ArrayAttr({1}));
-          slices.push_back(slice.getResult());
+      for (int64_t n : sendRows) {
+        if (n == rows) {
+          chunks.push_back(input);
+        } else if (n == 0) {
+          chunks.push_back(stablehlo::BroadcastInDimOp::create(
+              rewriter, loc, withRows(rows), zero,
+              rewriter.getDenseI64ArrayAttr({})));
+        } else {
+          SmallVector<int64_t> low(inputType.getRank(), 0);
+          SmallVector<int64_t> high(inputType.getRank(), 0);
+          high[0] = rows - n;
+          chunks.push_back(stablehlo::PadOp::create(
+              rewriter, loc, withRows(rows), sliceRows(input, offset, n), zero,
+              rewriter.getDenseI64ArrayAttr(low),
+              rewriter.getDenseI64ArrayAttr(high),
+              rewriter.getDenseI64ArrayAttr(low)));
         }
-        offset += actualRankSize;
+        offset += n;
       }
+      Value packed =
+          stablehlo::ConcatenateOp::create(rewriter, loc, chunks, 0);
+      Value exchanged =
+          stablehlo::AllToAllOp::create(
+              rewriter, loc, withRows(rows * worldSize), packed, splitDim,
+              concatDim, /*split_count=*/worldSize, replicaGroupsAttr,
+              createChannelHandle(rewriter))
+              .getResult(0);
 
-      if (slices.empty()) {
-        // All input splits are zero - create empty slice
-        auto emptyType = RankedTensorType::get({0}, inputType.getElementType());
-        allToAllResult =
-            stablehlo::SliceOp::create(rewriter, op.getLoc(), emptyType,
-                                       allGatherOp.getResult(0),
-                                       rewriter.getDenseI64ArrayAttr({0}),
-                                       rewriter.getDenseI64ArrayAttr({0}),
-                                       rewriter.getDenseI64ArrayAttr({1}))
-                .getResult();
-      } else {
-        allToAllResult =
-            stablehlo::ConcatenateOp::create(rewriter, op.getLoc(), slices, 0)
-                .getResult();
-      }
+      SmallVector<Value> received;
+      for (int64_t i = 0; i < worldSize; ++i)
+        if (recvRows[i] > 0)
+          received.push_back(sliceRows(exchanged, i * rows, recvRows[i]));
+      allToAllResult =
+          received.empty()
+              ? sliceRows(exchanged, 0, 0)
+              : stablehlo::ConcatenateOp::create(rewriter, loc, received, 0)
+                    .getResult();
     } else {
       auto allToAllOp = stablehlo::AllToAllOp::create(
           rewriter, op.getLoc(), outType, input, splitDim, concatDim,
