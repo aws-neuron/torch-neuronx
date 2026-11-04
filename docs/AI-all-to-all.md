@@ -42,6 +42,18 @@ local maximum. It runs an even `alltoall` and unpads the result. This fallback
 is correct only when every rank has the same largest send chunk, such as the
 permute pattern.
 
+## Compiler lowering
+
+`transformAllToAllSingle` in
+`third_party/torch-mlir/lib/Conversion/TorchToNeuron/TorchToNeuron.cpp` lowers
+uneven `torch._c10d_functional.all_to_all_single` by padding each send chunk
+to the input row count, exchanging chunks with one even StableHLO all-to-all,
+and trimming received chunks using `output_split_sizes`. Trailing dimensions
+are preserved, and zero-size chunks are supported. This path requires static
+input shapes and the same input row count on every rank. It is separate from
+the eager `alltoall_base` fallback above.
+
+
 ## NKI a2a-v buffers and metadata
 
 `torch_neuronx/python_ops/nki_kernels/all_to_all_v.py` defines the kernels.
