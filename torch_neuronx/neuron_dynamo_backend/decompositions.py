@@ -12,6 +12,7 @@ for PyTorch's built-in decompositions.
 
 import logging
 import math
+import threading
 from collections.abc import Callable
 from typing import ParamSpec, TypeVar
 
@@ -37,6 +38,7 @@ from torch_neuronx.python_ops.nki_kernels.rng_state import _has_nki_rng
 from torch_neuronx.python_ops.nki_kernels.triangular_solve import (
     triangular_solve_batched_nki as _triangular_solve_batched_nki_kernel,
 )
+from torch_neuronx.python_ops.torch_mlir.ops.indexing import topk_infinity_safe
 from torch_neuronx.python_ops.torch_mlir.ops.random import normal_fill, uniform_fill
 from torch_neuronx.python_ops.torch_mlir.ops.reduction import cummaxmin_scan
 
@@ -1971,6 +1973,9 @@ def split_with_sizes_decomposition(tensor, split_sizes, dim=0):
     return chunks
 
 
+_topk_native = threading.local()
+
+
 @register_decomposition([aten.topk.default])
 def topk_decomposition(x, k, dim=-1, largest=True, sorted=True):
     """Decompose unsupported ``topk`` configurations through last-dimension floating-point ``topk``.
@@ -2016,9 +2021,16 @@ def topk_decomposition(x, k, dim=-1, largest=True, sorted=True):
     if dim < 0:
         dim = x.ndim + dim
 
-    # If dim is already the last dimension and parameters are good, don't decompose
+    # Last dimension, largest, sorted: the native op, behind the infinite-ties guard. The
+    # guard's own topk call takes the native path (``_topk_native.active``).
     if dim == x.ndim - 1 and largest and sorted:
-        return NotImplemented
+        if getattr(_topk_native, "active", False):
+            return NotImplemented
+        _topk_native.active = True
+        try:
+            return topk_infinity_safe(x, k, dim, largest=True, sorted=True)
+        finally:
+            _topk_native.active = False
 
     # Handle non-last dimension by rearranging
     if dim != x.ndim - 1:

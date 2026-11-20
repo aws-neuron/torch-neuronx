@@ -877,7 +877,26 @@ def torch_topk(x, k, dim=-1, largest=True, sorted=True, values=None, indices=Non
     if x.ndim == 0:
         vals, idxs = torch.topk(x.unsqueeze(0), k, dim=0, largest=largest, sorted=sorted)
         return vals.squeeze(0), idxs.squeeze(0)
-    return torch.topk(x, k, dim, largest=largest, sorted=sorted)
+    return topk_infinity_safe(x, k, dim, largest=largest, sorted=sorted)
+
+
+def topk_infinity_safe(x, k, dim=-1, largest=True, sorted=True):
+    """``torch.topk`` that returns distinct indices when the input has infinite ties.
+
+    ``AwsNeuronTopK`` repeats indices 0..7 past the first 8 slots when a slice has more than
+    8 ties at ``-inf`` (``largest=True``) or ``+inf`` (``largest=False``). Select on a copy
+    with those entries replaced by the finite extreme of the dtype, then read the values back
+    from ``x``.
+    """
+    if not x.dtype.is_floating_point:
+        return torch.topk(x, k, dim, largest=largest, sorted=sorted)
+    info = torch.finfo(x.dtype)
+    if largest:
+        selectable = torch.where(x == float("-inf"), info.min, x)
+    else:
+        selectable = torch.where(x == float("inf"), info.max, x)
+    _, indices = torch.topk(selectable, k, dim, largest=largest, sorted=sorted)
+    return torch.gather(x, dim, indices), indices
 
 
 def _translate_index_put_args(*args, **kwargs):
