@@ -133,14 +133,14 @@ def _reuse_shard_index(device: torch.device) -> bool:
     # two threads in a mode exits, it is False in the other. A pre-dispatch mode such as
     # FunctionalTensorMode(pre_dispatch=True) sits on a separate stack, also process-wide, so the
     # check is the PreDispatch key in this thread's include set. Native functionalization adds the
-    # Functionalize key. The caller checks for torch function modes before it builds ``device``.
+    # Functionalize key. The caller checks for Dynamo and torch function modes before it builds
+    # ``device``.
     return (
         device.type in _SHARD_INDEX_CACHE_DEVICE_TYPES
         and torch._C._len_torch_dispatch_stack() == 0
         and not torch._C._dispatch_tls_is_dispatch_key_included(torch._C.DispatchKey.PreDispatch)
         and not torch._C._dispatch_tls_is_dispatch_key_included(torch._C.DispatchKey.Functionalize)
         and not torch._C._are_functorch_transforms_active()
-        and not torch.compiler.is_compiling()
     )
 
 
@@ -156,6 +156,9 @@ def _cached_shard_index_tensor(index, device, params, original_inputs):
     factory = TRANSFORM_REGISTRY["shard_index"]
     if factory is not _new_shard_index_tensor:
         return factory(index, device, params, original_inputs)
+    # Dynamo cannot trace the dispatch state checks below. A compiled call gets a new tensor.
+    if torch.compiler.is_compiling():
+        return torch.tensor(params["shard_index"], dtype=torch.int64, device=device)
     # A torch function mode can intercept torch.device() itself, so this check comes before it.
     # Under any such mode, torch.device() and set_default_device() included, a call gets a new
     # tensor made from the original argument, as without the cache.

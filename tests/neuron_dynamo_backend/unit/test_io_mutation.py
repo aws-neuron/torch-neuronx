@@ -377,6 +377,17 @@ def _device_constructor_mode(fn, x):
     return out
 
 
+def _dynamo_full_graph(fn, x):
+    # Dynamo full-graph capture with a backend that runs the captured graph as it is.
+    torch._dynamo.reset()
+    try:
+        out = torch.compile(fn, fullgraph=True, backend=lambda gm, example_inputs: gm.forward)(x)
+    finally:
+        torch._dynamo.reset()
+    assert out[0].tolist() == [False, True, False]
+    return out
+
+
 @pytest.mark.parametrize("warm", [False, True], ids=["empty", "warm"])
 @pytest.mark.parametrize("cached_types", [{"neuron"}, {"neuron", "cpu"}], ids=["neuron", "cpu"])
 @pytest.mark.parametrize(
@@ -390,6 +401,7 @@ def _device_constructor_mode(fn, x):
         _native_functionalization,
         _torch_function_mode,
         _device_constructor_mode,
+        _dynamo_full_graph,
     ],
     ids=[
         "fake",
@@ -400,6 +412,7 @@ def _device_constructor_mode(fn, x):
         "native_functionalization",
         "torch_function_mode",
         "device_constructor_mode",
+        "dynamo_full_graph",
     ],
 )
 def test_apply_input_mutations_shard_index_trace_then_run(monkeypatch, cached_types, trace, warm):
