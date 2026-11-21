@@ -12,6 +12,7 @@ import torch_neuronx
 from torch_neuronx.kernels.cache_utils import TensorDumper
 from torch_neuronx.neuron_dynamo_backend.exceptions import NEFFExecutionError
 from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+    _EXECUTOR_INPUT_TRANSFORMS,
     PassMutations,
     apply_input_mutations,
     apply_output_mutations,
@@ -417,8 +418,11 @@ class Executor:
         device_id = torch.neuron.current_device()
         device_str = f"neuron:{device_id}"
 
-        # Apply input mutations to transform caller inputs into NEFF inputs
-        mutated_inputs = apply_input_mutations(list(inputs), self.pass_mutations, device_str)
+        # Apply input mutations to transform caller inputs into NEFF inputs. The executor reuses
+        # the shard index tensor it injects: it only passes it to the graph as an input.
+        mutated_inputs = apply_input_mutations(
+            list(inputs), self.pass_mutations, device_str, _EXECUTOR_INPUT_TRANSFORMS
+        )
 
         if len(mutated_inputs) != len(self.io_spec.inputs):
             raise NEFFExecutionError(

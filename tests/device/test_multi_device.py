@@ -10,6 +10,13 @@ import torch
 
 import torch_neuronx  # This registers the neuron device
 from tests.utils.neuron_test_utils import assert_op_runs_on_neuron, assert_raises, track_neuron_ops
+from torch_neuronx.neuron_dynamo_backend.fx.io_mutation import (
+    _EXECUTOR_INPUT_TRANSFORMS,
+    IOMutation,
+    MutationKind,
+    PassMutations,
+    apply_input_mutations,
+)
 
 
 @pytest.mark.multi_device
@@ -89,6 +96,38 @@ class TestNeuronDevice(unittest.TestCase):
         dst = torch.empty(8, 4, dtype=torch.complex64, device="neuron:1")
         dst.copy_(src_cpu.to("neuron:0").conj())
         torch.testing.assert_close(dst.cpu(), src_cpu.conj().resolve_conj())
+
+    def test_shard_index_tensor_per_device(self):
+        """Test that each device gets its own cached shard index tensor.
+
+        Stream ids repeat across devices, so the cache key must include the device index.
+        The shard index is injected as the executor injects it, with the cached transform.
+        """
+        device_count = torch_neuronx.device_count()
+        if device_count < 2:
+            pytest.skip("Need at least 2 neuron devices")
+
+        mutation = IOMutation(
+            kind=MutationKind.ADD,
+            indices=[2],
+            transform_key="shard_index",
+            transform_params={"shard_index": 5},
+            pass_name="P",
+        )
+        passes = [PassMutations(pass_name="P", input_mutations=[mutation])]
+        tensors = [
+            apply_input_mutations(["a", "b"], passes, f"neuron:{d}", _EXECUTOR_INPUT_TRANSFORMS)[2]
+            for d in (0, 1)
+        ]
+        assert tensors[0] is not tensors[1]
+        for d, tensor in enumerate(tensors):
+            assert (
+                apply_input_mutations(
+                    ["a", "b"], passes, f"neuron:{d}", _EXECUTOR_INPUT_TRANSFORMS
+                )[2]
+                is tensor
+            )
+            assert tensor.device == torch.device("neuron", d) and tensor.item() == 5
 
     def test_ones_explicit_device_index(self):
         """Test that explicit device argument is respected, not overridden by current device."""
