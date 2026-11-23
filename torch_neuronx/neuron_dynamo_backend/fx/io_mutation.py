@@ -20,6 +20,7 @@ entries applying each pass's input mutations in order.
 mutations in reverse order (last pass undone first).
 """
 
+import functools
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -96,24 +97,109 @@ class PassMutations:
     output_mutations: list[IOMutation] = field(default_factory=list)
 
 
+# The executor reuses one tensor for each (device, stream, shard index) when it injects the shard
+# index (_EXECUTOR_INPUT_TRANSFORMS). TRANSFORM_REGISTRY["shard_index"] still makes a new tensor at
+# each call, so a caller that changes the tensor it gets never changes a later call's. The executor
+# only passes the tensor to the graph as an input. A new tensor at each call is a
+# host-to-device write. Python enqueues the write and the next graph without waiting. The runtime
+# submits a device op on another execution unit only after the previous op retires: the write
+# after the previous graph, then the next graph after the write. The first upload is asynchronous
+# on the current stream. Only graphs on that stream are ordered after it. Each new stream gets a
+# new id, so the cache is an LRU of fixed size. An evicted tensor is released as the per-call
+# tensor was before. The cache is process-wide. With more than 16 keys in use, each call can miss
+# and upload a new tensor again. The results stay the same.
+_SHARD_INDEX_CACHE_SIZE = 16
+# Only real execution on these devices reuses the tensor. The CPU fallback gets a new one.
+_SHARD_INDEX_CACHE_DEVICE_TYPES = frozenset({"neuron"})
+
+
+def _current_stream_id(device: str) -> int | None:
+    """Return the id of the current stream on a Neuron ``device``, ``None`` for other devices."""
+    if torch.device(device).type != "neuron":
+        return None
+    return torch.neuron.current_stream(device).stream_id
+
+
+@functools.lru_cache(maxsize=_SHARD_INDEX_CACHE_SIZE)
+def _shard_index_on(device: str, stream_id: int | None, shard_index: int) -> torch.Tensor:
+    return torch.tensor(shard_index, dtype=torch.int64, device=device)
+
+
+def _reuse_shard_index(device: torch.device) -> bool:
+    """Return whether a call on ``device`` can reuse the cached tensor."""
+    # A trace, fake or functional mode makes its own kind of tensor. A real call must not get it.
+    # These checks read this thread's dispatch mode stack, its PreDispatch and Functionalize keys
+    # and functorch transforms. is_in_torch_dispatch_mode() reads a process-wide flag: when one of
+    # two threads in a mode exits, it is False in the other. A pre-dispatch mode such as
+    # FunctionalTensorMode(pre_dispatch=True) sits on a separate stack, also process-wide, so the
+    # check is the PreDispatch key in this thread's include set. Native functionalization adds the
+    # Functionalize key. The caller checks for Dynamo and torch function modes before it builds
+    # ``device``.
+    return (
+        device.type in _SHARD_INDEX_CACHE_DEVICE_TYPES
+        and torch._C._len_torch_dispatch_stack() == 0
+        and not torch._C._dispatch_tls_is_dispatch_key_included(torch._C.DispatchKey.PreDispatch)
+        and not torch._C._dispatch_tls_is_dispatch_key_included(torch._C.DispatchKey.Functionalize)
+        and not torch._C._are_functorch_transforms_active()
+    )
+
+
+def _new_shard_index_tensor(index, device, params, original_inputs):
+    """Return a new int64 scalar tensor holding ``params["shard_index"]`` on ``device``."""
+    return torch.tensor(params["shard_index"], dtype=torch.int64, device=device)
+
+
+def _cached_shard_index_tensor(index, device, params, original_inputs):
+    """Return the cached int64 scalar tensor holding ``params["shard_index"]`` on ``device``."""
+    # A caller that replaces TRANSFORM_REGISTRY["shard_index"] gets its factory here too, as
+    # without the cache: the executor and the CPU fallback inject the same value.
+    factory = TRANSFORM_REGISTRY["shard_index"]
+    if factory is not _new_shard_index_tensor:
+        return factory(index, device, params, original_inputs)
+    # Dynamo cannot trace the dispatch state checks below. A compiled call gets a new tensor.
+    if torch.compiler.is_compiling():
+        return torch.tensor(params["shard_index"], dtype=torch.int64, device=device)
+    # A torch function mode can intercept torch.device() itself, so this check comes before it.
+    # Under any such mode, torch.device() and set_default_device() included, a call gets a new
+    # tensor made from the original argument, as without the cache.
+    if torch._C._is_torch_function_mode_enabled():
+        return torch.tensor(params["shard_index"], dtype=torch.int64, device=device)
+    device = torch.device(device)
+    if not _reuse_shard_index(device):
+        return torch.tensor(params["shard_index"], dtype=torch.int64, device=device)
+    # Stream ids repeat across devices, so a key without the device index can match another device.
+    if device.type == "neuron" and device.index is None:
+        device = torch.device("neuron", torch.neuron.current_device())
+    device = str(device)
+    return _shard_index_on(device, _current_stream_id(device), int(params["shard_index"]))
+
+
 TRANSFORM_REGISTRY: dict[str, Callable[[int, str, dict, list], Any]] = {
     "none": lambda index, device, params, original_inputs: None,
-    "shard_index": lambda index, device, params, original_inputs: torch.tensor(
-        params["shard_index"], dtype=torch.int64, device=device
-    ),
+    "shard_index": _new_shard_index_tensor,
     "input_passthrough": lambda index, device, params, original_inputs: (
         original_inputs[params["index_to_input"][index]] if original_inputs is not None else None
     ),
 }
 
+# Input transforms that only the executor passes to apply_input_mutations.
+_EXECUTOR_INPUT_TRANSFORMS: dict[str, Callable[[int, str, dict, list], Any]] = {
+    "shard_index": _cached_shard_index_tensor,
+}
 
-def _apply_input_mutation(values: list, m: IOMutation, device: str) -> list:
+
+def _apply_input_mutation(
+    values: list, m: IOMutation, device: str, transforms: dict | None = None
+) -> list:
     """Apply one input ADD/REMOVE mutation. ALIAS mutations are skipped."""
     if m.kind == MutationKind.REMOVE:
         remove_set = set(m.indices)
         return [v for i, v in enumerate(values) if i not in remove_set]
     if m.kind == MutationKind.ADD:
-        fn = TRANSFORM_REGISTRY[m.transform_key]
+        if transforms is not None and m.transform_key in transforms:
+            fn = transforms[m.transform_key]
+        else:
+            fn = TRANSFORM_REGISTRY[m.transform_key]
         params = m.transform_params or {}
         add_set = set(m.indices)
         result = []
@@ -458,6 +544,7 @@ def apply_input_mutations(
     inputs: list,
     pass_mutations: list[PassMutations],
     device: str,
+    transforms: dict | None = None,
 ) -> list:
     """Apply input mutations from caller space to NEFF space.
 
@@ -465,6 +552,8 @@ def apply_input_mutations(
         inputs (list): Values matching the original caller signature.
         pass_mutations (list[PassMutations]): Ordered pass-local mutation records.
         device (str): Device used by transforms that generate values.
+        transforms (dict | None, optional): Transforms used instead of the TRANSFORM_REGISTRY
+            entries with the same keys. Defaults to ``None``.
 
     Returns:
         list: Values matching the post-pass NEFF input signature.
@@ -476,7 +565,7 @@ def apply_input_mutations(
     values = inputs
     for pm in pass_mutations:
         for m in pm.input_mutations:
-            values = _apply_input_mutation(values, m, device)
+            values = _apply_input_mutation(values, m, device, transforms)
     return values
 
 
