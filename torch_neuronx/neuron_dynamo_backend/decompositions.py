@@ -37,6 +37,7 @@ from torch_neuronx.python_ops.nki_kernels.rng_state import _has_nki_rng
 from torch_neuronx.python_ops.nki_kernels.triangular_solve import (
     triangular_solve_batched_nki as _triangular_solve_batched_nki_kernel,
 )
+from torch_neuronx.python_ops.torch_mlir.ops.misc import pad_along, softmax_reduction_padding
 from torch_neuronx.python_ops.torch_mlir.ops.random import normal_fill, uniform_fill
 from torch_neuronx.python_ops.torch_mlir.ops.reduction import cummaxmin_scan
 
@@ -139,7 +140,6 @@ neuron_decompositions = get_decompositions(
         aten.gelu_backward,
         aten.threshold_backward,
         aten._log_softmax_backward_data,
-        aten._softmax_backward_data,
         aten.select_backward,
         aten.softplus_backward,
         aten.mish_backward,
@@ -644,6 +644,38 @@ def dot_empty_shortcut(a, b):
     if a.numel() != 0 and b.numel() != 0:
         return NotImplemented
     return _zero_result((), a, b)
+
+
+_STOCK_SOFTMAX_BACKWARD = get_decompositions([aten._softmax_backward_data])[
+    aten._softmax_backward_data.default
+]
+
+
+@register_decomposition([aten._softmax.default])
+def softmax_decomposition(x, dim, half_to_float):
+    """Pad a softmax reduction in (512, 2048) to a multiple of 512 with -inf
+    (see ``softmax_padded``).
+
+    Returns ``NotImplemented`` for other sizes, so the padded call keeps the native softmax.
+    """
+    pad = softmax_reduction_padding(x, dim)
+    if not pad:
+        return NotImplemented
+    y = aten._softmax.default(pad_along(x, dim, pad, float("-inf")), dim, half_to_float)
+    return y.narrow(dim, 0, x.shape[dim])
+
+
+@register_decomposition([aten._softmax_backward_data.default])
+def softmax_backward_decomposition(grad_output, output, dim, input_dtype):
+    """PyTorch's softmax backward decomposition, padded with zeros like
+    ``softmax_decomposition``."""
+    pad = softmax_reduction_padding(output, dim)
+    if not pad:
+        return _STOCK_SOFTMAX_BACKWARD(grad_output, output, dim, input_dtype)
+    grad_input = _STOCK_SOFTMAX_BACKWARD(
+        pad_along(grad_output, dim, pad, 0), pad_along(output, dim, pad, 0), dim, input_dtype
+    )
+    return grad_input.narrow(dim, 0, output.shape[dim])
 
 
 _NATIVE_FUSED_RMS_NORM = get_decompositions([aten._fused_rms_norm])[aten._fused_rms_norm.default]
