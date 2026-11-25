@@ -7,6 +7,47 @@ from ..validation import check_lerp_dtype, validate_inplace_broadcast
 from .unary import _validate_float_promoting_out
 
 
+# AwsNeuronSoftmax and AwsNeuronSoftmaxBackward (neuronx-cc native-to-custom-softmax, which the
+# transformer model type enables) tile the reduction in 512-wide chunks and return wrong rows when
+# the last chunk is partial: sizes 513..1023 in fp32, and parts of 513..1935 in bf16 and fp16
+# (neuronx-cc 2.28). Multiples of 512, sizes up to 512 and sizes 2048..4200 measured correct. Pad
+# sizes in (512, 2048) up to a multiple of 512: -inf for softmax inputs (exp gives 0), 0 for the
+# backward inputs (they add 0 to sum(g * y)).
+def softmax_reduction_padding(x, dim):
+    """Elements to append along ``dim`` so the softmax reduction ends on a full 512 chunk."""
+    if x.ndim == 0:
+        return 0
+    size = x.shape[dim]
+    return -size % 512 if 512 < size < 2048 else 0
+
+
+def pad_along(x, dim, pad, value):
+    """Append ``pad`` elements equal to ``value`` along ``dim``."""
+    shape = list(x.shape)
+    shape[dim] = pad
+    return torch.cat((x, x.new_full(shape, value)), dim)
+
+
+def softmax_padded(x, dim, dtype=None):
+    """``torch.softmax`` with the reduction padded to a multiple of 512."""
+    pad = softmax_reduction_padding(x, dim)
+    if not pad:
+        return torch.softmax(x, dim, dtype=dtype)
+    y = torch.softmax(pad_along(x, dim, pad, float("-inf")), dim, dtype=dtype)
+    return y.narrow(dim, 0, x.shape[dim])
+
+
+def softmax_backward_padded(grad_output, output, dim, input_dtype):
+    """``aten._softmax_backward_data`` with the reduction padded to a multiple of 512."""
+    pad = softmax_reduction_padding(output, dim)
+    if not pad:
+        return torch.ops.aten._softmax_backward_data(grad_output, output, dim, input_dtype)
+    grad_input = torch.ops.aten._softmax_backward_data(
+        pad_along(grad_output, dim, pad, 0), pad_along(output, dim, pad, 0), dim, input_dtype
+    )
+    return grad_input.narrow(dim, 0, output.shape[dim])
+
+
 @register_aten(["aten::embedding"], static_argnums=(2, 3, 4))
 def torch_embedding(weights, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=False):
     """Look up embedding rows for integer indices.
@@ -93,7 +134,7 @@ def torch_softmax_internal(x, dim, half_to_float, out=None):
     """
     if half_to_float:
         x = x.float()
-    return torch.softmax(x, dim)
+    return softmax_padded(x, dim)
 
 
 @register_aten(["aten::_log_softmax", "aten::_log_softmax.out"], static_argnums=(1, 2))
@@ -126,7 +167,7 @@ def torch_softmax(x, dim, dtype=None):
     Returns:
         torch.Tensor: Softmax probabilities.
     """
-    return torch.softmax(x, dim, dtype=dtype)
+    return softmax_padded(x, dim, dtype=dtype)
 
 
 @register_aten(["aten::log_softmax"], static_argnums=(1,), static_argnames=("dtype",))
@@ -163,7 +204,7 @@ def torch_softmax_backward_data(grad_output, output, dim, input_dtype, grad_inpu
     Returns:
         torch.Tensor: Gradient with respect to the softmax input.
     """
-    return torch.ops.aten._softmax_backward_data(grad_output, output, dim, input_dtype)
+    return softmax_backward_padded(grad_output, output, dim, input_dtype)
 
 
 @register_aten(
