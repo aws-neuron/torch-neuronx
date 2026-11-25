@@ -310,6 +310,37 @@ class TestTopkNanRegression:
         assert bool(torch.isfinite(out_cpu).all()), "scatter output has non-finite values"
 
 
+class TestTopkInfiniteTies:
+    """Regression for @AwsNeuronTopK repeating indices on infinite ties.
+
+    With more than 8 entries tied at -inf (largest=True) or +inf (largest=False), the custom
+    call returned indices 0..7 again past the first 8 slots. Sparse attention indexers mask
+    unused candidates with -inf and then take topk, so the repeats selected real candidates
+    several times.
+    """
+
+    @pytest.mark.parametrize("largest", [True, False])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("dim", [-1, 0])
+    def test_topk_infinite_ties_match_cpu(self, largest, dtype, dim):
+        x = torch.full((4, 64), float("-inf") if largest else float("inf"), dtype=dtype)
+        x[:, :5] = torch.arange(5, 0, -1, dtype=dtype) * (1 if largest else -1)
+        if dim == 0:
+            x = x.t().contiguous()
+
+        def fn(t):
+            return torch.topk(t, k=64, dim=dim, largest=largest)
+
+        with torch.no_grad():
+            compiled_fn = torch.compile(fn, backend="neuron", fullgraph=True)
+            values, indices = compiled_fn(x.to("neuron"))
+
+        cpu_values, _ = torch.topk(x, k=64, dim=dim, largest=largest)
+        torch.testing.assert_close(values.cpu(), cpu_values)
+        rows = indices.cpu() if dim == -1 else indices.cpu().t()
+        assert all(len(set(r.tolist())) == 64 for r in rows), "topk returned repeated indices"
+
+
 class TestNanmedianE2E:
     """E2E tests for nanmedian decomposition."""
 

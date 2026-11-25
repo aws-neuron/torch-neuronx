@@ -443,3 +443,16 @@ class TestTopK:
 
         torch.testing.assert_close(values_out.cpu(), cpu_values)
         torch.testing.assert_close(indices_out.cpu(), cpu_indices)
+
+    @pytest.mark.parametrize("largest", [True, False])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_topk_infinite_ties(self, largest, dtype):
+        """Distinct indices with more than 8 ties at -inf (largest) or +inf (smallest)."""
+        input_cpu = torch.full((4, 64), float("-inf") if largest else float("inf"), dtype=dtype)
+        input_cpu[:, :5] = torch.arange(5, 0, -1, dtype=dtype) * (1 if largest else -1)
+
+        cpu_values, _ = torch.topk(input_cpu, k=64, largest=largest)
+        neuron_values, neuron_indices = torch.topk(input_cpu.to("neuron"), k=64, largest=largest)
+
+        torch.testing.assert_close(neuron_values.cpu(), cpu_values)
+        assert all(len(set(r.tolist())) == 64 for r in neuron_indices.cpu())
